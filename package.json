@@ -15,7 +15,7 @@
     "db:migrate": "turbo db:migrate",
     "db:push": "turbo db:push",
     "db:studio": "turbo db:studio",
-    "start": "npx pm2 delete web-app 2>/dev/null || true; npx pm2 start ecosystem.config.cjs --update-env",
+    "start": "cd packages/web && bun src/server.ts",
     "build:web": "cd packages/web && bunx vite build",
     "kill:port": "lsof -t -i :${PORT:-4200} | xargs kill -9"
   },
