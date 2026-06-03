@@ -6,6 +6,7 @@ const indexPath = `${distDir}/index.html`;
 
 const server = Bun.serve({
   port,
+  hostname: "0.0.0.0",
   idleTimeout: 120, // 120s para requests lentas como descarga de attachments Gmail
   async fetch(request) {
     const url = new URL(request.url);
