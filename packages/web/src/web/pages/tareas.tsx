@@ -212,7 +212,7 @@ export default function Tareas() {
 
   return (
     <AppLayout>
-      <div style={{ padding: "24px", maxWidth: "900px", margin: "0 auto" }}>
+      <div className="p-4 lg:p-6" style={{ maxWidth: "900px", margin: "0 auto" }}>
 
         {/* Header */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "24px" }}>
@@ -260,7 +260,7 @@ export default function Tareas() {
           </div>
         )}
 
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "24px" }}>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
 
           {/* Recurring */}
           <div>

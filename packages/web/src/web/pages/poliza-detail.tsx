@@ -99,17 +99,17 @@ export default function PolizaDetail() {
 
   return (
     <AppLayout>
-      <div className="p-8 max-w-4xl">
+      <div className="p-4 lg:p-8 max-w-4xl">
         {/* Header */}
-        <div className="flex items-center gap-4 mb-6">
+        <div className="flex items-center gap-3 sm:gap-4 mb-6">
           <Link href="/polizas">
-            <a className="p-2 text-gray-400 hover:text-white hover:bg-[#1f2937] rounded-lg transition-all">
+            <a className="p-2 text-gray-400 hover:text-white hover:bg-[#1f2937] rounded-lg transition-all flex-shrink-0">
               <ArrowLeft className="w-5 h-5" />
             </a>
           </Link>
-          <div className="flex-1">
-            <div className="flex items-center gap-3 flex-wrap">
-              <h1 className="text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
+              <h1 className="text-xl lg:text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>
                 {p.policyNumber}
               </h1>
               <span className={cn("inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium border", typeInfo?.color)}>
@@ -133,9 +133,9 @@ export default function PolizaDetail() {
           </div>
           <button
             onClick={() => setShowEdit(true)}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium transition-all"
+            className="flex items-center gap-2 px-3 sm:px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium transition-all flex-shrink-0"
           >
-            <Edit className="w-4 h-4" /> Editar
+            <Edit className="w-4 h-4" /> <span className="hidden sm:inline">Editar</span>
           </button>
         </div>
 
@@ -366,8 +366,8 @@ export default function PolizaDetail() {
                   <p className="text-xs text-gray-600">Hacé clic en "Generar cuotas" para crear el plan de pagos.</p>
                 </div>
               ) : (
-              <div className="bg-[#111827] border border-[#1f2937] rounded-xl overflow-hidden">
-                <table className="w-full text-sm">
+              <div className="bg-[#111827] border border-[#1f2937] rounded-xl overflow-x-auto">
+                <table className="w-full text-sm min-w-[560px]">
                   <thead>
                     <tr className="text-xs text-gray-500 border-b border-[#1f2937]">
                       <th className="text-left px-4 py-2.5 font-medium">#</th>

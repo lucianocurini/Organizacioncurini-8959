@@ -55,10 +55,10 @@ export default function Dashboard() {
 
   return (
     <AppLayout>
-      <div className="p-8">
+      <div className="p-4 lg:p-8">
         {/* Header */}
         <div className="mb-8">
-          <h1 className="text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Dashboard</h1>
+          <h1 className="text-xl lg:text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Dashboard</h1>
           <p className="text-gray-400 text-sm mt-1">Resumen general de pólizas activas</p>
         </div>
 
@@ -88,14 +88,14 @@ export default function Dashboard() {
         </div>
 
         {/* Premium total */}
-        <div className="mb-8 bg-gradient-to-r from-blue-600/20 to-blue-800/10 border border-blue-600/20 rounded-xl p-6 flex items-center justify-between">
-          <div>
+        <div className="mb-8 bg-gradient-to-r from-blue-600/20 to-blue-800/10 border border-blue-600/20 rounded-xl p-5 lg:p-6 flex items-center justify-between gap-3">
+          <div className="min-w-0">
             <p className="text-gray-400 text-sm">Prima total (cartera activa)</p>
-            <p className="text-3xl font-bold text-white mt-1 font-mono" style={{ fontFamily: "JetBrains Mono, monospace" }}>
+            <p className="text-2xl lg:text-3xl font-bold text-white mt-1 font-mono truncate" style={{ fontFamily: "JetBrains Mono, monospace" }}>
               {formatCurrency(stats?.totalPremium)}
             </p>
           </div>
-          <div className="w-12 h-12 rounded-xl bg-blue-600/20 flex items-center justify-center">
+          <div className="w-12 h-12 rounded-xl bg-blue-600/20 flex items-center justify-center shrink-0">
             <TrendingUp className="w-6 h-6 text-blue-400" />
           </div>
         </div>

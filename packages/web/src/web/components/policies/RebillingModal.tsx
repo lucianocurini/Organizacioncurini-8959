@@ -86,8 +86,8 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
   const lbl = "block text-xs text-gray-400 mb-1.5";
 
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <div className="bg-[#111827] border border-[#1f2937] rounded-2xl w-full max-w-md">
+    <div className="fixed inset-0 bg-black/70 flex items-start sm:items-center justify-center z-50 p-4 overflow-y-auto">
+      <div className="bg-[#111827] border border-[#1f2937] rounded-2xl w-full max-w-md my-4 max-h-[90vh] overflow-y-auto">
 
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-[#1f2937]">

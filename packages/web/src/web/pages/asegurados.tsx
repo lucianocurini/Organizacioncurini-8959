@@ -58,19 +58,19 @@ export default function Asegurados() {
 
   return (
     <AppLayout>
-      <div className="p-8">
-        <div className="flex items-center justify-between mb-6">
+      <div className="p-4 lg:p-8">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-6">
           <div>
-            <h1 className="text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Asegurados</h1>
+            <h1 className="text-xl lg:text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Asegurados</h1>
             <p className="text-gray-400 text-sm mt-1">{insureds.length} registros</p>
           </div>
-          <button onClick={openCreate} className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium transition-all">
+          <button onClick={openCreate} className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium transition-all w-full sm:w-auto justify-center">
             <Plus className="w-4 h-4" /> Nuevo Asegurado
           </button>
         </div>
 
         {/* Search */}
-        <div className="relative max-w-sm mb-5">
+        <div className="relative w-full sm:max-w-sm mb-5">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
           <input
             value={q}
@@ -83,7 +83,41 @@ export default function Asegurados() {
         {loading ? (
           <div className="flex justify-center py-16"><div className="w-6 h-6 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" /></div>
         ) : (
-          <div className="bg-[#111827] border border-[#1f2937] rounded-xl overflow-hidden">
+          <>
+          {/* Mobile: tarjetas */}
+          <div className="lg:hidden space-y-3">
+            {insureds.length === 0 ? (
+              <div className="py-12 text-center text-gray-500 text-sm">No se encontraron asegurados</div>
+            ) : insureds.map(i => (
+              <div key={i.id} className="bg-[#111827] border border-[#1f2937] rounded-xl p-4">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <div className="w-8 h-8 rounded-full bg-blue-600/20 flex items-center justify-center text-sm font-bold text-blue-400 flex-shrink-0">
+                      {i.name.charAt(0)}
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-sm text-white font-medium truncate">{i.name}</p>
+                      {i.dni && <p className="text-xs text-gray-500 font-mono">DNI: {i.dni}</p>}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button onClick={() => openEdit(i)} className="p-2 text-gray-400 hover:text-blue-400 hover:bg-[#1f2937] rounded-md transition-all"><Edit className="w-4 h-4" /></button>
+                    <button onClick={() => setDeleteId(i.id)} className="p-2 text-gray-400 hover:text-red-400 hover:bg-[#1f2937] rounded-md transition-all"><Trash2 className="w-4 h-4" /></button>
+                  </div>
+                </div>
+                {(i.phone || i.email || i.address) && (
+                  <div className="mt-3 pt-3 border-t border-[#1f2937] space-y-1 text-xs text-gray-400">
+                    {i.phone && <p>📞 {i.phone}</p>}
+                    {i.email && <p className="truncate">✉ {i.email}</p>}
+                    {i.address && <p className="truncate">📍 {i.address}</p>}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {/* Desktop: tabla */}
+          <div className="hidden lg:block bg-[#111827] border border-[#1f2937] rounded-xl overflow-hidden">
             <table className="w-full">
               <thead className="border-b border-[#1f2937]">
                 <tr>
@@ -123,12 +157,13 @@ export default function Asegurados() {
               </tbody>
             </table>
           </div>
+          </>
         )}
       </div>
 
       {showModal && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-          <div className="bg-[#111827] border border-[#1f2937] rounded-2xl w-full max-w-md">
+          <div className="bg-[#111827] border border-[#1f2937] rounded-2xl w-full max-w-md max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between px-6 py-4 border-b border-[#1f2937]">
               <h2 className="text-lg font-semibold text-white" style={{ fontFamily: "Syne, sans-serif" }}>
                 {editItem ? "Editar Asegurado" : "Nuevo Asegurado"}

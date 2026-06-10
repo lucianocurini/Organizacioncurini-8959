@@ -165,11 +165,11 @@ export default function Polizas() {
 
   return (
     <AppLayout>
-      <div className="p-8">
+      <div className="p-4 lg:p-8">
         {/* Header */}
-        <div className="flex items-center justify-between mb-6">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-6">
           <div>
-            <h1 className="text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Pólizas</h1>
+            <h1 className="text-xl lg:text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Pólizas</h1>
             <p className="text-gray-400 text-sm mt-1">
               {sorted.length} registros
               {selected.size > 0 ? ` · ${selected.size} seleccionada${selected.size !== 1 ? "s" : ""}` : ""}
@@ -178,20 +178,20 @@ export default function Polizas() {
           </div>
           <div className="flex items-center gap-2">
             <button onClick={exportToCSV} className="flex items-center gap-2 px-3 py-2 bg-[#1f2937] border border-[#374151] text-gray-300 text-sm rounded-lg hover:text-white hover:border-gray-500 transition-all">
-              <Download className="w-4 h-4" /> Exportar CSV
+              <Download className="w-4 h-4" /> <span className="hidden sm:inline">Exportar CSV</span>
             </button>
             <button onClick={() => setShowImport(true)} className="flex items-center gap-2 px-3 py-2 bg-[#1f2937] border border-[#374151] text-gray-300 text-sm rounded-lg hover:text-white hover:border-gray-500 transition-all">
-              <Upload className="w-4 h-4" /> Importar
+              <Upload className="w-4 h-4" /> <span className="hidden sm:inline">Importar</span>
             </button>
-            <button onClick={() => { setEditPolicy(null); setShowModal(true); }} className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium transition-all">
-              <Plus className="w-4 h-4" /> Nueva Póliza
+            <button onClick={() => { setEditPolicy(null); setShowModal(true); }} className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium transition-all whitespace-nowrap">
+              <Plus className="w-4 h-4" /> <span className="hidden sm:inline">Nueva Póliza</span><span className="sm:hidden">Nueva</span>
             </button>
           </div>
         </div>
 
         {/* Filters */}
         <div className="flex flex-wrap gap-3 mb-5">
-          <div className="relative flex-1 min-w-[220px] max-w-xs">
+          <div className="relative flex-1 min-w-[180px] sm:max-w-xs">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
             <input
               value={q}
@@ -242,8 +242,76 @@ export default function Polizas() {
           </div>
         )}
 
-        {/* Table wrapper */}
-        <div className="bg-[#111827] border border-[#1f2937] rounded-xl overflow-hidden">
+        {/* Mobile: tarjetas */}
+        <div className="lg:hidden space-y-3">
+          {loading ? (
+            <div className="py-16 text-center text-gray-500 text-sm">Cargando...</div>
+          ) : sorted.length === 0 ? (
+            <div className="py-16 text-center text-gray-500 text-sm">No se encontraron pólizas</div>
+          ) : paged.map((row) => {
+            const days = daysUntil(row.policy.endDate);
+            const typeInfo = POLICY_TYPES[row.policy.type];
+            const statusInfo = STATUS_TYPES[row.policy.status];
+            const Icon = typeIcons[row.policy.type] || FileText;
+            const isSelected = selected.has(row.policy.id);
+            return (
+              <div key={row.policy.id} className={cn("bg-[#111827] border rounded-xl p-4", isSelected ? "border-blue-500/50 bg-blue-600/5" : "border-[#1f2937]")}>
+                <div className="flex items-start justify-between gap-2 mb-2">
+                  <div className="flex items-start gap-2.5 min-w-0">
+                    <button onClick={() => toggleSelect(row.policy.id)} className="mt-0.5 text-gray-400 hover:text-white transition-colors shrink-0">
+                      {isSelected ? <CheckSquare className="w-4 h-4 text-blue-400" /> : <Square className="w-4 h-4" />}
+                    </button>
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-white truncate">{row.insured?.name || "—"}</p>
+                      <p className="text-xs font-mono text-blue-400 truncate">{row.policy.policyNumber}</p>
+                    </div>
+                  </div>
+                  <span className={cn("inline-flex px-2 py-0.5 rounded-md text-xs font-medium border whitespace-nowrap shrink-0", statusInfo?.color)}>
+                    {statusInfo?.label || row.policy.status}
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 mb-3">
+                  <span className={cn("inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-xs font-medium border", typeInfo?.color)}>
+                    <Icon className="w-3 h-3 shrink-0" />
+                    <span className="truncate">{typeInfo?.label || row.policy.type}</span>
+                  </span>
+                  <span className="text-xs text-gray-400 truncate">{row.company?.name || "—"}</span>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 text-xs mb-3">
+                  <div>
+                    <p className="text-gray-500">Vigencia</p>
+                    <p className="text-gray-300">{formatDate(row.policy.endDate)}</p>
+                    {days >= 0 && days <= 30 && <p className="text-amber-400">{days === 0 ? "Vence hoy" : `${days}d restantes`}</p>}
+                    {days < 0 && <p className="text-red-400">Vencida {Math.abs(days)}d</p>}
+                  </div>
+                  <div className="text-right">
+                    <p className="text-gray-500">Cuota mensual</p>
+                    <p className="font-mono text-white">{row.policy.monthlyFee ? formatCurrency(row.policy.monthlyFee) : (row.policy.premium ? formatCurrency(row.policy.premium) : "—")}</p>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-end gap-1 pt-2 border-t border-[#1f2937]">
+                  <Link href={`/polizas/${row.policy.id}`}>
+                    <a className="flex items-center gap-1 px-3 py-1.5 text-xs text-gray-300 hover:text-white hover:bg-[#1f2937] rounded-md transition-all">
+                      <Eye className="w-3.5 h-3.5" /> Ver
+                    </a>
+                  </Link>
+                  <button onClick={() => { setEditPolicy(row); setShowModal(true); }} className="flex items-center gap-1 px-3 py-1.5 text-xs text-gray-300 hover:text-blue-400 hover:bg-[#1f2937] rounded-md transition-all">
+                    <Edit className="w-3.5 h-3.5" /> Editar
+                  </button>
+                  <button onClick={() => setDeleteId(row.policy.id)} className="flex items-center gap-1 px-3 py-1.5 text-xs text-gray-300 hover:text-red-400 hover:bg-[#1f2937] rounded-md transition-all">
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Desktop: tabla */}
+        <div className="hidden lg:block bg-[#111827] border border-[#1f2937] rounded-xl overflow-hidden">
 
           {/* Top scrollbar */}
           <div

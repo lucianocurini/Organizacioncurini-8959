@@ -146,7 +146,7 @@ function DeliveryModal({ open, onClose, onSaved, editing }: {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/70" onClick={onClose} />
-      <div className="relative w-full max-w-lg bg-[#0d1424] border border-[#1f2937] rounded-2xl shadow-2xl z-10 overflow-hidden">
+      <div className="relative w-full max-w-lg bg-[#0d1424] border border-[#1f2937] rounded-2xl shadow-2xl z-10 overflow-hidden max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between px-6 py-4 border-b border-[#1f2937]">
           <h2 className="text-white font-semibold text-lg">{editing ? "Editar envío" : "Registrar envío"}</h2>
           <button onClick={onClose} className="text-gray-400 hover:text-white transition-colors"><X className="w-5 h-5" /></button>
@@ -373,15 +373,15 @@ export default function Envios() {
 
   return (
     <AppLayout>
-      <div className="p-8 space-y-6">
+      <div className="p-4 lg:p-8 space-y-6">
         {/* Header */}
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
           <div>
-            <h1 className="text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Envíos y Entregas</h1>
+            <h1 className="text-xl lg:text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Envíos y Entregas</h1>
             <p className="text-gray-400 text-sm mt-1">Registro de envíos de pólizas y refacturaciones</p>
           </div>
           <button onClick={() => { setEditing(null); setModalOpen(true); }}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-all">
+            className="flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-all">
             <Plus className="w-4 h-4" /> Registrar envío
           </button>
         </div>
@@ -469,7 +469,75 @@ export default function Envios() {
                 className="mt-3 text-blue-400 text-sm hover:underline">Registrar primer envío</button>
             </div>
           ) : (
-            <div className="overflow-x-auto">
+            <>
+            {/* Mobile cards */}
+            <div className="lg:hidden divide-y divide-[#1f2937]">
+              {filtered.map(r => {
+                const Icon = CHANNEL_ICONS[r.delivery.channel] || Send;
+                const isPending = r.delivery.status === "pendiente";
+                const isManual = r.delivery.policyId == null;
+                const displayNum = r.policy?.policyNumber || r.delivery.manualPolicyNumber || "—";
+                const displayName = r.insured?.name || r.delivery.manualRecipient || "—";
+                return (
+                  <div key={r.delivery.id} className="p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <p className="text-white font-medium">{displayNum}</p>
+                          {isManual && (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] border border-orange-500/30 bg-orange-500/10 text-orange-400">manual</span>
+                          )}
+                        </div>
+                        <p className="text-xs text-gray-400 truncate">{displayName}</p>
+                      </div>
+                      <span className={cn("px-2 py-0.5 rounded text-xs border flex-shrink-0",
+                        isPending
+                          ? "bg-yellow-500/20 text-yellow-400 border-yellow-500/30"
+                          : "bg-green-500/20 text-green-400 border-green-500/30")}>
+                        {isPending ? "Pendiente" : "Realizado"}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap text-xs">
+                      <span className="px-2 py-0.5 rounded border border-[#2d3748] text-gray-300">
+                        {DOC_LABELS[r.delivery.documentType] || r.delivery.documentType}
+                      </span>
+                      <span className={cn("flex items-center gap-1.5 px-2 py-0.5 rounded border",
+                        CHANNEL_COLORS[r.delivery.channel] || "text-gray-400 border-gray-500/30")}>
+                        <Icon className="w-3 h-3" />
+                        {CHANNEL_LABELS[r.delivery.channel] || r.delivery.channel}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-4 text-xs text-gray-400">
+                      {r.delivery.scheduledDate && (
+                        <span>Prog: {new Date(r.delivery.scheduledDate + "T12:00:00").toLocaleDateString("es-AR")}</span>
+                      )}
+                      {r.delivery.completedDate && (
+                        <span>Real: {new Date(r.delivery.completedDate + "T12:00:00").toLocaleDateString("es-AR")}</span>
+                      )}
+                    </div>
+                    {r.delivery.notes && <p className="text-xs text-gray-400">{r.delivery.notes}</p>}
+                    <div className="flex items-center gap-2 pt-1">
+                      {isPending && (
+                        <button onClick={() => handleComplete(r.delivery.id)}
+                          className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-green-600/20 text-green-400 border border-green-500/30 hover:bg-green-600/40 transition-colors">
+                          <Check className="w-3 h-3" /> Realizado
+                        </button>
+                      )}
+                      <button onClick={() => { setEditing(r); setModalOpen(true); }}
+                        className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-blue-400 transition-colors">
+                        <Edit2 className="w-3 h-3" /> Editar
+                      </button>
+                      <button onClick={() => handleDelete(r.delivery.id)}
+                        className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-red-400 transition-colors">
+                        <Trash2 className="w-3 h-3" /> Eliminar
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            {/* Desktop table */}
+            <div className="hidden lg:block overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="text-xs text-gray-500 border-b border-[#1f2937]">
@@ -562,6 +630,7 @@ export default function Envios() {
                 </tbody>
               </table>
             </div>
+            </>
           )}
         </div>
       </div>

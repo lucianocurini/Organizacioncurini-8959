@@ -759,15 +759,15 @@ export default function Siniestros() {
 
   return (
     <AppLayout>
-      <div className="p-8">
+      <div className="p-4 lg:p-8">
         {/* Header */}
-        <div className="flex items-center justify-between mb-6">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-6">
           <div>
-            <h1 className="text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Siniestros</h1>
+            <h1 className="text-xl lg:text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Siniestros</h1>
             <p className="text-gray-400 text-sm mt-0.5">Gestión de siniestros de todas las ramas</p>
           </div>
           <button onClick={() => openWizard()}
-            className="flex items-center gap-2 px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white text-sm font-medium rounded-lg transition-all">
+            className="flex items-center justify-center gap-2 px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white text-sm font-medium rounded-lg transition-all">
             <Plus className="w-4 h-4" /> Nuevo siniestro
           </button>
         </div>
@@ -806,10 +806,10 @@ export default function Siniestros() {
                 const hasManual = c.manualInsured || c.manualCompany || c.manualPolicyNumber;
                 return (
                   <div key={c.id} className={cn(
-                    "flex items-center gap-4 px-5 py-4 hover:bg-[#1a2540]/30 transition-colors group",
+                    "flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4 px-4 sm:px-5 py-4 hover:bg-[#1a2540]/30 transition-colors group",
                     idx < pendingClaims.length - 1 && "border-b border-[#1f2937]"
                   )}>
-                    <div className="w-8 h-8 rounded-lg bg-gray-500/15 border border-gray-500/20 flex items-center justify-center flex-shrink-0">
+                    <div className="hidden sm:flex w-8 h-8 rounded-lg bg-gray-500/15 border border-gray-500/20 items-center justify-center flex-shrink-0">
                       <Inbox className="w-4 h-4 text-gray-500" />
                     </div>
                     <div className="flex-1 min-w-0">
@@ -824,7 +824,7 @@ export default function Siniestros() {
                         )}
                         {!hasManual && <span className="text-sm text-gray-500 italic">Sin datos</span>}
                       </div>
-                      <div className="flex items-center gap-3 mt-0.5">
+                      <div className="flex items-center flex-wrap gap-x-3 gap-y-1 mt-0.5">
                         {c.manualPolicyNumber && (
                           <span className="text-xs text-gray-500 font-mono">Póliza aprox: {c.manualPolicyNumber}</span>
                         )}
@@ -903,7 +903,52 @@ export default function Siniestros() {
           </div>
         ) : (
           <div className="bg-[#111827] border border-[#1f2937] rounded-2xl overflow-hidden">
-            <table className="w-full text-sm">
+            {/* Mobile cards */}
+            <div className="md:hidden divide-y divide-[#1f2937]">
+              {activeClaims.map((r: any) => {
+                const c = r.claim;
+                const statusInfo = CLAIM_STATUS[c.status];
+                const StatusIcon = statusInfo?.icon || Clock;
+                const typeInfo = POLICY_TYPES[r.policy?.type];
+                return (
+                  <div key={c.id} className="p-4 space-y-2.5">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <div className={cn("w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 text-xs", typeInfo?.color || "bg-gray-500/10 text-gray-400 border border-gray-500/20")}>
+                          {r.policy?.type === "automotor" ? <Car className="w-3.5 h-3.5" /> :
+                           r.policy?.type === "motovehiculo" ? <Bike className="w-3.5 h-3.5" /> :
+                           <FileText className="w-3.5 h-3.5" />}
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-white font-mono text-xs font-medium truncate">{r.policy?.policyNumber || c.manualPolicyNumber || "—"}</p>
+                          <p className="text-gray-400 text-xs truncate">{r.insured?.name || c.manualInsured || <span className="text-gray-600 italic">Sin asegurado</span>}</p>
+                        </div>
+                      </div>
+                      <span className={cn("inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-medium border flex-shrink-0", statusInfo?.color)}>
+                        <StatusIcon className="w-3 h-3" />{statusInfo?.label}
+                      </span>
+                    </div>
+                    <div className="flex items-center flex-wrap gap-x-4 gap-y-1 text-xs text-gray-400 pl-9">
+                      <span>{c.incidentDate ? formatDate(c.incidentDate) : <span className="text-gray-600">Sin fecha</span>}{c.incidentTime && <span className="text-gray-500 ml-1">{c.incidentTime}</span>}</span>
+                      {c.incidentLocation && <span className="truncate max-w-[180px]">{c.incidentLocation}</span>}
+                    </div>
+                    <div className="flex items-center gap-2 pl-9">
+                      <Link href={`/siniestros/${c.id}`}>
+                        <a className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-blue-400 transition-colors">
+                          <Eye className="w-3 h-3" /> Ver detalle
+                        </a>
+                      </Link>
+                      <button onClick={() => deleteClaim(c.id)}
+                        className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-red-400 transition-colors">
+                        <Trash2 className="w-3 h-3" /> Eliminar
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            {/* Desktop table */}
+            <table className="w-full text-sm hidden md:table">
               <thead className="border-b border-[#1f2937]">
                 <tr>
                   <th className="text-left text-xs text-gray-500 px-5 py-3 font-medium">Póliza / Asegurado</th>

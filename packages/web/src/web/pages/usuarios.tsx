@@ -119,19 +119,65 @@ export default function Usuarios() {
 
   return (
     <AppLayout>
-      <div className="p-8 max-w-3xl">
-        <div className="flex items-center justify-between mb-6">
+      <div className="p-4 lg:p-8 max-w-3xl">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-6">
           <div>
-            <h1 className="text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Usuarios</h1>
+            <h1 className="text-xl lg:text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Usuarios</h1>
             <p className="text-gray-400 text-sm mt-1">Gestión de acceso al sistema</p>
           </div>
           <button onClick={() => setShowModal(true)}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium transition-all">
+            className="flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium transition-all">
             <Plus className="w-4 h-4" /> Nuevo usuario
           </button>
         </div>
 
-        <div className="bg-[#111827] border border-[#1f2937] rounded-xl overflow-hidden">
+        {/* Mobile cards */}
+        <div className="md:hidden space-y-3">
+          {loading ? (
+            <div className="py-12 text-center text-gray-500 text-sm">Cargando...</div>
+          ) : users.map(u => (
+            <div key={u.id} className={cn("bg-[#111827] border border-[#1f2937] rounded-xl p-4 space-y-3", u.active === 0 && "opacity-60")}>
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-8 h-8 rounded-full bg-blue-600/20 flex items-center justify-center text-xs font-bold text-blue-400 flex-shrink-0">
+                    {u.name.charAt(0)}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm text-white truncate">{u.name}</span>
+                      {isSelf(u) && <span className="px-1.5 py-0.5 rounded text-[10px] border border-blue-500/30 bg-blue-500/10 text-blue-400 flex-shrink-0">vos</span>}
+                    </div>
+                    <p className="text-xs text-gray-400 truncate">{u.email}</p>
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium border ${u.role === "admin" ? "bg-purple-500/15 text-purple-400 border-purple-500/20" : "bg-gray-500/15 text-gray-400 border-gray-500/20"}`}>
+                  {u.role === "admin" ? <Shield className="w-3 h-3" /> : <User className="w-3 h-3" />}{u.role}
+                </span>
+                {u.active === 1 ? (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium border bg-green-500/15 text-green-400 border-green-500/20"><CheckCircle className="w-3 h-3" /> Activo</span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium border bg-red-500/15 text-red-400 border-red-500/20"><Ban className="w-3 h-3" /> Suspendido</span>
+                )}
+              </div>
+              <div className="flex items-center gap-2 pt-1 border-t border-[#1f2937]">
+                <button onClick={() => openEdit(u)} className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-blue-400 transition-colors"><Edit2 className="w-3 h-3" /> Editar</button>
+                {!isSelf(u) && (u.active === 1 ? (
+                  <button onClick={() => toggleActive(u)} className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-yellow-400 transition-colors"><Ban className="w-3 h-3" /> Suspender</button>
+                ) : (
+                  <button onClick={() => toggleActive(u)} className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-green-400 transition-colors"><CheckCircle className="w-3 h-3" /> Reactivar</button>
+                ))}
+                {!isSelf(u) && (
+                  <button onClick={() => setDeleteId(u.id)} className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-red-400 transition-colors"><Trash2 className="w-3 h-3" /> Eliminar</button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Desktop table */}
+        <div className="hidden md:block bg-[#111827] border border-[#1f2937] rounded-xl overflow-hidden">
           <table className="w-full">
             <thead className="border-b border-[#1f2937]">
               <tr>

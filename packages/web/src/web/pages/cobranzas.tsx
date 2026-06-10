@@ -190,7 +190,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/70" onClick={onClose} />
-      <div className="relative w-full max-w-lg bg-[#0d1424] border border-[#1f2937] rounded-2xl shadow-2xl z-10 overflow-hidden">
+      <div className="relative w-full max-w-lg bg-[#0d1424] border border-[#1f2937] rounded-2xl shadow-2xl z-10 overflow-hidden max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between px-6 py-4 border-b border-[#1f2937]">
           <h2 className="text-white font-semibold text-lg">{editing ? "Editar pago" : "Imputar pago"}</h2>
           <button onClick={onClose} className="text-gray-400 hover:text-white transition-colors"><X className="w-5 h-5" /></button>
@@ -428,15 +428,15 @@ export default function Cobranzas() {
 
   return (
     <AppLayout>
-      <div className="p-8 space-y-6">
+      <div className="p-4 lg:p-8 space-y-6">
         {/* Header */}
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
           <div>
-            <h1 className="text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Cobranzas</h1>
+            <h1 className="text-xl lg:text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Cobranzas</h1>
             <p className="text-gray-400 text-sm mt-1">Registro e imputación de pagos de pólizas</p>
           </div>
           <button onClick={() => { setEditing(null); setModalOpen(true); }}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-all">
+            className="flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-all">
             <Plus className="w-4 h-4" /> Imputar pago
           </button>
         </div>
@@ -552,7 +552,58 @@ export default function Cobranzas() {
                 className="mt-3 text-blue-400 text-sm hover:underline">Imputar primer pago</button>
             </div>
           ) : (
-            <div className="overflow-x-auto">
+            <>
+            {/* Mobile cards */}
+            <div className="lg:hidden divide-y divide-[#1f2937]">
+              {filtered.map(r => {
+                const isManual = r.payment.policyId == null;
+                const displayPolicyNum = r.policy?.policyNumber || r.payment.manualPolicyNumber || "—";
+                const displayInsured = r.insured?.name || r.payment.manualPayer || "—";
+                return (
+                  <div key={r.payment.id} className="p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <p className="text-white font-medium">{displayPolicyNum}</p>
+                          {isManual && (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] border border-orange-500/30 bg-orange-500/10 text-orange-400">manual</span>
+                          )}
+                        </div>
+                        <p className="text-xs text-gray-400 truncate">{displayInsured}</p>
+                      </div>
+                      <p className="text-white font-semibold flex-shrink-0">{formatCurrency(r.payment.amount)}</p>
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap text-xs">
+                      <span className={cn("px-2 py-0.5 rounded border", METHOD_COLORS[r.payment.paymentMethod] || "text-gray-400 border-gray-500/30")}>
+                        {METHOD_LABELS[r.payment.paymentMethod] || r.payment.paymentMethod}
+                      </span>
+                      <span className={cn("px-2 py-0.5 rounded border", STATUS_COLORS[r.payment.status] || "text-gray-400 border-gray-500/30")}>
+                        {r.payment.status.charAt(0).toUpperCase() + r.payment.status.slice(1)}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-4 text-xs text-gray-400">
+                      <span>Fecha: {new Date(r.payment.paymentDate + "T12:00:00").toLocaleDateString("es-AR")}</span>
+                      {r.payment.periodMonth && (
+                        <span>Período: {new Date(r.payment.periodMonth + "-02").toLocaleDateString("es-AR", { month: "short", year: "numeric" })}</span>
+                      )}
+                    </div>
+                    {r.payment.notes && <p className="text-xs text-gray-400">{r.payment.notes}</p>}
+                    <div className="flex items-center gap-2 pt-1">
+                      <button onClick={() => { setEditing(r); setModalOpen(true); }}
+                        className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-blue-400 transition-colors">
+                        <Edit2 className="w-3 h-3" /> Editar
+                      </button>
+                      <button onClick={() => handleDelete(r.payment.id)}
+                        className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-red-400 transition-colors">
+                        <Trash2 className="w-3 h-3" /> Eliminar
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            {/* Desktop table */}
+            <div className="hidden lg:block overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="text-xs text-gray-500 border-b border-[#1f2937]">
@@ -624,6 +675,7 @@ export default function Cobranzas() {
                 </tbody>
               </table>
             </div>
+            </>
           )}
         </div>
       </div>
