@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { eq, like, or, desc, asc, and, inArray } from "drizzle-orm";
+import { eq, like, or, desc, asc, and, inArray, isNull } from "drizzle-orm";
 import { database as db } from "./database/index";
 import { execSync } from "child_process";
 import {
@@ -210,6 +210,7 @@ app.get("/policies", requireAuth(async (c: any) => {
     .from(policies)
     .leftJoin(companies, eq(policies.companyId, companies.id))
     .leftJoin(insureds, eq(policies.insuredId, insureds.id))
+    .where(isNull(policies.parentPolicyId))
     .orderBy(desc(policies.createdAt))
     .all();
   if (q) {
@@ -425,6 +426,7 @@ app.get("/stats", requireAuth(async (c: any) => {
     .select({ policy: policies, company: companies })
     .from(policies)
     .leftJoin(companies, eq(policies.companyId, companies.id))
+    .where(isNull(policies.parentPolicyId))
     .all();
   const total = allPolicies.length;
   const activas = allPolicies.filter((p) => p.policy.status === "activa").length;
