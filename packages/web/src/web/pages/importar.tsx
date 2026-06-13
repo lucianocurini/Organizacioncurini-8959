@@ -398,6 +398,11 @@ function parseCooperacionCsv(content: string): ImportPreview {
         basePolicyNumber = polizaRaw.replace(/^(14-|12-)/, "");
       }
 
+      if (ramo === "31" && isSubPolicy) {
+        errors.push(`Fila ${i}: ramo 31 hogar bundleado (${polizaRaw}) — omitida`);
+        continue;
+      }
+
       // Determinar tipo por ramo
       let vehicleType = "automotor";
       if (ramo === "31") vehicleType = "hogar";
