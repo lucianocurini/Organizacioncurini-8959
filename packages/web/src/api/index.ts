@@ -1,7 +1,6 @@
 import { Hono } from "hono";
-import { eq, like, or, desc, asc, and, inArray, isNull } from "drizzle-orm";
+import { eq, like, or, desc, asc, and, inArray, lte, gte, isNull, ne } from "drizzle-orm";
 import { database as db } from "./database/index";
-import { execSync } from "child_process";
 import {
   users,
   companies,
@@ -17,55 +16,16 @@ import {
   policyFleetVehicles,
   taskTemplates,
   tasks,
+  importLogs,
 } from "./database/schema";
 import { nanoid } from "nanoid";
-import { createORPCClient } from "@orpc/client";
-import { RPCLink } from "@orpc/client/fetch";
-
-// ─── Gmail Attachment Helper ──────────────────────────────────────────────────
-// Descarga el attachment de Gmail via ORPC (mismo protocolo que el CLI connector).
-// El resultado incluye exports.$filestash_uploads con una URL S3 presignada válida 30min.
-async function gmailGetAttachmentContent(messageId: string, attachmentId: string, filename?: string): Promise<string> {
-  const cliUrl = process.env.CLI_URL || process.env.RUNABLE_URL;
-  if (!cliUrl) throw new Error("CLI_URL no configurada");
-
-  const cli: any = createORPCClient(new RPCLink({ url: cliUrl }));
-
-  const safeFilename = filename || `attachment_${messageId}.TXT`;
-  const orpcResult: any = await cli.connectors.run({
-    appId: "gmail",
-    actionId: "gmail-download-attachment",
-    props: { messageId, attachmentId, filename: safeFilename },
-  });
-
-  // El resultado tiene exports.$filestash_uploads con URL S3 presignada (30min TTL)
-  const uploads = orpcResult?.exports?.$filestash_uploads;
-  if (uploads && uploads.length > 0 && uploads[0].get_url) {
-    const s3Resp = await fetch(uploads[0].get_url);
-    if (!s3Resp.ok) throw new Error(`S3 download failed: ${s3Resp.status}`);
-    const buf = await s3Resp.arrayBuffer();
-    return Buffer.from(buf).toString("latin1");
-  }
-
-  // Fallback: si result tiene filePath local (sandbox)
-  const result = orpcResult?.result;
-  if (result?.filePath) {
-    try {
-      const { readFileSync } = await import("fs");
-      return readFileSync(result.filePath, { encoding: "latin1" });
-    } catch (_) {
-      // no-op
-    }
-  }
-
-  // Fallback: data base64 inline
-  if (result?.data) {
-    const b64 = result.data.replace(/-/g, "+").replace(/_/g, "/");
-    return Buffer.from(b64, "base64").toString("latin1");
-  }
-
-  throw new Error(`gmail-download-attachment sin resultado utilizable para messageId=${messageId}`);
-}
+import {
+  gmailSearch,
+  gmailDownloadAttachment,
+  findTxtAttachment,
+  gmailConfigured,
+} from "../lib/gmail-client";
+import { parseElNorteTxtV2 } from "../lib/parsers/el-norte-v2";
 
 const app = new Hono().basePath("/api");
 
@@ -422,30 +382,31 @@ app.delete("/policies/:id", requireAuth(async (c: any) => {
 
 // ─── DASHBOARD STATS ──────────────────────────────────────────────────────────
 app.get("/stats", requireAuth(async (c: any) => {
-  const allPolicies = await db
+  const allPolicies = (await db
     .select({ policy: policies, company: companies })
     .from(policies)
     .leftJoin(companies, eq(policies.companyId, companies.id))
     .where(isNull(policies.parentPolicyId))
     .all();
-  const total = allPolicies.length;
   const activas = allPolicies.filter((p) => p.policy.status === "activa").length;
   const vencidas = allPolicies.filter((p) => p.policy.status === "vencida").length;
   const porVencer = allPolicies.filter((p) => p.policy.status === "por_vencer").length;
   const canceladas = allPolicies.filter((p) => p.policy.status === "cancelada").length;
+  const vigentes = allPolicies.filter((p) => p.policy.status === "activa" || p.policy.status === "por_vencer");
+  const total = vigentes.length;
   const byType: Record<string, number> = {};
-  for (const p of allPolicies) {
+  for (const p of vigentes) {
     const t = p.policy.type || "otro";
     byType[t] = (byType[t] || 0) + 1;
   }
   const byCompany: Record<string, { count: number; premium: number }> = {};
-  for (const p of allPolicies) {
+  for (const p of vigentes) {
     const cname = p.company?.name || "Sin compañía";
     if (!byCompany[cname]) byCompany[cname] = { count: 0, premium: 0 };
     byCompany[cname].count++;
     byCompany[cname].premium += p.policy.premium || 0;
   }
-  const totalPremium = allPolicies.reduce((s, p) => s + (p.policy.premium || 0), 0);
+  const totalPremium = vigentes.reduce((s, p) => s + (p.policy.premium || 0), 0);
   const today = new Date().toISOString().split("T")[0];
   const in30 = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
   const upcoming = allPolicies.filter((p) => p.policy.endDate >= today && p.policy.endDate <= in30).length;
@@ -1117,6 +1078,7 @@ app.get("/backup", requireAuth(async (c: any) => {
     allFleetVehicles,
     allTaskTemplates,
     allTasks,
+    allImportLogs,
   ] = await Promise.all([
     db.select().from(users),
     db.select().from(companies),
@@ -1131,6 +1093,7 @@ app.get("/backup", requireAuth(async (c: any) => {
     db.select().from(policyFleetVehicles),
     db.select().from(taskTemplates),
     db.select().from(tasks),
+    db.select().from(importLogs),
   ]);
 
   // Strip passwords from users
@@ -1153,6 +1116,7 @@ app.get("/backup", requireAuth(async (c: any) => {
       policyFleetVehicles: allFleetVehicles,
       taskTemplates: allTaskTemplates,
       tasks: allTasks,
+      importLogs: allImportLogs,
     },
   };
 
@@ -1231,9 +1195,13 @@ app.post("/import/el-norte", requireAuth(async (c: any) => {
   // Helper: determinar tipo y status
   function resolveTypeAndStatus(p: any) {
     const vt = (p.vehicleType || "").toLowerCase();
+    const brand = (p.vehicleBrand || "").toUpperCase();
+    const model = (p.vehicleModel || "").toUpperCase();
     let polType: string;
     if (vt === "motovehiculo" || vt === "moto") polType = "motovehiculo";
     else if (vt.includes("accidentes_pasajeros") || vt.includes("accidente")) polType = "accidentes";
+    // XR aplica solo si la marca es Honda (Peugeot 206 XR → automotor)
+    else if (brand === "HONDA" && /\b(WAVE|BIZ|TITAN|XR)\b/.test(model)) polType = "motovehiculo";
     else polType = "automotor";
     const today = new Date().toISOString().split("T")[0];
     const daysToEnd = Math.ceil((new Date(p.endDate).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24));
@@ -1440,8 +1408,11 @@ app.post("/import/rivadavia", requireAuth(async (c: any) => {
   function resolveTypeAndStatus(p: any) {
     const vt = (p.vehicleType || "").toLowerCase();
     let polType: string;
-    if (vt === "motovehiculo" || vt === "moto") polType = "motovehiculo";
-    else if (vt === "accidentes_pasajeros") polType = "accidentes_pasajeros";
+    if      (vt === "motovehiculo" || vt === "moto") polType = "motovehiculo";
+    else if (vt === "accidentes_pasajeros")           polType = "accidentes_pasajeros";
+    else if (vt === "hogar")                          polType = "hogar";
+    else if (vt === "riesgos_varios")                 polType = "riesgos_varios";
+    else if (vt === "integral_comercio")              polType = "integral_comercio";
     else polType = "automotor";
     const today = new Date().toISOString().split("T")[0];
     const daysToEnd = Math.ceil((new Date(p.endDate).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24));
@@ -1451,22 +1422,20 @@ app.post("/import/rivadavia", requireAuth(async (c: any) => {
     return { polType, status };
   }
 
-  // Buscar póliza de auto activa de un asegurado por DNI
-  async function findParentAutoPolicyId(insuredDni: string, insuredName: string): Promise<number | null> {
+  // Buscar póliza automotor 02 de un asegurado con endDate exacto (evita picks incorrectos)
+  async function findParentAutoPolicyId(insuredDni: string, insuredName: string, endDate: string): Promise<number | null> {
     try {
-      // Buscar asegurado por DNI o nombre
       let ins = insuredDni
         ? await db.select().from(insureds).where(eq(insureds.dni, String(insuredDni))).get()
         : null;
       if (!ins && insuredName) ins = await db.select().from(insureds).where(eq(insureds.name, insuredName)).get();
       if (!ins) return null;
-      // Buscar la póliza de automotor activa (o por_vencer) de este asegurado en Rivadavia
       const autoPol = await db.select().from(policies)
         .where(and(
           eq(policies.insuredId, ins.id),
           eq(policies.companyId, companyId),
-          inArray(policies.type, ["automotor", "motovehiculo"]),
-          inArray(policies.status, ["activa", "por_vencer"]),
+          eq(policies.type, "automotor"),
+          eq(policies.endDate, endDate),
         ))
         .orderBy(desc(policies.startDate))
         .limit(1)
@@ -1475,11 +1444,17 @@ app.post("/import/rivadavia", requireAuth(async (c: any) => {
     } catch { return null; }
   }
 
-  for (const p of parsedPolicies) {
+  // ── Pasada 1: pólizas principales 02/04/05/09/20 ────────────────────────────
+  // Mapa para vincular 10s del mismo batch: `${dni}|${endDate}` → policyId automotor
+  const batchAutomotorMap = new Map<string, number>(); // clave: `${dni}|${startDate}|${endDate}`
+  const mainPolicies = parsedPolicies.filter(p => !String(p.policyNumber).startsWith("09-10-"));
+  const tenPolicies  = parsedPolicies.filter(p =>  String(p.policyNumber).startsWith("09-10-"));
+
+  for (const p of mainPolicies) {
     try {
       const mov = (p.movType || "").toUpperCase();
 
-      // REDUCCION → skip (endoso de reducción, sin acción en la DB)
+      // REDUCCION → skip
       if (mov.includes("REDUCCION")) { results.skipped++; continue; }
 
       // ANULACION
@@ -1494,12 +1469,9 @@ app.post("/import/rivadavia", requireAuth(async (c: any) => {
         continue;
       }
 
-      // PRORROGA (PR / PRO) con póliza existente
+      // PRORROGA
       if (mov.includes("PRORROGA")) {
-        // Para PR: policyNumber es el NUEVO número, _renovacionRef apunta al anterior
-        // Para PRO: mismo número de póliza con distinto sufijo
         let existing = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
-        // Si no encontró y hay _renovacionRef, buscar por número parcial
         if (!existing && p._renovacionRef) {
           const refNum = String(p._renovacionRef).split("/").pop() || "";
           if (refNum) {
@@ -1518,6 +1490,9 @@ app.post("/import/rivadavia", requireAuth(async (c: any) => {
           if (p.installments?.length > 0) await insertInstallments(existing.id, p.installments);
           const { status } = resolveTypeAndStatus(p);
           await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
+          if (existing.type === "automotor" && p.insuredDni) {
+            batchAutomotorMap.set(`${p.insuredDni}|${p.startDate}|${p.endDate}`, existing.id);
+          }
           results.rebillings++;
           continue;
         }
@@ -1555,27 +1530,23 @@ app.post("/import/rivadavia", requireAuth(async (c: any) => {
           });
           await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || null }).where(eq(policies.id, basePolId));
           if (p.installments?.length > 0) await insertInstallments(basePolId, p.installments);
+          if (polType === "automotor" && p.insuredDni) {
+            batchAutomotorMap.set(`${p.insuredDni}|${p.startDate}|${p.endDate}`, basePolId);
+          }
           results.rebillings++;
           continue;
         }
         // Sin datos base → crear como póliza nueva marcada isRebilling
       }
 
-      // PÓLIZA NUEVA / huérfana sin datos base
+      // PÓLIZA NUEVA
       const existingPol = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
       if (existingPol && !mov.includes("PRORROGA")) { results.skipped++; continue; }
 
       const insuredId = await resolveInsured(p);
       const { polType, status } = resolveTypeAndStatus(p);
       const isMoto = polType === "motovehiculo";
-      const isAccidentesPasajeros = polType === "accidentes_pasajeros";
       const isRebilling = mov.includes("PRORROGA") ? 1 : 0;
-
-      // Para accidentes_pasajeros: buscar póliza de auto activa del mismo asegurado
-      let parentPolicyId: number | null = null;
-      if (isAccidentesPasajeros) {
-        parentPolicyId = await findParentAutoPolicyId(p.insuredDni, p.insuredName);
-      }
 
       const [newPolicy] = await db.insert(policies).values({
         policyNumber: String(p.policyNumber), type: polType, status,
@@ -1585,15 +1556,105 @@ app.post("/import/rivadavia", requireAuth(async (c: any) => {
         startDate: p.startDate, endDate: p.endDate,
         installments: p.installments?.length || null,
         isRebilling,
-        vehicleBrand: (!isMoto && !isAccidentesPasajeros) ? (p.vehicleBrand || null) : null,
-        vehicleModel: (!isMoto && !isAccidentesPasajeros) ? (p.vehicleModel || null) : null,
-        vehicleYear: (!isMoto && !isAccidentesPasajeros) ? (p.vehicleYear || null) : null,
-        vehiclePlate: (!isMoto && !isAccidentesPasajeros) ? (p.vehiclePlate || null) : null,
+        vehicleBrand: !isMoto ? (p.vehicleBrand || null) : null,
+        vehicleModel: !isMoto ? (p.vehicleModel || null) : null,
+        vehicleYear: !isMoto ? (p.vehicleYear || null) : null,
+        vehiclePlate: !isMoto ? (p.vehiclePlate || null) : null,
         motoBrand: isMoto ? (p.vehicleBrand || null) : null,
         motoModel: isMoto ? (p.vehicleModel || null) : null,
         motoYear: isMoto ? (p.vehicleYear || null) : null,
         motoPlate: isMoto ? (p.vehiclePlate || null) : null,
         motoEngine: isMoto ? (p.engineNumber || null) : null,
+        notes: `Importado de Rivadavia. Movimiento: ${p.movType || "RENOVACION"}`,
+        createdBy: user.id,
+      }).returning({ id: policies.id });
+
+      if (p.installments?.length > 0) await insertInstallments(newPolicy.id, p.installments);
+      if (polType === "automotor" && p.insuredDni) {
+        batchAutomotorMap.set(`${p.insuredDni}|${p.startDate}|${p.endDate}`, newPolicy!.id);
+      }
+      isRebilling ? results.rebillings++ : results.imported++;
+
+    } catch (e: any) {
+      results.errors.push(`Póliza ${p.policyNumber}: ${e.message}`);
+      results.skipped++;
+    }
+  }
+
+  // ── Pasada 2: pólizas 10 (accidentes_pasajeros) ──────────────────────────────
+  for (const p of tenPolicies) {
+    try {
+      const mov = (p.movType || "").toUpperCase();
+
+      if (mov.includes("REDUCCION")) { results.skipped++; continue; }
+
+      // ANULACION de 10 existente
+      if (mov.includes("ANULACION")) {
+        const existing = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
+        if (existing) {
+          await db.update(policies).set({ status: "cancelada", notes: (existing.notes ? existing.notes + " | " : "") + "Anulada por importación Rivadavia" }).where(eq(policies.id, existing.id));
+          results.cancelled++;
+        } else {
+          results.skipped++;
+        }
+        continue;
+      }
+
+      // PRORROGA de 10 existente
+      if (mov.includes("PRORROGA")) {
+        let existing = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
+        if (!existing && p._renovacionRef) {
+          const refNum = String(p._renovacionRef).split("/").pop() || "";
+          if (refNum) {
+            const candidates = await db.select().from(policies).where(like(policies.policyNumber, `%${refNum}%`)).all();
+            if (candidates.length > 0) existing = candidates[0];
+          }
+        }
+        if (existing) {
+          await db.insert(rebillings).values({
+            policyId: existing.id,
+            billingStart: p.startDate, billingEnd: p.endDate,
+            premium: p.premium || null, sumInsured: p.sumInsured || null,
+            notes: `Importado de Rivadavia`,
+            createdBy: user.id,
+          });
+          if (p.installments?.length > 0) await insertInstallments(existing.id, p.installments);
+          const { status } = resolveTypeAndStatus(p);
+          await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
+          results.rebillings++;
+          continue;
+        }
+        // Sin 10 previa → crear nueva con padre (fall through)
+      }
+
+      // Duplicado check
+      const existingPol = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
+      if (existingPol && !mov.includes("PRORROGA")) { results.skipped++; continue; }
+
+      // Buscar padre 02 en batch del mismo TXT, luego en DB con endDate exacto
+      const batchKey = `${p.insuredDni}|${p.startDate}|${p.endDate}`;
+      let parentPolicyId = batchAutomotorMap.get(batchKey) ?? null;
+      if (!parentPolicyId) {
+        parentPolicyId = await findParentAutoPolicyId(p.insuredDni, p.insuredName, p.endDate);
+      }
+      if (!parentPolicyId) {
+        results.errors.push(`Póliza ${p.policyNumber} (acc. pasajeros): sin automotor 02 para DNI ${p.insuredDni}, venc. ${p.endDate}. Revisar manualmente.`);
+        results.skipped++;
+        continue;
+      }
+
+      const insuredId = await resolveInsured(p);
+      const { status } = resolveTypeAndStatus(p);
+      const isRebilling = mov.includes("PRORROGA") ? 1 : 0;
+
+      const [newPolicy] = await db.insert(policies).values({
+        policyNumber: String(p.policyNumber), type: "accidentes_pasajeros", status,
+        companyId, insuredId,
+        premium: p.premium || null, sumInsured: p.sumInsured || null,
+        coverageType: p.coverageLabel || null,
+        startDate: p.startDate, endDate: p.endDate,
+        installments: p.installments?.length || null,
+        isRebilling,
         parentPolicyId,
         notes: `Importado de Rivadavia. Movimiento: ${p.movType || "RENOVACION"}`,
         createdBy: user.id,
@@ -1663,7 +1724,43 @@ app.post("/import/cooperacion", requireAuth(async (c: any) => {
     return found ? found.id : null;
   }
 
-  for (const p of parsedPolicies) {
+  // Busca padre auto/moto del mismo asegurado en Cooperación.
+  // Paso 1: vigencia exacta. Paso 2: superposición. Con 0 o >1 por superposición → null.
+  async function findParentByDniVigencia(insuredDni: string, startDate: string, endDate: string): Promise<number | null> {
+    if (!insuredDni) return null;
+    const ins = await db.select().from(insureds).where(eq(insureds.dni, String(insuredDni))).get();
+    if (!ins) return null;
+
+    const exact = await db.select().from(policies)
+      .where(and(
+        eq(policies.insuredId, ins.id),
+        eq(policies.companyId, companyId),
+        inArray(policies.type, ["automotor", "motovehiculo"]),
+        eq(policies.startDate, startDate),
+        eq(policies.endDate, endDate),
+      ))
+      .limit(1).get();
+    if (exact) return exact.id;
+
+    const candidates = await db.select().from(policies)
+      .where(and(
+        eq(policies.insuredId, ins.id),
+        eq(policies.companyId, companyId),
+        inArray(policies.type, ["automotor", "motovehiculo"]),
+        lte(policies.startDate, endDate),
+        gte(policies.endDate, startDate),
+      ))
+      .all();
+
+    return candidates.length === 1 ? candidates[0].id : null;
+  }
+
+  // Pasada 1: principales (ramo 32, 31 standalone, 46)
+  // Pasada 2: hijas (ramo 41 con 14- o 1405..., ramo 31 con 12-)
+  const mainPolicies = parsedPolicies.filter((p: any) => !p._parentPolicyNumber && !p._findParentByDni);
+  const childPolicies = parsedPolicies.filter((p: any) =>  p._parentPolicyNumber || p._findParentByDni);
+
+  for (const p of [...mainPolicies, ...childPolicies]) {
     try {
       const mov = (p.movType || "").toUpperCase();
 
@@ -1702,6 +1799,15 @@ app.post("/import/cooperacion", requireAuth(async (c: any) => {
       let parentPolicyId: number | null = null;
       if (p._parentPolicyNumber) {
         parentPolicyId = await findParentByNumber(p._parentPolicyNumber);
+      }
+      if (p._findParentByDni) {
+        parentPolicyId = await findParentByDniVigencia(p.insuredDni, p.startDate, p.endDate);
+      }
+      // Ramo 41 nueva sin padre confirmado → no importar
+      if (vt === "accidentes_pasajeros" && parentPolicyId === null && !existing) {
+        results.skipped++;
+        results.errors.push(`Póliza ${p.policyNumber}: ramo 41 sin póliza principal asociable`);
+        continue;
       }
 
       if (existing) {
@@ -1923,490 +2029,572 @@ app.post("/import/mercantil-andina", requireAuth(async (c: any) => {
 
   return c.json(results, 200);
 }));
-// ── /gmail/import-el-norte ────────────────────────────────────────────────────
-app.post("/gmail/import-el-norte", requireAuth(async (c: any) => {
-  try {
-    // 1. Buscar el mail más reciente de El Norte
-    const searchRaw = execSync(
-      `connector run gmail gmail-find-email '{"q":"from:gestorweb@elnorte.com.ar subject:\\"Archivo de Emision\\"","withTextPayload":false,"metadataOnly":false,"maxResults":1}'`,
-      { encoding: "utf8", env: process.env }
-    );
-    const messages = JSON.parse(searchRaw);
-    if (!messages || !messages.length) {
-      return c.json({ error: "No se encontraron mails de El Norte" }, 404);
-    }
-    const msg = messages[0];
+// ─────────────────────────────────────────────────────────────────────────────
 
-    // 2. Encontrar el adjunto TXT
-    const parts: any[] = msg.payload?.parts || [];
-    const attachment = parts.find((p: any) => p.filename && p.filename.toUpperCase().endsWith(".TXT"));
-    if (!attachment) {
-      return c.json({ error: "El mail no tiene adjunto TXT" }, 404);
-    }
-
-    const messageId = msg.id;
-    const attachmentId = attachment.body?.attachmentId;
-    const filename = attachment.filename;
-
-    if (!attachmentId) {
-      return c.json({ error: "No se pudo obtener attachmentId" }, 404);
-    }
-
-    // 3. Descargar el adjunto via ORPC + S3 presigned URL
-    const content = await gmailGetAttachmentContent(messageId, attachmentId, filename);
-
-    // 4. Devolver el contenido para que el frontend lo parsee y muestre preview
-    return c.json({ content, filename, subject: msg.subject, date: msg.date }, 200);
-
-  } catch (e: any) {
-    return c.json({ error: e.message }, 500);
-  }
-}));
-// ── Jobs en memoria para batch ───────────────────────────────────────────────
-const batchJobs = new Map<string, {
+// ── Jobs en memoria — El Norte Gmail ─────────────────────────────────────────
+const elNorteJobs = new Map<string, {
   status: "running" | "done" | "error";
   phase: string;
-  mails: number;
   totalMails: number;
   processed: number;
   imported: number;
   rebillings: number;
-  cancelled: number;
+  endosos: number;
+  anulaciones: number;
+  duplicados: number;
+  revisar: number;
   skipped: number;
-  parseErrors: number;
   errors: string[];
   startedAt: number;
   finishedAt?: number;
 }>();
 
-// GET job status
-app.get("/gmail/import-el-norte-batch/:jobId", requireAuth(async (c: any) => {
-  const jobId = c.req.param("jobId");
-  const job = batchJobs.get(jobId);
-  if (!job) return c.json({ error: "Job no encontrado" }, 404);
-  return c.json(job, 200);
+// ── Helpers internos El Norte v2 ──────────────────────────────────────────────
+async function enResolveInsured(p: any, userId: number): Promise<number> {
+  let existing: any = null;
+  if (p.insuredDni) existing = await db.select().from(insureds).where(eq(insureds.dni, String(p.insuredDni))).get();
+  if (!existing) existing = await db.select().from(insureds).where(eq(insureds.name, p.insuredName)).get();
+  if (existing) {
+    if (p.insuredEmail && !existing.email) await db.update(insureds).set({ email: p.insuredEmail }).where(eq(insureds.id, existing.id));
+    if (p.insuredPhone && !existing.phone) await db.update(insureds).set({ phone: p.insuredPhone }).where(eq(insureds.id, existing.id));
+    return existing.id;
+  }
+  const [ni] = await db.insert(insureds).values({
+    name: p.insuredName, dni: p.insuredDni || null,
+    phone: p.insuredPhone || null, email: p.insuredEmail || null,
+    address: p.insuredAddress || null, createdBy: userId,
+  }).returning({ id: insureds.id });
+  return ni.id;
+}
+
+async function enInsertInstallments(policyId: number, insts: any[]) {
+  for (const inst of insts) {
+    await db.insert(policyInstallments).values({
+      policyId, number: inst.number, dueDate: inst.dueDate, amount: inst.amount, status: "pendiente",
+    });
+  }
+}
+
+function enResolveTypeAndStatus(p: any): { polType: string; status: string } {
+  const policyNumber = String(p.policyNumber || "").trim().toLowerCase();
+  const vt = (p.vehicleType || "").toLowerCase();
+  const brand = (p.vehicleBrand || "").toUpperCase();
+  const vehicleSignals = [
+    p.vehicleType,
+    p.vehicleBrand,
+    p.vehicleModel,
+    p.coverageLabel,
+    p.coverageCode,
+  ].filter(Boolean).join(" ").toLowerCase();
+  let polType: string;
+  if (policyNumber.startsWith("3-")) polType = "motovehiculo";
+  else if (policyNumber.startsWith("4-")) polType = "automotor";
+  else if (vt.includes("accidentes_pasajeros") || vt.includes("accidente")) polType = "accidentes";
+  else if (
+    vt === "motovehiculo" ||
+    vt === "motovehículo" ||
+    vt === "moto" ||
+    vehicleSignals.includes("motoveh") ||
+    vehicleSignals.includes("moto") ||
+    vehicleSignals.includes("honda wave") ||
+    vehicleSignals.includes("wave") ||
+    vehicleSignals.includes("biz") ||
+    // XR y Titan: solo si la marca es Honda (Peugeot 206 XR → automotor)
+    (brand === "HONDA" && (vehicleSignals.includes("xr") || vehicleSignals.includes("titan")))
+  ) polType = "motovehiculo";
+  else polType = "automotor";
+  const today = new Date().toISOString().split("T")[0];
+  const daysToEnd = Math.ceil((new Date(p.endDate).getTime() - new Date(today).getTime()) / 86400000);
+  let status = "activa";
+  if (daysToEnd < 0) status = "vencida";
+  else if (daysToEnd <= 30) status = "por_vencer";
+  return { polType, status };
+}
+
+type ImportCounts = {
+  imported: number; rebillings: number; endosos: number;
+  anulaciones: number; duplicados: number; revisar: number; skipped: number;
+  errors: string[];
+};
+
+async function enImportOne(p: any, companyId: number, userId: number, counts: ImportCounts) {
+  const mov = (p.movType || "").toUpperCase();
+
+  if (mov.includes("NOTA DE CREDITO") || mov.includes("NOTA_DE_CREDITO")) {
+    counts.skipped++;
+    return;
+  }
+
+  if (mov.includes("ANULACION")) {
+    const existing = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
+    if (existing) {
+      await db.update(policies).set({ status: "cancelada", notes: (existing.notes ? existing.notes + " | " : "") + "Anulada por importación El Norte" }).where(eq(policies.id, existing.id));
+      counts.anulaciones++;
+    } else {
+      counts.skipped++;
+    }
+    return;
+  }
+
+  if (mov.includes("ENDOSO")) {
+    const existing = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
+    if (existing) {
+      await db.insert(rebillings).values({
+        policyId: existing.id, billingStart: p.startDate, billingEnd: p.endDate,
+        premium: p.premium || null, sumInsured: p.sumInsured || null,
+        notes: `Importado de El Norte v2. Endoso ${p.endoso || ""}`, createdBy: userId,
+      });
+      if (p.installments?.length > 0) await enInsertInstallments(existing.id, p.installments);
+      const { status } = enResolveTypeAndStatus(p);
+      await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
+      counts.endosos++;
+    } else {
+      counts.revisar++;
+    }
+    return;
+  }
+
+  if (mov.includes("PRORROGA")) {
+    const existing = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
+    if (existing) {
+      await db.insert(rebillings).values({
+        policyId: existing.id, billingStart: p.startDate, billingEnd: p.endDate,
+        premium: p.premium || null, sumInsured: p.sumInsured || null,
+        notes: `Importado de El Norte v2. Prórroga endoso ${p.endoso || ""}`, createdBy: userId,
+      });
+      if (p.installments?.length > 0) await enInsertInstallments(existing.id, p.installments);
+      const { status } = enResolveTypeAndStatus(p);
+      await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
+      counts.rebillings++;
+      return;
+    }
+    if (p._baseStartDate) {
+      const insuredId = await enResolveInsured(p, userId);
+      const { polType } = enResolveTypeAndStatus(p);
+      const isMoto = polType === "motovehiculo";
+      const [basePol] = await db.insert(policies).values({
+        policyNumber: String(p.policyNumber), type: polType, status: "vencida", companyId, insuredId,
+        premium: p._basePremium || p.premium || null, sumInsured: p._baseSumInsured || p.sumInsured || null,
+        coverageType: p._baseCoverage || p.coverageLabel || null,
+        startDate: p._baseStartDate, endDate: p._baseEndDate || p.startDate, isRebilling: 0,
+        vehicleBrand: !isMoto ? (p.vehicleBrand || null) : null,
+        vehicleModel: !isMoto ? (p.vehicleModel || null) : null,
+        vehicleYear: !isMoto ? (p.vehicleYear || null) : null,
+        vehiclePlate: !isMoto ? (p.vehiclePlate || null) : null,
+        motoBrand: isMoto ? (p.vehicleBrand || null) : null,
+        motoModel: isMoto ? (p.vehicleModel || null) : null,
+        motoYear: isMoto ? (p.vehicleYear || null) : null,
+        motoPlate: isMoto ? (p.vehiclePlate || null) : null,
+        motoEngine: isMoto ? (p.engineNumber || null) : null,
+        notes: p._baseNotes || "Póliza base creada al importar prórroga El Norte",
+        createdBy: userId,
+      }).returning({ id: policies.id });
+      const { status } = enResolveTypeAndStatus(p);
+      await db.insert(rebillings).values({
+        policyId: basePol.id, billingStart: p.startDate, billingEnd: p.endDate,
+        premium: p.premium || null, sumInsured: p.sumInsured || null,
+        notes: `Importado de El Norte v2. Prórroga endoso ${p.endoso || ""}`, createdBy: userId,
+      });
+      await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || null }).where(eq(policies.id, basePol.id));
+      if (p.installments?.length > 0) await enInsertInstallments(basePol.id, p.installments);
+      counts.rebillings++;
+      return;
+    }
+  }
+
+  const existingPol = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
+  if (existingPol && !mov.includes("PRORROGA")) {
+    counts.duplicados++;
+    return;
+  }
+
+  const insuredId = await enResolveInsured(p, userId);
+  const { polType, status } = enResolveTypeAndStatus(p);
+  const isMoto = polType === "motovehiculo";
+  const isRebilling = mov.includes("PRORROGA") ? 1 : 0;
+
+  const [newPol] = await db.insert(policies).values({
+    policyNumber: String(p.policyNumber), type: polType, status, companyId, insuredId,
+    premium: p.premium || null, sumInsured: p.sumInsured || null,
+    coverageType: p.coverageLabel || null, startDate: p.startDate, endDate: p.endDate,
+    installments: p.installments?.length || null, isRebilling,
+    vehicleBrand: !isMoto ? (p.vehicleBrand || null) : null,
+    vehicleModel: !isMoto ? (p.vehicleModel || null) : null,
+    vehicleYear: !isMoto ? (p.vehicleYear || null) : null,
+    vehiclePlate: !isMoto ? (p.vehiclePlate || null) : null,
+    motoBrand: isMoto ? (p.vehicleBrand || null) : null,
+    motoModel: isMoto ? (p.vehicleModel || null) : null,
+    motoYear: isMoto ? (p.vehicleYear || null) : null,
+    motoPlate: isMoto ? (p.vehiclePlate || null) : null,
+    motoEngine: isMoto ? (p.engineNumber || null) : null,
+    notes: `Importado de El Norte v2. Movimiento: ${p.movType || "RENOVACION"}`,
+    createdBy: userId,
+  }).returning({ id: policies.id });
+
+  if (p.installments?.length > 0) await enInsertInstallments(newPol.id, p.installments);
+  isRebilling ? counts.rebillings++ : counts.imported++;
+}
+
+async function enGetOrCreateCompany(): Promise<number> {
+  const existing = await db.select().from(companies).where(eq(companies.name, "El Norte")).get();
+  if (existing) return existing.id;
+  const [nc] = await db.insert(companies).values({ name: "El Norte" }).returning({ id: companies.id });
+  return nc.id;
+}
+
+async function enInsertImportLog(values: typeof importLogs.$inferInsert): Promise<number | null> {
+  if (values.gmailMessageId) {
+    const existing = await db
+      .select({ id: importLogs.id })
+      .from(importLogs)
+      .where(eq(importLogs.gmailMessageId, values.gmailMessageId))
+      .get();
+    if (existing) return existing.id;
+  }
+
+  try {
+    const [log] = await db.insert(importLogs).values(values).returning({ id: importLogs.id });
+    return log?.id ?? null;
+  } catch (e: any) {
+    const message = String(e?.message || "");
+    const isDuplicateGmailMessageId =
+      !!values.gmailMessageId &&
+      (message.includes("UNIQUE constraint failed: import_logs.gmail_message_id") ||
+        message.includes("import_logs_gmail_message_id_unique"));
+    if (!isDuplicateGmailMessageId) throw e;
+
+    const existing = await db
+      .select({ id: importLogs.id })
+      .from(importLogs)
+      .where(eq(importLogs.gmailMessageId, values.gmailMessageId))
+      .get();
+    if (existing) return existing.id;
+    throw e;
+  }
+}
+
+// ── POST /import/el-norte/preview ─────────────────────────────────────────────
+app.post("/import/el-norte/preview", requireAuth(async (c: any) => {
+  const body = await c.req.json();
+  const content: string = body.content || "";
+  if (!content) return c.json({ error: "Sin contenido" }, 400);
+  const result = parseElNorteTxtV2(content);
+  return c.json(result, 200);
 }));
 
-// ── /gmail/import-el-norte-batch ─────────────────────────────────────────────
-// Pagina Gmail desde una fecha dada, baja todos los TXT de El Norte y los importa
-// directamente sin preview. Devuelve jobId inmediatamente, procesa en background.
-app.post("/gmail/import-el-norte-batch", requireAuth(async (c: any) => {
+// ── POST /import/el-norte/confirm ─────────────────────────────────────────────
+app.post("/import/el-norte/confirm", requireAuth(async (c: any) => {
+  const user = c.get("user");
+  const body = await c.req.json();
+  const parsedPolicies: any[] = body.policies || [];
+  if (!parsedPolicies.length) return c.json({ error: "Sin pólizas" }, 400);
+
+  const companyId = await enGetOrCreateCompany();
+  const counts: ImportCounts = {
+    imported: 0, rebillings: 0, endosos: 0, anulaciones: 0,
+    duplicados: 0, revisar: 0, skipped: 0, errors: [],
+  };
+
+  for (const p of parsedPolicies) {
+    try {
+      await enImportOne(p, companyId, user.id, counts);
+    } catch (e: any) {
+      counts.errors.push(`Póliza ${p.policyNumber}: ${e.message}`);
+      counts.skipped++;
+    }
+  }
+
+  const logStatus = counts.errors.length === 0 ? "ok" : counts.imported + counts.rebillings > 0 ? "partial" : "error";
+  const logId = await enInsertImportLog({
+    source: "manual",
+    filename: body.filename || null,
+    gmailMessageId: body.gmailMessageId || null,
+    fechaArchivo: body.fechaArchivo || null,
+    status: logStatus,
+    registrosImportados: counts.imported,
+    rebillings: counts.rebillings,
+    endosos: counts.endosos,
+    anulaciones: counts.anulaciones,
+    duplicados: counts.duplicados,
+    revisar: counts.revisar,
+    skipped: counts.skipped,
+    errors: JSON.stringify(counts.errors),
+    createdBy: user.id,
+  });
+
+  return c.json({ ...counts, logId }, 200);
+}));
+
+// ── POST /gmail/el-norte/latest ───────────────────────────────────────────────
+app.post("/gmail/el-norte/latest", requireAuth(async (c: any) => {
+  if (!gmailConfigured) return c.json({ error: "Gmail no configurado" }, 503);
   try {
-    const user = c.get("user");
-    const body = await c.req.json();
-    const desde: string = body.desde || "2025-12-01";
-    const hasta: string | null = body.hasta || null; // null = sin límite superior
-    const afterDate = desde.replace(/-/g, "/");
-    const beforeDate = hasta ? hasta.replace(/-/g, "/") : null;
-
-    // Crear job
-    const jobId = `batch_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const job = {
-      status: "running" as const,
-      phase: "Buscando mails...",
-      mails: 0,
-      totalMails: 0,
-      processed: 0,
-      imported: 0,
-      rebillings: 0,
-      cancelled: 0,
-      skipped: 0,
-      parseErrors: 0,
-      errors: [] as string[],
-      startedAt: Date.now(),
-    };
-    batchJobs.set(jobId, job);
-
-    // Procesar en background (no awaited)
-    (async () => {
-      try {
-        const { parseElNorteTxt } = await import("../lib/parsers/el-norte");
-
-        // Compañía
-        let companyId: number;
-        const existingCompany = await db.select().from(companies).where(eq(companies.name, "El Norte")).get();
-        if (existingCompany) {
-          companyId = existingCompany.id;
-        } else {
-          const [nc] = await db.insert(companies).values({ name: "El Norte" }).returning({ id: companies.id });
-          companyId = nc.id;
-        }
-
-        async function resolveInsured(p: any): Promise<number> {
-          let existing: any = null;
-          if (p.insuredDni) existing = await db.select().from(insureds).where(eq(insureds.dni, String(p.insuredDni))).get();
-          if (!existing) existing = await db.select().from(insureds).where(eq(insureds.name, p.insuredName)).get();
-          if (existing) {
-            if (p.insuredEmail && !existing.email) await db.update(insureds).set({ email: p.insuredEmail }).where(eq(insureds.id, existing.id));
-            if (p.insuredPhone && !existing.phone) await db.update(insureds).set({ phone: p.insuredPhone }).where(eq(insureds.id, existing.id));
-            return existing.id;
-          }
-          const [ni] = await db.insert(insureds).values({
-            name: p.insuredName, dni: p.insuredDni || null,
-            phone: p.insuredPhone || null, email: p.insuredEmail || null,
-            address: p.insuredAddress || null, createdBy: user.id,
-          }).returning({ id: insureds.id });
-          return ni.id;
-        }
-
-        async function insertInstallments(policyId: number, installments: any[]) {
-          for (const inst of installments) {
-            await db.insert(policyInstallments).values({
-              policyId, number: inst.number, dueDate: inst.dueDate,
-              amount: inst.amount, status: "pendiente",
-            });
-          }
-        }
-
-        function resolveTypeAndStatus(p: any) {
-          const vt = (p.vehicleType || "").toLowerCase();
-          let polType: string;
-          if (vt === "motovehiculo" || vt === "moto") polType = "motovehiculo";
-          else if (vt.includes("accidentes_pasajeros") || vt.includes("accidente")) polType = "accidentes";
-          else polType = "automotor";
-          const today = new Date().toISOString().split("T")[0];
-          const daysToEnd = Math.ceil((new Date(p.endDate).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24));
-          let status = "activa";
-          if (daysToEnd < 0) status = "vencida";
-          else if (daysToEnd <= 30) status = "por_vencer";
-          return { polType, status };
-        }
-
-        async function importPolicy(p: any) {
-          const mov = (p.movType || "").toUpperCase();
-
-          if (mov.includes("ANULACION")) {
-            const existing = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
-            if (existing) {
-              await db.update(policies).set({ status: "cancelada", notes: (existing.notes ? existing.notes + " | " : "") + "Anulada por importación El Norte" }).where(eq(policies.id, existing.id));
-              job.cancelled++;
-            } else job.skipped++;
-            return;
-          }
-
-          if (mov.includes("NOTA DE CREDITO") || mov.includes("NOTA_DE_CREDITO")) {
-            job.skipped++;
-            return;
-          }
-
-          if (mov.includes("PRORROGA")) {
-            const existing = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
-            if (existing) {
-              await db.insert(rebillings).values({
-                policyId: existing.id, billingStart: p.startDate, billingEnd: p.endDate,
-                premium: p.premium || null, sumInsured: p.sumInsured || null,
-                notes: `Importado de El Norte (batch). Prórroga endoso ${p.endoso || ""}`,
-                createdBy: user.id,
-              });
-              if (p.installments?.length > 0) await insertInstallments(existing.id, p.installments);
-              const { status } = resolveTypeAndStatus(p);
-              await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
-              job.rebillings++;
-              return;
-            }
-            // Prórroga huérfana
-            const insuredId = await resolveInsured(p);
-            const { polType, status } = resolveTypeAndStatus(p);
-            const isMoto = polType === "motovehiculo";
-            const [newPol] = await db.insert(policies).values({
-              policyNumber: String(p.policyNumber), type: polType, status, companyId, insuredId,
-              premium: p.premium || null, sumInsured: p.sumInsured || null,
-              coverageType: p.coverageLabel || null, startDate: p.startDate, endDate: p.endDate,
-              installments: p.installments?.length || null, isRebilling: 1,
-              vehicleBrand: !isMoto ? (p.vehicleBrand || null) : null,
-              vehicleModel: !isMoto ? (p.vehicleModel || null) : null,
-              vehicleYear: !isMoto ? (p.vehicleYear || null) : null,
-              vehiclePlate: !isMoto ? (p.vehiclePlate || null) : null,
-              motoBrand: isMoto ? (p.vehicleBrand || null) : null,
-              motoModel: isMoto ? (p.vehicleModel || null) : null,
-              motoYear: isMoto ? (p.vehicleYear || null) : null,
-              motoPlate: isMoto ? (p.vehiclePlate || null) : null,
-              motoEngine: isMoto ? (p.engineNumber || null) : null,
-              notes: `Importado de El Norte (batch). Prórroga huérfana. Endoso ${p.endoso || ""}`,
-              createdBy: user.id,
-            }).returning({ id: policies.id });
-            if (p.installments?.length > 0) await insertInstallments(newPol.id, p.installments);
-            job.rebillings++;
-            return;
-          }
-
-          // Alta nueva / renovación
-          const existingPol = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
-          if (existingPol) {
-            console.log(`[BATCH] Póliza ${p.policyNumber} ya existe (mov: ${mov}) — skip`);
-            job.skipped++; return;
-          }
-
-          const insuredId = await resolveInsured(p);
-          const { polType, status } = resolveTypeAndStatus(p);
-          const isMoto = polType === "motovehiculo";
-          const [newPolicy] = await db.insert(policies).values({
-            policyNumber: String(p.policyNumber), type: polType, status, companyId, insuredId,
-            premium: p.premium || null, sumInsured: p.sumInsured || null,
-            coverageType: p.coverageLabel || null, startDate: p.startDate, endDate: p.endDate,
-            installments: p.installments?.length || null, isRebilling: 0,
-            vehicleBrand: !isMoto ? (p.vehicleBrand || null) : null,
-            vehicleModel: !isMoto ? (p.vehicleModel || null) : null,
-            vehicleYear: !isMoto ? (p.vehicleYear || null) : null,
-            vehiclePlate: !isMoto ? (p.vehiclePlate || null) : null,
-            motoBrand: isMoto ? (p.vehicleBrand || null) : null,
-            motoModel: isMoto ? (p.vehicleModel || null) : null,
-            motoYear: isMoto ? (p.vehicleYear || null) : null,
-            motoPlate: isMoto ? (p.vehicleModel || null) : null,
-            motoEngine: isMoto ? (p.engineNumber || null) : null,
-            notes: `Importado de El Norte (batch). Movimiento: ${p.movType || "RENOVACION"}`,
-            createdBy: user.id,
-          }).returning({ id: policies.id });
-          if (p.installments?.length > 0) await insertInstallments(newPolicy.id, p.installments);
-          job.imported++;
-        }
-
-        // ── Paginación Gmail ────────────────────────────────────────────────
-        job.phase = "Buscando mails en Gmail...";
-        const allMessages: any[] = [];
-        let pageToken: string | null = null;
-        let page = 0;
-
-        do {
-          page++;
-          const queryObj: any = {
-            q: `from:gestorweb@elnorte.com.ar subject:"Archivo de Emision" after:${afterDate}${beforeDate ? ` before:${beforeDate}` : ""}`,
-            metadataOnly: false,
-            maxResults: 100,
-          };
-          if (pageToken) queryObj.pageToken = pageToken;
-
-          const raw = execSync(
-            `connector run gmail gmail-find-email '${JSON.stringify(queryObj)}'`,
-            { encoding: "utf8", env: process.env, maxBuffer: 50 * 1024 * 1024, timeout: 60000 }
-          );
-
-          let parsed: any;
-          try { parsed = JSON.parse(raw); } catch { break; }
-
-          let msgs: any[] = [];
-          if (Array.isArray(parsed)) {
-            msgs = parsed;
-            pageToken = null;
-          } else if (parsed?.messages) {
-            msgs = parsed.messages;
-            pageToken = parsed.nextPageToken || null;
-          } else {
-            pageToken = null;
-          }
-
-          allMessages.push(...msgs);
-          job.phase = `Buscando mails... (${allMessages.length} encontrados)`;
-
-          if (!pageToken || msgs.length === 0) break;
-        } while (page < 20);
-
-        if (!allMessages.length) {
-          (job as any).status = "error";
-          job.phase = "No se encontraron mails en el período indicado";
-          (job as any).finishedAt = Date.now();
-          return;
-        }
-
-        // Ordenar ascendente (más antiguo primero)
-        allMessages.sort((a: any, b: any) =>
-          parseInt(a.internalDate || "0") - parseInt(b.internalDate || "0")
-        );
-
-        job.totalMails = allMessages.length;
-        job.mails = allMessages.length;
-        job.phase = `Procesando 0 / ${allMessages.length} mails...`;
-
-        // ── Procesar cada mail ──────────────────────────────────────────────
-        for (let i = 0; i < allMessages.length; i++) {
-          const msg = allMessages[i];
-          const subject = msg.subject || "sin-asunto";
-          job.phase = `Procesando mail ${i + 1} / ${allMessages.length}: ${subject.slice(0, 50)}`;
-
-          try {
-            const parts: any[] = msg.payload?.parts || [];
-            const attachment = parts.find((p: any) => p.filename && p.filename.toUpperCase().endsWith(".TXT"));
-            if (!attachment) {
-              job.errors.push(`Mail "${subject}": sin adjunto TXT`);
-              job.skipped++;
-              continue;
-            }
-
-            const messageId = msg.id;
-            const attachmentId = attachment.body?.attachmentId;
-            const filename = attachment.filename;
-
-            if (!attachmentId) {
-              job.errors.push(`Mail "${subject}": sin attachmentId`);
-              job.skipped++;
-              continue;
-            }
-
-            const uniqueFilename = `elnorte_${messageId}_${filename}`;
-            let content: string;
-            try {
-              content = await gmailGetAttachmentContent(messageId, attachmentId, uniqueFilename);
-            } catch (dlErr: any) {
-              job.errors.push(`Mail "${subject}": error descargando adjunto - ${dlErr.message}`);
-              job.skipped++;
-              continue;
-            }
-
-            const { policies: parsedPolicies, errors: parseErrs } = parseElNorteTxt(content);
-            console.log(`[BATCH] Mail "${subject}": parseó ${parsedPolicies.length} pólizas, ${parseErrs.length} errores de parse`);
-            if (parseErrs.length > 0) {
-              job.parseErrors += parseErrs.length;
-              parseErrs.forEach(pe => console.error(`[BATCH][parseError] ${pe}`));
-            }
-            if (parsedPolicies.length === 0) {
-              console.error(`[BATCH] Mail "${subject}": 0 pólizas parseadas, contenido primeros 500 chars: ${content.slice(0, 500)}`);
-            }
-
-            for (const p of parsedPolicies) {
-              try {
-                await importPolicy(p);
-              } catch (e: any) {
-                console.error(`[BATCH] Póliza ${p.policyNumber}: ${e.message}`);
-                job.errors.push(`Póliza ${p.policyNumber}: ${e.message}`);
-                job.skipped++;
-              }
-            }
-
-            job.processed++;
-
-          } catch (e: any) {
-            console.error(`[BATCH] Mail "${subject}": ${e.message}`);
-            job.errors.push(`Mail "${subject}": ${e.message}`);
-            job.skipped++;
-          }
-        }
-
-        (job as any).status = "done";
-        job.phase = "Completado";
-        (job as any).finishedAt = Date.now();
-
-      } catch (e: any) {
-        (job as any).status = "error";
-        job.phase = `Error: ${e.message}`;
-        (job as any).finishedAt = Date.now();
-      }
-    })();
-
-    // Devolver jobId inmediatamente
-    return c.json({ jobId }, 200);
-
+    const msgs = await gmailSearch(
+      'from:gestorweb@elnorte.com.ar subject:"Archivo de Emision"', 1
+    );
+    if (!msgs.length) return c.json({ error: "No se encontraron mails de El Norte" }, 404);
+    const msg = msgs[0];
+    const att = findTxtAttachment(msg);
+    if (!att) return c.json({ error: "El mail no tiene adjunto TXT" }, 404);
+    const content = await gmailDownloadAttachment(msg.id, att.attachmentId);
+    const parsed = parseElNorteTxtV2(content);
+    const subject = msg.payload?.headers?.find((h: any) => h.name === "Subject")?.value || "";
+    const date = msg.payload?.headers?.find((h: any) => h.name === "Date")?.value || "";
+    return c.json({ messageId: msg.id, subject, date, filename: att.filename, ...parsed }, 200);
   } catch (e: any) {
     return c.json({ error: e.message }, 500);
   }
 }));
-// ─────────────────────────────────────────────────────────────────────────────
 
-// ── Cron diario: importar El Norte automáticamente ───────────────────────────
-// Corre una vez al día a las 8am (hora Argentina, UTC-3 = 11:00 UTC)
-// Solo activo si hay un admin en la DB
-let dailyCronRunning = false;
+// ── GET /gmail/el-norte/job/:jobId ────────────────────────────────────────────
+app.get("/gmail/el-norte/job/:jobId", requireAuth(async (c: any) => {
+  const job = elNorteJobs.get(c.req.param("jobId"));
+  if (!job) return c.json({ error: "Job no encontrado" }, 404);
+  return c.json(job, 200);
+}));
 
-async function runDailyElNorte() {
-  if (dailyCronRunning) return;
-  dailyCronRunning = true;
+// ── GET /import/el-norte/logs ─────────────────────────────────────────────────
+app.get("/import/el-norte/logs", requireAuth(async (c: any) => {
+  const logs = await db.select().from(importLogs).orderBy(desc(importLogs.importedAt)).all();
+  return c.json(logs, 200);
+}));
+
+// ── POST /gmail/el-norte/batch-preview ───────────────────────────────────────
+app.post("/gmail/el-norte/batch-preview", requireAuth(async (c: any) => {
+  if (!gmailConfigured) return c.json({ error: "Gmail no configurado" }, 503);
   try {
-    const adminUser = await db.select().from(users).limit(1).get();
-    if (!adminUser) return;
+    const body = await c.req.json();
+    const desde: string = body.desde || "";
+    const hasta: string = body.hasta || "";
+    if (!desde) return c.json({ error: "Se requiere campo 'desde'" }, 400);
+    const q = `from:gestorweb@elnorte.com.ar subject:"Archivo de Emision" after:${desde.replace(/-/g, "/")}${hasta ? ` before:${hasta.replace(/-/g, "/")}` : ""}`;
+    const msgs = await gmailSearch(q, 200);
+    msgs.sort((a: any, b: any) => parseInt(a.internalDate || "0") - parseInt(b.internalDate || "0"));
 
-    const today = new Date();
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
-    const desde = yesterday.toISOString().split("T")[0];
-    const hasta = today.toISOString().split("T")[0];
-
-    console.log(`[cron] Importando El Norte del día ${desde}...`);
-
-    const { parseElNorteTxt } = await import("../lib/parsers/el-norte");
-
-    let companyId: number;
-    const existingCompany = await db.select().from(companies).where(eq(companies.name, "El Norte")).get();
-    if (existingCompany) {
-      companyId = existingCompany.id;
-    } else {
-      const [nc] = await db.insert(companies).values({ name: "El Norte" }).returning({ id: companies.id });
-      companyId = nc.id;
-    }
-
-    const afterDate = desde.replace(/-/g, "/");
-    const beforeDate = hasta.replace(/-/g, "/");
-    const q = `from:gestorweb@elnorte.com.ar subject:"Archivo de Emision" after:${afterDate} before:${beforeDate}`;
-
-    const raw = execSync(
-      `connector run gmail gmail-find-email '${JSON.stringify({ q, metadataOnly: false, maxResults: 10 })}'`,
-      { encoding: "utf8", env: process.env, maxBuffer: 20 * 1024 * 1024, timeout: 60000 }
-    );
-
-    let msgs: any[] = [];
-    try {
-      const parsed = JSON.parse(raw);
-      msgs = Array.isArray(parsed) ? parsed : (parsed?.messages || []);
-    } catch { return; }
-
-    let imported = 0, rebillings = 0, skipped = 0;
-
+    const previews: any[] = [];
     for (const msg of msgs) {
+      const att = findTxtAttachment(msg);
+      if (!att) continue;
       try {
-        const parts: any[] = msg.payload?.parts || [];
-        const attachment = parts.find((p: any) => p.filename?.toUpperCase().endsWith(".TXT"));
-        if (!attachment?.body?.attachmentId) continue;
-
-        const uniqueFilename = `elnorte_cron_${msg.id}_${attachment.filename}`;
-        const content = await gmailGetAttachmentContent(msg.id, attachment.body.attachmentId, uniqueFilename);
-        const { policies: parsed } = parseElNorteTxt(content);
-
-        for (const p of parsed) {
-          const mov = (p.movType || "").toUpperCase();
-          if (mov.includes("NOTA DE CREDITO")) { skipped++; continue; }
-          if (mov.includes("ANULACION")) {
-            const ex = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
-            if (ex) await db.update(policies).set({ status: "cancelada" }).where(eq(policies.id, ex.id));
-            continue;
-          }
-          if (mov.includes("PRORROGA")) {
-            const ex = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
-            if (ex) {
-              await db.insert(rebillings).values({ policyId: ex.id, billingStart: p.startDate, billingEnd: p.endDate, premium: p.premium || null, sumInsured: p.sumInsured || null, notes: "Cron diario El Norte", createdBy: adminUser.id });
-              const daysToEnd = Math.ceil((new Date(p.endDate).getTime() - Date.now()) / 86400000);
-              await db.update(policies).set({ endDate: p.endDate, status: daysToEnd < 0 ? "vencida" : daysToEnd <= 30 ? "por_vencer" : "activa", premium: p.premium || ex.premium }).where(eq(policies.id, ex.id));
-              rebillings++;
-            } else skipped++;
-            continue;
-          }
-          const ex = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
-          if (ex) { skipped++; continue; }
-          imported++;
-        }
+        const content = await gmailDownloadAttachment(msg.id, att.attachmentId);
+        const parsed = parseElNorteTxtV2(content);
+        const subject = msg.payload?.headers?.find((h: any) => h.name === "Subject")?.value || "";
+        const date = msg.payload?.headers?.find((h: any) => h.name === "Date")?.value || "";
+        previews.push({ messageId: msg.id, subject, date, filename: att.filename, ...parsed });
       } catch (e: any) {
-        console.error(`[cron] Error procesando mail ${msg.id}:`, e.message);
+        previews.push({ messageId: msg.id, error: e.message });
       }
     }
-
-    console.log(`[cron] El Norte: ${imported} nuevas, ${rebillings} prórrogas, ${skipped} saltadas`);
+    return c.json({ total: previews.length, previews }, 200);
   } catch (e: any) {
-    console.error("[cron] Error en cron diario El Norte:", e.message);
-  } finally {
-    dailyCronRunning = false;
+    return c.json({ error: e.message }, 500);
   }
-}
+}));
 
-// Arrancar el cron: cada hora revisamos si hay que correr
-setInterval(() => {
-  const now = new Date();
-  // Correr a las 8:00 AM hora Argentina (UTC-3 = 11:00 UTC)
-  if (now.getUTCHours() === 11 && now.getUTCMinutes() < 5) {
-    runDailyElNorte();
-  }
-}, 5 * 60 * 1000); // check cada 5 minutos
+// ── POST /gmail/el-norte/batch-import ────────────────────────────────────────
+app.post("/gmail/el-norte/batch-import", requireAuth(async (c: any) => {
+  if (!gmailConfigured) return c.json({ error: "Gmail no configurado" }, 503);
+  const user = c.get("user");
+  const body = await c.req.json();
+  const desde: string = body.desde || "";
+  if (!desde) return c.json({ error: "Se requiere campo 'desde'" }, 400);
+  const hasta: string = body.hasta || "";
 
-// Endpoint para disparar el cron manualmente
-app.post("/gmail/cron-el-norte", requireAuth(async (c: any) => {
-  runDailyElNorte(); // fire and forget
-  return c.json({ ok: true, message: "Cron iniciado" }, 200);
+  const jobId = `en_batch_${Date.now()}`;
+  const job = {
+    status: "running" as const, phase: "Iniciando...",
+    totalMails: 0, processed: 0, imported: 0, rebillings: 0,
+    endosos: 0, anulaciones: 0, duplicados: 0, revisar: 0, skipped: 0,
+    errors: [] as string[], startedAt: Date.now(),
+  };
+  elNorteJobs.set(jobId, job);
+
+  (async () => {
+    try {
+      const q = `from:gestorweb@elnorte.com.ar subject:"Archivo de Emision" after:${desde.replace(/-/g, "/")}${hasta ? ` before:${hasta.replace(/-/g, "/")}` : ""}`;
+      job.phase = "Buscando mails en Gmail...";
+      const msgs = await gmailSearch(q, 200);
+      msgs.sort((a: any, b: any) => parseInt(a.internalDate || "0") - parseInt(b.internalDate || "0"));
+      job.totalMails = msgs.length;
+      if (!msgs.length) { (job as any).status = "error"; job.phase = "Sin mails en el período"; (job as any).finishedAt = Date.now(); return; }
+
+      const companyId = await enGetOrCreateCompany();
+
+      for (let i = 0; i < msgs.length; i++) {
+        const msg = msgs[i];
+        const subject = msg.payload?.headers?.find((h: any) => h.name === "Subject")?.value || "sin-asunto";
+        job.phase = `Procesando ${i + 1}/${msgs.length}: ${subject.slice(0, 40)}`;
+        const att = findTxtAttachment(msg);
+        if (!att) { job.errors.push(`Mail "${subject}": sin adjunto TXT`); job.skipped++; continue; }
+        try {
+          const content = await gmailDownloadAttachment(msg.id, att.attachmentId);
+          const { policies: parsed, errors: parseErrs } = parseElNorteTxtV2(content);
+          if (parseErrs.length) parseErrs.forEach(e => job.errors.push(`[parse] ${e}`));
+          const counts: ImportCounts = { imported: 0, rebillings: 0, endosos: 0, anulaciones: 0, duplicados: 0, revisar: 0, skipped: 0, errors: [] };
+          for (const p of parsed) {
+            try { await enImportOne(p, companyId, user.id, counts); } catch (e: any) { counts.errors.push(`Póliza ${p.policyNumber}: ${e.message}`); counts.skipped++; }
+          }
+          job.imported += counts.imported;
+          job.rebillings += counts.rebillings;
+          job.endosos += counts.endosos;
+          job.anulaciones += counts.anulaciones;
+          job.duplicados += counts.duplicados;
+          job.revisar += counts.revisar;
+          job.skipped += counts.skipped;
+          if (counts.errors.length) counts.errors.forEach(e => job.errors.push(e));
+          await enInsertImportLog({
+            source: "gmail", filename: att.filename, gmailMessageId: msg.id,
+            status: counts.errors.length === 0 ? "ok" : "partial",
+            registrosImportados: counts.imported, rebillings: counts.rebillings,
+            endosos: counts.endosos, anulaciones: counts.anulaciones,
+            duplicados: counts.duplicados, revisar: counts.revisar, skipped: counts.skipped,
+            errors: JSON.stringify(counts.errors), createdBy: user.id,
+          });
+          job.processed++;
+        } catch (e: any) { job.errors.push(`Mail "${subject}": ${e.message}`); job.skipped++; }
+      }
+      (job as any).status = "done"; job.phase = "Completado"; (job as any).finishedAt = Date.now();
+    } catch (e: any) {
+      (job as any).status = "error"; job.phase = `Error: ${e.message}`; (job as any).finishedAt = Date.now();
+    }
+  })();
+
+  return c.json({ jobId }, 200);
+}));
+
+// ── POST /gmail/el-norte/daily ────────────────────────────────────────────────
+app.post("/gmail/el-norte/daily", requireAuth(async (c: any) => {
+  if (!gmailConfigured) return c.json({ error: "Gmail no configurado" }, 503);
+  const user = c.get("user");
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const desde = yesterday.toISOString().split("T")[0];
+  const hasta = today.toISOString().split("T")[0];
+
+  const jobId = `en_daily_${Date.now()}`;
+  const job = {
+    status: "running" as const, phase: "Iniciando...",
+    totalMails: 0, processed: 0, imported: 0, rebillings: 0,
+    endosos: 0, anulaciones: 0, duplicados: 0, revisar: 0, skipped: 0,
+    errors: [] as string[], startedAt: Date.now(),
+  };
+  elNorteJobs.set(jobId, job);
+
+  (async () => {
+    try {
+      const q = `from:gestorweb@elnorte.com.ar subject:"Archivo de Emision" after:${desde.replace(/-/g, "/")} before:${hasta.replace(/-/g, "/")}`;
+      job.phase = "Buscando mails del día anterior...";
+      const msgs = await gmailSearch(q, 20);
+      job.totalMails = msgs.length;
+      if (!msgs.length) { (job as any).status = "done"; job.phase = "Sin mails nuevos"; (job as any).finishedAt = Date.now(); return; }
+
+      const companyId = await enGetOrCreateCompany();
+
+      for (const msg of msgs) {
+        const subject = msg.payload?.headers?.find((h: any) => h.name === "Subject")?.value || "sin-asunto";
+        const att = findTxtAttachment(msg);
+        if (!att) { job.skipped++; continue; }
+        try {
+          const content = await gmailDownloadAttachment(msg.id, att.attachmentId);
+          const { policies: parsed, errors: parseErrs } = parseElNorteTxtV2(content);
+          if (parseErrs.length) parseErrs.forEach(e => job.errors.push(`[parse] ${e}`));
+          const counts: ImportCounts = { imported: 0, rebillings: 0, endosos: 0, anulaciones: 0, duplicados: 0, revisar: 0, skipped: 0, errors: [] };
+          for (const p of parsed) {
+            try { await enImportOne(p, companyId, user.id, counts); } catch (e: any) { counts.errors.push(`Póliza ${p.policyNumber}: ${e.message}`); counts.skipped++; }
+          }
+          job.imported += counts.imported;
+          job.rebillings += counts.rebillings;
+          job.endosos += counts.endosos;
+          job.anulaciones += counts.anulaciones;
+          job.duplicados += counts.duplicados;
+          job.revisar += counts.revisar;
+          job.skipped += counts.skipped;
+          if (counts.errors.length) counts.errors.forEach(e => job.errors.push(e));
+          await enInsertImportLog({
+            source: "gmail", filename: att.filename, gmailMessageId: msg.id,
+            fechaArchivo: desde, status: counts.errors.length === 0 ? "ok" : "partial",
+            registrosImportados: counts.imported, rebillings: counts.rebillings,
+            endosos: counts.endosos, anulaciones: counts.anulaciones,
+            duplicados: counts.duplicados, revisar: counts.revisar, skipped: counts.skipped,
+            errors: JSON.stringify(counts.errors), createdBy: user.id,
+          });
+          job.processed++;
+        } catch (e: any) { job.errors.push(`Mail "${subject}": ${e.message}`); job.skipped++; }
+      }
+      (job as any).status = "done"; job.phase = "Completado"; (job as any).finishedAt = Date.now();
+    } catch (e: any) {
+      (job as any).status = "error"; job.phase = `Error: ${e.message}`; (job as any).finishedAt = Date.now();
+    }
+  })();
+
+  return c.json({ jobId, desde, hasta }, 200);
+}));
+
+// ── Cron diario El Norte — DESACTIVADO
+// El procesamiento diario queda disponible solo como disparo manual:
+// POST /gmail/el-norte/daily
+
+// ── /admin/audit/coop-orphans ─────────────────────────────────────────────────
+app.get("/admin/audit/coop-orphans", requireAuth(async (c: any) => {
+  const coop = await db.select().from(companies).where(eq(companies.name, "Cooperación")).get();
+  if (!coop) return c.json({ error: "Compañía Cooperación no encontrada" }, 404);
+
+  const orphans = await db.select().from(policies)
+    .where(and(
+      eq(policies.companyId, coop.id),
+      eq(policies.type, "accidentes_pasajeros"),
+      isNull(policies.parentPolicyId),
+      ne(policies.status, "cancelada"),
+    ))
+    .all();
+
+  const report = await Promise.all(orphans.map(async (orphan) => {
+    const insured = await db.select().from(insureds).where(eq(insureds.id, orphan.insuredId)).get();
+
+    let candidates: { id: number; policyNumber: string; startDate: string; endDate: string }[] = [];
+    if (insured) {
+      candidates = await db.select({
+        id: policies.id,
+        policyNumber: policies.policyNumber,
+        startDate: policies.startDate,
+        endDate: policies.endDate,
+      }).from(policies)
+        .where(and(
+          eq(policies.insuredId, insured.id),
+          eq(policies.companyId, coop.id),
+          inArray(policies.type, ["automotor", "motovehiculo"]),
+          lte(policies.startDate, orphan.endDate),
+          gte(policies.endDate, orphan.startDate),
+        ))
+        .all();
+    }
+
+    const action =
+      candidates.length === 1 ? "link" :
+      candidates.length  > 1  ? "ambiguous" :
+                                 "no_parent";
+
+    return {
+      policyId:     orphan.id,
+      policyNumber: orphan.policyNumber,
+      insuredName:  insured?.name ?? "(sin asegurado)",
+      insuredDni:   insured?.dni  ?? null,
+      startDate:    orphan.startDate,
+      endDate:      orphan.endDate,
+      status:       orphan.status,
+      candidates,
+      action,
+    };
+  }));
+
+  return c.json({
+    total:     report.length,
+    link:      report.filter(r => r.action === "link").length,
+    ambiguous: report.filter(r => r.action === "ambiguous").length,
+    no_parent: report.filter(r => r.action === "no_parent").length,
+    policies:  report,
+  }, 200);
 }));
 
 // ─────────────────────────────────────────────────────────────────────────────
