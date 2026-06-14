@@ -2667,7 +2667,8 @@ app.post("/admin/fix/coop-orphans", requireAuth(async (c: any) => {
   const errors: string[] = [];
 
   for (const orphan of orphans) {
-    const candidates = await db.select({
+    // Paso 1: exact match por fechas
+    const exact = await db.select({
       id:           policies.id,
       policyNumber: policies.policyNumber,
     }).from(policies)
@@ -2675,19 +2676,41 @@ app.post("/admin/fix/coop-orphans", requireAuth(async (c: any) => {
         eq(policies.insuredId, orphan.insuredId),
         eq(policies.companyId, coop.id),
         inArray(policies.type, ["automotor", "motovehiculo"]),
-        lte(policies.startDate, orphan.endDate),
-        gte(policies.endDate, orphan.startDate),
+        eq(policies.startDate, orphan.startDate),
+        eq(policies.endDate, orphan.endDate),
       ))
       .all();
 
-    if (candidates.length !== 1) {
-      errors.push(`Póliza ${orphan.policyNumber}: ${candidates.length} candidatos — omitida`);
+    let chosen: { id: number; policyNumber: string } | null = null;
+
+    if (exact.length === 1) {
+      chosen = exact[0];
+    } else if (exact.length === 0) {
+      // Paso 2: fallback overlap
+      const overlap = await db.select({
+        id:           policies.id,
+        policyNumber: policies.policyNumber,
+      }).from(policies)
+        .where(and(
+          eq(policies.insuredId, orphan.insuredId),
+          eq(policies.companyId, coop.id),
+          inArray(policies.type, ["automotor", "motovehiculo"]),
+          lte(policies.startDate, orphan.endDate),
+          gte(policies.endDate, orphan.startDate),
+        ))
+        .all();
+
+      if (overlap.length === 1) chosen = overlap[0];
+    }
+
+    if (!chosen) {
+      errors.push(`Póliza ${orphan.policyNumber}: exact=${exact.length} — omitida`);
       skipped++;
       continue;
     }
 
     await db.update(policies)
-      .set({ parentPolicyId: candidates[0].id })
+      .set({ parentPolicyId: chosen.id })
       .where(and(
         eq(policies.id, orphan.id),
         isNull(policies.parentPolicyId),
