@@ -237,3 +237,23 @@ export const tasks = sqliteTable("tasks", {
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
   completedAt: integer("completed_at", { mode: "timestamp" }),
 });
+
+// ─── IMPORT LOGS ──────────────────────────────────────────────────────────────
+export const importLogs = sqliteTable("import_logs", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  source: text("source").notNull(), // "gmail" | "manual"
+  filename: text("filename"),
+  gmailMessageId: text("gmail_message_id").unique(),
+  fechaArchivo: text("fecha_archivo"), // YYYY-MM-DD del archivo importado
+  importedAt: integer("imported_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  status: text("status").notNull().default("ok"), // "ok" | "error" | "partial"
+  registrosImportados: integer("registros_importados").notNull().default(0),
+  rebillings: integer("rebillings").notNull().default(0),
+  endosos: integer("endosos").notNull().default(0),
+  anulaciones: integer("anulaciones").notNull().default(0),
+  duplicados: integer("duplicados").notNull().default(0),
+  revisar: integer("revisar").notNull().default(0),
+  skipped: integer("skipped").notNull().default(0),
+  errors: text("errors"), // JSON array of strings
+  createdBy: integer("created_by").references(() => users.id),
+});
