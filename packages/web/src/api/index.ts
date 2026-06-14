@@ -382,7 +382,7 @@ app.delete("/policies/:id", requireAuth(async (c: any) => {
 
 // ─── DASHBOARD STATS ──────────────────────────────────────────────────────────
 app.get("/stats", requireAuth(async (c: any) => {
-  const allPolicies = (await db
+  const allPolicies = await db
     .select({ policy: policies, company: companies })
     .from(policies)
     .leftJoin(companies, eq(policies.companyId, companies.id))
