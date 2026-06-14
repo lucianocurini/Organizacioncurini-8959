@@ -2597,6 +2597,55 @@ app.get("/admin/audit/coop-orphans", requireAuth(async (c: any) => {
   }, 200);
 }));
 
+// ── /admin/preview/coop-orphans ──────────────────────────────────────────────
+app.get("/admin/preview/coop-orphans", requireAuth(async (c: any) => {
+  const coop = await db.select().from(companies)
+    .where(eq(companies.name, "Cooperación")).get();
+  if (!coop) return c.json({ error: "Compañía Cooperación no encontrada" }, 404);
+
+  const orphans = await db.select().from(policies)
+    .where(and(
+      eq(policies.companyId, coop.id),
+      eq(policies.type, "accidentes_pasajeros"),
+      isNull(policies.parentPolicyId),
+      ne(policies.status, "cancelada"),
+    ))
+    .all();
+
+  const detail = await Promise.all(orphans.map(async (orphan) => {
+    const candidates = await db.select({
+      id:           policies.id,
+      policyNumber: policies.policyNumber,
+    }).from(policies)
+      .where(and(
+        eq(policies.insuredId, orphan.insuredId),
+        eq(policies.companyId, coop.id),
+        inArray(policies.type, ["automotor", "motovehiculo"]),
+        lte(policies.startDate, orphan.endDate),
+        gte(policies.endDate, orphan.startDate),
+      ))
+      .all();
+
+    return {
+      id:                 orphan.id,
+      policyNumber:       orphan.policyNumber,
+      insuredId:          orphan.insuredId,
+      startDate:          orphan.startDate,
+      endDate:            orphan.endDate,
+      cantidadCandidatos: candidates.length,
+      candidatos:         candidates,
+    };
+  }));
+
+  return c.json({
+    total:          detail.length,
+    conUnCandidato: detail.filter(d => d.cantidadCandidatos === 1).length,
+    sinCandidatos:  detail.filter(d => d.cantidadCandidatos === 0).length,
+    ambiguos:       detail.filter(d => d.cantidadCandidatos  > 1).length,
+    policies:       detail,
+  }, 200);
+}));
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default app;
