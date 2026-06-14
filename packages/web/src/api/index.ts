@@ -2646,6 +2646,58 @@ app.get("/admin/preview/coop-orphans", requireAuth(async (c: any) => {
   }, 200);
 }));
 
+// ── /admin/fix/coop-orphans ───────────────────────────────────────────────────
+// Vincula huérfanas con candidato único. Omite las de 0 y >1 candidatos.
+// La guardia AND parentPolicyId IS NULL impide pisar datos ya corregidos.
+app.post("/admin/fix/coop-orphans", requireAuth(async (c: any) => {
+  const coop = await db.select().from(companies)
+    .where(eq(companies.name, "Cooperación")).get();
+  if (!coop) return c.json({ error: "Compañía Cooperación no encontrada" }, 404);
+
+  const orphans = await db.select().from(policies)
+    .where(and(
+      eq(policies.companyId, coop.id),
+      eq(policies.type, "accidentes_pasajeros"),
+      isNull(policies.parentPolicyId),
+      ne(policies.status, "cancelada"),
+    ))
+    .all();
+
+  let fixed = 0, skipped = 0;
+  const errors: string[] = [];
+
+  for (const orphan of orphans) {
+    const candidates = await db.select({
+      id:           policies.id,
+      policyNumber: policies.policyNumber,
+    }).from(policies)
+      .where(and(
+        eq(policies.insuredId, orphan.insuredId),
+        eq(policies.companyId, coop.id),
+        inArray(policies.type, ["automotor", "motovehiculo"]),
+        lte(policies.startDate, orphan.endDate),
+        gte(policies.endDate, orphan.startDate),
+      ))
+      .all();
+
+    if (candidates.length !== 1) {
+      errors.push(`Póliza ${orphan.policyNumber}: ${candidates.length} candidatos — omitida`);
+      skipped++;
+      continue;
+    }
+
+    await db.update(policies)
+      .set({ parentPolicyId: candidates[0].id })
+      .where(and(
+        eq(policies.id, orphan.id),
+        isNull(policies.parentPolicyId),
+      ));
+    fixed++;
+  }
+
+  return c.json({ fixed, skipped, errors }, 200);
+}));
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default app;
