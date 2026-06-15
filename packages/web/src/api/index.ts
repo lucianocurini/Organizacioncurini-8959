@@ -2723,5 +2723,225 @@ app.post("/admin/fix/coop-orphans", requireAuth(async (c: any) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── POST /import/ssn-gde ──────────────────────────────────────────────────────
+// SSN-GDE CSV (formato Rivadavia vía plataforma SSN).
+// El parsing viene hecho desde el frontend (parseSsnGdeCsv en importar.tsx).
+app.post("/import/ssn-gde", requireAuth(async (c: any) => {
+  const user = c.get("user");
+  const body = await c.req.json();
+  const parsedPolicies: any[] = body.policies || [];
+  if (!parsedPolicies.length) return c.json({ error: "Sin pólizas" }, 400);
+
+  const counts = {
+    imported: 0, rebillings: 0, anulaciones: 0, rehabilitadas: 0,
+    duplicados: 0, revisar: 0, skipped: 0, errors: [] as string[],
+  };
+
+  // Reusar la compañía Rivadavia existente (misma que el importador TXT)
+  let companyId: number;
+  const existingCo = await db.select().from(companies).where(eq(companies.name, "Rivadavia")).get();
+  if (existingCo) {
+    companyId = existingCo.id;
+  } else {
+    const [nc] = await db.insert(companies).values({ name: "Rivadavia" }).returning({ id: companies.id });
+    companyId = nc.id;
+  }
+
+  async function ssnResolveInsured(p: any): Promise<number> {
+    let existing = null;
+    if (p.insuredDni) existing = await db.select().from(insureds).where(eq(insureds.dni, String(p.insuredDni))).get();
+    if (!existing) existing = await db.select().from(insureds).where(eq(insureds.name, p.insuredName)).get();
+    if (existing) return existing.id;
+    const [ni] = await db.insert(insureds).values({
+      name: p.insuredName, dni: p.insuredDni ? String(p.insuredDni) : null,
+      email: null, phone: null, address: p.insuredAddress || null, createdBy: user.id,
+    }).returning({ id: insureds.id });
+    return ni.id;
+  }
+
+  function ssnResolveTypeAndStatus(p: any): { polType: string; status: string } {
+    const vt = (p.vehicleType || "").toLowerCase();
+    let polType: string;
+    if      (vt === "motovehiculo")      polType = "motovehiculo";
+    else if (vt === "hogar")             polType = "hogar";
+    else if (vt === "riesgos_varios")    polType = "riesgos_varios";
+    else if (vt === "integral_comercio") polType = "integral_comercio";
+    else                                 polType = "automotor";
+    const today = new Date().toISOString().split("T")[0];
+    const daysToEnd = Math.ceil((new Date(p.endDate).getTime() - new Date(today).getTime()) / 86400000);
+    let status = "activa";
+    if (daysToEnd < 0) status = "vencida";
+    else if (daysToEnd <= 30) status = "por_vencer";
+    return { polType, status };
+  }
+
+  async function ssnInsertPolicy(p: any, noteStr: string): Promise<void> {
+    const insuredId = await ssnResolveInsured(p);
+    const { polType, status } = ssnResolveTypeAndStatus(p);
+    const isMoto = polType === "motovehiculo";
+    await db.insert(policies).values({
+      policyNumber: String(p.policyNumber), type: polType, status, companyId, insuredId,
+      premium: null, sumInsured: p.sumInsured || null,
+      coverageType: p.coverageLabel || null,
+      startDate: p.startDate, endDate: p.endDate,
+      isRebilling: 0,
+      vehicleBrand: !isMoto ? (p.vehicleBrand || null) : null,
+      vehicleModel: !isMoto ? (p.vehicleModel || null) : null,
+      vehicleYear:  !isMoto ? (p.vehicleYear  || null) : null,
+      vehiclePlate: !isMoto ? (p.vehiclePlate || null) : null,
+      motoBrand: isMoto ? (p.vehicleBrand || null) : null,
+      motoModel: isMoto ? (p.vehicleModel || null) : null,
+      motoYear:  isMoto ? (p.vehicleYear  || null) : null,
+      motoPlate: isMoto ? (p.vehiclePlate || null) : null,
+      notes: noteStr,
+      createdBy: user.id,
+    });
+  }
+
+  // Pasada 1: crear/encontrar pólizas base (ALTA, RENOVACION, REFACTURACION)
+  const creatables = parsedPolicies.filter(
+    p => ["ALTA", "RENOVACION", "REFACTURACION"].includes((p.movType || "").toUpperCase())
+  );
+  for (const p of creatables) {
+    try {
+      const mov = (p.movType || "").toUpperCase();
+      const polNum = String(p.policyNumber);
+      const mes = p._ssnMes || body.fechaArchivo || "";
+      const orden = p._ssnOrden ?? 0;
+
+      // ── ALTA / RENOVACION ──────────────────────────────────────────────────
+      if (mov === "ALTA" || mov === "RENOVACION") {
+        const exists = await db.select({ id: policies.id })
+          .from(policies).where(eq(policies.policyNumber, polNum)).get();
+        if (exists) { counts.duplicados++; continue; }
+        await ssnInsertPolicy(p, `Importado SSN-GDE ${mes}. Mov: ${mov}`);
+        counts.imported++;
+        continue;
+      }
+
+      // ── REFACTURACION ──────────────────────────────────────────────────────
+      if (mov === "REFACTURACION") {
+        const existing = await db.select().from(policies).where(eq(policies.policyNumber, polNum)).get();
+        if (!existing) {
+          // Base no encontrada: crear como póliza nueva con nota
+          await ssnInsertPolicy(p, `Importado SSN-GDE ${mes}. REFACTURACION Orden ${orden} (base no encontrada)`);
+          counts.imported++;
+          continue;
+        }
+        // Período idéntico al de la póliza base → es la vigencia original, no un rebilling
+        if (existing.startDate === p.startDate && existing.endDate === p.endDate) {
+          counts.duplicados++;
+          continue;
+        }
+        // Dedup: no insertar rebilling si ya existe el mismo período
+        const dupRebilling = await db.select({ id: rebillings.id })
+          .from(rebillings)
+          .where(and(
+            eq(rebillings.policyId, existing.id),
+            eq(rebillings.billingStart, p.startDate),
+            eq(rebillings.billingEnd, p.endDate),
+          )).get();
+        if (dupRebilling) { counts.duplicados++; continue; }
+        await db.insert(rebillings).values({
+          policyId: existing.id,
+          billingStart: p.startDate, billingEnd: p.endDate,
+          premium: null, sumInsured: p.sumInsured || null,
+          notes: `SSN-GDE ${mes}. Orden ${orden}`,
+          createdBy: user.id,
+        });
+        const { status } = ssnResolveTypeAndStatus(p);
+        await db.update(policies)
+          .set({ endDate: p.endDate, status })
+          .where(eq(policies.id, existing.id));
+        counts.rebillings++;
+      }
+
+    } catch (e: any) {
+      counts.errors.push(`Póliza ${p.policyNumber}: ${e.message}`);
+      counts.skipped++;
+    }
+  }
+
+  // Pasada 2: actuar sobre pólizas ya creadas/encontradas (ANULACION, REHABILITACION)
+  const actables = parsedPolicies.filter(
+    p => ["ANULACION", "REHABILITACION"].includes((p.movType || "").toUpperCase())
+  );
+  for (const p of actables) {
+    try {
+      const mov = (p.movType || "").toUpperCase();
+      const polNum = String(p.policyNumber);
+      const mes = p._ssnMes || body.fechaArchivo || "";
+      const suplemento = p._ssnSuplemento ?? 0;
+
+      // ── ANULACION ──────────────────────────────────────────────────────────
+      if (mov === "ANULACION") {
+        const existing = await db.select().from(policies).where(eq(policies.policyNumber, polNum)).get();
+        if (!existing) { counts.skipped++; continue; }
+        await db.update(policies).set({
+          status: "cancelada",
+          notes: (existing.notes ? existing.notes + " | " : "") +
+            `Anulada SSN-GDE ${mes}. Supl: ${suplemento}`,
+        }).where(eq(policies.id, existing.id));
+        counts.anulaciones++;
+        continue;
+      }
+
+      // ── REHABILITACION ─────────────────────────────────────────────────────
+      if (mov === "REHABILITACION") {
+        const existing = await db.select().from(policies).where(eq(policies.policyNumber, polNum)).get();
+        if (!existing) {
+          counts.revisar++;
+          counts.errors.push(`REHABILITACION: póliza ${polNum} no encontrada`);
+          continue;
+        }
+        const { status } = ssnResolveTypeAndStatus(p);
+        await db.update(policies).set({
+          status, endDate: p.endDate,
+          notes: (existing.notes ? existing.notes + " | " : "") +
+            `Rehabilitada SSN-GDE ${mes}. Supl: ${suplemento}`,
+        }).where(eq(policies.id, existing.id));
+        counts.rehabilitadas++;
+        continue;
+      }
+
+      // Movimiento no reconocido en pasada 2
+      counts.errors.push(`Póliza ${polNum}: movType desconocido "${p.movType}"`);
+      counts.skipped++;
+
+    } catch (e: any) {
+      counts.errors.push(`Póliza ${p.policyNumber}: ${e.message}`);
+      counts.skipped++;
+    }
+  }
+
+  const logStatus = counts.errors.length === 0 ? "ok"
+    : counts.imported + counts.rebillings > 0 ? "partial" : "error";
+
+  let logId: number | null = null;
+  let logWarning: string | undefined;
+  try {
+    logId = await enInsertImportLog({
+      source: "manual",
+      filename: body.filename || null,
+      gmailMessageId: null,
+      fechaArchivo: body.fechaArchivo || null,
+      status: logStatus,
+      registrosImportados: counts.imported,
+      rebillings: counts.rebillings,
+      endosos: 0,
+      anulaciones: counts.anulaciones,
+      duplicados: counts.duplicados,
+      revisar: counts.revisar + counts.rehabilitadas,
+      skipped: counts.skipped,
+      errors: JSON.stringify(counts.errors),
+      createdBy: user.id,
+    });
+  } catch {
+    logWarning = "Import registrado pero log no pudo guardarse";
+  }
+
+  return c.json({ ...counts, logId, ...(logWarning ? { logWarning } : {}) }, 200);
+}));
+
 export default app;
 export type AppType = typeof app;

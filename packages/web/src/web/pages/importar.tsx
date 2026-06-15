@@ -39,11 +39,25 @@ interface ImportPreview {
   policies: ParsedPolicy[];
   errors: string[];
   companyName: string;
+  stats?: {
+    total: number;
+    nuevas: number;
+    prorrogas: number;
+    endosos: number;
+    anulaciones: number;
+    notasCredito: number;
+    otros: number;
+  };
 }
 
-function parseFecha(s: string): string {
-  if (!s || s.length !== 8) return "";
-  return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+interface BatchPreviewSummary {
+  totalMails: number;
+  totalPolicies: number;
+  nuevas: number;
+  prorrogas: number;
+  endosos: number;
+  anulaciones: number;
+  errores: number;
 }
 
 function detectVehicleType(vt: string): string {
@@ -53,111 +67,9 @@ function detectVehicleType(vt: string): string {
   if (v === "hogar") return "hogar";
   if (v === "cascos") return "cascos";
   if (v === "comercial") return "comercial";
+  if (v === "riesgos_varios") return "riesgos_varios";
+  if (v === "integral_comercio") return "integral_comercio";
   return "automotor";
-}
-
-function parseElNorteTxt(content: string): ImportPreview {
-  const lines = content.split(/\r?\n/).filter(l => l.trim());
-  const errors: string[] = [];
-  const pvMap: Record<string, any> = {};
-  const asMap: Record<string, any> = {};
-  const itMap: Record<string, any> = {};
-  const ppMap: Record<string, any[]> = {};
-
-  for (const line of lines) {
-    try {
-      const cols = line.match(/(".*?"|[^,]+|(?<=,)(?=,)|(?<=,)$|^(?=,))/g)
-        ?.map(c => c.replace(/^"|"$/g, "").trim()) || [];
-      const type = cols[0];
-      if (type === "PV") {
-        const polNum = cols[3];
-        const endoso = cols[4];
-        const key = `${polNum}_${endoso}`;
-        pvMap[key] = {
-          policyNumber: polNum, endoso,
-          movType: cols[10],
-          emisionDate: parseFecha(cols[12]),
-          startDate: parseFecha(cols[13]),
-          endDate: parseFecha(cols[14]),
-          insuredId: cols[15],
-          premium: parseFloat(cols[17]) || 0,
-        };
-      } else if (type === "AS") {
-        const insuredId = cols[1];
-        asMap[insuredId] = {
-          name: cols[4],
-          address: `${cols[6]}, ${cols[7]}, ${cols[8]}`.trim(),
-          phone: cols[11]?.replace(/[^0-9 \-\+\(\)]/g, "").trim(),
-          email: cols[12] === "organizacioncurini@gmail.com" ? "" : cols[12],
-          dni: cols[3],
-        };
-      } else if (type === "IT") {
-        const key = `${cols[3]}_${cols[4]}`;
-        itMap[key] = {
-          sumInsured: parseFloat(cols[6]) || 0,
-          coverageCode: cols[8],
-          coverageLabel: cols[9],
-          plate: cols[16],
-          engine: cols[17],
-          brand: cols[19],
-          model: cols[20],
-          year: parseInt(cols[21]) || 0,
-          vehicleType: cols[22],
-        };
-      } else if (type === "PP") {
-        const key = `${cols[3]}_${cols[4]}`;
-        if (!ppMap[key]) ppMap[key] = [];
-        ppMap[key].push({ number: parseInt(cols[5]) || 0, dueDate: parseFecha(cols[7]), amount: parseFloat(cols[8]) || 0 });
-      }
-    } catch {
-      errors.push(`Error parseando: ${line.slice(0, 60)}`);
-    }
-  }
-
-  const policies: ParsedPolicy[] = [];
-  for (const key of Object.keys(pvMap)) {
-    const pv = pvMap[key];
-    const it = itMap[key];
-    const pp = ppMap[key] || [];
-    const as = asMap[pv.insuredId];
-    if (!as) { errors.push(`Póliza ${pv.policyNumber}: asegurado ${pv.insuredId} no encontrado`); continue; }
-
-    const mov = (pv.movType || "").toUpperCase();
-    const isOrphanProrroga = mov.includes("PRORROGA"); // el backend confirmará si realmente es huérfana
-
-    policies.push({
-      policyNumber: pv.policyNumber,
-      movType: pv.movType,
-      startDate: pv.startDate,
-      endDate: pv.endDate,
-      premium: pv.premium,
-      sumInsured: it?.sumInsured || 0,
-      coverageCode: it?.coverageCode || "",
-      coverageLabel: it?.coverageLabel || "",
-      insuredName: as.name,
-      insuredDni: as.dni,
-      insuredEmail: as.email,
-      insuredPhone: as.phone,
-      insuredAddress: as.address,
-      vehiclePlate: it?.plate || "",
-      vehicleBrand: it?.brand || "",
-      vehicleModel: it?.model || "",
-      vehicleYear: it?.year || 0,
-      vehicleType: it?.vehicleType || "",
-      engineNumber: it?.engine || "",
-      installments: pp.sort((a, b) => a.number - b.number),
-      _orphan: isOrphanProrroga,
-      // valores default para la póliza base (editables)
-      _baseStartDate: "",
-      _baseEndDate: pv.startDate, // la base termina donde empieza la prórroga
-      _basePremium: pv.premium,
-      _baseSumInsured: it?.sumInsured || 0,
-      _baseCoverage: it?.coverageLabel || "",
-      _baseNotes: "",
-    });
-  }
-
-  return { policies, errors, companyName: "El Norte" };
 }
 
 // ── PARSER RIVADAVIA ──────────────────────────────────────────────────────────
@@ -253,23 +165,25 @@ function parseRivadaviaTxt(content: string): ImportPreview {
       // RIESGO A CUBRIR
       const riesgoLine = lines.find(l => l.includes("RIESGO A CUBRIR:"));
       let coverageLabel = "", sumInsured = 0;
+
+      // El prefijo del número de póliza siempre determina el tipo (ignora RIESGO A CUBRIR para esto)
+      if      (policyNumber.startsWith("09-02-")) vehicleType = "automotor";
+      else if (policyNumber.startsWith("09-20-")) vehicleType = "motovehiculo";
+      else if (policyNumber.startsWith("09-10-")) vehicleType = "accidentes_pasajeros";
+      else if (policyNumber.startsWith("09-04-")) vehicleType = "riesgos_varios";
+      else if (policyNumber.startsWith("09-05-")) vehicleType = "hogar";
+      else if (policyNumber.startsWith("09-09-")) vehicleType = "integral_comercio";
+      else vehicleType = "automotor";
+
+      // RIESGO A CUBRIR: solo para extraer cobertura y suma asegurada
       if (riesgoLine) {
         const riesgoM = riesgoLine.match(/RIESGO A CUBRIR:\s*(\S+)/);
         const planM = riesgoLine.match(/PLAN:\s*(\S+)/);
         const sumaM = riesgoLine.match(/SUMA ASEG\.\s*([\d\.,]+)/);
         const riesgoTipo = riesgoM ? riesgoM[1].toUpperCase() : "";
-        // "AUTOMOTORES" contiene "MOTO" → comparar explícitamente
-        vehicleType = (riesgoTipo === "MOTOVEHICULO" || riesgoTipo === "MOTO" || riesgoTipo.startsWith("MOTOV"))
-          ? "motovehiculo"
-          : "automotor";
         const planStr = planM ? planM[1] : "";
         coverageLabel = planStr && planStr !== "SUMA" ? `Plan ${planStr}` : riesgoTipo;
         sumInsured = sumaM ? parseNumAR(sumaM[1]) : 0;
-      } else {
-        // Sin RIESGO A CUBRIR → detectar por prefijo del número de póliza
-        if (policyNumber.startsWith("09-20-")) vehicleType = "motovehiculo";
-        else if (policyNumber.startsWith("09-10-")) vehicleType = "accidentes_pasajeros";
-        else vehicleType = "automotor"; // 09-02-* y default
       }
 
       // INF. ADICIONAL → prima y premio
@@ -397,6 +311,13 @@ function parseCooperacionCsv(content: string): ImportPreview {
         isSubPolicy = true;
         basePolicyNumber = polizaRaw.replace(/^(14-|12-)/, "");
       }
+      // Ramo 31 bundleado (12-) → no importar como póliza
+      if (ramo === "31" && isSubPolicy) {
+        errors.push(`Fila ${i}: ramo 31 hogar bundleado (${polizaRaw}) — omitida`);
+        continue;
+      }
+      // Ramo 41 con número "1405..." (sin guión) → parent por DNI+vigencia en el importer
+      const findParentByDni = ramo === "41" && !isSubPolicy && polizaRaw.startsWith("1405");
 
       if (ramo === "31" && isSubPolicy) {
         errors.push(`Fila ${i}: ramo 31 hogar bundleado (${polizaRaw}) — omitida`);
@@ -474,6 +395,7 @@ function parseCooperacionCsv(content: string): ImportPreview {
         _baseCoverage: coverageLabel,
         _baseNotes: "",
         ...(isSubPolicy ? { _parentPolicyNumber: basePolicyNumber } : {}),
+        ...(findParentByDni ? { _findParentByDni: true } : {}),
       } as any);
     } catch (e: any) {
       errors.push(`Fila ${i}: ${e.message}`);
@@ -619,18 +541,209 @@ function parseMercantilAndinaCsv(content: string): ImportPreview {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── PARSER RIVADAVIA SSN-GDE ──────────────────────────────────────────────────
+// Formato: CSV separado por ; con campos string entre comillas dobles.
+// Columnas: PAS;MES;Fecha de EMISION;Apellido y Nombre;N Documento;Domicilio;
+//   Ubicación del Riesgo;Bien a Asegurar;Riesgo a Cubrir;Capital Asegurado;
+//   Vig. Desde;Vig. Hasta;Movimientos;Observaciones;Poliza;Orden;Suplemento
+// Movimientos: EMISION | ANULACION | REHABILITACION
+// Observaciones: NUEVA | RENOVACION | REFACTURACIONN (doble N en el original SSN)
+function parseSsnGdeCsv(content: string): ImportPreview {
+  const errors: string[] = [];
+  const policies: ParsedPolicy[] = [];
+
+  const lines = content.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) return { policies, errors: ["Archivo vacío"], companyName: "Rivadavia SSN" };
+
+  // Splitter CSV que respeta campos entre comillas dobles
+  function splitLine(line: string): string[] {
+    const result: string[] = [];
+    let cur = "";
+    let inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQ = !inQ; }
+      else if (ch === ';' && !inQ) { result.push(cur.trim()); cur = ""; }
+      else { cur += ch; }
+    }
+    result.push(cur.trim());
+    return result;
+  }
+
+  const header = splitLine(lines[0]);
+
+  // Busca por nombre exacto; si falla, por prefijo de 10 chars (tolera encoding latin1)
+  function colIdx(name: string): number {
+    let idx = header.findIndex(h => h === name);
+    if (idx < 0) idx = header.findIndex(h => h.startsWith(name.slice(0, 10)));
+    return idx;
+  }
+
+  const IDX = {
+    mes:    colIdx("MES"),
+    emit:   colIdx("Fecha de EMISION"),
+    nombre: colIdx("Apellido y Nombre"),
+    dni:    colIdx("N Documento"),
+    dom:    colIdx("Domicilio"),
+    bien:   colIdx("Bien a Asegurar"),
+    riesgo: colIdx("Riesgo a Cubrir"),
+    cap:    colIdx("Capital Asegurado"),
+    desde:  colIdx("Vig. Desde"),
+    hasta:  colIdx("Vig. Hasta"),
+    movim:  colIdx("Movimientos"),
+    obs:    colIdx("Observaciones"),
+    poliza: colIdx("Poliza"),
+    orden:  colIdx("Orden"),
+    suplem: colIdx("Suplemento"),
+  };
+
+  const missingCols = (["poliza", "nombre", "desde", "hasta", "movim"] as const)
+    .filter(k => IDX[k] < 0);
+  if (missingCols.length > 0) {
+    return {
+      policies,
+      errors: [`Columnas no encontradas: ${missingCols.join(", ")}. ¿Es un archivo SSN-GDE válido?`],
+      companyName: "Rivadavia SSN",
+    };
+  }
+
+  function get(row: string[], idx: number): string {
+    return idx >= 0 ? (row[idx] || "").trim() : "";
+  }
+
+  function parseDate(s: string): string {
+    const m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    return m ? `${m[3]}-${m[2]}-${m[1]}` : "";
+  }
+
+  // "Patente: AD080MF Marca: PEUGEOT 308 1.6 ALLURE PACK Modelo: 2018"
+  function parseBien(bien: string): { plate: string; brand: string; model: string; year: number } {
+    const patM   = bien.match(/Patente:\s*(\S+)/i);
+    const marcaM = bien.match(/Marca:\s*(.+?)(?:\s+Modelo:|$)/i);
+    const modM   = bien.match(/Modelo:\s*(\d{4})/i);
+    const rawPlate  = patM ? patM[1].trim() : "";
+    const brandFull = marcaM ? marcaM[1].trim() : "";
+    const year      = modM ? parseInt(modM[1]) : 0;
+    const parts     = brandFull.split(/\s+/);
+    return {
+      plate: rawPlate === "A/D" ? "" : rawPlate,
+      brand: parts[0] || "",
+      model: parts.slice(1).join(" ").trim(),
+      year,
+    };
+  }
+
+  // Tipo de póliza por prefijo del número (igual que importador Rivadavia TXT)
+  function detectVType(pol: string): string {
+    if (pol.startsWith("09-02-")) return "automotor";
+    if (pol.startsWith("09-20-")) return "motovehiculo";
+    if (pol.startsWith("09-10-")) return "accidentes_pasajeros";
+    if (pol.startsWith("09-04-")) return "riesgos_varios";
+    if (pol.startsWith("09-05-")) return "hogar";
+    if (pol.startsWith("09-09-")) return "integral_comercio";
+    return "automotor";
+  }
+
+  // Combina Movimientos + Observaciones → movType interno
+  function mapMovType(movimientos: string, obs: string): string {
+    const m = movimientos.toUpperCase().trim();
+    const o = obs.toUpperCase().trim();
+    if (m === "ANULACION")      return "ANULACION";
+    if (m === "REHABILITACION") return "REHABILITACION";
+    if (o === "NUEVA")          return "ALTA";
+    if (o === "RENOVACION")     return "RENOVACION";
+    if (o.startsWith("REFACTURACION")) return "REFACTURACION"; // normaliza doble-N
+    return m;
+  }
+
+  for (let i = 1; i < lines.length; i++) {
+    const row = splitLine(lines[i]);
+    if (row.length < 10) continue;
+    try {
+      const policyNumber = get(row, IDX.poliza);
+      const startDate    = parseDate(get(row, IDX.desde));
+      const endDate      = parseDate(get(row, IDX.hasta));
+      if (!policyNumber || !startDate || !endDate) {
+        errors.push(`Fila ${i}: póliza o fechas inválidas (${get(row, IDX.poliza)})`);
+        continue;
+      }
+
+      const nombre      = get(row, IDX.nombre);
+      const dniRaw      = get(row, IDX.dni);
+      const dni         = dniRaw === "0" ? "" : dniRaw; // 0 = persona jurídica
+      const domicilio   = get(row, IDX.dom);
+      const bien        = get(row, IDX.bien);
+      const riesgo      = get(row, IDX.riesgo);
+      const capital     = parseFloat(get(row, IDX.cap)) || 0;
+      const movimientos = get(row, IDX.movim);
+      const observacion = get(row, IDX.obs);
+      const orden       = parseInt(get(row, IDX.orden)) || 0;
+      const suplemento  = parseInt(get(row, IDX.suplem)) || 0;
+      const mes         = get(row, IDX.mes);
+      const fechaEmit   = parseDate(get(row, IDX.emit));
+
+      const movType     = mapMovType(movimientos, observacion);
+      const vehicleType = detectVType(policyNumber);
+      const { plate, brand, model, year } = parseBien(bien);
+
+      policies.push({
+        policyNumber,
+        movType,
+        startDate,
+        endDate,
+        premium:        0,       // SSN-GDE no incluye prima
+        sumInsured:     capital,
+        coverageCode:   policyNumber.split("-")[1] || "",
+        coverageLabel:  riesgo,
+        insuredName:    nombre,
+        insuredDni:     dni,
+        insuredEmail:   "",
+        insuredPhone:   "",
+        insuredAddress: domicilio,
+        vehiclePlate:   plate,
+        vehicleBrand:   brand,
+        vehicleModel:   model,
+        vehicleYear:    year,
+        vehicleType,
+        engineNumber:   "",
+        installments:   [],
+        _orphan:        false,
+        _baseStartDate: "",
+        _baseEndDate:   "",
+        _basePremium:   0,
+        _baseSumInsured: capital,
+        _baseCoverage:  riesgo,
+        _baseNotes:     `SSN-GDE ${mes}. ${movimientos}/${observacion}`,
+        // Metadatos SSN-GDE (solo para preview; no se envían al backend en esta etapa)
+        _ssnMes:          mes,
+        _ssnFechaEmision: fechaEmit,
+        _ssnMovimientos:  movimientos,
+        _ssnObservacion:  observacion,
+        _ssnOrden:        orden,
+        _ssnSuplemento:   suplemento,
+      } as any);
+    } catch (e: any) {
+      errors.push(`Fila ${i}: ${e.message}`);
+    }
+  }
+
+  return { policies, errors, companyName: "Rivadavia SSN" };
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 const FIELD_LABEL: Record<string, string> = {
   insuredName: "Asegurado", insuredDni: "DNI", insuredEmail: "Email", insuredPhone: "Teléfono",
   vehiclePlate: "Patente", vehicleBrand: "Marca", vehicleModel: "Modelo", coverageLabel: "Cobertura",
 };
 
 export default function Importar() {
-  const [company, setCompany] = useState<"el-norte" | "rivadavia" | "cooperacion" | "mercantil-andina">("el-norte");
+  const [company, setCompany] = useState<"el-norte" | "rivadavia" | "cooperacion" | "mercantil-andina" | "rivadavia-ssn">("el-norte");
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [policies, setPolicies] = useState<ParsedPolicy[]>([]);
+  const [importMeta, setImportMeta] = useState<{ filename?: string; gmailMessageId?: string; fechaArchivo?: string }>({});
   const [loading, setLoading] = useState(false);
   const [importing, setImporting] = useState(false);
-  const [result, setResult] = useState<{ imported: number; rebillings: number; cancelled: number; skipped: number; errors: string[] } | null>(null);
+  const [result, setResult] = useState<{ imported: number; rebillings: number; cancelled?: number; anulaciones?: number; skipped: number; errors: string[] } | null>(null);
   const [expanded, setExpanded] = useState<number | null>(null);
   const [editing, setEditing] = useState<number | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -641,18 +754,21 @@ export default function Importar() {
     setResult(null);
     setPolicies([]);
     const reader = new FileReader();
-    reader.onload = (e) => {
+    reader.onload = async (e) => {
       try {
         const content = e.target?.result as string;
-        const parsed = company === "rivadavia"
+        const parsed = company === "el-norte"
+          ? { ...(await api.post("/api/import/el-norte/preview", { content })), companyName: "El Norte" }
+          : company === "rivadavia"
           ? parseRivadaviaTxt(content)
           : company === "cooperacion"
           ? parseCooperacionCsv(content)
-          : company === "mercantil-andina"
-          ? parseMercantilAndinaCsv(content)
-          : parseElNorteTxt(content);
+          : company === "rivadavia-ssn"
+          ? parseSsnGdeCsv(content)
+          : parseMercantilAndinaCsv(content);
         setPreview(parsed);
         setPolicies(parsed.policies);
+        setImportMeta({ filename: file.name });
       } catch {
         toast.error("No se pudo parsear el archivo");
       } finally {
@@ -670,11 +786,13 @@ export default function Importar() {
 
   const [gmailLoading, setGmailLoading] = useState(false);
   const [batchLoading, setBatchLoading] = useState(false);
+  const [batchPreviewLoading, setBatchPreviewLoading] = useState(false);
+  const [batchPreview, setBatchPreview] = useState<BatchPreviewSummary | null>(null);
   const [batchDesde, setBatchDesde] = useState("2025-12-01");
   const [batchHasta, setBatchHasta] = useState(() => new Date().toISOString().split("T")[0]);
   const [batchPhase, setBatchPhase] = useState("");
   // Resultados acumulados por mes
-  const [monthResults, setMonthResults] = useState<Array<{ label: string; imported: number; rebillings: number; skipped: number; cancelled: number; errors: string[] }>>([]);
+  const [monthResults, setMonthResults] = useState<Array<{ label: string; imported: number; rebillings: number; endosos: number; anulaciones: number; duplicados: number; revisar: number; skipped: number; errors: string[] }>>([]);
   const [batchDone, setBatchDone] = useState(false);
 
   // Genera rangos mensuales entre dos fechas YYYY-MM-DD
@@ -697,21 +815,48 @@ export default function Importar() {
   }
 
   async function pollJob(jobId: string, onPhase: (p: string) => void): Promise<any> {
-    return new Promise((resolve) => {
-      const iv = setInterval(async () => {
-        try {
-          const s = await api.get(`/api/gmail/import-el-norte-batch/${jobId}`);
-          onPhase(s.phase || "Procesando...");
-          if (s.status === "done" || s.status === "error") {
-            clearInterval(iv);
-            resolve(s);
-          }
-        } catch { /* retry */ }
-      }, 3000);
-    });
+    for (;;) {
+      try {
+        const s = await api.get(`/api/gmail/el-norte/job/${jobId}`);
+        onPhase(s.phase || "Procesando...");
+        if (s.status === "done" || s.status === "error") return s;
+      } catch { /* retry */ }
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    }
   }
 
+  const handleBatchPreview = async () => {
+    setBatchPreviewLoading(true);
+    setBatchPreview(null);
+    setMonthResults([]);
+    setBatchDone(false);
+    try {
+      const res = await api.post("/api/gmail/el-norte/batch-preview", { desde: batchDesde, hasta: batchHasta });
+      const summary = (res.previews || []).reduce((acc: BatchPreviewSummary, item: any) => {
+        const stats = item.stats || {};
+        acc.totalMails++;
+        acc.totalPolicies += stats.total || item.policies?.length || 0;
+        acc.nuevas += stats.nuevas || 0;
+        acc.prorrogas += stats.prorrogas || 0;
+        acc.endosos += stats.endosos || 0;
+        acc.anulaciones += stats.anulaciones || 0;
+        acc.errores += item.error ? 1 : (item.errors?.length || 0);
+        return acc;
+      }, { totalMails: 0, totalPolicies: 0, nuevas: 0, prorrogas: 0, endosos: 0, anulaciones: 0, errores: 0 });
+      setBatchPreview(summary);
+      toast.success(`Preview listo: ${summary.totalMails} mails, ${summary.totalPolicies} registros`);
+    } catch (e: any) {
+      toast.error(e.message || "Error en preview histórico");
+    } finally {
+      setBatchPreviewLoading(false);
+    }
+  };
+
   const handleBatchImport = async () => {
+    if (!batchPreview) {
+      toast.error("Primero generá el preview histórico");
+      return;
+    }
     setBatchLoading(true);
     setMonthResults([]);
     setBatchDone(false);
@@ -725,15 +870,18 @@ export default function Importar() {
         const { desde, hasta, label } = ranges[i];
         setBatchPhase(`Mes ${i + 1}/${ranges.length}: ${label}`);
 
-        const { jobId } = await api.post("/api/gmail/import-el-norte-batch", { desde, hasta });
+        const { jobId } = await api.post("/api/gmail/el-norte/batch-import", { desde, hasta });
         const result = await pollJob(jobId, (p) => setBatchPhase(`${label} — ${p}`));
 
         const monthEntry = {
           label,
           imported: result.imported || 0,
           rebillings: result.rebillings || 0,
+          endosos: result.endosos || 0,
+          anulaciones: result.anulaciones || 0,
+          duplicados: result.duplicados || 0,
+          revisar: result.revisar || 0,
           skipped: result.skipped || 0,
-          cancelled: result.cancelled || 0,
           errors: result.errors || [],
         };
         accumulated.push(monthEntry);
@@ -743,8 +891,12 @@ export default function Importar() {
       const totals = accumulated.reduce((acc, m) => ({
         imported: acc.imported + m.imported,
         rebillings: acc.rebillings + m.rebillings,
+        endosos: acc.endosos + m.endosos,
+        anulaciones: acc.anulaciones + m.anulaciones,
+        duplicados: acc.duplicados + m.duplicados,
+        revisar: acc.revisar + m.revisar,
         skipped: acc.skipped + m.skipped,
-      }), { imported: 0, rebillings: 0, skipped: 0 });
+      }), { imported: 0, rebillings: 0, endosos: 0, anulaciones: 0, duplicados: 0, revisar: 0, skipped: 0 });
 
       toast.success(`Completado: ${totals.imported} pólizas nuevas, ${totals.rebillings} prórrogas`);
       setBatchDone(true);
@@ -762,11 +914,11 @@ export default function Importar() {
     setPolicies([]);
     setResult(null);
     try {
-      const res = await api.post("/api/gmail/import-el-norte", {});
-      if (!res.content) throw new Error("Sin contenido en la respuesta");
-      const parsed = parseElNorteTxt(res.content);
+      const res = await api.post("/api/gmail/el-norte/latest", {});
+      const parsed = { policies: res.policies || [], errors: res.errors || [], stats: res.stats, companyName: "El Norte" };
       setPreview(parsed);
       setPolicies(parsed.policies);
+      setImportMeta({ filename: res.filename, gmailMessageId: res.messageId });
       toast.success(`Mail de El Norte cargado: ${res.subject}`);
     } catch (e: any) {
       toast.error(e.message || "Error al importar desde Gmail");
@@ -785,12 +937,17 @@ export default function Importar() {
     try {
       const endpoint = company === "rivadavia"
         ? "/api/import/rivadavia"
+        : company === "rivadavia-ssn"
+        ? "/api/import/ssn-gde"
         : company === "cooperacion"
         ? "/api/import/cooperacion"
         : company === "mercantil-andina"
         ? "/api/import/mercantil-andina"
-        : "/api/import/el-norte";
-      const res = await api.post(endpoint, { policies });
+        : "/api/import/el-norte/confirm";
+      const payload = company === "el-norte" ? { policies, ...importMeta }
+        : company === "rivadavia-ssn" ? { policies, filename: importMeta.filename }
+        : { policies };
+      const res = await api.post(endpoint, payload);
       setResult(res);
       toast.success(`Importación completada`);
     } catch (e: any) {
@@ -800,17 +957,20 @@ export default function Importar() {
     }
   };
 
-  const reset = () => { setPreview(null); setResult(null); setPolicies([]); if (fileRef.current) fileRef.current.value = ""; };
+  const reset = () => { setPreview(null); setResult(null); setPolicies([]); setImportMeta({}); if (fileRef.current) fileRef.current.value = ""; };
 
   const formatCurrency = (n: number) =>
     n ? new Intl.NumberFormat("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 }).format(n) : "-";
 
   const movBadge = (movType: string) => {
     const m = (movType || "").toUpperCase();
-    if (m.includes("PRORROGA")) return { label: "PRÓRROGA", cls: "bg-blue-500/15 text-blue-300" };
-    if (m.includes("ANULACION")) return { label: "ANULACIÓN", cls: "bg-orange-500/15 text-orange-300" };
+    if (m === "ALTA")           return { label: "ALTA",          cls: "bg-emerald-500/15 text-emerald-300" };
+    if (m === "REFACTURACION")  return { label: "REFACTURACIÓN", cls: "bg-yellow-500/15 text-yellow-400" };
+    if (m === "REHABILITACION") return { label: "REHABILIT.",    cls: "bg-teal-500/15 text-teal-300" };
+    if (m.includes("PRORROGA")) return { label: "PRÓRROGA",      cls: "bg-blue-500/15 text-blue-300" };
+    if (m.includes("ANULACION")) return { label: "ANULACIÓN",    cls: "bg-orange-500/15 text-orange-300" };
     if (m.includes("NOTA DE CREDITO")) return { label: "NOTA CRÉDITO", cls: "bg-gray-500/15 text-gray-400" };
-    if (m.includes("REDUCCION")) return { label: "REDUCCIÓN", cls: "bg-gray-500/15 text-gray-400" };
+    if (m.includes("REDUCCION")) return { label: "REDUCCIÓN",    cls: "bg-gray-500/15 text-gray-400" };
     return { label: "RENOVACIÓN", cls: "bg-green-500/15 text-green-300" };
   };
 
@@ -827,7 +987,7 @@ export default function Importar() {
         {/* Selector de compañía */}
         {!preview && !result && (
           <div className="flex gap-3">
-            {([["el-norte", "El Norte"], ["rivadavia", "Rivadavia"], ["cooperacion", "Cooperación"], ["mercantil-andina", "Mercantil Andina"]] as const).map(([key, label]) => (
+            {([["el-norte", "El Norte"], ["rivadavia", "Rivadavia"], ["rivadavia-ssn", "Rivadavia SSN"], ["cooperacion", "Cooperación"], ["mercantil-andina", "Mercantil Andina"]] as const).map(([key, label]) => (
               <button
                 key={key}
                 onClick={() => setCompany(key)}
@@ -858,7 +1018,7 @@ export default function Importar() {
                 <div className="w-14 h-14 rounded-xl bg-blue-600/20 flex items-center justify-center">
                   <Upload className="w-7 h-7 text-blue-400" />
                 </div>
-                <p className="text-white font-medium">Arrastrá el archivo de {company === "el-norte" ? "El Norte" : company === "rivadavia" ? "Rivadavia" : company === "cooperacion" ? "Cooperación" : "Mercantil Andina"} acá</p>
+                <p className="text-white font-medium">Arrastrá el archivo de {company === "el-norte" ? "El Norte" : company === "rivadavia" ? "Rivadavia" : company === "cooperacion" ? "Cooperación" : company === "rivadavia-ssn" ? "Rivadavia SSN (GDE)" : "Mercantil Andina"} acá</p>
                 <p className="text-gray-500 text-sm">o hacé click para seleccionar</p>
               </div>
             )}
@@ -902,7 +1062,7 @@ export default function Importar() {
               <h3 className="text-sm font-semibold text-gray-200">Importar histórico desde Gmail</h3>
             </div>
             <p className="text-xs text-gray-500">
-              Procesa todos los mails de El Norte mes por mes. Al terminar, el sistema importa automáticamente cada día a las 8am.
+              Procesa todos los mails de El Norte mes por mes. No activa sincronización automática ni tareas diarias.
             </p>
 
             {/* Rango de fechas */}
@@ -912,8 +1072,8 @@ export default function Importar() {
                 <input
                   type="date"
                   value={batchDesde}
-                  onChange={e => setBatchDesde(e.target.value)}
-                  disabled={batchLoading}
+                  onChange={e => { setBatchDesde(e.target.value); setBatchPreview(null); setMonthResults([]); setBatchDone(false); }}
+                  disabled={batchLoading || batchPreviewLoading}
                   className="w-full bg-[#111827] border border-[#1f2937] rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-purple-500 disabled:opacity-50"
                 />
               </div>
@@ -922,25 +1082,55 @@ export default function Importar() {
                 <input
                   type="date"
                   value={batchHasta}
-                  onChange={e => setBatchHasta(e.target.value)}
-                  disabled={batchLoading}
+                  onChange={e => { setBatchHasta(e.target.value); setBatchPreview(null); setMonthResults([]); setBatchDone(false); }}
+                  disabled={batchLoading || batchPreviewLoading}
                   className="w-full bg-[#111827] border border-[#1f2937] rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-purple-500 disabled:opacity-50"
                 />
               </div>
             </div>
 
             <button
-              onClick={handleBatchImport}
-              disabled={batchLoading || !batchDesde || !batchHasta}
+              onClick={handleBatchPreview}
+              disabled={batchLoading || batchPreviewLoading || !batchDesde || !batchHasta}
               className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-sm font-medium transition-colors disabled:opacity-50"
             >
-              {batchLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : (
+              {batchPreviewLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : (
                 <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
                 </svg>
               )}
-              {batchLoading ? "Importando..." : "Importar mes a mes"}
+              {batchPreviewLoading ? "Revisando..." : "Previsualizar histórico"}
             </button>
+
+            {batchPreview && !batchLoading && (
+              <div className="space-y-3">
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="bg-[#111827] rounded-lg p-2.5 text-center">
+                    <p className="text-lg font-bold text-white">{batchPreview.totalMails}</p>
+                    <p className="text-xs text-gray-400">Mails</p>
+                  </div>
+                  <div className="bg-[#111827] rounded-lg p-2.5 text-center">
+                    <p className="text-lg font-bold text-green-400">{batchPreview.totalPolicies}</p>
+                    <p className="text-xs text-gray-400">Registros</p>
+                  </div>
+                  <div className="bg-[#111827] rounded-lg p-2.5 text-center">
+                    <p className="text-lg font-bold text-red-400">{batchPreview.errores}</p>
+                    <p className="text-xs text-gray-400">Errores</p>
+                  </div>
+                </div>
+                <div className="bg-red-500/10 border border-red-500/25 rounded-lg px-3 py-2 text-xs text-red-300">
+                  Esta acción sí escribe en la base de datos: creará/actualizará pólizas, refacturaciones y logs de importación para el rango seleccionado.
+                </div>
+                <button
+                  onClick={handleBatchImport}
+                  disabled={batchLoading}
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-medium transition-colors disabled:opacity-50"
+                >
+                  {batchLoading && <Loader2 className="w-4 h-4 animate-spin" />}
+                  Confirmar importación histórica
+                </button>
+              </div>
+            )}
 
             {/* Progreso */}
             {batchLoading && (
@@ -963,25 +1153,50 @@ export default function Importar() {
                 <p className="text-xs text-gray-500 font-medium">Resultado por mes:</p>
                 <div className="space-y-1.5 max-h-52 overflow-y-auto pr-1">
                   {monthResults.map((m, i) => (
-                    <div key={i} className="flex items-center justify-between bg-[#111827] rounded-lg px-3 py-2">
-                      <span className="text-xs text-gray-300 capitalize w-36 truncate">{m.label}</span>
-                      <div className="flex items-center gap-3 text-xs">
+                    <div key={i} className="bg-[#111827] rounded-lg px-3 py-2 space-y-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-xs text-gray-300 capitalize w-36 truncate">{m.label}</span>
+                        <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 text-xs">
                         <span className="text-green-400">{m.imported} nuevas</span>
                         <span className="text-blue-400">{m.rebillings} prórr.</span>
+                        <span className="text-purple-400">{m.endosos} end.</span>
+                        {m.anulaciones > 0 && <span className="text-orange-400">{m.anulaciones} anul.</span>}
+                        {m.duplicados > 0 && <span className="text-yellow-400">{m.duplicados} dup.</span>}
+                        {m.revisar > 0 && <span className="text-amber-300">{m.revisar} revisar</span>}
                         <span className="text-gray-500">{m.skipped} salt.</span>
                         {m.errors.length > 0 && (
                           <span className="text-red-400">{m.errors.length} err.</span>
                         )}
+                        </div>
                       </div>
+                      {m.errors.length > 0 && (
+                        <details className="rounded-md border border-red-500/20 bg-red-500/5 px-2 py-1.5">
+                          <summary className="cursor-pointer text-xs text-red-300">Ver detalle de errores</summary>
+                          <div className="mt-2 space-y-1 max-h-36 overflow-y-auto pr-1">
+                            {m.errors.map((error, errorIndex) => (
+                              <p key={errorIndex} className="text-xs text-red-200/80">{error}</p>
+                            ))}
+                          </div>
+                        </details>
+                      )}
                     </div>
                   ))}
                 </div>
 
                 {/* Totales */}
                 {!batchLoading && monthResults.length > 0 && (() => {
-                  const t = monthResults.reduce((a, m) => ({ imported: a.imported + m.imported, rebillings: a.rebillings + m.rebillings, skipped: a.skipped + m.skipped, cancelled: a.cancelled + m.cancelled }), { imported: 0, rebillings: 0, skipped: 0, cancelled: 0 });
+                  const t = monthResults.reduce((a, m) => ({
+                    imported: a.imported + m.imported,
+                    rebillings: a.rebillings + m.rebillings,
+                    endosos: a.endosos + m.endosos,
+                    anulaciones: a.anulaciones + m.anulaciones,
+                    duplicados: a.duplicados + m.duplicados,
+                    revisar: a.revisar + m.revisar,
+                    skipped: a.skipped + m.skipped,
+                    errors: a.errors + m.errors.length,
+                  }), { imported: 0, rebillings: 0, endosos: 0, anulaciones: 0, duplicados: 0, revisar: 0, skipped: 0, errors: 0 });
                   return (
-                    <div className="grid grid-cols-3 gap-2 pt-1">
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1">
                       <div className="bg-green-500/10 border border-green-500/20 rounded-lg p-2.5 text-center">
                         <p className="text-lg font-bold text-green-400">{t.imported}</p>
                         <p className="text-xs text-gray-400">Nuevas</p>
@@ -991,8 +1206,28 @@ export default function Importar() {
                         <p className="text-xs text-gray-400">Prórrogas</p>
                       </div>
                       <div className="bg-gray-500/10 border border-gray-500/20 rounded-lg p-2.5 text-center">
-                        <p className="text-lg font-bold text-gray-400">{t.skipped}</p>
+                        <p className="text-lg font-bold text-purple-400">{t.endosos}</p>
+                        <p className="text-xs text-gray-400">Endosos</p>
+                      </div>
+                      <div className="bg-orange-500/10 border border-orange-500/20 rounded-lg p-2.5 text-center">
+                        <p className="text-lg font-bold text-orange-400">{t.anulaciones}</p>
+                        <p className="text-xs text-gray-400">Anulaciones</p>
+                      </div>
+                      <div className="bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-2.5 text-center">
+                        <p className="text-lg font-bold text-yellow-400">{t.duplicados}</p>
+                        <p className="text-xs text-gray-400">Duplicados</p>
+                      </div>
+                      <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg p-2.5 text-center">
+                        <p className="text-lg font-bold text-amber-300">{t.revisar}</p>
+                        <p className="text-xs text-gray-400">A revisar</p>
+                      </div>
+                      <div className="bg-gray-500/10 border border-gray-500/20 rounded-lg p-2.5 text-center">
+                        <p className="text-lg font-bold text-gray-300">{t.skipped}</p>
                         <p className="text-xs text-gray-400">Saltadas</p>
+                      </div>
+                      <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-2.5 text-center">
+                        <p className="text-lg font-bold text-red-400">{t.errors}</p>
+                        <p className="text-xs text-gray-400">Errores</p>
                       </div>
                     </div>
                   );
@@ -1003,7 +1238,7 @@ export default function Importar() {
                     <svg className="w-3.5 h-3.5 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
                     </svg>
-                    Histórico importado. El sistema sincronizará automáticamente cada día a las 8am.
+                    Histórico importado. No se activó ninguna sincronización automática.
                   </div>
                 )}
 
@@ -1035,7 +1270,7 @@ export default function Importar() {
                 <p className="text-sm text-gray-400 mt-1">Refacturaciones</p>
               </div>
               <div className="bg-orange-500/10 border border-orange-500/20 rounded-lg p-4 text-center">
-                <p className="text-2xl font-bold text-orange-400">{result.cancelled}</p>
+                <p className="text-2xl font-bold text-orange-400">{result.anulaciones ?? result.cancelled ?? 0}</p>
                 <p className="text-sm text-gray-400 mt-1">Anuladas</p>
               </div>
               <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-4 text-center">
@@ -1078,13 +1313,29 @@ export default function Importar() {
                 <button onClick={reset} className="px-4 py-2 border border-[#1f2937] text-gray-400 text-sm rounded-lg hover:text-white transition-colors">
                   Cancelar
                 </button>
-                <button onClick={handleImport} disabled={importing}
-                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm rounded-lg transition-colors flex items-center gap-2">
+                <button
+                  onClick={handleImport}
+                  disabled={importing}
+                  className="px-4 py-2 disabled:opacity-60 text-white text-sm rounded-lg transition-colors flex items-center gap-2 bg-blue-600 hover:bg-blue-700"
+                >
                   {importing && <Loader2 className="w-4 h-4 animate-spin" />}
                   {importing ? "Importando..." : "Confirmar importación"}
                 </button>
               </div>
             </div>
+
+            {/* Aviso SSN-GDE */}
+            {company === "rivadavia-ssn" && (
+              <div className="bg-blue-500/10 border border-blue-500/25 rounded-xl p-4 flex items-start gap-3">
+                <AlertTriangle className="w-4 h-4 text-blue-400 flex-shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-sm font-medium text-blue-300">Importación SSN-GDE</p>
+                  <p className="text-xs text-gray-400 mt-0.5">
+                    El archivo se importará a Rivadavia. Prima y cuotas no disponibles en este formato.
+                  </p>
+                </div>
+              </div>
+            )}
 
             {/* Alerta de prórrogas huérfanas */}
             {orphanCount > 0 && (
@@ -1160,6 +1411,18 @@ export default function Importar() {
                             <div><p className="text-xs text-gray-500">Motor</p><p className="text-sm text-white">{p.engineNumber || "-"}</p></div>
                             <div><p className="text-xs text-gray-500">Cuotas</p><p className="text-sm text-white">{p.installments.length}</p></div>
                           </div>
+
+                          {/* Metadatos SSN-GDE */}
+                          {(p as any)._ssnMovimientos && (
+                            <div className="grid grid-cols-2 md:grid-cols-3 gap-3 pt-2 border-t border-[#1f2937]">
+                              <div><p className="text-xs text-gray-500">Movimiento SSN</p><p className="text-sm text-white font-mono">{(p as any)._ssnMovimientos}</p></div>
+                              <div><p className="text-xs text-gray-500">Observación SSN</p><p className="text-sm text-white font-mono">{(p as any)._ssnObservacion}</p></div>
+                              <div><p className="text-xs text-gray-500">Período</p><p className="text-sm text-white">{(p as any)._ssnMes}</p></div>
+                              <div><p className="text-xs text-gray-500">Fecha emisión</p><p className="text-sm text-white">{(p as any)._ssnFechaEmision || "—"}</p></div>
+                              <div><p className="text-xs text-gray-500">Orden</p><p className="text-sm text-white">{(p as any)._ssnOrden}</p></div>
+                              <div><p className="text-xs text-gray-500">Suplemento</p><p className="text-sm text-white">{(p as any)._ssnSuplemento || "—"}</p></div>
+                            </div>
+                          )}
 
                           {/* Cuotas */}
                           {p.installments.length > 0 && (
