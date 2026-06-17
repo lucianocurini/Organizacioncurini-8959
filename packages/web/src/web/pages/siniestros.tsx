@@ -91,7 +91,7 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
     const t = setTimeout(async () => {
       setSearchLoading(true);
       try {
-        const res = await api.get(`/api/policies?search=${encodeURIComponent(policySearch)}`);
+        const res = await api.get(`/api/policies?q=${encodeURIComponent(policySearch)}`);
         setPolicyResults(Array.isArray(res) ? res : []);
       } finally {
         setSearchLoading(false);
