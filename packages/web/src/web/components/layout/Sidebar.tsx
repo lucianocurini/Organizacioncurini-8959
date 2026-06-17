@@ -3,7 +3,7 @@ import { useAuth } from "@/lib/auth";
 import {
   LayoutDashboard, FileText, Building2, Users, Car, Home, ShieldCheck, Briefcase,
   LogOut, ChevronRight, Shield, Settings, Bike, HeartPulse, Zap, Scale, HardHat, Flame,
-  DollarSign, Send, AlertTriangle, ClipboardList, Upload, X
+  DollarSign, Send, AlertTriangle, ClipboardList, Upload, X, Wallet
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -12,7 +12,7 @@ const navItems = [
   { href: "/polizas", icon: FileText, label: "Pólizas" },
   { href: "/companias", icon: Building2, label: "Compañías" },
   { href: "/asegurados", icon: Users, label: "Asegurados" },
-  { href: "/cobranzas", icon: DollarSign, label: "Cobranzas" },
+  { href: "/cobranzas", icon: DollarSign, label: "Cobranzas y Rendiciones" },
   { href: "/envios", icon: Send, label: "Envíos y Entregas" },
   { href: "/siniestros", icon: AlertTriangle, label: "Siniestros" },
   { href: "/tareas", icon: ClipboardList, label: "Tareas" },
@@ -123,6 +123,17 @@ export function Sidebar({ mobileOpen = false, onClose }: { mobileOpen?: boolean;
                 )}>
                   <Upload className="w-4 h-4" />
                   Importar pólizas
+                </a>
+              </Link>
+              <Link href="/caja">
+                <a onClick={handleNav} className={cn(
+                  "flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-all",
+                  location === "/caja"
+                    ? "bg-blue-600/20 text-blue-400 font-medium"
+                    : "text-gray-400 hover:text-white hover:bg-[#1a2540]"
+                )}>
+                  <Wallet className="w-4 h-4" />
+                  Caja
                 </a>
               </Link>
               <Link href="/usuarios">

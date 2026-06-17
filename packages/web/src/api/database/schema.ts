@@ -86,6 +86,8 @@ export const payments = sqliteTable("payments", {
   periodMonth: text("period_month"), // e.g. "2024-03" — mes al que corresponde
   notes: text("notes"),
   status: text("status").notNull().default("confirmado"), // confirmado | pendiente | anulado
+  rendered: integer("rendered").notNull().default(0), // 0 = en cartera, 1 = rendido
+  renderedAt: integer("rendered_at", { mode: "timestamp" }),
   installmentId: integer("installment_id").references(() => policyInstallments.id),
   createdBy: integer("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
@@ -256,4 +258,100 @@ export const importLogs = sqliteTable("import_logs", {
   skipped: integer("skipped").notNull().default(0),
   errors: text("errors"), // JSON array of strings
   createdBy: integer("created_by").references(() => users.id),
+});
+
+// ─── CAJA ─────────────────────────────────────────────────────────────────────
+// Cobros manuales (no vienen de Cobranzas/payments)
+export const cashEntries = sqliteTable("cash_entries", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  clientName: text("client_name").notNull(),
+  policyNumber: text("policy_number"),
+  companyName: text("company_name"),
+  amount: real("amount").notNull(),
+  paymentMethod: text("payment_method").notNull(), // efectivo | transferencia | cheque
+  paymentDate: text("payment_date").notNull(),    // YYYY-MM-DD
+  dueDate: text("due_date"),
+  notes: text("notes"),
+  rendered: integer("rendered").notNull().default(0),
+  renderedAt: integer("rendered_at", { mode: "timestamp" }),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
+// Adeudados por asegurados
+export const cashDebts = sqliteTable("cash_debts", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  clientName: text("client_name").notNull(),
+  policyNumber: text("policy_number"),
+  companyName: text("company_name"),
+  amount: real("amount").notNull(),
+  dueDate: text("due_date"),
+  notes: text("notes"),
+  status: text("status").notNull().default("pendiente"), // pendiente | cobrado
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
+// ─── RENDICIONES ──────────────────────────────────────────────────────────────
+export const remittances = sqliteTable("remittances", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  date: text("date").notNull(),
+  canal: text("canal").notNull(),
+  notes: text("notes"),
+  paymentBreakdown: text("payment_breakdown").notNull().default("{}"),
+  prontoPagoSurcharge: real("pronto_pago_surcharge").default(0),
+  totalAmount: real("total_amount").notNull().default(0),
+  totalPaid: real("total_paid").notNull().default(0),
+  status: text("status").notNull().default("confirmada"),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
+export const remittanceItems = sqliteTable("remittance_items", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  remittanceId: integer("remittance_id").notNull().references(() => remittances.id),
+  source: text("source").notNull(),
+  sourceId: integer("source_id").notNull(),
+  amount: real("amount").notNull(),
+  debtorStatus: text("debtor_status").notNull().default("pagado"),
+  paidAt: integer("paid_at", { mode: "timestamp" }),
+  clientName: text("client_name"),
+  policyNumber: text("policy_number"),
+  companyName: text("company_name"),
+  paymentMethod: text("payment_method"),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
+// ─── GASTOS DE CAJA ──────────────────────────────────────────────────────────
+export const cashExpenses = sqliteTable("cash_expenses", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  date: text("date").notNull(),
+  description: text("description").notNull(),
+  amount: real("amount").notNull(),
+  category: text("category"),
+  notes: text("notes"),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
+// ─── COMISIONES ───────────────────────────────────────────────────────────────
+export const commissionEntries = sqliteTable("commission_entries", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  companyId: integer("company_id").references(() => companies.id),
+  date: text("date").notNull(),
+  amount: real("amount").notNull(),
+  notes: text("notes"),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
+// ─── IVA ──────────────────────────────────────────────────────────────────────
+export const ivaEntries = sqliteTable("iva_entries", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  companyId: integer("company_id").references(() => companies.id),
+  date: text("date").notNull(),
+  amount: real("amount").notNull(),
+  notes: text("notes"),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });

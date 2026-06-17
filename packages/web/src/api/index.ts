@@ -17,6 +17,13 @@ import {
   taskTemplates,
   tasks,
   importLogs,
+  cashEntries,
+  cashDebts,
+  cashExpenses,
+  remittances,
+  remittanceItems,
+  commissionEntries,
+  ivaEntries,
 } from "./database/schema";
 import { nanoid } from "nanoid";
 import {
@@ -2942,6 +2949,800 @@ app.post("/import/ssn-gde", requireAuth(async (c: any) => {
 
   return c.json({ ...counts, logId, ...(logWarning ? { logWarning } : {}) }, 200);
 }));
+
+// ─── CAJA ─────────────────────────────────────────────────────────────────────
+
+function requireAdmin(handler: any) {
+  return requireAuth(async (c: any) => {
+    const user = c.get ? c.get("user") : null;
+    // get user from session
+    const sessionId = c.req.header("x-session-id");
+    if (!sessionId) return c.json({ error: "No autenticado" }, 401);
+    const session = await db.select().from(sessions).where(eq(sessions.id, sessionId)).get();
+    if (!session) return c.json({ error: "Sesión inválida" }, 401);
+    const usr = await db.select().from(users).where(eq(users.id, session.userId)).get();
+    if (!usr || usr.role !== "admin") return c.json({ error: "Solo administradores" }, 403);
+    c.set("cajaUser", usr);
+    return handler(c);
+  });
+}
+
+// GET /api/cash/entries — listar cobros manuales
+app.get("/cash/entries", requireAdmin(async (c: any) => {
+  const entries = await db.select().from(cashEntries).orderBy(desc(cashEntries.createdAt)).all();
+  return c.json(entries);
+}));
+
+// POST /api/cash/entries — crear cobro manual
+app.post("/cash/entries", requireAdmin(async (c: any) => {
+  const body = await c.req.json();
+  const sessionId = c.req.header("x-session-id");
+  const session = await db.select().from(sessions).where(eq(sessions.id, sessionId)).get();
+  const result = await db.insert(cashEntries).values({
+    clientName: body.clientName,
+    policyNumber: body.policyNumber || null,
+    companyName: body.companyName || null,
+    amount: Number(body.amount),
+    paymentMethod: body.paymentMethod,
+    paymentDate: body.paymentDate,
+    dueDate: body.dueDate || null,
+    notes: body.notes || null,
+    rendered: 0,
+    createdBy: session?.userId || null,
+    createdAt: new Date(),
+  }).returning().get();
+  return c.json(result, 201);
+}));
+
+// PUT /api/cash/entries/:id — editar cobro manual
+app.put("/cash/entries/:id", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json();
+  const result = await db.update(cashEntries).set({
+    clientName: body.clientName,
+    policyNumber: body.policyNumber || null,
+    companyName: body.companyName || null,
+    amount: Number(body.amount),
+    paymentMethod: body.paymentMethod,
+    paymentDate: body.paymentDate,
+    dueDate: body.dueDate || null,
+    notes: body.notes || null,
+  }).where(eq(cashEntries.id, id)).returning().get();
+  if (!result) return c.json({ error: "No encontrado" }, 404);
+  return c.json(result);
+}));
+
+// DELETE /api/cash/entries/:id
+app.delete("/cash/entries/:id", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  await db.delete(cashEntries).where(eq(cashEntries.id, id));
+  return c.json({ ok: true });
+}));
+
+// PATCH /api/cash/entries/:id/render — marcar rendido / no rendido
+app.patch("/cash/entries/:id/render", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json();
+  const rendered = body.rendered ? 1 : 0;
+  const result = await db.update(cashEntries).set({
+    rendered,
+    renderedAt: rendered ? new Date() : null,
+  }).where(eq(cashEntries.id, id)).returning().get();
+  if (!result) return c.json({ error: "No encontrado" }, 404);
+  return c.json(result);
+}));
+
+// PATCH /api/cash/payments/:id/render — marcar rendido en payment de Cobranzas
+app.patch("/cash/payments/:id/render", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json();
+  const rendered = body.rendered ? 1 : 0;
+  const result = await db.update(payments).set({
+    rendered,
+    renderedAt: rendered ? new Date() : null,
+  }).where(eq(payments.id, id)).returning().get();
+  if (!result) return c.json({ error: "No encontrado" }, 404);
+  return c.json(result);
+}));
+
+// GET /api/cash/payments/transferencias — cobros por transferencia_compania con estado de rendición
+app.get("/cash/payments/transferencias", requireAdmin(async (c: any) => {
+  const rows = await db
+    .select({
+      id: payments.id,
+      policyId: payments.policyId,
+      manualPayer: payments.manualPayer,
+      manualPolicyNumber: payments.manualPolicyNumber,
+      manualCompany: payments.manualCompany,
+      amount: payments.amount,
+      paymentMethod: payments.paymentMethod,
+      paymentDate: payments.paymentDate,
+      periodMonth: payments.periodMonth,
+      notes: payments.notes,
+      status: payments.status,
+      rendered: payments.rendered,
+      renderedAt: payments.renderedAt,
+      insuredName: insureds.name,
+      policyNumber: policies.policyNumber,
+      companyName: companies.name,
+    })
+    .from(payments)
+    .leftJoin(policies, eq(payments.policyId, policies.id))
+    .leftJoin(insureds, eq(policies.insuredId, insureds.id))
+    .leftJoin(companies, eq(policies.companyId, companies.id))
+    .where(eq(payments.paymentMethod, "transferencia_compania"))
+    .orderBy(desc(payments.paymentDate))
+    .all();
+  return c.json(rows);
+}));
+
+// GET /api/cash/debts — listar adeudados
+app.get("/cash/debts", requireAdmin(async (c: any) => {
+  const debts = await db.select().from(cashDebts).orderBy(desc(cashDebts.createdAt)).all();
+  return c.json(debts);
+}));
+
+// POST /api/cash/debts — crear adeudado
+app.post("/cash/debts", requireAdmin(async (c: any) => {
+  const body = await c.req.json();
+  const sessionId = c.req.header("x-session-id");
+  const session = await db.select().from(sessions).where(eq(sessions.id, sessionId)).get();
+  const result = await db.insert(cashDebts).values({
+    clientName: body.clientName,
+    policyNumber: body.policyNumber || null,
+    companyName: body.companyName || null,
+    amount: Number(body.amount),
+    dueDate: body.dueDate || null,
+    notes: body.notes || null,
+    status: "pendiente",
+    createdBy: session?.userId || null,
+    createdAt: new Date(),
+  }).returning().get();
+  return c.json(result, 201);
+}));
+
+// PUT /api/cash/debts/:id
+app.put("/cash/debts/:id", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json();
+  const result = await db.update(cashDebts).set({
+    clientName: body.clientName,
+    policyNumber: body.policyNumber || null,
+    companyName: body.companyName || null,
+    amount: Number(body.amount),
+    dueDate: body.dueDate || null,
+    notes: body.notes || null,
+    status: body.status || "pendiente",
+  }).where(eq(cashDebts.id, id)).returning().get();
+  if (!result) return c.json({ error: "No encontrado" }, 404);
+  return c.json(result);
+}));
+
+// DELETE /api/cash/debts/:id
+app.delete("/cash/debts/:id", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  await db.delete(cashDebts).where(eq(cashDebts.id, id));
+  return c.json({ ok: true });
+}));
+
+// PATCH /api/cash/debts/:id/status — marcar cobrado
+app.patch("/cash/debts/:id/status", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json();
+  const result = await db.update(cashDebts).set({
+    status: body.status,
+  }).where(eq(cashDebts.id, id)).returning().get();
+  if (!result) return c.json({ error: "No encontrado" }, 404);
+  return c.json(result);
+}));
+
+// GET /api/cash/summary — resumen completo de caja
+app.get("/cash/summary", requireAdmin(async (c: any) => {
+  // Cobros manuales en cartera (no rendidos)
+  const manualInCartera = await db.select().from(cashEntries)
+    .where(eq(cashEntries.rendered, 0)).all();
+
+  // Cobros manuales rendidos
+  const manualRendered = await db.select().from(cashEntries)
+    .where(eq(cashEntries.rendered, 1)).all();
+
+  // Payments de Cobranzas: todos confirmados (no anulados)
+  const allPayments = await db.select().from(payments)
+    .where(eq(payments.status, "confirmado")).all();
+
+  const paymentsInCartera = allPayments.filter((p: any) => !p.rendered);
+  const paymentsRendered = allPayments.filter((p: any) => p.rendered);
+
+  // Adeudados de rendiciones (cuotas rendidas pero asegurado aún no pagó)
+  const remittanceDebtItems = await db.select({
+    id: remittanceItems.id,
+    amount: remittanceItems.amount,
+    paidAt: remittanceItems.paidAt,
+  }).from(remittanceItems)
+    .where(eq(remittanceItems.debtorStatus, "adeudado"))
+    .all();
+  const unpaidDebtItems = remittanceDebtItems.filter((i: any) => !i.paidAt);
+
+  // Rendiciones confirmadas — para calcular lo ya rendido por método
+  const confirmedRemittances = await db.select().from(remittances)
+    .where(eq(remittances.status, "confirmada")).all();
+
+  // Totales rendidos por método (sumados del paymentBreakdown de cada rendición)
+  const rendidoPorMetodo = { efectivo: 0, transferencia: 0, cheque: 0, pronto_pago: 0, total: 0 };
+  for (const r of confirmedRemittances) {
+    const bd = JSON.parse(r.paymentBreakdown || "{}");
+    rendidoPorMetodo.efectivo += bd.efectivo || 0;
+    rendidoPorMetodo.transferencia += bd.transferencia || 0;
+    rendidoPorMetodo.cheque += bd.cheque || 0;
+    rendidoPorMetodo.pronto_pago += bd.pronto_pago || 0;
+    rendidoPorMetodo.total += r.totalPaid || 0;
+  }
+
+  // Adeudados clásicos (módulo antiguo — por compatibilidad)
+  const debtsLegacy = await db.select().from(cashDebts)
+    .where(eq(cashDebts.status, "pendiente")).all();
+
+  // Métodos que van directo a la compañía (NO a cuentas propias)
+  const DIRECTO_COMPANIA = ["transferencia_compania", "link_pago"];
+
+  // Cobrado en cartera propia (sin rendir aún)
+  const cartera = { efectivo: 0, transferencia: 0, cheque: 0, total: 0 };
+  // Cobrado directo a la compañía (transf. compañía + links de pago)
+  const directoCompania = { transferencia_compania: 0, link_pago: 0, total: 0 };
+
+  for (const p of paymentsInCartera) {
+    const m = p.paymentMethod as string;
+    if (DIRECTO_COMPANIA.includes(m)) {
+      if (m === "transferencia_compania") directoCompania.transferencia_compania += p.amount;
+      else if (m === "link_pago") directoCompania.link_pago += p.amount;
+      directoCompania.total += p.amount;
+    } else {
+      if (m === "efectivo") cartera.efectivo += p.amount;
+      else if (m === "transferencia") cartera.transferencia += p.amount;
+      else if (m === "cheque") cartera.cheque += p.amount;
+      cartera.total += p.amount;
+    }
+  }
+  for (const e of manualInCartera) {
+    const m = e.paymentMethod as string;
+    if (DIRECTO_COMPANIA.includes(m)) {
+      if (m === "transferencia_compania") directoCompania.transferencia_compania += e.amount;
+      else if (m === "link_pago") directoCompania.link_pago += e.amount;
+      directoCompania.total += e.amount;
+    } else {
+      if (m === "efectivo") cartera.efectivo += e.amount;
+      else if (m === "transferencia") cartera.transferencia += e.amount;
+      else if (m === "cheque") cartera.cheque += e.amount;
+      cartera.total += e.amount;
+    }
+  }
+
+  // Total cobrado histórico (en cartera + ya rendido + directo compañía)
+  const totalCobrado = cartera.total + directoCompania.total +
+    manualRendered.reduce((s: number, e: any) => s + e.amount, 0) +
+    paymentsRendered.reduce((s: number, p: any) => s + p.amount, 0);
+
+  // Total adeudado = adeudados de rendiciones sin pagar + legacy
+  const totalAdeudadoRendiciones = unpaidDebtItems.reduce((s: number, i: any) => s + i.amount, 0);
+  const totalAdeudadoLegacy = debtsLegacy.reduce((s: number, d: any) => s + d.amount, 0);
+  const totalAdeudado = totalAdeudadoRendiciones + totalAdeudadoLegacy;
+
+  // Gastos registrados
+  const allExpenses = await db.select().from(cashExpenses).all();
+  const totalGastos = allExpenses.reduce((s: number, e: any) => s + e.amount, 0);
+
+  // Mes y año actuales
+  const now = new Date();
+  const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  const currentYear = String(now.getFullYear());
+
+  // Comisiones
+  const allCommissions = await db
+    .select({ id: commissionEntries.id, date: commissionEntries.date, amount: commissionEntries.amount, companyId: commissionEntries.companyId, companyName: companies.name, notes: commissionEntries.notes, createdAt: commissionEntries.createdAt })
+    .from(commissionEntries)
+    .leftJoin(companies, eq(commissionEntries.companyId, companies.id))
+    .orderBy(desc(commissionEntries.date))
+    .all();
+  const comisionesMes = allCommissions
+    .filter((c: any) => c.date && c.date.startsWith(currentMonth))
+    .reduce((s: number, c: any) => s + c.amount, 0);
+  const comisionesAnio = allCommissions
+    .filter((c: any) => c.date && c.date.startsWith(currentYear))
+    .reduce((s: number, c: any) => s + c.amount, 0);
+
+  // IVA
+  const allIva = await db
+    .select({ id: ivaEntries.id, date: ivaEntries.date, amount: ivaEntries.amount, companyId: ivaEntries.companyId, companyName: companies.name, notes: ivaEntries.notes, createdAt: ivaEntries.createdAt })
+    .from(ivaEntries)
+    .leftJoin(companies, eq(ivaEntries.companyId, companies.id))
+    .orderBy(desc(ivaEntries.date))
+    .all();
+  const ivaMes = allIva
+    .filter((i: any) => i.date && i.date.startsWith(currentMonth))
+    .reduce((s: number, i: any) => s + i.amount, 0);
+  const ivaAnio = allIva
+    .filter((i: any) => i.date && i.date.startsWith(currentYear))
+    .reduce((s: number, i: any) => s + i.amount, 0);
+
+  // Gastos del mes
+  const gastosMes = allExpenses
+    .filter((e: any) => e.date && e.date.startsWith(currentMonth))
+    .reduce((s: number, e: any) => s + e.amount, 0);
+
+  // Ganancia neta del mes = comisiones del mes - gastos del mes
+  const gananciaNeta = comisionesMes - gastosMes;
+
+  // En caja neta: lo cobrado en cartera propia - lo ya rendido por rendiciones
+  const cajaEfectivo = cartera.efectivo - rendidoPorMetodo.efectivo;
+  const cajaTransferencia = cartera.transferencia - rendidoPorMetodo.transferencia;
+  const cajaCheque = cartera.cheque - rendidoPorMetodo.cheque;
+  const cajaNeta = cartera.total - rendidoPorMetodo.total + totalAdeudadoRendiciones;
+
+  // Diferencia = caja neta - adeudados - gastos
+  const diferencia = cajaNeta - totalAdeudado - totalGastos;
+
+  return c.json({
+    cartera,
+    directoCompania,
+    // Neto en caja después de rendiciones
+    cajaNeta: {
+      efectivo: Math.max(0, cajaEfectivo),
+      transferencia: Math.max(0, cajaTransferencia),
+      cheque: Math.max(0, cajaCheque),
+      total: cajaNeta,
+    },
+    rendidoPorMetodo,
+    totalRendiciones: confirmedRemittances.length,
+    totalCobrado,
+    totalRendido: rendidoPorMetodo.total,
+    totalAdeudado,
+    totalAdeudadoRendiciones,
+    totalAdeudadoLegacy,
+    totalGastos,
+    gastosMes,
+    diferencia,
+    comisiones: {
+      totalMes: comisionesMes,
+      totalAnio: comisionesAnio,
+    },
+    iva: {
+      totalMes: ivaMes,
+      totalAnio: ivaAnio,
+    },
+    gananciaNeta,
+    counts: {
+      manualInCartera: manualInCartera.length,
+      manualRendered: manualRendered.length,
+      paymentsInCartera: paymentsInCartera.length,
+      paymentsRendered: paymentsRendered.length,
+      debts: debtsLegacy.length,
+      adeudadosRendiciones: unpaidDebtItems.length,
+      gastos: allExpenses.length,
+      comisiones: allCommissions.length,
+      iva: allIva.length,
+    }
+  });
+}));
+
+// GET /api/cash/payments — payments de Cobranzas para Caja (con datos enriquecidos)
+app.get("/cash/payments", requireAdmin(async (c: any) => {
+  const allPayments = await db
+    .select({
+      id: payments.id,
+      policyId: payments.policyId,
+      manualPayer: payments.manualPayer,
+      manualPolicyNumber: payments.manualPolicyNumber,
+      manualCompany: payments.manualCompany,
+      amount: payments.amount,
+      paymentMethod: payments.paymentMethod,
+      paymentDate: payments.paymentDate,
+      periodMonth: payments.periodMonth,
+      notes: payments.notes,
+      status: payments.status,
+      rendered: payments.rendered,
+      renderedAt: payments.renderedAt,
+      createdAt: payments.createdAt,
+      insuredName: insureds.name,
+      policyNumber: policies.policyNumber,
+      companyName: companies.name,
+    })
+    .from(payments)
+    .leftJoin(policies, eq(payments.policyId, policies.id))
+    .leftJoin(insureds, eq(policies.insuredId, insureds.id))
+    .leftJoin(companies, eq(policies.companyId, companies.id))
+    .where(eq(payments.status, "confirmado"))
+    .orderBy(desc(payments.createdAt))
+    .all();
+  return c.json(allPayments);
+}));
+
+// GET /api/cash/stats — estadísticas históricas por mes
+app.get("/cash/stats", requireAdmin(async (c: any) => {
+  // Todos los cobros manuales
+  const allEntries = await db.select().from(cashEntries).all();
+  // Todos los payments confirmados
+  const allPays = await db.select().from(payments).where(eq(payments.status, "confirmado")).all();
+
+  // Agrupar por mes "YYYY-MM"
+  const monthMap: Record<string, { cobrado: number; rendido: number }> = {};
+
+  const getMonth = (dateStr: string | null) => {
+    if (!dateStr) return null;
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return null;
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  };
+
+  const tsToStr = (ts: Date | null | undefined): string | null => {
+    if (!ts) return null;
+    return ts instanceof Date ? ts.toISOString() : String(ts);
+  };
+
+  for (const e of allEntries) {
+    const m = getMonth(e.paymentDate || tsToStr(e.createdAt));
+    if (!m) continue;
+    if (!monthMap[m]) monthMap[m] = { cobrado: 0, rendido: 0 };
+    monthMap[m].cobrado += e.amount;
+    if (e.rendered) monthMap[m].rendido += e.amount;
+  }
+
+  for (const p of allPays) {
+    const m = getMonth(p.paymentDate || tsToStr(p.createdAt));
+    if (!m) continue;
+    if (!monthMap[m]) monthMap[m] = { cobrado: 0, rendido: 0 };
+    monthMap[m].cobrado += p.amount;
+    if ((p as any).rendered) monthMap[m].rendido += p.amount;
+  }
+
+  // Ordenar por mes y calcular acumulado
+  const sorted = Object.entries(monthMap)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([mes, v]) => ({ mes, ...v }));
+
+  let acumuladoCobrado = 0;
+  let acumuladoRendido = 0;
+  const result = sorted.map((row) => {
+    acumuladoCobrado += row.cobrado;
+    acumuladoRendido += row.rendido;
+    return { ...row, acumuladoCobrado, acumuladoRendido };
+  });
+
+  return c.json(result);
+}));
+
+// ─── RENDICIONES ─────────────────────────────────────────────────────────────
+
+// GET /api/remittances — listar rendiciones con totales
+app.get("/remittances", requireAdmin(async (c: any) => {
+  const all = await db.select().from(remittances).orderBy(desc(remittances.date)).all();
+  // Para cada rendición traer cantidad de items
+  const result = await Promise.all(all.map(async (r: any) => {
+    const items = await db.select().from(remittanceItems)
+      .where(eq(remittanceItems.remittanceId, r.id)).all();
+    const adeudados = items.filter((i: any) => i.debtorStatus === "adeudado" && !i.paidAt);
+    return {
+      ...r,
+      paymentBreakdown: JSON.parse(r.paymentBreakdown || "{}"),
+      itemCount: items.length,
+      adeudadoCount: adeudados.length,
+      adeudadoTotal: adeudados.reduce((s: number, i: any) => s + i.amount, 0),
+    };
+  }));
+  return c.json(result);
+}));
+
+// GET /api/remittances/:id/items — detalle de items de una rendición
+app.get("/remittances/:id/items", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const items = await db.select().from(remittanceItems)
+    .where(eq(remittanceItems.remittanceId, id)).all();
+  return c.json(items);
+}));
+
+// POST /api/remittances — crear nueva rendición
+app.post("/remittances", requireAdmin(async (c: any) => {
+  const body = await c.req.json();
+  // body: { date, canal, notes, paymentBreakdown, prontoPagoSurcharge, items: [{source, sourceId, amount, debtorStatus, clientName, policyNumber, companyName, paymentMethod}] }
+  const user = c.get("user");
+
+  const totalAmount = (body.items || []).reduce((s: number, i: any) => s + (i.amount || 0), 0);
+  const breakdown = body.paymentBreakdown || {};
+  const totalPaid = Object.values(breakdown).reduce((s: number, v: any) => s + (Number(v) || 0), 0);
+
+  // Crear rendición
+  const [rem] = await db.insert(remittances).values({
+    date: body.date,
+    canal: body.canal || "directo",
+    notes: body.notes || null,
+    paymentBreakdown: JSON.stringify(breakdown),
+    prontoPagoSurcharge: body.prontoPagoSurcharge || 0,
+    totalAmount,
+    totalPaid: totalPaid as number,
+    status: "confirmada",
+    createdBy: user?.id || null,
+    createdAt: new Date(),
+  }).returning();
+
+  // Insertar items y marcar fuentes como rendidas
+  for (const item of (body.items || [])) {
+    await db.insert(remittanceItems).values({
+      remittanceId: rem.id,
+      source: item.source,
+      sourceId: item.sourceId,
+      amount: item.amount,
+      debtorStatus: item.debtorStatus || "pagado",
+      clientName: item.clientName || null,
+      policyNumber: item.policyNumber || null,
+      companyName: item.companyName || null,
+      paymentMethod: item.paymentMethod || null,
+      createdAt: new Date(),
+    });
+
+    // Marcar la fuente como rendida
+    if (item.source === "payment") {
+      await db.update(payments).set({ rendered: 1, renderedAt: new Date() })
+        .where(eq(payments.id, item.sourceId));
+    } else if (item.source === "cash_entry") {
+      await db.update(cashEntries).set({ rendered: 1, renderedAt: new Date() })
+        .where(eq(cashEntries.id, item.sourceId));
+    }
+  }
+
+  return c.json({ ok: true, id: rem.id });
+}));
+
+// DELETE /api/remittances/:id — eliminar rendición (des-rinde las cuotas)
+app.delete("/remittances/:id", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const items = await db.select().from(remittanceItems)
+    .where(eq(remittanceItems.remittanceId, id)).all();
+
+  // Des-rendir fuentes
+  for (const item of items) {
+    if (item.source === "payment") {
+      await db.update(payments).set({ rendered: 0, renderedAt: null })
+        .where(eq(payments.id, item.sourceId));
+    } else if (item.source === "cash_entry") {
+      await db.update(cashEntries).set({ rendered: 0, renderedAt: null })
+        .where(eq(cashEntries.id, item.sourceId));
+    }
+  }
+
+  await db.delete(remittanceItems).where(eq(remittanceItems.remittanceId, id));
+  await db.delete(remittances).where(eq(remittances.id, id));
+  return c.json({ ok: true });
+}));
+
+// PATCH /api/remittances/items/:id/paid — marcar adeudado como cobrado
+app.patch("/remittances/items/:id/paid", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  await db.update(remittanceItems).set({ debtorStatus: "pagado", paidAt: new Date() })
+    .where(eq(remittanceItems.id, id));
+  return c.json({ ok: true });
+}));
+
+// GET /api/remittances/pending — cobros aún no rendidos (para seleccionar al crear rendición)
+app.get("/remittances/pending", requireAdmin(async (c: any) => {
+  // payments no rendidos y confirmados
+  const pendingPayments = await db
+    .select({
+      id: payments.id,
+      amount: payments.amount,
+      paymentMethod: payments.paymentMethod,
+      paymentDate: payments.paymentDate,
+      policyId: payments.policyId,
+      manualPayer: payments.manualPayer,
+      manualPolicyNumber: payments.manualPolicyNumber,
+      manualCompany: payments.manualCompany,
+      notes: payments.notes,
+      insuredName: insureds.name,
+      policyNumber: policies.policyNumber,
+      companyName: companies.name,
+    })
+    .from(payments)
+    .leftJoin(policies, eq(payments.policyId, policies.id))
+    .leftJoin(insureds, eq(policies.insuredId, insureds.id))
+    .leftJoin(companies, eq(policies.companyId, companies.id))
+    .where(and(eq(payments.rendered, 0), eq(payments.status, "confirmado")))
+    .orderBy(desc(payments.paymentDate))
+    .all();
+
+  // cashEntries no rendidas
+  const pendingEntries = await db.select().from(cashEntries)
+    .where(eq(cashEntries.rendered, 0))
+    .orderBy(desc(cashEntries.paymentDate))
+    .all();
+
+  const result = [
+    ...pendingPayments.map((p: any) => ({
+      source: "payment" as const,
+      sourceId: p.id,
+      amount: p.amount,
+      paymentMethod: p.paymentMethod,
+      paymentDate: p.paymentDate,
+      clientName: p.insuredName || p.manualPayer || "—",
+      policyNumber: p.policyNumber || p.manualPolicyNumber || "—",
+      companyName: p.companyName || p.manualCompany || "—",
+      notes: p.notes,
+    })),
+    ...pendingEntries.map((e: any) => ({
+      source: "cash_entry" as const,
+      sourceId: e.id,
+      amount: e.amount,
+      paymentMethod: e.paymentMethod,
+      paymentDate: e.paymentDate,
+      clientName: e.clientName,
+      policyNumber: e.policyNumber || "—",
+      companyName: e.companyName || "—",
+      notes: e.notes,
+    })),
+  ].sort((a, b) => b.paymentDate.localeCompare(a.paymentDate));
+
+  return c.json(result);
+}));
+
+// GET /api/remittances/adeudados — items adeudados no cobrados aún
+app.get("/remittances/adeudados", requireAdmin(async (c: any) => {
+  const items = await db.select({
+    id: remittanceItems.id,
+    remittanceId: remittanceItems.remittanceId,
+    amount: remittanceItems.amount,
+    clientName: remittanceItems.clientName,
+    policyNumber: remittanceItems.policyNumber,
+    companyName: remittanceItems.companyName,
+    paymentMethod: remittanceItems.paymentMethod,
+    createdAt: remittanceItems.createdAt,
+    remittanceDate: remittances.date,
+    remittanceCanal: remittances.canal,
+  })
+    .from(remittanceItems)
+    .innerJoin(remittances, eq(remittanceItems.remittanceId, remittances.id))
+    .where(eq(remittanceItems.debtorStatus, "adeudado"))
+    .orderBy(desc(remittances.date))
+    .all();
+
+  // Solo los no pagados (paidAt null)
+  const unpaid = items.filter((i: any) => !i.paidAt);
+  return c.json(unpaid);
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GASTOS (cash expenses)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/cash/expenses
+app.get("/cash/expenses", requireAdmin(async (c: any) => {
+  const rows = await db.select().from(cashExpenses).orderBy(desc(cashExpenses.date)).all();
+  return c.json(rows);
+}));
+
+// POST /api/cash/expenses
+app.post("/cash/expenses", requireAdmin(async (c: any) => {
+  const body = await c.req.json();
+  const result = await db.insert(cashExpenses).values({
+    date: body.date,
+    description: body.description,
+    amount: Number(body.amount),
+    category: body.category || null,
+    notes: body.notes || null,
+  }).returning().get();
+  return c.json(result);
+}));
+
+// PUT /api/cash/expenses/:id
+app.put("/cash/expenses/:id", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json();
+  const result = await db.update(cashExpenses).set({
+    date: body.date,
+    description: body.description,
+    amount: Number(body.amount),
+    category: body.category || null,
+    notes: body.notes || null,
+  }).where(eq(cashExpenses.id, id)).returning().get();
+  return c.json(result);
+}));
+
+// DELETE /api/cash/expenses/:id
+app.delete("/cash/expenses/:id", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  await db.delete(cashExpenses).where(eq(cashExpenses.id, id));
+  return c.json({ ok: true });
+}));
+
+// ─── COMISIONES ──────────────────────────────────────────────────────────────
+
+// GET /api/cash/commissions
+app.get("/cash/commissions", requireAdmin(async (c: any) => {
+  const rows = await db
+    .select({ id: commissionEntries.id, date: commissionEntries.date, amount: commissionEntries.amount, companyId: commissionEntries.companyId, companyName: companies.name, notes: commissionEntries.notes, createdAt: commissionEntries.createdAt })
+    .from(commissionEntries)
+    .leftJoin(companies, eq(commissionEntries.companyId, companies.id))
+    .orderBy(desc(commissionEntries.date))
+    .all();
+  return c.json(rows);
+}));
+
+// POST /api/cash/commissions
+app.post("/cash/commissions", requireAdmin(async (c: any) => {
+  const body = await c.req.json();
+  const result = await db.insert(commissionEntries).values({
+    companyId: body.companyId ? Number(body.companyId) : null,
+    date: body.date,
+    amount: Number(body.amount),
+    notes: body.notes || null,
+  }).returning().get();
+  return c.json(result, 201);
+}));
+
+// PUT /api/cash/commissions/:id
+app.put("/cash/commissions/:id", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json();
+  const result = await db.update(commissionEntries).set({
+    companyId: body.companyId ? Number(body.companyId) : null,
+    date: body.date,
+    amount: Number(body.amount),
+    notes: body.notes || null,
+  }).where(eq(commissionEntries.id, id)).returning().get();
+  if (!result) return c.json({ error: "No encontrado" }, 404);
+  return c.json(result);
+}));
+
+// DELETE /api/cash/commissions/:id
+app.delete("/cash/commissions/:id", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  await db.delete(commissionEntries).where(eq(commissionEntries.id, id));
+  return c.json({ ok: true });
+}));
+
+// ─── IVA ─────────────────────────────────────────────────────────────────────
+
+// GET /api/cash/iva
+app.get("/cash/iva", requireAdmin(async (c: any) => {
+  const rows = await db
+    .select({ id: ivaEntries.id, date: ivaEntries.date, amount: ivaEntries.amount, companyId: ivaEntries.companyId, companyName: companies.name, notes: ivaEntries.notes, createdAt: ivaEntries.createdAt })
+    .from(ivaEntries)
+    .leftJoin(companies, eq(ivaEntries.companyId, companies.id))
+    .orderBy(desc(ivaEntries.date))
+    .all();
+  return c.json(rows);
+}));
+
+// POST /api/cash/iva
+app.post("/cash/iva", requireAdmin(async (c: any) => {
+  const body = await c.req.json();
+  const result = await db.insert(ivaEntries).values({
+    companyId: body.companyId ? Number(body.companyId) : null,
+    date: body.date,
+    amount: Number(body.amount),
+    notes: body.notes || null,
+  }).returning().get();
+  return c.json(result, 201);
+}));
+
+// PUT /api/cash/iva/:id
+app.put("/cash/iva/:id", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json();
+  const result = await db.update(ivaEntries).set({
+    companyId: body.companyId ? Number(body.companyId) : null,
+    date: body.date,
+    amount: Number(body.amount),
+    notes: body.notes || null,
+  }).where(eq(ivaEntries.id, id)).returning().get();
+  if (!result) return c.json({ error: "No encontrado" }, 404);
+  return c.json(result);
+}));
+
+// DELETE /api/cash/iva/:id
+app.delete("/cash/iva/:id", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  await db.delete(ivaEntries).where(eq(ivaEntries.id, id));
+  return c.json({ ok: true });
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 export default app;
 export type AppType = typeof app;

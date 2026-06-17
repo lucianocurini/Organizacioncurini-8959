@@ -19,6 +19,7 @@ import Siniestros from "./pages/siniestros";
 import SiniestroDetail from "./pages/siniestro-detail";
 import Tareas from "./pages/tareas";
 import Importar from "./pages/importar";
+import Caja from "./pages/caja";
 
 function SeedOnMount() {
   useEffect(() => {
@@ -59,6 +60,7 @@ function ProtectedRoutes() {
       <Route path="/siniestros/:id" component={SiniestroDetail} />
       <Route path="/tareas" component={Tareas} />
       <Route path="/importar" component={Importar} />
+      <Route path="/caja" component={Caja} />
       <Route path="/login">
         <Redirect to="/" />
       </Route>
