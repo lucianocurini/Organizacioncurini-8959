@@ -188,6 +188,8 @@ export const policyInstallments = sqliteTable("policy_installments", {
   amount: real("amount").notNull(),
   status: text("status").notNull().default("pendiente"), // pendiente | pagada | vencida
   notes: text("notes"),
+  rendered: integer("rendered").notNull().default(0), // 1 = rendida a compañía sin cobrar al asegurado
+  renderedAt: integer("rendered_at", { mode: "timestamp" }),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
 
@@ -311,7 +313,7 @@ export const remittanceItems = sqliteTable("remittance_items", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   remittanceId: integer("remittance_id").notNull().references(() => remittances.id),
   source: text("source").notNull(),
-  sourceId: integer("source_id").notNull(),
+  sourceId: integer("source_id"),
   amount: real("amount").notNull(),
   debtorStatus: text("debtor_status").notNull().default("pagado"),
   paidAt: integer("paid_at", { mode: "timestamp" }),

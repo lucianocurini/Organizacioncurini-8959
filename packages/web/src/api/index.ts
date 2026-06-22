@@ -3444,51 +3444,63 @@ app.post("/remittances", requireAdmin(async (c: any) => {
   const body = await c.req.json();
   // body: { date, canal, notes, paymentBreakdown, prontoPagoSurcharge, items: [{source, sourceId, amount, debtorStatus, clientName, policyNumber, companyName, paymentMethod}] }
   const user = c.get("user");
+  try {
+    const totalAmount = (body.items || []).reduce((s: number, i: any) => s + (i.amount || 0), 0);
+    const breakdown = body.paymentBreakdown || {};
+    const totalPaid = Object.values(breakdown).reduce((s: number, v: any) => s + (Number(v) || 0), 0);
 
-  const totalAmount = (body.items || []).reduce((s: number, i: any) => s + (i.amount || 0), 0);
-  const breakdown = body.paymentBreakdown || {};
-  const totalPaid = Object.values(breakdown).reduce((s: number, v: any) => s + (Number(v) || 0), 0);
+    const remId = await db.transaction(async (tx) => {
+      // Crear rendición
+      const [rem] = await tx.insert(remittances).values({
+        date: body.date,
+        canal: body.canal || "directo",
+        notes: body.notes || null,
+        paymentBreakdown: JSON.stringify(breakdown),
+        prontoPagoSurcharge: body.prontoPagoSurcharge || 0,
+        totalAmount,
+        totalPaid: totalPaid as number,
+        status: "confirmada",
+        createdBy: user?.id || null,
+        createdAt: new Date(),
+      }).returning();
 
-  // Crear rendición
-  const [rem] = await db.insert(remittances).values({
-    date: body.date,
-    canal: body.canal || "directo",
-    notes: body.notes || null,
-    paymentBreakdown: JSON.stringify(breakdown),
-    prontoPagoSurcharge: body.prontoPagoSurcharge || 0,
-    totalAmount,
-    totalPaid: totalPaid as number,
-    status: "confirmada",
-    createdBy: user?.id || null,
-    createdAt: new Date(),
-  }).returning();
+      // Insertar items y marcar fuentes como rendidas
+      for (const item of (body.items || [])) {
+        await tx.insert(remittanceItems).values({
+          remittanceId: rem.id,
+          source: item.source,
+          sourceId: item.sourceId,
+          amount: item.amount,
+          debtorStatus: item.debtorStatus || "pagado",
+          clientName: item.clientName || null,
+          policyNumber: item.policyNumber || null,
+          companyName: item.companyName || null,
+          paymentMethod: item.paymentMethod || null,
+          createdAt: new Date(),
+        });
 
-  // Insertar items y marcar fuentes como rendidas
-  for (const item of (body.items || [])) {
-    await db.insert(remittanceItems).values({
-      remittanceId: rem.id,
-      source: item.source,
-      sourceId: item.sourceId,
-      amount: item.amount,
-      debtorStatus: item.debtorStatus || "pagado",
-      clientName: item.clientName || null,
-      policyNumber: item.policyNumber || null,
-      companyName: item.companyName || null,
-      paymentMethod: item.paymentMethod || null,
-      createdAt: new Date(),
+        // Marcar la fuente como rendida
+        if (item.source === "payment") {
+          await tx.update(payments).set({ rendered: 1, renderedAt: new Date() })
+            .where(eq(payments.id, item.sourceId));
+        } else if (item.source === "cash_entry") {
+          await tx.update(cashEntries).set({ rendered: 1, renderedAt: new Date() })
+            .where(eq(cashEntries.id, item.sourceId));
+        } else if (item.source === "installment") {
+          // Cuota no cobrada rendida a compañía: marcar como rendida sin cambiar status ni crear payment
+          await tx.update(policyInstallments).set({ rendered: 1, renderedAt: new Date() })
+            .where(eq(policyInstallments.id, item.sourceId));
+        }
+      }
+
+      return rem.id;
     });
 
-    // Marcar la fuente como rendida
-    if (item.source === "payment") {
-      await db.update(payments).set({ rendered: 1, renderedAt: new Date() })
-        .where(eq(payments.id, item.sourceId));
-    } else if (item.source === "cash_entry") {
-      await db.update(cashEntries).set({ rendered: 1, renderedAt: new Date() })
-        .where(eq(cashEntries.id, item.sourceId));
-    }
+    return c.json({ ok: true, id: remId });
+  } catch (e: any) {
+    console.error("[POST /remittances]", e?.message, e);
+    return c.json({ error: "No se pudo guardar la rendición" }, 500);
   }
-
-  return c.json({ ok: true, id: rem.id });
 }));
 
 // DELETE /api/remittances/:id — eliminar rendición (des-rinde las cuotas)
@@ -3505,6 +3517,9 @@ app.delete("/remittances/:id", requireAdmin(async (c: any) => {
     } else if (item.source === "cash_entry") {
       await db.update(cashEntries).set({ rendered: 0, renderedAt: null })
         .where(eq(cashEntries.id, item.sourceId));
+    } else if (item.source === "installment") {
+      await db.update(policyInstallments).set({ rendered: 0, renderedAt: null })
+        .where(eq(policyInstallments.id, item.sourceId));
     }
   }
 
@@ -3519,6 +3534,43 @@ app.patch("/remittances/items/:id/paid", requireAdmin(async (c: any) => {
   await db.update(remittanceItems).set({ debtorStatus: "pagado", paidAt: new Date() })
     .where(eq(remittanceItems.id, id));
   return c.json({ ok: true });
+}));
+
+// GET /api/remittances/uncollected — cuotas no cobradas y no rendidas (para rendir sin cobro previo)
+// Filtros opcionales: ?insured=&policy=&company=&month=YYYY-MM
+app.get("/remittances/uncollected", requireAdmin(async (c: any) => {
+  const { insured: insuredQ, policy: policyQ, company: companyQ, month } = c.req.query();
+
+  let rows = await db
+    .select({
+      id: policyInstallments.id,
+      policyId: policyInstallments.policyId,
+      number: policyInstallments.number,
+      dueDate: policyInstallments.dueDate,
+      amount: policyInstallments.amount,
+      status: policyInstallments.status,
+      insuredName: insureds.name,
+      policyNumber: policies.policyNumber,
+      companyName: companies.name,
+    })
+    .from(policyInstallments)
+    .innerJoin(policies, eq(policyInstallments.policyId, policies.id))
+    .innerJoin(insureds, eq(policies.insuredId, insureds.id))
+    .innerJoin(companies, eq(policies.companyId, companies.id))
+    .where(and(
+      ne(policyInstallments.status, "pagada"),
+      eq(policyInstallments.rendered, 0),
+      ne(policies.status, "cancelada"),
+    ))
+    .orderBy(asc(policyInstallments.dueDate))
+    .all();
+
+  if (insuredQ) rows = rows.filter((r: any) => r.insuredName?.toLowerCase().includes(insuredQ.toLowerCase()));
+  if (policyQ) rows = rows.filter((r: any) => r.policyNumber?.toLowerCase().includes(policyQ.toLowerCase()));
+  if (companyQ) rows = rows.filter((r: any) => r.companyName?.toLowerCase().includes(companyQ.toLowerCase()));
+  if (month) rows = rows.filter((r: any) => r.dueDate?.startsWith(month));
+
+  return c.json(rows);
 }));
 
 // GET /api/remittances/pending — cobros aún no rendidos (para seleccionar al crear rendición)

@@ -144,7 +144,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
     (p.insured?.name || "").toLowerCase().includes(policySearch.toLowerCase())
   );
   const selectedPolicy = policies.find(p => String(p.policy.id) === form.policyId);
-  const pendingInstallments = installments.filter((i: any) => i.status !== "pagada");
+  const pendingInstallments = installments.filter((i: any) => i.status !== "pagada" && !i.rendered);
   const selectedInstallment = installments.find((i: any) => String(i.id) === form.installmentId);
 
   async function handleSave() {
@@ -735,11 +735,16 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
   const [debtorItems, setDebtorItems] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
 
+  // ── Estado para ítems manuales ───────────────────────────────────────────────
+  const [manualForm, setManualForm] = useState({ insured: "", policy: "", company: "", period: "", amount: "", notes: "" });
+  const [manualItems, setManualItems] = useState<any[]>([]);
+  const [showManualForm, setShowManualForm] = useState(false);
+
   useEffect(() => {
     api.get("/api/remittances/pending").then(d => { setPending(d); setLoadingPending(false); });
   }, []);
 
-  const key = (item: any) => `${item.source}:${item.sourceId}`;
+  const key = (item: any) => item._uid != null ? `manual_debt:${item._uid}` : `${item.source}:${item.sourceId}`;
 
   const toggle = (item: any) => {
     const k = key(item);
@@ -761,10 +766,37 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
     });
   };
 
-  const selectedItems = pending.filter(i => selected.has(key(i)));
+  function addManualItem() {
+    if (!manualForm.insured.trim() || !manualForm.amount) {
+      toast.error("Completá al menos asegurado e importe");
+      return;
+    }
+    setManualItems(prev => [...prev, {
+      source: "manual_debt",
+      sourceId: null,
+      _uid: Date.now(),
+      amount: Number(manualForm.amount),
+      clientName: manualForm.insured.trim(),
+      policyNumber: manualForm.policy.trim() || "—",
+      companyName: manualForm.company.trim() || "—",
+      paymentMethod: null,
+      period: manualForm.period.trim(),
+      notes: manualForm.notes.trim(),
+    }]);
+    setManualForm({ insured: "", policy: "", company: "", period: "", amount: "", notes: "" });
+  }
+
+  function removeManualItem(uid: number) {
+    setManualItems(prev => prev.filter(i => i._uid !== uid));
+  }
+
+  const selectedCobradas = pending.filter(i => selected.has(key(i)));
+  const selectedItems = [...selectedCobradas, ...manualItems];
   const totalSeleccionado = selectedItems.reduce((s, i) => s + i.amount, 0);
   const totalBreakdown = (Number(breakdown.efectivo) || 0) + (Number(breakdown.transferencia) || 0) +
     (Number(breakdown.cheque) || 0) + (Number(breakdown.pronto_pago) || 0);
+  const rivadaviaItems = selectedItems.filter(i => i.companyName?.toLowerCase().includes("rivadavia"));
+  const surchargeTotal = canal === "pronto_pago" ? rivadaviaItems.length * (Number(prontoPagoSurcharge) || 0) : 0;
 
   const filteredPending = pending.filter(i => {
     if (!search) return true;
@@ -798,11 +830,11 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
           source: i.source,
           sourceId: i.sourceId,
           amount: i.amount,
-          debtorStatus: debtorItems.has(key(i)) ? "adeudado" : "pagado",
+          debtorStatus: (i.source === "manual_debt" || debtorItems.has(key(i))) ? "adeudado" : "pagado",
           clientName: i.clientName,
           policyNumber: i.policyNumber,
           companyName: i.companyName,
-          paymentMethod: i.paymentMethod,
+          paymentMethod: i.paymentMethod || null,
         })),
       });
       toast.success("Rendición registrada");
@@ -832,93 +864,191 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
         <div className="overflow-y-auto flex-1 p-6">
           {step === "select" ? (
             <div className="space-y-4">
-              <p className="text-sm text-white/50">Seleccioná las cuotas a incluir en esta rendición. Marcá las que el asegurado aún no pagó como "adeudado".</p>
+              {/* ── Sección 1: Cobradas pendientes de rendir ─────────────────── */}
+              <div>
+                <p className="text-xs text-white/30 uppercase tracking-wider mb-3 font-medium">Cobradas — pendientes de rendir</p>
+                <p className="text-xs text-white/40 mb-3">Seleccioná los cobros ya registrados. Marcá como "adeudado" los que el asegurado aún no pagó.</p>
 
-              <div className="relative">
-                <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-white/30" />
-                <input className="w-full pl-8 pr-3 py-2 bg-white/5 border border-white/10 rounded-lg text-sm text-white placeholder-white/30 focus:outline-none focus:border-blue-500"
-                  placeholder="Buscar por cliente, póliza o compañía..."
-                  value={search} onChange={e => setSearch(e.target.value)} />
+                <div className="relative mb-3">
+                  <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-white/30" />
+                  <input className="w-full pl-8 pr-3 py-2 bg-white/5 border border-white/10 rounded-lg text-sm text-white placeholder-white/30 focus:outline-none focus:border-blue-500"
+                    placeholder="Buscar por cliente, póliza o compañía..."
+                    value={search} onChange={e => setSearch(e.target.value)} />
+                </div>
+
+                {loadingPending ? (
+                  <div className="text-center py-6 text-white/30 text-sm">Cargando cobros pendientes...</div>
+                ) : pending.length === 0 ? (
+                  <div className="text-center py-6 text-white/30 text-sm">No hay cobros pendientes de rendir.</div>
+                ) : (
+                  <div className="space-y-3">
+                    {propios.length > 0 && (
+                      <div>
+                        <p className="text-xs text-white/20 uppercase tracking-wider mb-1.5">Cuentas propias</p>
+                        <div className="space-y-1">
+                          {propios.map(item => {
+                            const k = key(item);
+                            const sel = selected.has(k);
+                            const isDebtor = debtorItems.has(k);
+                            return (
+                              <div key={k} className={cn("flex items-center gap-3 px-3 py-2.5 rounded-lg border transition-all cursor-pointer",
+                                sel ? "bg-blue-900/20 border-blue-500/30" : "bg-white/3 border-white/8 hover:bg-white/5")}
+                                onClick={() => toggle(item)}>
+                                <div className={cn("w-4 h-4 rounded border flex items-center justify-center shrink-0",
+                                  sel ? "bg-blue-600 border-blue-600" : "border-white/20")}>
+                                  {sel && <Check size={10} className="text-white" />}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-sm text-white truncate">{item.clientName}</p>
+                                  <p className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {item.paymentDate}</p>
+                                </div>
+                                <div className="text-right shrink-0">
+                                  <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>
+                                  <span className={cn("text-xs px-1.5 py-0.5 rounded border", METHOD_COLORS[item.paymentMethod] || "text-gray-400 border-gray-500/30")}>
+                                    {METHOD_LABELS[item.paymentMethod] || item.paymentMethod}
+                                  </span>
+                                </div>
+                                {sel && (
+                                  <button type="button" onClick={e => { e.stopPropagation(); toggleDebtor(item); }}
+                                    className={cn("text-xs px-2 py-1 rounded border shrink-0 transition-all",
+                                      isDebtor ? "bg-red-900/30 border-red-500/40 text-red-400" : "border-white/15 text-white/40 hover:border-yellow-500/40 hover:text-yellow-400")}>
+                                    {isDebtor ? "Adeudado" : "Pagado"}
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                    {directos.length > 0 && (
+                      <div>
+                        <p className="text-xs text-orange-400/60 uppercase tracking-wider mb-1.5">Directo a Compañía</p>
+                        <div className="space-y-1">
+                          {directos.map(item => {
+                            const k = key(item);
+                            const sel = selected.has(k);
+                            return (
+                              <div key={k} className={cn("flex items-center gap-3 px-3 py-2.5 rounded-lg border transition-all cursor-pointer",
+                                sel ? "bg-orange-900/20 border-orange-500/30" : "bg-white/3 border-white/8 hover:bg-white/5")}
+                                onClick={() => toggle(item)}>
+                                <div className={cn("w-4 h-4 rounded border flex items-center justify-center shrink-0",
+                                  sel ? "bg-orange-600 border-orange-600" : "border-white/20")}>
+                                  {sel && <Check size={10} className="text-white" />}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-sm text-white truncate">{item.clientName}</p>
+                                  <p className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {item.paymentDate}</p>
+                                </div>
+                                <div className="text-right shrink-0">
+                                  <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>
+                                  <span className={cn("text-xs px-1.5 py-0.5 rounded border", METHOD_COLORS[item.paymentMethod] || "text-gray-400 border-gray-500/30")}>
+                                    {METHOD_LABELS[item.paymentMethod] || item.paymentMethod}
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
-              {loadingPending ? (
-                <div className="text-center py-8 text-white/30 text-sm">Cargando cobros pendientes...</div>
-              ) : pending.length === 0 ? (
-                <div className="text-center py-8 text-white/30 text-sm">No hay cobros pendientes de rendir.</div>
-              ) : (
-                <div className="space-y-3">
-                  {propios.length > 0 && (
-                    <div>
-                      <p className="text-xs text-white/30 uppercase tracking-wider mb-2">Cuentas propias</p>
-                      <div className="space-y-1">
-                        {propios.map(item => {
-                          const k = key(item);
-                          const sel = selected.has(k);
-                          const isDebtor = debtorItems.has(k);
-                          return (
-                            <div key={k} className={cn("flex items-center gap-3 px-3 py-2.5 rounded-lg border transition-all cursor-pointer",
-                              sel ? "bg-blue-900/20 border-blue-500/30" : "bg-white/3 border-white/8 hover:bg-white/5")}
-                              onClick={() => toggle(item)}>
-                              <div className={cn("w-4 h-4 rounded border flex items-center justify-center shrink-0",
-                                sel ? "bg-blue-600 border-blue-600" : "border-white/20")}>
-                                {sel && <Check size={10} className="text-white" />}
-                              </div>
-                              <div className="flex-1 min-w-0">
-                                <p className="text-sm text-white truncate">{item.clientName}</p>
-                                <p className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {item.paymentDate}</p>
-                              </div>
-                              <div className="text-right shrink-0">
-                                <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>
-                                <span className={cn("text-xs px-1.5 py-0.5 rounded border", METHOD_COLORS[item.paymentMethod] || "text-gray-400 border-gray-500/30")}>
-                                  {METHOD_LABELS[item.paymentMethod] || item.paymentMethod}
-                                </span>
-                              </div>
-                              {sel && (
-                                <button type="button" onClick={e => { e.stopPropagation(); toggleDebtor(item); }}
-                                  className={cn("text-xs px-2 py-1 rounded border shrink-0 transition-all",
-                                    isDebtor ? "bg-red-900/30 border-red-500/40 text-red-400" : "border-white/15 text-white/40 hover:border-yellow-500/40 hover:text-yellow-400")}>
-                                  {isDebtor ? "Adeudado" : "Pagado"}
-                                </button>
-                              )}
-                            </div>
-                          );
-                        })}
+              <div className="pt-4 border-t border-white/10">
+                {/* ── Carga manual ─────────────────────────────────────────────── */}
+                <div className="mt-0 pt-0">
+                  <button
+                    type="button"
+                    onClick={() => setShowManualForm(v => !v)}
+                    className="flex items-center gap-1.5 text-xs text-white/40 hover:text-white/70 transition-colors"
+                  >
+                    <Plus size={12} />
+                    {showManualForm ? "Cancelar carga manual" : "Agregar adeudada manualmente"}
+                  </button>
+
+                  {showManualForm && (
+                    <div className="mt-3 p-3 bg-orange-950/20 border border-orange-500/20 rounded-lg space-y-2">
+                      <p className="text-xs text-orange-400/70 font-medium">Deuda manual — se agregará como adeudada</p>
+                      <div className="grid grid-cols-2 gap-2">
+                        <input
+                          placeholder="Asegurado *"
+                          value={manualForm.insured}
+                          onChange={e => setManualForm(f => ({ ...f, insured: e.target.value }))}
+                          className="px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-sm text-white placeholder-white/25 focus:outline-none focus:border-orange-500/50"
+                        />
+                        <input
+                          placeholder="Póliza"
+                          value={manualForm.policy}
+                          onChange={e => setManualForm(f => ({ ...f, policy: e.target.value }))}
+                          className="px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-sm text-white placeholder-white/25 focus:outline-none focus:border-orange-500/50"
+                        />
+                        <input
+                          placeholder="Compañía"
+                          value={manualForm.company}
+                          onChange={e => setManualForm(f => ({ ...f, company: e.target.value }))}
+                          className="px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-sm text-white placeholder-white/25 focus:outline-none focus:border-orange-500/50"
+                        />
+                        <input
+                          placeholder="Período / cuota (ej: Cuota 1 - Jun 2026)"
+                          value={manualForm.period}
+                          onChange={e => setManualForm(f => ({ ...f, period: e.target.value }))}
+                          className="px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-sm text-white placeholder-white/25 focus:outline-none focus:border-orange-500/50"
+                        />
+                        <input
+                          type="number"
+                          placeholder="Importe *"
+                          value={manualForm.amount}
+                          onChange={e => setManualForm(f => ({ ...f, amount: e.target.value }))}
+                          className="px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-sm text-white placeholder-white/25 focus:outline-none focus:border-orange-500/50"
+                        />
+                        <input
+                          placeholder="Observación (opcional)"
+                          value={manualForm.notes}
+                          onChange={e => setManualForm(f => ({ ...f, notes: e.target.value }))}
+                          className="px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-sm text-white placeholder-white/25 focus:outline-none focus:border-orange-500/50"
+                        />
                       </div>
+                      <button
+                        type="button"
+                        onClick={addManualItem}
+                        className="flex items-center gap-1.5 px-3 py-1.5 bg-orange-600/80 hover:bg-orange-500 text-white text-xs rounded-lg transition-all font-medium"
+                      >
+                        <Plus size={12} /> Agregar a la rendición
+                      </button>
                     </div>
                   )}
-                  {directos.length > 0 && (
-                    <div>
-                      <p className="text-xs text-orange-400/60 uppercase tracking-wider mb-2">Directo a Compañía</p>
-                      <div className="space-y-1">
-                        {directos.map(item => {
-                          const k = key(item);
-                          const sel = selected.has(k);
-                          return (
-                            <div key={k} className={cn("flex items-center gap-3 px-3 py-2.5 rounded-lg border transition-all cursor-pointer",
-                              sel ? "bg-orange-900/20 border-orange-500/30" : "bg-white/3 border-white/8 hover:bg-white/5")}
-                              onClick={() => toggle(item)}>
-                              <div className={cn("w-4 h-4 rounded border flex items-center justify-center shrink-0",
-                                sel ? "bg-orange-600 border-orange-600" : "border-white/20")}>
-                                {sel && <Check size={10} className="text-white" />}
-                              </div>
-                              <div className="flex-1 min-w-0">
-                                <p className="text-sm text-white truncate">{item.clientName}</p>
-                                <p className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {item.paymentDate}</p>
-                              </div>
-                              <div className="text-right shrink-0">
-                                <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>
-                                <span className={cn("text-xs px-1.5 py-0.5 rounded border", METHOD_COLORS[item.paymentMethod] || "text-gray-400 border-gray-500/30")}>
-                                  {METHOD_LABELS[item.paymentMethod] || item.paymentMethod}
-                                </span>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
+
+                  {manualItems.length > 0 && (
+                    <div className="mt-2 space-y-1">
+                      {manualItems.map(item => (
+                        <div key={item._uid} className="flex items-center gap-3 px-3 py-2.5 rounded-lg border bg-orange-900/20 border-orange-500/30">
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm text-white truncate">{item.clientName}</p>
+                            <p className="text-xs text-white/40">
+                              {item.companyName} · {item.policyNumber}
+                              {item.period && ` · ${item.period}`}
+                              {item.notes && ` · ${item.notes}`}
+                            </p>
+                          </div>
+                          <div className="text-right shrink-0">
+                            <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>
+                            <span className="text-xs text-orange-400 border border-orange-500/30 bg-orange-900/20 px-1.5 py-0.5 rounded">Adeudado</span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => removeManualItem(item._uid)}
+                            className="p-1 text-white/30 hover:text-red-400 shrink-0 transition-colors"
+                          >
+                            <X size={14} />
+                          </button>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
-              )}
+              </div>
             </div>
           ) : (
             <div className="space-y-5">
@@ -988,8 +1118,8 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                 </div>
                 {canal === "pronto_pago" && (
                   <div className="mt-1 flex justify-between items-center text-xs text-white/40">
-                    <span>Cargo extra Pronto Pago ({selectedItems.length} cuotas × {"$"}{prontoPagoSurcharge}):</span>
-                    <span className="text-purple-400">+{fmt(selectedItems.length * (Number(prontoPagoSurcharge) || 0))}</span>
+                    <span>Cargo extra Pronto Pago ({rivadaviaItems.length} cuotas Rivadavia × {"$"}{prontoPagoSurcharge}):</span>
+                    <span className="text-purple-400">+{fmt(surchargeTotal)}</span>
                   </div>
                 )}
               </div>
@@ -1004,16 +1134,24 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
 
               {/* Resumen cuotas */}
               <div className="bg-white/3 border border-white/8 rounded-lg p-3">
-                <p className="text-xs text-white/40 mb-2">{selectedItems.length} cuotas — {debtorItems.size > 0 ? `${debtorItems.size} marcadas como adeudadas` : "todas pagadas"}</p>
+                <p className="text-xs text-white/40 mb-2">
+                  {selectedCobradas.length > 0 && `${selectedCobradas.length} cobradas`}
+                  {selectedCobradas.length > 0 && manualItems.length > 0 && " · "}
+                  {manualItems.length > 0 && <span className="text-orange-400/70">{manualItems.length} manuales (adeudadas)</span>}
+                  {" — "}{fmt(totalSeleccionado)}
+                </p>
                 <div className="space-y-1 max-h-32 overflow-y-auto">
-                  {selectedItems.map(i => (
-                    <div key={key(i)} className="flex justify-between text-xs">
-                      <span className="text-white/60 truncate mr-2">{i.clientName} · {i.companyName}</span>
-                      <span className={cn("shrink-0", debtorItems.has(key(i)) ? "text-red-400" : "text-white/60")}>
-                        {debtorItems.has(key(i)) ? "⚠ " : ""}{fmt(i.amount)}
-                      </span>
-                    </div>
-                  ))}
+                  {selectedItems.map(i => {
+                    const isDebtor = i.source === "manual_debt" || debtorItems.has(key(i));
+                    return (
+                      <div key={key(i)} className="flex justify-between text-xs">
+                        <span className="text-white/60 truncate mr-2">{i.clientName} · {i.companyName}</span>
+                        <span className={cn("shrink-0", isDebtor ? (i.source === "manual_debt" ? "text-orange-400" : "text-red-400") : "text-white/60")}>
+                          {isDebtor ? "⚠ " : ""}{fmt(i.amount)}
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             </div>
@@ -1024,8 +1162,8 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
         <div className="px-6 py-4 border-t border-[#1f2937] flex justify-between items-center shrink-0">
           {step === "select" ? (
             <>
-              <span className="text-sm text-white/40">{selected.size} seleccionadas — {fmt(totalSeleccionado)}</span>
-              <button onClick={() => { if (selected.size === 0) { toast.error("Seleccioná al menos una cuota"); return; } setStep("pago"); }}
+              <span className="text-sm text-white/40">{selectedItems.length} seleccionadas — {fmt(totalSeleccionado)}</span>
+              <button onClick={() => { if (selectedItems.length === 0) { toast.error("Seleccioná al menos una cuota"); return; } setStep("pago"); }}
                 className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-all">
                 Siguiente <ChevronRight size={16} />
               </button>
