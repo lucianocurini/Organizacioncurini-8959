@@ -401,7 +401,7 @@ function CobranzasTab() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<PaymentRow | null>(null);
   const [filterMethod, setFilterMethod] = useState("");
-  const [filterStatus, setFilterStatus] = useState("");
+  const [filterVista, setFilterVista] = useState<"pendiente_rendir" | "rendidos" | "anulados" | "todos">("pendiente_rendir");
   const [search, setSearch] = useState("");
 
   async function load() {
@@ -424,8 +424,14 @@ function CobranzasTab() {
   }
 
   const filtered = payments.filter(r => {
+    if (filterVista === "pendiente_rendir") {
+      if (r.payment.status !== "confirmado" || r.payment.rendered !== 0) return false;
+    } else if (filterVista === "rendidos") {
+      if (r.payment.status !== "confirmado" || r.payment.rendered !== 1) return false;
+    } else if (filterVista === "anulados") {
+      if (r.payment.status !== "anulado") return false;
+    }
     if (filterMethod && r.payment.paymentMethod !== filterMethod) return false;
-    if (filterStatus && r.payment.status !== filterStatus) return false;
     if (search) {
       const q = search.toLowerCase();
       const insuredName = (r.insured?.name || r.payment.manualPayer || "").toLowerCase();
@@ -542,15 +548,15 @@ function CobranzasTab() {
             <option value="">Todos los métodos</option>
             {Object.entries(METHOD_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
           </select>
-          <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)}
+          <select value={filterVista} onChange={e => setFilterVista(e.target.value as any)}
             className="px-3 py-2 bg-[#0d1424] border border-[#1f2937] rounded-lg text-sm text-gray-300 outline-none">
-            <option value="">Todos los estados</option>
-            <option value="confirmado">Confirmado</option>
-            <option value="pendiente">Pendiente</option>
-            <option value="anulado">Anulado</option>
+            <option value="pendiente_rendir">Pendientes de rendir</option>
+            <option value="rendidos">Rendidos</option>
+            <option value="anulados">Anulados</option>
+            <option value="todos">Todos</option>
           </select>
-          {(filterMethod || filterStatus || search) && (
-            <button onClick={() => { setFilterMethod(""); setFilterStatus(""); setSearch(""); }}
+          {(filterMethod || filterVista !== "pendiente_rendir" || search) && (
+            <button onClick={() => { setFilterMethod(""); setFilterVista("pendiente_rendir"); setSearch(""); }}
               className="flex items-center gap-1 px-3 py-2 text-sm text-gray-400 hover:text-white border border-[#1f2937] rounded-lg transition-colors">
               <X className="w-3 h-3" /> Limpiar
             </button>
