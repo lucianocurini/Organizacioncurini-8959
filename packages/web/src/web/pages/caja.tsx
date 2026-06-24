@@ -10,7 +10,6 @@ import {
   X,
   ChevronDown,
   ChevronRight,
-  AlertCircle,
   ArrowDownCircle,
   Banknote,
   CreditCard,
@@ -568,6 +567,12 @@ export default function CajaPage() {
   });
   const [statView, setStatView] = useState<"mensual" | "historico">("mensual");
 
+  // Período seleccionado para el resumen (mes actual por defecto)
+  const [periodoMes, setPeriodoMes] = useState<string>(() => {
+    const n = new Date();
+    return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, "0")}`;
+  });
+
   const [modals, setModals] = useState({
     addEntry: false,
     editEntry: null as any,
@@ -593,7 +598,7 @@ export default function CajaPage() {
 
   const loadAll = useCallback(async () => {
     const [s, e, p, d, st, comm, iva, comp] = await Promise.all([
-      api.get("/api/cash/summary"),
+      api.get(`/api/cash/summary?month=${periodoMes}`),
       api.get("/api/cash/entries"),
       api.get("/api/cash/payments"),
       api.get("/api/cash/debts"),
@@ -610,11 +615,11 @@ export default function CajaPage() {
     setCommissions(Array.isArray(comm) ? comm : []);
     setIvaList(Array.isArray(iva) ? iva : []);
     setCompaniesList(Array.isArray(comp) ? comp : []);
-  }, []);
+  }, [periodoMes]);
 
   useEffect(() => {
     if (user) loadAll();
-  }, [user]);
+  }, [user, loadAll]);
 
   function toggleSection(k: keyof typeof sections) {
     setSections((s) => ({ ...s, [k]: !s[k] }));
@@ -770,11 +775,21 @@ export default function CajaPage() {
             title="Resumen de caja"
             open={sections.resumen}
             onToggle={() => toggleSection("resumen")}
+            action={
+              <input
+                type="month"
+                value={periodoMes}
+                onChange={(e) => setPeriodoMes(e.target.value)}
+                className="bg-white/5 border border-white/10 rounded-lg px-2 py-1 text-xs text-white focus:outline-none focus:border-blue-500"
+              />
+            }
           >
             {summary ? (
               <div className="p-5">
-                {/* Diferencia grande */}
-                <div className={`rounded-xl p-5 mb-5 flex items-center justify-between ${summary.diferencia >= 0 ? "bg-green-900/30 border border-green-500/30" : "bg-red-900/30 border border-red-500/30"}`}>
+                {/* Diferencia de caja — temporalmente oculto.
+                    Mezcla cartera + adeudados + gastos históricos en un solo número;
+                    se reemplazará con un indicador de dinero propio en etapa posterior. */}
+                {/* <div className={`rounded-xl p-5 mb-5 flex items-center justify-between ${summary.diferencia >= 0 ? "bg-green-900/30 border border-green-500/30" : "bg-red-900/30 border border-red-500/30"}`}>
                   <div>
                     <p className="text-xs text-white/50 mb-1">Diferencia de caja</p>
                     <p className={`text-3xl font-bold ${summary.diferencia >= 0 ? "text-green-400" : "text-red-400"}`}>
@@ -783,7 +798,7 @@ export default function CajaPage() {
                     <p className="text-xs text-white/40 mt-1">En cartera − Adeudados</p>
                   </div>
                   <AlertCircle size={36} className={summary.diferencia >= 0 ? "text-green-500/40" : "text-red-500/40"} />
-                </div>
+                </div> */}
 
                 {/* Tarjetas detalle */}
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -796,8 +811,8 @@ export default function CajaPage() {
                     <p className="text-lg font-bold text-orange-400">{fmt(summary.totalRendido)}</p>
                   </div>
                   <div className="bg-white/5 rounded-xl p-4">
-                    <p className="text-xs text-white/40 mb-1">En cartera</p>
-                    <p className="text-lg font-bold text-blue-400">{fmt(summary.cartera.total)}</p>
+                    <p className="text-xs text-white/40 mb-1">Pendiente de rendir</p>
+                    <p className="text-lg font-bold text-blue-400">{fmt(summary.cajaNeta.total)}</p>
                   </div>
                   <div className="bg-white/5 rounded-xl p-4">
                     <p className="text-xs text-white/40 mb-1">Adeudados</p>
@@ -868,6 +883,38 @@ export default function CajaPage() {
                     <div className="mt-2 bg-orange-900/10 border border-orange-500/10 rounded-lg px-4 py-2 flex justify-between items-center">
                       <p className="text-xs text-white/40">Total directo a compañía</p>
                       <p className="text-sm font-bold text-orange-300">{fmt(summary.directoCompania.total)}</p>
+                    </div>
+                  </div>
+                )}
+
+                {/* ── Totales del período seleccionado ──────────────────────── */}
+                {summary.periodo && (
+                  <div className="mt-5 border-t border-white/10 pt-5">
+                    <p className="text-xs text-white/30 uppercase tracking-wider mb-3 font-medium">
+                      Período: {summary.periodo.from} → {summary.periodo.to}
+                    </p>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                      <div className="bg-white/5 rounded-xl p-4">
+                        <p className="text-xs text-white/40 mb-1">Cobrado en el período</p>
+                        <p className="text-lg font-bold text-white">{fmt(summary.periodo.cobrado)}</p>
+                      </div>
+                      <div className="bg-white/5 rounded-xl p-4">
+                        <p className="text-xs text-white/40 mb-1">Rendido en el período</p>
+                        <p className="text-lg font-bold text-orange-400">{fmt(summary.periodo.rendido)}</p>
+                      </div>
+                      <div className="bg-white/5 rounded-xl p-4">
+                        <p className="text-xs text-white/40 mb-1">Gastos en el período</p>
+                        <p className="text-lg font-bold text-red-400">-{fmt(summary.periodo.gastos)}</p>
+                      </div>
+                      <div className={`rounded-xl p-4 border ${summary.periodo.flujoNeto >= 0 ? "bg-emerald-900/20 border-emerald-500/30" : "bg-red-900/20 border-red-500/30"}`}>
+                        <p className="text-xs text-white/40 mb-1">Flujo neto del período</p>
+                        <p className={`text-lg font-bold ${summary.periodo.flujoNeto >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                          {fmt(summary.periodo.flujoNeto)}
+                        </p>
+                        <p className="text-xs text-white/30 mt-1">
+                          Puede incluir rendiciones de cobros realizados en períodos anteriores.
+                        </p>
+                      </div>
                     </div>
                   </div>
                 )}

@@ -3137,7 +3137,55 @@ app.patch("/cash/debts/:id/status", requireAdmin(async (c: any) => {
 }));
 
 // GET /api/cash/summary — resumen completo de caja
+// Parámetros opcionales: ?month=YYYY-MM  |  ?from=YYYY-MM-DD&to=YYYY-MM-DD
 app.get("/cash/summary", requireAdmin(async (c: any) => {
+  // ── Validación de parámetros de período ───────────────────────────────────
+  const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+  const DATE_RE  = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
+
+  // Devuelve true solo si la fecha existe en el calendario (ej. rechaza 2026-02-31)
+  function isRealDate(s: string): boolean {
+    const [y, m, d] = s.split("-").map(Number);
+    const dt = new Date(y, m - 1, d);
+    return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d;
+  }
+
+  const rawMonth = c.req.query("month");
+  const rawFrom  = c.req.query("from");
+  const rawTo    = c.req.query("to");
+
+  let periodFrom: string | null = null;
+  let periodTo:   string | null = null;
+
+  if (rawMonth) {
+    if (!MONTH_RE.test(rawMonth)) {
+      return c.json({ error: "Parámetro 'month' inválido. Formato esperado: YYYY-MM (ej. 2025-06)" }, 400);
+    }
+    const [y, m] = rawMonth.split("-");
+    const lastDay = new Date(Number(y), Number(m), 0).getDate();
+    periodFrom = `${y}-${m}-01`;
+    periodTo   = `${y}-${m}-${String(lastDay).padStart(2, "0")}`;
+  } else if (rawFrom || rawTo) {
+    if (!rawFrom || !rawTo) {
+      return c.json({ error: "Se requieren ambos parámetros 'from' y 'to'" }, 400);
+    }
+    if (!DATE_RE.test(rawFrom) || !DATE_RE.test(rawTo)) {
+      return c.json({ error: "Formato de fecha inválido. Esperado: YYYY-MM-DD (ej. 2025-06-01)" }, 400);
+    }
+    if (!isRealDate(rawFrom)) {
+      return c.json({ error: `La fecha 'from' (${rawFrom}) no existe en el calendario` }, 400);
+    }
+    if (!isRealDate(rawTo)) {
+      return c.json({ error: `La fecha 'to' (${rawTo}) no existe en el calendario` }, 400);
+    }
+    if (rawFrom > rawTo) {
+      return c.json({ error: "'from' debe ser anterior o igual a 'to'" }, 400);
+    }
+    periodFrom = rawFrom;
+    periodTo   = rawTo;
+  }
+
+  // ── Consultas principales ─────────────────────────────────────────────────
   // Cobros manuales en cartera (no rendidos)
   const manualInCartera = await db.select().from(cashEntries)
     .where(eq(cashEntries.rendered, 0)).all();
@@ -3272,14 +3320,53 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   // Ganancia neta del mes = comisiones del mes - gastos del mes
   const gananciaNeta = comisionesMes - gastosMes;
 
-  // En caja neta: lo cobrado en cartera propia - lo ya rendido por rendiciones
-  const cajaEfectivo = cartera.efectivo - rendidoPorMetodo.efectivo;
-  const cajaTransferencia = cartera.transferencia - rendidoPorMetodo.transferencia;
-  const cajaCheque = cartera.cheque - rendidoPorMetodo.cheque;
-  const cajaNeta = cartera.total - rendidoPorMetodo.total + totalAdeudadoRendiciones;
+  // Pendiente de rendir actual: lo cobrado en cuentas propias que aún no fue rendido.
+  // cajaNeta = cartera.total (solo ítems no rendidos, métodos propios).
+  // No se resta rendidoPorMetodo porque cartera ya excluye ítems rendidos (rendered=0).
+  const cajaEfectivo = cartera.efectivo;
+  const cajaTransferencia = cartera.transferencia;
+  const cajaCheque = cartera.cheque;
+  const cajaNeta = cartera.total; // Pendiente de rendir actual
 
-  // Diferencia = caja neta - adeudados - gastos
+  // Diferencia = caja neta - adeudados - gastos (campo conservado sin cambios)
   const diferencia = cajaNeta - totalAdeudado - totalGastos;
+
+  // ── Totales del período (solo si se recibieron parámetros válidos) ─────────
+  let cobradoPeriodo = 0;
+  let rendidoPeriodo = 0;
+  let gastosPeriodo  = 0;
+
+  if (periodFrom && periodTo) {
+    const DIRECTO_COMPANIA_LOCAL = ["transferencia_compania", "link_pago"];
+
+    // Payments confirmados, métodos propios, dentro del período
+    const periodPayments = allPayments.filter((p: any) =>
+      p.status === "confirmado" &&
+      !DIRECTO_COMPANIA_LOCAL.includes(p.paymentMethod as string) &&
+      p.paymentDate >= periodFrom! && p.paymentDate <= periodTo!
+    );
+
+    // Cash entries (rendidos + no rendidos), métodos propios, dentro del período
+    const allManual = [...manualInCartera, ...manualRendered];
+    const periodEntries = allManual.filter((e: any) =>
+      !DIRECTO_COMPANIA_LOCAL.includes(e.paymentMethod as string) &&
+      e.paymentDate >= periodFrom! && e.paymentDate <= periodTo!
+    );
+
+    cobradoPeriodo =
+      periodPayments.reduce((s: number, p: any) => s + (p.amount || 0), 0) +
+      periodEntries.reduce((s: number, e: any) => s + (e.amount || 0), 0);
+
+    // Rendiciones confirmadas cuya fecha cae en el período
+    rendidoPeriodo = confirmedRemittances
+      .filter((r: any) => r.date >= periodFrom! && r.date <= periodTo!)
+      .reduce((s: number, r: any) => s + (r.totalPaid || 0), 0);
+
+    // Gastos del período
+    gastosPeriodo = allExpenses
+      .filter((e: any) => e.date >= periodFrom! && e.date <= periodTo!)
+      .reduce((s: number, e: any) => s + (e.amount || 0), 0);
+  }
 
   return c.json({
     cartera,
@@ -3320,7 +3407,16 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
       gastos: allExpenses.length,
       comisiones: allCommissions.length,
       iva: allIva.length,
-    }
+    },
+    // Totales del período solicitado (null si no se pasaron parámetros)
+    periodo: periodFrom && periodTo ? {
+      from:       periodFrom,
+      to:         periodTo,
+      cobrado:    cobradoPeriodo,
+      rendido:    rendidoPeriodo,
+      gastos:     gastosPeriodo,
+      flujoNeto:  cobradoPeriodo - rendidoPeriodo - gastosPeriodo,
+    } : null,
   });
 }));
 
