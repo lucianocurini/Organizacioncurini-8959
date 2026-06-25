@@ -17,6 +17,7 @@ import {
   BarChart2,
   TrendingUp,
   Receipt,
+  AlertTriangle,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { api } from "@/lib/api";
@@ -558,11 +559,14 @@ export default function CajaPage() {
 
   const [sections, setSections] = useState({
     resumen: true,
+    cajaPropia: true,
     estadisticas: true,
     cobrados: true,
     cartera: false,
     adeudados: true,
     comisiones: true,
+    gastos: true,
+    movimientosPropios: true,
     iva: true,
   });
   const [statView, setStatView] = useState<"mensual" | "historico">("mensual");
@@ -585,7 +589,15 @@ export default function CajaPage() {
 
   // ── Comisiones
   const [commissions, setCommissions] = useState<any[]>([]);
-  const [commForm, setCommForm] = useState({ companyId: "", date: new Date().toISOString().slice(0, 10), amount: "", notes: "" });
+  const [commForm, setCommForm] = useState({
+    companyId: "",
+    date: new Date().toISOString().slice(0, 10),
+    amount: "",
+    notes: "",
+    paymentMethod: "transferencia",
+    periodMonth: "",
+    status: "registrado",
+  });
   const [editingComm, setEditingComm] = useState<any>(null);
 
   // ── IVA
@@ -596,8 +608,37 @@ export default function CajaPage() {
   // ── Companies
   const [companiesList, setCompaniesList] = useState<any[]>([]);
 
+  // ── Gastos y Sueldos
+  const [expenses, setExpenses] = useState<any[]>([]);
+  const [expForm, setExpForm] = useState({
+    type: "gasto_operativo",
+    date: new Date().toISOString().slice(0, 10),
+    description: "",
+    category: "",
+    amount: "",
+    paymentMethod: "efectivo",
+    payeeName: "",
+    salaryPeriod: "",
+    notes: "",
+    status: "registrado",
+  });
+  const [editingExp, setEditingExp] = useState<any>(null);
+  const [expError, setExpError] = useState<string | null>(null);
+
+  // ── Movimientos propios
+  const [ownMovements, setOwnMovements] = useState<any[]>([]);
+  const [ownForm, setOwnForm] = useState({
+    type: "aporte",
+    date: new Date().toISOString().slice(0, 10),
+    amount: "",
+    paymentMethod: "efectivo",
+    notes: "",
+  });
+  const [editingOwn, setEditingOwn] = useState<any>(null);
+  const [ownError, setOwnError] = useState<string | null>(null);
+
   const loadAll = useCallback(async () => {
-    const [s, e, p, d, st, comm, iva, comp] = await Promise.all([
+    const [s, e, p, d, st, comm, iva, comp, exp, own] = await Promise.all([
       api.get(`/api/cash/summary?month=${periodoMes}`),
       api.get("/api/cash/entries"),
       api.get("/api/cash/payments"),
@@ -606,6 +647,8 @@ export default function CajaPage() {
       api.get("/api/cash/commissions"),
       api.get("/api/cash/iva"),
       api.get("/api/companies"),
+      api.get("/api/cash/expenses"),
+      api.get("/api/cash/own-movements"),
     ]);
     setSummary(s);
     setEntries(Array.isArray(e) ? e : []);
@@ -615,6 +658,8 @@ export default function CajaPage() {
     setCommissions(Array.isArray(comm) ? comm : []);
     setIvaList(Array.isArray(iva) ? iva : []);
     setCompaniesList(Array.isArray(comp) ? comp : []);
+    setExpenses(Array.isArray(exp) ? exp : []);
+    setOwnMovements(Array.isArray(own) ? own : []);
   }, [periodoMes]);
 
   useEffect(() => {
@@ -677,7 +722,16 @@ export default function CajaPage() {
 
   // ── Commissions CRUD
   async function saveComm() {
-    const data = { ...commForm, amount: parseFloat(commForm.amount), companyId: commForm.companyId ? parseInt(commForm.companyId) : null };
+    const src = editingComm ?? commForm;
+    const data = {
+      companyId: src.companyId ? parseInt(String(src.companyId)) : null,
+      date: src.date,
+      amount: parseFloat(String(src.amount)),
+      notes: src.notes || null,
+      paymentMethod: src.paymentMethod || "transferencia",
+      periodMonth: src.periodMonth || null,
+      status: src.status || "registrado",
+    };
     if (!data.amount || isNaN(data.amount)) return;
     if (editingComm) {
       await api.put(`/api/cash/commissions/${editingComm.id}`, data);
@@ -685,11 +739,11 @@ export default function CajaPage() {
     } else {
       await api.post("/api/cash/commissions", data);
     }
-    setCommForm({ companyId: "", date: new Date().toISOString().slice(0, 10), amount: "", notes: "" });
+    setCommForm({ companyId: "", date: new Date().toISOString().slice(0, 10), amount: "", notes: "", paymentMethod: "transferencia", periodMonth: "", status: "registrado" });
     loadAll();
   }
   async function deleteComm(id: number) {
-    if (!confirm("¿Eliminar esta comisión?")) return;
+    if (!confirm("¿Anular esta comisión? Quedará visible en el historial como anulada.")) return;
     await api.delete(`/api/cash/commissions/${id}`);
     loadAll();
   }
@@ -711,6 +765,83 @@ export default function CajaPage() {
     if (!confirm("¿Eliminar este registro de IVA?")) return;
     await api.delete(`/api/cash/iva/${id}`);
     loadAll();
+  }
+
+  // ── Expenses CRUD
+  async function saveExp() {
+    setExpError(null);
+    const src = editingExp ?? expForm;
+    const data = {
+      type: src.type,
+      date: src.date,
+      description: src.description,
+      category: src.category || null,
+      amount: parseFloat(String(src.amount)),
+      paymentMethod: src.paymentMethod,
+      payeeName: src.type === "sueldo" ? (src.payeeName || null) : null,
+      salaryPeriod: src.type === "sueldo" ? (src.salaryPeriod || null) : null,
+      notes: src.notes || null,
+      status: src.status || "registrado",
+    };
+    if (!data.amount || isNaN(data.amount) || !data.date || !data.description?.trim()) return;
+    try {
+      if (editingExp) {
+        await api.put(`/api/cash/expenses/${editingExp.id}`, data);
+        setEditingExp(null);
+      } else {
+        await api.post("/api/cash/expenses", data);
+      }
+      setExpForm({ type: "gasto_operativo", date: new Date().toISOString().slice(0, 10), description: "", category: "", amount: "", paymentMethod: "efectivo", payeeName: "", salaryPeriod: "", notes: "", status: "registrado" });
+      loadAll();
+    } catch (e: any) {
+      setExpError(e.message || "Error al guardar");
+    }
+  }
+
+  async function anularExp(id: number) {
+    if (!confirm("¿Anular este gasto/sueldo? Quedará visible como anulado.")) return;
+    try {
+      await api.delete(`/api/cash/expenses/${id}`);
+      loadAll();
+    } catch (e: any) {
+      setExpError(e.message || "Error al anular");
+    }
+  }
+
+  // ── OwnMovements CRUD
+  async function saveOwn() {
+    setOwnError(null);
+    const src = editingOwn ?? ownForm;
+    const data = {
+      type: src.type,
+      date: src.date,
+      amount: parseFloat(String(src.amount)),
+      paymentMethod: src.paymentMethod,
+      notes: src.notes || null,
+    };
+    if (!data.amount || isNaN(data.amount) || !data.date) return;
+    try {
+      if (editingOwn) {
+        await api.put(`/api/cash/own-movements/${editingOwn.id}`, data);
+        setEditingOwn(null);
+      } else {
+        await api.post("/api/cash/own-movements", data);
+      }
+      setOwnForm({ type: "aporte", date: new Date().toISOString().slice(0, 10), amount: "", paymentMethod: "efectivo", notes: "" });
+      loadAll();
+    } catch (e: any) {
+      setOwnError(e.message || "Error al guardar movimiento");
+    }
+  }
+
+  async function anularOwn(id: number) {
+    if (!confirm("¿Anular este movimiento?")) return;
+    try {
+      await api.delete(`/api/cash/own-movements/${id}`);
+      loadAll();
+    } catch (e: any) {
+      setOwnError(e.message || "Error al anular");
+    }
   }
 
   if (!user || user.role !== "admin") return <AppLayout><div /></AppLayout>;
@@ -924,6 +1055,102 @@ export default function CajaPage() {
             )}
           </Section>
 
+          {/* ─── Resumen Caja Propia ───────────────────────────────────────── */}
+          <Section
+            title="Resumen — Caja Propia"
+            open={sections.cajaPropia}
+            onToggle={() => toggleSection("cajaPropia")}
+            action={
+              <span className="text-xs text-white/30 font-normal">período: {periodoMes}</span>
+            }
+          >
+            {summary?.cajaPropia ? (
+              <div className="p-5 space-y-4">
+                <div>
+                  <p className="text-xs text-white/30 uppercase tracking-wider mb-2 font-medium">Histórico acumulado</p>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    <div className="bg-emerald-900/20 border border-emerald-500/20 rounded-xl p-4">
+                      <p className="text-xs text-white/40 mb-1">Comisiones</p>
+                      <p className="text-lg font-bold text-emerald-400">{fmt(summary.cajaPropia.historico.comisiones)}</p>
+                    </div>
+                    <div className="bg-blue-900/20 border border-blue-500/20 rounded-xl p-4">
+                      <p className="text-xs text-white/40 mb-1">Aportes</p>
+                      <p className="text-lg font-bold text-blue-400">{fmt(summary.cajaPropia.historico.aportes)}</p>
+                    </div>
+                    <div className="bg-orange-900/20 border border-orange-500/20 rounded-xl p-4">
+                      <p className="text-xs text-white/40 mb-1">Gastos operativos</p>
+                      <p className="text-lg font-bold text-orange-400">−{fmt(summary.cajaPropia.historico.gastosOperativos)}</p>
+                    </div>
+                    <div className="bg-purple-900/20 border border-purple-500/20 rounded-xl p-4">
+                      <p className="text-xs text-white/40 mb-1">Sueldos</p>
+                      <p className="text-lg font-bold text-purple-400">−{fmt(summary.cajaPropia.historico.sueldos)}</p>
+                    </div>
+                    <div className="bg-red-900/20 border border-red-500/20 rounded-xl p-4">
+                      <p className="text-xs text-white/40 mb-1">Reintegros</p>
+                      <p className="text-lg font-bold text-red-400">−{fmt(summary.cajaPropia.historico.reintegros)}</p>
+                    </div>
+                    <div className={`rounded-xl p-4 border ${summary.cajaPropia.historico.resultadoOperativo >= 0 ? "bg-emerald-900/20 border-emerald-500/30" : "bg-red-900/20 border-red-500/30"}`}>
+                      <p className="text-xs text-white/40 mb-1">Resultado operativo</p>
+                      <p className={`text-base font-bold ${summary.cajaPropia.historico.resultadoOperativo >= 0 ? "text-emerald-400" : "text-red-400"}`}>{fmt(summary.cajaPropia.historico.resultadoOperativo)}</p>
+                      <p className="text-xs text-white/30 mt-0.5">comisiones − gastos − sueldos</p>
+                    </div>
+                    <div className={`rounded-xl p-4 border ${summary.cajaPropia.historico.saldoPropio >= 0 ? "bg-blue-900/20 border-blue-500/30" : "bg-red-900/20 border-red-500/30"}`}>
+                      <p className="text-xs text-white/40 mb-1">Saldo propio</p>
+                      <p className={`text-base font-bold ${summary.cajaPropia.historico.saldoPropio >= 0 ? "text-blue-400" : "text-red-400"}`}>{fmt(summary.cajaPropia.historico.saldoPropio)}</p>
+                      <p className="text-xs text-white/30 mt-0.5">comisiones + aportes − gastos − reintegros</p>
+                    </div>
+                    <div className="bg-yellow-900/20 border border-yellow-500/20 rounded-xl p-4">
+                      <p className="text-xs text-white/40 mb-1">Aportes pendientes</p>
+                      <p className="text-lg font-bold text-yellow-400">{fmt(summary.cajaPropia.historico.aportesPendientes)}</p>
+                      <p className="text-xs text-white/30 mt-0.5">aportes − reintegros</p>
+                    </div>
+                  </div>
+                </div>
+
+                {summary.cajaPropia.periodo && (
+                  <div className="border-t border-white/10 pt-4">
+                    <p className="text-xs text-white/30 uppercase tracking-wider mb-2 font-medium">
+                      Período: {summary.cajaPropia.periodo.from} → {summary.cajaPropia.periodo.to}
+                    </p>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                      <div className="bg-white/5 rounded-xl p-4">
+                        <p className="text-xs text-white/40 mb-1">Comisiones</p>
+                        <p className="text-lg font-bold text-emerald-400">{fmt(summary.cajaPropia.periodo.comisiones)}</p>
+                      </div>
+                      <div className="bg-white/5 rounded-xl p-4">
+                        <p className="text-xs text-white/40 mb-1">Aportes</p>
+                        <p className="text-lg font-bold text-blue-400">{fmt(summary.cajaPropia.periodo.aportes)}</p>
+                      </div>
+                      <div className="bg-white/5 rounded-xl p-4">
+                        <p className="text-xs text-white/40 mb-1">Gastos operativos</p>
+                        <p className="text-lg font-bold text-orange-400">−{fmt(summary.cajaPropia.periodo.gastosOperativos)}</p>
+                      </div>
+                      <div className="bg-white/5 rounded-xl p-4">
+                        <p className="text-xs text-white/40 mb-1">Sueldos</p>
+                        <p className="text-lg font-bold text-purple-400">−{fmt(summary.cajaPropia.periodo.sueldos)}</p>
+                      </div>
+                      <div className="bg-white/5 rounded-xl p-4">
+                        <p className="text-xs text-white/40 mb-1">Reintegros</p>
+                        <p className="text-lg font-bold text-red-400">−{fmt(summary.cajaPropia.periodo.reintegros)}</p>
+                      </div>
+                      <div className="bg-white/5 rounded-xl p-4">
+                        <p className="text-xs text-white/40 mb-1">Resultado operativo</p>
+                        <p className={`text-lg font-bold ${summary.cajaPropia.periodo.resultadoOperativo >= 0 ? "text-emerald-400" : "text-red-400"}`}>{fmt(summary.cajaPropia.periodo.resultadoOperativo)}</p>
+                      </div>
+                      <div className={`md:col-span-2 rounded-xl p-4 border ${summary.cajaPropia.periodo.flujoPropio >= 0 ? "bg-emerald-900/20 border-emerald-500/30" : "bg-red-900/20 border-red-500/30"}`}>
+                        <p className="text-xs text-white/40 mb-1">Flujo propio del período</p>
+                        <p className={`text-xl font-bold ${summary.cajaPropia.periodo.flujoPropio >= 0 ? "text-emerald-400" : "text-red-400"}`}>{fmt(summary.cajaPropia.periodo.flujoPropio)}</p>
+                        <p className="text-xs text-white/30 mt-0.5">comisiones + aportes − gastos − sueldos − reintegros</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="p-8 text-center text-white/30 text-sm">Cargando...</div>
+            )}
+          </Section>
+
           {/* ─── Cobrados ──────────────────────────────────────────────────── */}
           <Section
             title="Cobrados"
@@ -1055,7 +1282,7 @@ export default function CajaPage() {
           {/* ─── Comisiones ────────────────────────────────────────────────── */}
           <Section
             title="Comisiones"
-            badge={commissions.length || undefined}
+            badge={commissions.filter((c: any) => c.status !== "anulado").length || undefined}
             badgeColor="bg-emerald-600"
             open={sections.comisiones}
             onToggle={() => toggleSection("comisiones")}
@@ -1083,7 +1310,7 @@ export default function CajaPage() {
               {/* Form nuevo/editar */}
               <div className="bg-white/5 rounded-xl p-4">
                 <p className="text-xs text-white/40 uppercase tracking-wider mb-3">{editingComm ? "Editar comisión" : "Nueva comisión"}</p>
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
                   <div>
                     <label className="text-xs text-white/40 mb-1 block">Compañía</label>
                     <select
@@ -1107,6 +1334,15 @@ export default function CajaPage() {
                     />
                   </div>
                   <div>
+                    <label className="text-xs text-white/40 mb-1 block">Período (AAAA-MM)</label>
+                    <input
+                      type="month"
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-emerald-500"
+                      value={editingComm ? editingComm.periodMonth ?? "" : commForm.periodMonth}
+                      onChange={(e) => editingComm ? setEditingComm({ ...editingComm, periodMonth: e.target.value }) : setCommForm((f) => ({ ...f, periodMonth: e.target.value }))}
+                    />
+                  </div>
+                  <div>
                     <label className="text-xs text-white/40 mb-1 block">Importe *</label>
                     <input
                       type="number"
@@ -1119,6 +1355,28 @@ export default function CajaPage() {
                     />
                   </div>
                   <div>
+                    <label className="text-xs text-white/40 mb-1 block">Medio de pago</label>
+                    <select
+                      className="w-full bg-[#111827] border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-emerald-500"
+                      value={editingComm ? editingComm.paymentMethod ?? "transferencia" : commForm.paymentMethod}
+                      onChange={(e) => editingComm ? setEditingComm({ ...editingComm, paymentMethod: e.target.value }) : setCommForm((f) => ({ ...f, paymentMethod: e.target.value }))}
+                    >
+                      <option value="transferencia">Transferencia</option>
+                      <option value="efectivo">Efectivo</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-white/40 mb-1 block">Estado</label>
+                    <select
+                      className="w-full bg-[#111827] border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-emerald-500"
+                      value={editingComm ? editingComm.status ?? "registrado" : commForm.status}
+                      onChange={(e) => editingComm ? setEditingComm({ ...editingComm, status: e.target.value }) : setCommForm((f) => ({ ...f, status: e.target.value }))}
+                    >
+                      <option value="registrado">Registrado</option>
+                      <option value="anulado">Anulado</option>
+                    </select>
+                  </div>
+                  <div className="md:col-span-3">
                     <label className="text-xs text-white/40 mb-1 block">Notas</label>
                     <input
                       placeholder="Opcional"
@@ -1152,25 +1410,258 @@ export default function CajaPage() {
                   <table className="w-full text-xs">
                     <thead>
                       <tr className="text-white/40 border-b border-white/10">
-                        <th className="text-left py-2 pr-4">Fecha</th>
-                        <th className="text-left py-2 pr-4">Compañía</th>
-                        <th className="text-left py-2 pr-4">Notas</th>
-                        <th className="text-right py-2 pr-4">Importe</th>
+                        <th className="text-left py-2 pr-3">Fecha</th>
+                        <th className="text-left py-2 pr-3">Compañía</th>
+                        <th className="text-left py-2 pr-3">Período</th>
+                        <th className="text-left py-2 pr-3">Medio</th>
+                        <th className="text-left py-2 pr-3">Estado</th>
+                        <th className="text-left py-2 pr-3">Notas</th>
+                        <th className="text-right py-2 pr-3">Importe</th>
                         <th className="text-right py-2">Acciones</th>
                       </tr>
                     </thead>
                     <tbody>
                       {commissions.map((c: any) => (
-                        <tr key={c.id} className="border-b border-white/5 hover:bg-white/3">
-                          <td className="py-2 pr-4 text-white/70">{c.date}</td>
-                          <td className="py-2 pr-4 text-white/70">{c.companyName || "—"}</td>
-                          <td className="py-2 pr-4 text-white/50">{c.notes || "—"}</td>
-                          <td className="py-2 pr-4 text-right font-bold text-emerald-400">{fmt(c.amount)}</td>
+                        <tr key={c.id} className={`border-b border-white/5 hover:bg-white/3 ${c.status === "anulado" ? "opacity-50" : ""}`}>
+                          <td className="py-2 pr-3 text-white/70">{c.date}</td>
+                          <td className="py-2 pr-3 text-white/70">{c.companyName || "—"}</td>
+                          <td className="py-2 pr-3 text-white/50">{c.periodMonth || "—"}</td>
+                          <td className="py-2 pr-3 text-white/50 capitalize">{c.paymentMethod || "—"}</td>
+                          <td className="py-2 pr-3">
+                            {c.status === "anulado"
+                              ? <span className="bg-red-900/40 text-red-400 text-xs px-2 py-0.5 rounded-full">Anulada</span>
+                              : <span className="bg-emerald-900/40 text-emerald-400 text-xs px-2 py-0.5 rounded-full">Registrada</span>
+                            }
+                          </td>
+                          <td className="py-2 pr-3 text-white/50">{c.notes || "—"}</td>
+                          <td className="py-2 pr-3 text-right font-bold text-emerald-400">{fmt(c.amount)}</td>
                           <td className="py-2 text-right">
-                            <div className="flex items-center gap-1 justify-end">
-                              <button onClick={() => setEditingComm({ ...c, companyId: c.companyId ?? "" })} className="p-1 text-white/30 hover:text-white rounded"><Pencil size={13} /></button>
-                              <button onClick={() => deleteComm(c.id)} className="p-1 text-white/30 hover:text-red-400 rounded"><Trash2 size={13} /></button>
-                            </div>
+                            {c.status !== "anulado" && (
+                              <div className="flex items-center gap-1 justify-end">
+                                <button onClick={() => setEditingComm({ ...c, companyId: c.companyId ?? "", periodMonth: c.periodMonth ?? "", status: c.status ?? "registrado", paymentMethod: c.paymentMethod ?? "transferencia" })} className="p-1 text-white/30 hover:text-white rounded"><Pencil size={13} /></button>
+                                <button onClick={() => deleteComm(c.id)} className="p-1 text-white/30 hover:text-red-400 rounded"><Trash2 size={13} /></button>
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </Section>
+
+          {/* ─── Gastos y Sueldos ──────────────────────────────────────────── */}
+          <Section
+            title="Gastos y Sueldos"
+            badge={expenses.filter((e: any) => e.status !== "anulado").length || undefined}
+            badgeColor="bg-orange-600"
+            open={sections.gastos}
+            onToggle={() => toggleSection("gastos")}
+          >
+            <div className="p-4 space-y-4">
+              {/* Resumen chips */}
+              {expenses.length > 0 && (
+                <div className="flex flex-wrap gap-2 text-xs">
+                  <span className="bg-orange-900/30 border border-orange-500/20 text-orange-400 px-3 py-1 rounded-full">
+                    Gastos: {expenses.filter((e: any) => e.type === "gasto_operativo" && e.status !== "anulado").length}
+                    {" · "}{fmt(expenses.filter((e: any) => e.type === "gasto_operativo" && e.status !== "anulado").reduce((s: number, e: any) => s + e.amount, 0))}
+                  </span>
+                  <span className="bg-purple-900/30 border border-purple-500/20 text-purple-400 px-3 py-1 rounded-full">
+                    Sueldos: {expenses.filter((e: any) => e.type === "sueldo" && e.status !== "anulado").length}
+                    {" · "}{fmt(expenses.filter((e: any) => e.type === "sueldo" && e.status !== "anulado").reduce((s: number, e: any) => s + e.amount, 0))}
+                  </span>
+                  {expenses.some((e: any) => e.status === "conciliado") && (
+                    <span className="bg-teal-900/30 border border-teal-500/20 text-teal-400 px-3 py-1 rounded-full">
+                      Conciliados: {expenses.filter((e: any) => e.status === "conciliado").length}
+                    </span>
+                  )}
+                  {expenses.some((e: any) => e.status === "anulado") && (
+                    <span className="bg-red-900/30 border border-red-500/20 text-red-400 px-3 py-1 rounded-full">
+                      Anulados: {expenses.filter((e: any) => e.status === "anulado").length}
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {/* Error */}
+              {expError && (
+                <div className="flex items-center gap-2 bg-red-900/30 border border-red-500/30 text-red-400 rounded-lg px-4 py-3 text-sm">
+                  <AlertTriangle size={15} />
+                  {expError}
+                  <button onClick={() => setExpError(null)} className="ml-auto text-red-400/60 hover:text-red-400"><X size={14} /></button>
+                </div>
+              )}
+
+              {/* Form */}
+              <div className="bg-white/5 rounded-xl p-4">
+                <p className="text-xs text-white/40 uppercase tracking-wider mb-3">{editingExp ? "Editar gasto / sueldo" : "Nuevo gasto / sueldo"}</p>
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                  <div>
+                    <label className="text-xs text-white/40 mb-1 block">Tipo</label>
+                    <select
+                      className="w-full bg-[#111827] border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-orange-500"
+                      value={editingExp ? editingExp.type : expForm.type}
+                      onChange={(e) => editingExp ? setEditingExp({ ...editingExp, type: e.target.value }) : setExpForm((f) => ({ ...f, type: e.target.value }))}
+                    >
+                      <option value="gasto_operativo">Gasto operativo</option>
+                      <option value="sueldo">Sueldo</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-white/40 mb-1 block">Fecha *</label>
+                    <input
+                      type="date"
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-orange-500"
+                      value={editingExp ? editingExp.date : expForm.date}
+                      onChange={(e) => editingExp ? setEditingExp({ ...editingExp, date: e.target.value }) : setExpForm((f) => ({ ...f, date: e.target.value }))}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-white/40 mb-1 block">Importe *</label>
+                    <input
+                      type="number" min="0" step="0.01" placeholder="0.00"
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-orange-500"
+                      value={editingExp ? editingExp.amount : expForm.amount}
+                      onChange={(e) => editingExp ? setEditingExp({ ...editingExp, amount: e.target.value }) : setExpForm((f) => ({ ...f, amount: e.target.value }))}
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="text-xs text-white/40 mb-1 block">Descripción *</label>
+                    <input
+                      placeholder="Descripción del gasto"
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-orange-500"
+                      value={editingExp ? editingExp.description : expForm.description}
+                      onChange={(e) => editingExp ? setEditingExp({ ...editingExp, description: e.target.value }) : setExpForm((f) => ({ ...f, description: e.target.value }))}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-white/40 mb-1 block">Categoría</label>
+                    <input
+                      placeholder="Opcional"
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-orange-500"
+                      value={editingExp ? editingExp.category ?? "" : expForm.category}
+                      onChange={(e) => editingExp ? setEditingExp({ ...editingExp, category: e.target.value }) : setExpForm((f) => ({ ...f, category: e.target.value }))}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-white/40 mb-1 block">Medio de pago</label>
+                    <select
+                      className="w-full bg-[#111827] border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-orange-500"
+                      value={editingExp ? editingExp.paymentMethod : expForm.paymentMethod}
+                      onChange={(e) => editingExp ? setEditingExp({ ...editingExp, paymentMethod: e.target.value }) : setExpForm((f) => ({ ...f, paymentMethod: e.target.value }))}
+                    >
+                      <option value="efectivo">Efectivo</option>
+                      <option value="transferencia">Transferencia</option>
+                      <option value="cheque">Cheque</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-white/40 mb-1 block">Estado</label>
+                    <select
+                      className="w-full bg-[#111827] border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-orange-500"
+                      value={editingExp ? editingExp.status : expForm.status}
+                      onChange={(e) => editingExp ? setEditingExp({ ...editingExp, status: e.target.value }) : setExpForm((f) => ({ ...f, status: e.target.value }))}
+                    >
+                      <option value="registrado">Registrado</option>
+                      <option value="conciliado">Conciliado</option>
+                    </select>
+                  </div>
+                  {(editingExp ? editingExp.type : expForm.type) === "sueldo" && (
+                    <>
+                      <div>
+                        <label className="text-xs text-white/40 mb-1 block">Beneficiario *</label>
+                        <input
+                          placeholder="Nombre del empleado"
+                          className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-purple-500"
+                          value={editingExp ? editingExp.payeeName ?? "" : expForm.payeeName}
+                          onChange={(e) => editingExp ? setEditingExp({ ...editingExp, payeeName: e.target.value }) : setExpForm((f) => ({ ...f, payeeName: e.target.value }))}
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs text-white/40 mb-1 block">Período salarial * (AAAA-MM)</label>
+                        <input
+                          type="month"
+                          className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-purple-500"
+                          value={editingExp ? editingExp.salaryPeriod ?? "" : expForm.salaryPeriod}
+                          onChange={(e) => editingExp ? setEditingExp({ ...editingExp, salaryPeriod: e.target.value }) : setExpForm((f) => ({ ...f, salaryPeriod: e.target.value }))}
+                        />
+                      </div>
+                    </>
+                  )}
+                  <div className="md:col-span-3">
+                    <label className="text-xs text-white/40 mb-1 block">Notas</label>
+                    <input
+                      placeholder="Opcional"
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-orange-500"
+                      value={editingExp ? editingExp.notes ?? "" : expForm.notes}
+                      onChange={(e) => editingExp ? setEditingExp({ ...editingExp, notes: e.target.value }) : setExpForm((f) => ({ ...f, notes: e.target.value }))}
+                    />
+                  </div>
+                </div>
+                <div className="flex gap-2 mt-3 justify-end">
+                  {editingExp && (
+                    <button onClick={() => setEditingExp(null)} className="px-4 py-2 text-xs text-white/50 hover:text-white">Cancelar</button>
+                  )}
+                  <button
+                    onClick={saveExp}
+                    disabled={!(editingExp ? editingExp.amount && editingExp.description : expForm.amount && expForm.description)}
+                    className="flex items-center gap-1.5 px-4 py-2 text-xs bg-orange-600 hover:bg-orange-500 disabled:opacity-40 text-white rounded-lg font-medium"
+                  >
+                    <Plus size={13} /> {editingExp ? "Actualizar" : "Guardar"}
+                  </button>
+                </div>
+              </div>
+
+              {/* Tabla */}
+              {expenses.length === 0 ? (
+                <div className="text-center py-6 text-white/30 text-sm">No hay gastos ni sueldos registrados.</div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-white/40 border-b border-white/10">
+                        <th className="text-left py-2 pr-3">Tipo</th>
+                        <th className="text-left py-2 pr-3">Fecha</th>
+                        <th className="text-left py-2 pr-3">Descripción</th>
+                        <th className="text-left py-2 pr-3">Categoría</th>
+                        <th className="text-left py-2 pr-3">Medio</th>
+                        <th className="text-left py-2 pr-3">Estado</th>
+                        <th className="text-right py-2 pr-3">Importe</th>
+                        <th className="text-right py-2">Acciones</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {expenses.map((e: any) => (
+                        <tr key={e.id} className={`border-b border-white/5 hover:bg-white/3 ${e.status === "anulado" ? "opacity-50" : ""}`}>
+                          <td className="py-2 pr-3">
+                            {e.type === "sueldo"
+                              ? <span className="bg-purple-900/40 text-purple-400 text-xs px-2 py-0.5 rounded-full">Sueldo</span>
+                              : <span className="bg-orange-900/40 text-orange-400 text-xs px-2 py-0.5 rounded-full">Gasto</span>
+                            }
+                          </td>
+                          <td className="py-2 pr-3 text-white/70">{e.date}</td>
+                          <td className="py-2 pr-3 text-white/70">
+                            {e.description}
+                            {e.payeeName && <span className="text-white/40 ml-1">· {e.payeeName}</span>}
+                            {e.salaryPeriod && <span className="text-white/40 ml-1">({e.salaryPeriod})</span>}
+                          </td>
+                          <td className="py-2 pr-3 text-white/50">{e.category || "—"}</td>
+                          <td className="py-2 pr-3 text-white/50 capitalize">{e.paymentMethod}</td>
+                          <td className="py-2 pr-3">
+                            {e.status === "anulado" && <span className="bg-red-900/40 text-red-400 text-xs px-2 py-0.5 rounded-full">Anulado</span>}
+                            {e.status === "conciliado" && <span className="bg-teal-900/40 text-teal-400 text-xs px-2 py-0.5 rounded-full">Conciliado</span>}
+                            {e.status === "registrado" && <span className="text-white/30 text-xs">Registrado</span>}
+                          </td>
+                          <td className="py-2 pr-3 text-right font-bold text-orange-400">{fmt(e.amount)}</td>
+                          <td className="py-2 text-right">
+                            {e.status !== "anulado" && (
+                              <div className="flex items-center gap-1 justify-end">
+                                <button onClick={() => setEditingExp({ ...e, category: e.category ?? "", payeeName: e.payeeName ?? "", salaryPeriod: e.salaryPeriod ?? "", notes: e.notes ?? "" })} className="p-1 text-white/30 hover:text-white rounded"><Pencil size={13} /></button>
+                                <button onClick={() => anularExp(e.id)} className="p-1 text-white/30 hover:text-red-400 rounded"><Trash2 size={13} /></button>
+                              </div>
+                            )}
                           </td>
                         </tr>
                       ))}
@@ -1384,6 +1875,168 @@ export default function CajaPage() {
               )}
             </div>
           </Section>
+          {/* ─── Movimientos propios ───────────────────────────────────────── */}
+          <Section
+            title="Movimientos propios"
+            badge={ownMovements.filter((m: any) => m.status === "registrado").length || undefined}
+            badgeColor="bg-blue-600"
+            open={sections.movimientosPropios}
+            onToggle={() => toggleSection("movimientosPropios")}
+          >
+            <div className="p-4 space-y-4">
+              {/* Balance */}
+              {(() => {
+                const aportes = ownMovements.filter((m: any) => m.type === "aporte" && m.status === "registrado").reduce((s: number, m: any) => s + m.amount, 0);
+                const reintegros = ownMovements.filter((m: any) => m.type === "reintegro" && m.status === "registrado").reduce((s: number, m: any) => s + m.amount, 0);
+                const saldo = aportes - reintegros;
+                return (
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="bg-blue-900/20 border border-blue-500/20 rounded-xl p-4">
+                      <p className="text-xs text-white/40 mb-1">Aportes registrados</p>
+                      <p className="text-lg font-bold text-blue-400">{fmt(aportes)}</p>
+                    </div>
+                    <div className="bg-red-900/20 border border-red-500/20 rounded-xl p-4">
+                      <p className="text-xs text-white/40 mb-1">Reintegros registrados</p>
+                      <p className="text-lg font-bold text-red-400">{fmt(reintegros)}</p>
+                    </div>
+                    <div className={`rounded-xl p-4 border ${saldo >= 0 ? "bg-emerald-900/20 border-emerald-500/30" : "bg-red-900/20 border-red-500/30"}`}>
+                      <p className="text-xs text-white/40 mb-1">Aportes pendientes</p>
+                      <p className={`text-lg font-bold ${saldo >= 0 ? "text-emerald-400" : "text-red-400"}`}>{fmt(saldo)}</p>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Error */}
+              {ownError && (
+                <div className="flex items-center gap-2 bg-red-900/30 border border-red-500/30 text-red-400 rounded-lg px-4 py-3 text-sm">
+                  <AlertTriangle size={15} />
+                  {ownError}
+                  <button onClick={() => setOwnError(null)} className="ml-auto text-red-400/60 hover:text-red-400"><X size={14} /></button>
+                </div>
+              )}
+
+              {/* Form */}
+              <div className="bg-white/5 rounded-xl p-4">
+                <p className="text-xs text-white/40 uppercase tracking-wider mb-3">{editingOwn ? "Editar movimiento" : "Nuevo movimiento"}</p>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  <div>
+                    <label className="text-xs text-white/40 mb-1 block">Tipo</label>
+                    <select
+                      className="w-full bg-[#111827] border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500"
+                      value={editingOwn ? editingOwn.type : ownForm.type}
+                      onChange={(e) => editingOwn ? setEditingOwn({ ...editingOwn, type: e.target.value }) : setOwnForm((f) => ({ ...f, type: e.target.value }))}
+                    >
+                      <option value="aporte">Aporte</option>
+                      <option value="reintegro">Reintegro</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-white/40 mb-1 block">Fecha *</label>
+                    <input
+                      type="date"
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500"
+                      value={editingOwn ? editingOwn.date : ownForm.date}
+                      onChange={(e) => editingOwn ? setEditingOwn({ ...editingOwn, date: e.target.value }) : setOwnForm((f) => ({ ...f, date: e.target.value }))}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-white/40 mb-1 block">Importe *</label>
+                    <input
+                      type="number" min="0" step="0.01" placeholder="0.00"
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500"
+                      value={editingOwn ? editingOwn.amount : ownForm.amount}
+                      onChange={(e) => editingOwn ? setEditingOwn({ ...editingOwn, amount: e.target.value }) : setOwnForm((f) => ({ ...f, amount: e.target.value }))}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-white/40 mb-1 block">Medio de pago</label>
+                    <select
+                      className="w-full bg-[#111827] border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500"
+                      value={editingOwn ? editingOwn.paymentMethod : ownForm.paymentMethod}
+                      onChange={(e) => editingOwn ? setEditingOwn({ ...editingOwn, paymentMethod: e.target.value }) : setOwnForm((f) => ({ ...f, paymentMethod: e.target.value }))}
+                    >
+                      <option value="efectivo">Efectivo</option>
+                      <option value="transferencia">Transferencia</option>
+                    </select>
+                  </div>
+                  <div className="md:col-span-4">
+                    <label className="text-xs text-white/40 mb-1 block">Notas</label>
+                    <input
+                      placeholder="Opcional"
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500"
+                      value={editingOwn ? editingOwn.notes ?? "" : ownForm.notes}
+                      onChange={(e) => editingOwn ? setEditingOwn({ ...editingOwn, notes: e.target.value }) : setOwnForm((f) => ({ ...f, notes: e.target.value }))}
+                    />
+                  </div>
+                </div>
+                <div className="flex gap-2 mt-3 justify-end">
+                  {editingOwn && (
+                    <button onClick={() => setEditingOwn(null)} className="px-4 py-2 text-xs text-white/50 hover:text-white">Cancelar</button>
+                  )}
+                  <button
+                    onClick={saveOwn}
+                    disabled={!(editingOwn ? editingOwn.amount : ownForm.amount)}
+                    className="flex items-center gap-1.5 px-4 py-2 text-xs bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white rounded-lg font-medium"
+                  >
+                    <Plus size={13} /> {editingOwn ? "Actualizar" : "Guardar"}
+                  </button>
+                </div>
+              </div>
+
+              {/* Tabla */}
+              {ownMovements.length === 0 ? (
+                <div className="text-center py-6 text-white/30 text-sm">No hay movimientos propios registrados.</div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-white/40 border-b border-white/10">
+                        <th className="text-left py-2 pr-3">Tipo</th>
+                        <th className="text-left py-2 pr-3">Fecha</th>
+                        <th className="text-left py-2 pr-3">Medio</th>
+                        <th className="text-left py-2 pr-3">Estado</th>
+                        <th className="text-left py-2 pr-3">Notas</th>
+                        <th className="text-right py-2 pr-3">Importe</th>
+                        <th className="text-right py-2">Acciones</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ownMovements.map((m: any) => (
+                        <tr key={m.id} className={`border-b border-white/5 hover:bg-white/3 ${m.status === "anulado" ? "opacity-50" : ""}`}>
+                          <td className="py-2 pr-3">
+                            {m.type === "aporte"
+                              ? <span className="bg-blue-900/40 text-blue-400 text-xs px-2 py-0.5 rounded-full">Aporte</span>
+                              : <span className="bg-red-900/40 text-red-400 text-xs px-2 py-0.5 rounded-full">Reintegro</span>
+                            }
+                          </td>
+                          <td className="py-2 pr-3 text-white/70">{m.date}</td>
+                          <td className="py-2 pr-3 text-white/50 capitalize">{m.paymentMethod}</td>
+                          <td className="py-2 pr-3">
+                            {m.status === "anulado"
+                              ? <span className="bg-red-900/40 text-red-400 text-xs px-2 py-0.5 rounded-full">Anulado</span>
+                              : <span className="text-white/30 text-xs">Registrado</span>
+                            }
+                          </td>
+                          <td className="py-2 pr-3 text-white/50">{m.notes || "—"}</td>
+                          <td className="py-2 pr-3 text-right font-bold text-white">{fmt(m.amount)}</td>
+                          <td className="py-2 text-right">
+                            {m.status !== "anulado" && (
+                              <div className="flex items-center gap-1 justify-end">
+                                <button onClick={() => setEditingOwn({ ...m, notes: m.notes ?? "" })} className="p-1 text-white/30 hover:text-white rounded"><Pencil size={13} /></button>
+                                <button onClick={() => anularOwn(m.id)} className="p-1 text-white/30 hover:text-red-400 rounded"><Trash2 size={13} /></button>
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </Section>
+
         </div>
       </div>
 
