@@ -26,6 +26,13 @@ const METHOD_LABELS: Record<string, string> = {
   transferencia_compania: "Transf. a Compañía",
 };
 
+const BREAKDOWN_LABELS: Record<string, string> = {
+  efectivo: "Efectivo",
+  transferencia: "Transferencia",
+  cheque: "Cheque",
+  pronto_pago: "Pronto Pago",
+};
+
 const METHOD_COLORS: Record<string, string> = {
   efectivo: "bg-green-500/20 text-green-400 border-green-500/30",
   transferencia: "bg-blue-500/20 text-blue-400 border-blue-500/30",
@@ -1309,7 +1316,7 @@ function RendicionesTab() {
                     {/* Métodos */}
                     {Object.entries(bd).filter(([, v]) => Number(v) > 0).map(([m, v]) => (
                       <span key={m} className={cn("hidden lg:inline text-xs px-1.5 py-0.5 rounded border", METHOD_COLORS[m] || "text-gray-400 border-gray-500/30")}>
-                        {METHOD_LABELS[m] || m}: {fmt(Number(v))}
+                        {BREAKDOWN_LABELS[m] || m}: {fmt(Number(v))}
                       </span>
                     ))}
                     <button onClick={e => { e.stopPropagation(); handleDelete(r.id); }}
