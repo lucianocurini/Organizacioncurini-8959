@@ -276,6 +276,8 @@ export const cashEntries = sqliteTable("cash_entries", {
   notes: text("notes"),
   rendered: integer("rendered").notNull().default(0),
   renderedAt: integer("rendered_at", { mode: "timestamp" }),
+  entryType: text("entry_type").notNull().default("normal"), // normal | pronto_pago_surcharge
+  paymentId: integer("payment_id").references(() => payments.id), // único por payment cuando entry_type = 'pronto_pago_surcharge' (ver ux_cash_entries_pronto_pago_payment)
   createdBy: integer("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
@@ -332,6 +334,12 @@ export const cashExpenses = sqliteTable("cash_expenses", {
   amount: real("amount").notNull(),
   category: text("category"),
   notes: text("notes"),
+  type: text("type").notNull().default("gasto_operativo"), // gasto_operativo | sueldo
+  paymentMethod: text("payment_method").notNull().default("efectivo"),
+  payeeName: text("payee_name"),
+  salaryPeriod: text("salary_period"),
+  status: text("status").notNull().default("registrado"), // registrado | conciliado | anulado
+  reconciledAt: integer("reconciled_at", { mode: "timestamp" }),
   createdBy: integer("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
@@ -343,6 +351,9 @@ export const commissionEntries = sqliteTable("commission_entries", {
   date: text("date").notNull(),
   amount: real("amount").notNull(),
   notes: text("notes"),
+  paymentMethod: text("payment_method").notNull().default("transferencia"),
+  periodMonth: text("period_month"),
+  status: text("status").notNull().default("registrado"), // registrado | anulado
   createdBy: integer("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
@@ -353,6 +364,21 @@ export const ivaEntries = sqliteTable("iva_entries", {
   companyId: integer("company_id").references(() => companies.id),
   date: text("date").notNull(),
   amount: real("amount").notNull(),
+  notes: text("notes"),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
+// ─── CAJA PROPIA ──────────────────────────────────────────────────────────────
+// CHECK en DB: type IN ('aporte','reintegro'), amount > 0,
+//              payment_method IN ('efectivo','transferencia'), status IN ('registrado','anulado')
+export const ownMoneyMovements = sqliteTable("own_money_movements", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  type: text("type").notNull(), // aporte | reintegro
+  date: text("date").notNull(),
+  amount: real("amount").notNull(), // > 0
+  paymentMethod: text("payment_method").notNull().default("efectivo"), // efectivo | transferencia
+  status: text("status").notNull().default("registrado"), // registrado | anulado
   notes: text("notes"),
   createdBy: integer("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),

@@ -24,6 +24,7 @@ import {
   remittanceItems,
   commissionEntries,
   ivaEntries,
+  ownMoneyMovements,
 } from "./database/schema";
 import { nanoid } from "nanoid";
 import {
@@ -2952,6 +2953,16 @@ app.post("/import/ssn-gde", requireAuth(async (c: any) => {
 
 // ─── CAJA ─────────────────────────────────────────────────────────────────────
 
+// Validadores compartidos por todos los handlers de Caja
+const CAJA_MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+const CAJA_DATE_RE  = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
+
+function cajaIsRealDate(s: string): boolean {
+  const [y, m, d] = s.split("-").map(Number) as [number, number, number];
+  const dt = new Date(y, m - 1, d);
+  return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d;
+}
+
 function requireAdmin(handler: any) {
   return requireAuth(async (c: any) => {
     const user = c.get ? c.get("user") : null;
@@ -3136,6 +3147,118 @@ app.patch("/cash/debts/:id/status", requireAdmin(async (c: any) => {
   return c.json(result);
 }));
 
+// ─── CAJA PROPIA: movimientos propios ────────────────────────────────────────
+
+// GET /api/cash/own-movements
+app.get("/cash/own-movements", requireAdmin(async (c: any) => {
+  const rows = await db.select().from(ownMoneyMovements)
+    .orderBy(desc(ownMoneyMovements.date)).all();
+  return c.json(rows);
+}));
+
+// POST /api/cash/own-movements
+app.post("/cash/own-movements", requireAdmin(async (c: any) => {
+  const cajaUser = c.get("cajaUser");
+  const body = await c.req.json();
+
+  if (!body.date || !CAJA_DATE_RE.test(body.date) || !cajaIsRealDate(body.date))
+    return c.json({ error: "Fecha inválida. Formato esperado: YYYY-MM-DD" }, 400);
+
+  const amount = Number(body.amount);
+  if (isNaN(amount) || amount <= 0)
+    return c.json({ error: "El monto debe ser mayor a cero" }, 400);
+
+  const type = body.type;
+  if (!["aporte", "reintegro"].includes(type))
+    return c.json({ error: "type inválido. Valores: aporte | reintegro" }, 400);
+
+  const paymentMethod = body.paymentMethod ?? "efectivo";
+  if (!["efectivo", "transferencia"].includes(paymentMethod))
+    return c.json({ error: "paymentMethod inválido. Valores: efectivo | transferencia" }, 400);
+
+  const status = body.status ?? "registrado";
+  if (!["registrado", "anulado"].includes(status))
+    return c.json({ error: "status inválido. Valores: registrado | anulado" }, 400);
+
+  if (type === "reintegro" && status === "registrado") {
+    const activos = await db.select().from(ownMoneyMovements)
+      .where(eq(ownMoneyMovements.status, "registrado")).all();
+    const totalAportes    = activos.filter((m: any) => m.type === "aporte").reduce((s: number, m: any) => s + m.amount, 0);
+    const totalReintegros = activos.filter((m: any) => m.type === "reintegro").reduce((s: number, m: any) => s + m.amount, 0);
+    if (totalAportes < totalReintegros + amount)
+      return c.json({ error: `Saldo insuficiente. Aportes: ${totalAportes.toFixed(2)}, ya reintegrado: ${totalReintegros.toFixed(2)}, disponible: ${(totalAportes - totalReintegros).toFixed(2)}` }, 400);
+  }
+
+  const result = await db.insert(ownMoneyMovements).values({
+    type,
+    date: body.date,
+    amount,
+    paymentMethod,
+    status,
+    notes: body.notes || null,
+    createdBy: cajaUser?.id ?? null,
+  }).returning().get();
+  return c.json(result, 201);
+}));
+
+// PUT /api/cash/own-movements/:id
+app.put("/cash/own-movements/:id", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json();
+
+  const existing = await db.select().from(ownMoneyMovements).where(eq(ownMoneyMovements.id, id)).get();
+  if (!existing) return c.json({ error: "No encontrado" }, 404);
+  if (existing.status === "anulado") return c.json({ error: "No se puede editar un movimiento anulado" }, 400);
+
+  if (!body.date || !CAJA_DATE_RE.test(body.date) || !cajaIsRealDate(body.date))
+    return c.json({ error: "Fecha inválida. Formato esperado: YYYY-MM-DD" }, 400);
+
+  const amount = Number(body.amount);
+  if (isNaN(amount) || amount <= 0)
+    return c.json({ error: "El monto debe ser mayor a cero" }, 400);
+
+  const type = body.type ?? existing.type;
+  if (!["aporte", "reintegro"].includes(type))
+    return c.json({ error: "type inválido. Valores: aporte | reintegro" }, 400);
+
+  const paymentMethod = body.paymentMethod ?? existing.paymentMethod ?? "efectivo";
+  if (!["efectivo", "transferencia"].includes(paymentMethod))
+    return c.json({ error: "paymentMethod inválido. Valores: efectivo | transferencia" }, 400);
+
+  const status = body.status ?? existing.status ?? "registrado";
+  if (!["registrado", "anulado"].includes(status))
+    return c.json({ error: "status inválido. Valores: registrado | anulado" }, 400);
+
+  if (type === "reintegro" && status === "registrado") {
+    const activos = await db.select().from(ownMoneyMovements)
+      .where(and(eq(ownMoneyMovements.status, "registrado"), ne(ownMoneyMovements.id, id))).all();
+    const totalAportes    = activos.filter((m: any) => m.type === "aporte").reduce((s: number, m: any) => s + m.amount, 0);
+    const totalReintegros = activos.filter((m: any) => m.type === "reintegro").reduce((s: number, m: any) => s + m.amount, 0);
+    if (totalAportes < totalReintegros + amount)
+      return c.json({ error: `Saldo insuficiente. Aportes: ${totalAportes.toFixed(2)}, ya reintegrado: ${totalReintegros.toFixed(2)}, disponible: ${(totalAportes - totalReintegros).toFixed(2)}` }, 400);
+  }
+
+  const result = await db.update(ownMoneyMovements).set({
+    type,
+    date: body.date,
+    amount,
+    paymentMethod,
+    status,
+    notes: body.notes !== undefined ? (body.notes || null) : existing.notes,
+  }).where(eq(ownMoneyMovements.id, id)).returning().get();
+  return c.json(result);
+}));
+
+// DELETE /api/cash/own-movements/:id — soft-delete
+app.delete("/cash/own-movements/:id", requireAdmin(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const existing = await db.select().from(ownMoneyMovements).where(eq(ownMoneyMovements.id, id)).get();
+  if (!existing) return c.json({ error: "No encontrado" }, 404);
+  if (existing.status === "anulado") return c.json({ error: "El movimiento ya está anulado" }, 400);
+  await db.update(ownMoneyMovements).set({ status: "anulado" }).where(eq(ownMoneyMovements.id, id));
+  return c.json({ ok: true, anulado: true });
+}));
+
 // GET /api/cash/summary — resumen completo de caja
 // Parámetros opcionales: ?month=YYYY-MM  |  ?from=YYYY-MM-DD&to=YYYY-MM-DD
 app.get("/cash/summary", requireAdmin(async (c: any) => {
@@ -3145,7 +3268,7 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
 
   // Devuelve true solo si la fecha existe en el calendario (ej. rechaza 2026-02-31)
   function isRealDate(s: string): boolean {
-    const [y, m, d] = s.split("-").map(Number);
+    const [y, m, d] = s.split("-").map(Number) as [number, number, number];
     const dt = new Date(y, m - 1, d);
     return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d;
   }
@@ -3275,9 +3398,13 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   const totalAdeudadoLegacy = debtsLegacy.reduce((s: number, d: any) => s + d.amount, 0);
   const totalAdeudado = totalAdeudadoRendiciones + totalAdeudadoLegacy;
 
-  // Gastos registrados
+  // Gastos registrados (excluye anulados)
   const allExpenses = await db.select().from(cashExpenses).all();
-  const totalGastos = allExpenses.reduce((s: number, e: any) => s + e.amount, 0);
+  const totalGastos = allExpenses.filter((e: any) => e.status !== "anulado").reduce((s: number, e: any) => s + e.amount, 0);
+
+  // Movimientos propios registrados (aportes y reintegros)
+  const ownMovements = await db.select().from(ownMoneyMovements)
+    .where(eq(ownMoneyMovements.status, "registrado")).all();
 
   // Mes y año actuales
   const now = new Date();
@@ -3286,16 +3413,16 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
 
   // Comisiones
   const allCommissions = await db
-    .select({ id: commissionEntries.id, date: commissionEntries.date, amount: commissionEntries.amount, companyId: commissionEntries.companyId, companyName: companies.name, notes: commissionEntries.notes, createdAt: commissionEntries.createdAt })
+    .select({ id: commissionEntries.id, date: commissionEntries.date, amount: commissionEntries.amount, companyId: commissionEntries.companyId, companyName: companies.name, notes: commissionEntries.notes, status: commissionEntries.status, createdAt: commissionEntries.createdAt })
     .from(commissionEntries)
     .leftJoin(companies, eq(commissionEntries.companyId, companies.id))
     .orderBy(desc(commissionEntries.date))
     .all();
   const comisionesMes = allCommissions
-    .filter((c: any) => c.date && c.date.startsWith(currentMonth))
+    .filter((c: any) => c.status !== "anulado" && c.date && c.date.startsWith(currentMonth))
     .reduce((s: number, c: any) => s + c.amount, 0);
   const comisionesAnio = allCommissions
-    .filter((c: any) => c.date && c.date.startsWith(currentYear))
+    .filter((c: any) => c.status !== "anulado" && c.date && c.date.startsWith(currentYear))
     .reduce((s: number, c: any) => s + c.amount, 0);
 
   // IVA
@@ -3312,13 +3439,23 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     .filter((i: any) => i.date && i.date.startsWith(currentYear))
     .reduce((s: number, i: any) => s + i.amount, 0);
 
-  // Gastos del mes
+  // Gastos del mes (excluye anulados)
   const gastosMes = allExpenses
-    .filter((e: any) => e.date && e.date.startsWith(currentMonth))
+    .filter((e: any) => e.status !== "anulado" && e.date && e.date.startsWith(currentMonth))
     .reduce((s: number, e: any) => s + e.amount, 0);
 
   // Ganancia neta del mes = comisiones del mes - gastos del mes
   const gananciaNeta = comisionesMes - gastosMes;
+
+  // ── Caja propia — histórico ───────────────────────────────────────────────
+  const cpComisiones  = allCommissions.filter((c: any) => c.status !== "anulado").reduce((s: number, c: any) => s + c.amount, 0);
+  const cpAportes     = ownMovements.filter((m: any) => m.type === "aporte").reduce((s: number, m: any) => s + m.amount, 0);
+  const cpReintegros  = ownMovements.filter((m: any) => m.type === "reintegro").reduce((s: number, m: any) => s + m.amount, 0);
+  const cpGastosOp    = allExpenses.filter((e: any) => e.type === "gasto_operativo" && e.status !== "anulado").reduce((s: number, e: any) => s + e.amount, 0);
+  const cpSueldos     = allExpenses.filter((e: any) => e.type === "sueldo" && e.status !== "anulado").reduce((s: number, e: any) => s + e.amount, 0);
+  const cpResultadoOp = cpComisiones - cpGastosOp - cpSueldos;
+  const cpSaldoPropio = cpComisiones + cpAportes - cpGastosOp - cpSueldos - cpReintegros;
+  const cpAportesPend = cpAportes - cpReintegros;
 
   // Pendiente de rendir actual: lo cobrado en cuentas propias que aún no fue rendido.
   // cajaNeta = cartera.total (solo ítems no rendidos, métodos propios).
@@ -3335,6 +3472,11 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   let cobradoPeriodo = 0;
   let rendidoPeriodo = 0;
   let gastosPeriodo  = 0;
+  let cpPComisiones  = 0;
+  let cpPAportes     = 0;
+  let cpPReintegros  = 0;
+  let cpPGastosOp    = 0;
+  let cpPSueldos     = 0;
 
   if (periodFrom && periodTo) {
     const DIRECTO_COMPANIA_LOCAL = ["transferencia_compania", "link_pago"];
@@ -3366,6 +3508,13 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     gastosPeriodo = allExpenses
       .filter((e: any) => e.date >= periodFrom! && e.date <= periodTo!)
       .reduce((s: number, e: any) => s + (e.amount || 0), 0);
+
+    // Caja propia del período
+    cpPComisiones = allCommissions.filter((c: any) => c.status !== "anulado" && c.date >= periodFrom! && c.date <= periodTo!).reduce((s: number, c: any) => s + c.amount, 0);
+    cpPAportes    = ownMovements.filter((m: any) => m.type === "aporte" && m.date >= periodFrom! && m.date <= periodTo!).reduce((s: number, m: any) => s + m.amount, 0);
+    cpPReintegros = ownMovements.filter((m: any) => m.type === "reintegro" && m.date >= periodFrom! && m.date <= periodTo!).reduce((s: number, m: any) => s + m.amount, 0);
+    cpPGastosOp   = allExpenses.filter((e: any) => e.type === "gasto_operativo" && e.status !== "anulado" && e.date >= periodFrom! && e.date <= periodTo!).reduce((s: number, e: any) => s + e.amount, 0);
+    cpPSueldos    = allExpenses.filter((e: any) => e.type === "sueldo" && e.status !== "anulado" && e.date >= periodFrom! && e.date <= periodTo!).reduce((s: number, e: any) => s + e.amount, 0);
   }
 
   return c.json({
@@ -3417,6 +3566,29 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
       gastos:     gastosPeriodo,
       flujoNeto:  cobradoPeriodo - rendidoPeriodo - gastosPeriodo,
     } : null,
+    cajaPropia: {
+      historico: {
+        comisiones:        cpComisiones,
+        aportes:           cpAportes,
+        reintegros:        cpReintegros,
+        gastosOperativos:  cpGastosOp,
+        sueldos:           cpSueldos,
+        resultadoOperativo: cpResultadoOp,
+        saldoPropio:       cpSaldoPropio,
+        aportesPendientes: cpAportesPend,
+      },
+      periodo: periodFrom && periodTo ? {
+        from:               periodFrom,
+        to:                 periodTo,
+        comisiones:         cpPComisiones,
+        aportes:            cpPAportes,
+        reintegros:         cpPReintegros,
+        gastosOperativos:   cpPGastosOp,
+        sueldos:            cpPSueldos,
+        resultadoOperativo: cpPComisiones - cpPGastosOp - cpPSueldos,
+        flujoPropio:        cpPComisiones + cpPAportes - cpPGastosOp - cpPSueldos - cpPReintegros,
+      } : null,
+    },
   });
 }));
 
@@ -3759,43 +3931,156 @@ app.get("/remittances/adeudados", requireAdmin(async (c: any) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // GET /api/cash/expenses
-app.get("/cash/expenses", requireAdmin(async (c: any) => {
-  const rows = await db.select().from(cashExpenses).orderBy(desc(cashExpenses.date)).all();
+// requireAuth: usuarios comunes pueden ver gasto_operativo; sueldos solo admins.
+app.get("/cash/expenses", requireAuth(async (c: any) => {
+  const user = c.get("user");
+  const isAdmin = user.role === "admin";
+  let rows = await db.select().from(cashExpenses).orderBy(desc(cashExpenses.date)).all();
+  if (!isAdmin) rows = rows.filter((e: any) => e.type !== "sueldo");
   return c.json(rows);
 }));
 
 // POST /api/cash/expenses
-app.post("/cash/expenses", requireAdmin(async (c: any) => {
+// Acceso: cualquier usuario autenticado puede crear gasto_operativo.
+// Sueldos requieren admin. payeeName y salaryPeriod son obligatorios para sueldo.
+app.post("/cash/expenses", requireAuth(async (c: any) => {
+  const user = c.get("user");
+  const isAdmin = user.role === "admin";
   const body = await c.req.json();
+
+  if (!body.date || !CAJA_DATE_RE.test(body.date) || !cajaIsRealDate(body.date))
+    return c.json({ error: "Fecha inválida. Formato esperado: YYYY-MM-DD" }, 400);
+
+  const amount = Number(body.amount);
+  if (isNaN(amount) || amount <= 0)
+    return c.json({ error: "El monto debe ser mayor a cero" }, 400);
+
+  const type = body.type ?? "gasto_operativo";
+  if (!["gasto_operativo", "sueldo"].includes(type))
+    return c.json({ error: "type inválido. Valores: gasto_operativo | sueldo" }, 400);
+  if (type === "sueldo" && !isAdmin)
+    return c.json({ error: "Solo administradores pueden registrar sueldos" }, 403);
+
+  const paymentMethod = body.paymentMethod ?? "efectivo";
+  if (!["efectivo", "transferencia"].includes(paymentMethod))
+    return c.json({ error: "paymentMethod inválido. Valores: efectivo | transferencia" }, 400);
+
+  const status = body.status ?? "registrado";
+  if (!["registrado", "conciliado", "anulado"].includes(status))
+    return c.json({ error: "status inválido. Valores: registrado | conciliado | anulado" }, 400);
+  if (status === "conciliado" && !isAdmin)
+    return c.json({ error: "Solo administradores pueden marcar gastos como conciliados" }, 403);
+
+  const payeeName = body.payeeName || null;
+  const salaryPeriod = body.salaryPeriod || null;
+
+  if (type === "sueldo") {
+    if (!payeeName)
+      return c.json({ error: "Para sueldos, payeeName es obligatorio" }, 400);
+    if (!salaryPeriod || !CAJA_MONTH_RE.test(salaryPeriod))
+      return c.json({ error: "Para sueldos, salaryPeriod es obligatorio y debe tener formato YYYY-MM" }, 400);
+  }
+  if (salaryPeriod && !CAJA_MONTH_RE.test(salaryPeriod))
+    return c.json({ error: "salaryPeriod inválido. Formato esperado: YYYY-MM" }, 400);
+
+  const reconciledAt = status === "conciliado" ? new Date() : null;
+
   const result = await db.insert(cashExpenses).values({
     date: body.date,
     description: body.description,
-    amount: Number(body.amount),
+    amount,
     category: body.category || null,
     notes: body.notes || null,
+    type,
+    paymentMethod,
+    payeeName,
+    salaryPeriod,
+    status,
+    reconciledAt,
+    createdBy: user.id,
   }).returning().get();
-  return c.json(result);
+  return c.json(result, 201);
 }));
 
 // PUT /api/cash/expenses/:id
-app.put("/cash/expenses/:id", requireAdmin(async (c: any) => {
+app.put("/cash/expenses/:id", requireAuth(async (c: any) => {
+  const user = c.get("user");
+  const isAdmin = user.role === "admin";
   const id = Number(c.req.param("id"));
   const body = await c.req.json();
+
+  const existing = await db.select().from(cashExpenses).where(eq(cashExpenses.id, id)).get();
+  if (!existing) return c.json({ error: "No encontrado" }, 404);
+  if (existing.type === "sueldo" && !isAdmin)
+    return c.json({ error: "Solo administradores pueden modificar sueldos" }, 403);
+
+  if (!body.date || !CAJA_DATE_RE.test(body.date) || !cajaIsRealDate(body.date))
+    return c.json({ error: "Fecha inválida. Formato esperado: YYYY-MM-DD" }, 400);
+
+  const amount = Number(body.amount);
+  if (isNaN(amount) || amount <= 0)
+    return c.json({ error: "El monto debe ser mayor a cero" }, 400);
+
+  const type = body.type ?? existing.type ?? "gasto_operativo";
+  if (!["gasto_operativo", "sueldo"].includes(type))
+    return c.json({ error: "type inválido. Valores: gasto_operativo | sueldo" }, 400);
+  if (type === "sueldo" && !isAdmin)
+    return c.json({ error: "Solo administradores pueden registrar sueldos" }, 403);
+
+  const paymentMethod = body.paymentMethod ?? existing.paymentMethod ?? "efectivo";
+  if (!["efectivo", "transferencia"].includes(paymentMethod))
+    return c.json({ error: "paymentMethod inválido. Valores: efectivo | transferencia" }, 400);
+
+  const status = body.status ?? existing.status ?? "registrado";
+  if (!["registrado", "conciliado", "anulado"].includes(status))
+    return c.json({ error: "status inválido. Valores: registrado | conciliado | anulado" }, 400);
+  if (status === "conciliado" && !isAdmin)
+    return c.json({ error: "Solo administradores pueden marcar gastos como conciliados" }, 403);
+
+  const payeeName = body.payeeName !== undefined ? (body.payeeName || null) : existing.payeeName;
+  const salaryPeriod = body.salaryPeriod !== undefined ? (body.salaryPeriod || null) : existing.salaryPeriod;
+
+  if (type === "sueldo") {
+    if (!payeeName)
+      return c.json({ error: "Para sueldos, payeeName es obligatorio" }, 400);
+    if (!salaryPeriod || !CAJA_MONTH_RE.test(salaryPeriod))
+      return c.json({ error: "Para sueldos, salaryPeriod es obligatorio y debe tener formato YYYY-MM" }, 400);
+  }
+  if (salaryPeriod && !CAJA_MONTH_RE.test(salaryPeriod))
+    return c.json({ error: "salaryPeriod inválido. Formato esperado: YYYY-MM" }, 400);
+
+  let reconciledAt: Date | null = existing.reconciledAt ?? null;
+  if (status === "conciliado" && !reconciledAt) reconciledAt = new Date();
+  if (status !== "conciliado") reconciledAt = null;
+
   const result = await db.update(cashExpenses).set({
     date: body.date,
     description: body.description,
-    amount: Number(body.amount),
-    category: body.category || null,
-    notes: body.notes || null,
+    amount,
+    category: body.category !== undefined ? (body.category || null) : existing.category,
+    notes: body.notes !== undefined ? (body.notes || null) : existing.notes,
+    type,
+    paymentMethod,
+    payeeName,
+    salaryPeriod,
+    status,
+    reconciledAt,
   }).where(eq(cashExpenses.id, id)).returning().get();
   return c.json(result);
 }));
 
-// DELETE /api/cash/expenses/:id
-app.delete("/cash/expenses/:id", requireAdmin(async (c: any) => {
+// DELETE /api/cash/expenses/:id — soft-delete: marca status = 'anulado'.
+// Para sueldos requiere admin. Preserva historial de caja propia.
+app.delete("/cash/expenses/:id", requireAuth(async (c: any) => {
+  const user = c.get("user");
+  const isAdmin = user.role === "admin";
   const id = Number(c.req.param("id"));
-  await db.delete(cashExpenses).where(eq(cashExpenses.id, id));
-  return c.json({ ok: true });
+  const existing = await db.select().from(cashExpenses).where(eq(cashExpenses.id, id)).get();
+  if (!existing) return c.json({ error: "No encontrado" }, 404);
+  if (existing.type === "sueldo" && !isAdmin)
+    return c.json({ error: "Solo administradores pueden anular sueldos" }, 403);
+  await db.update(cashExpenses).set({ status: "anulado" }).where(eq(cashExpenses.id, id));
+  return c.json({ ok: true, anulado: true });
 }));
 
 // ─── COMISIONES ──────────────────────────────────────────────────────────────
@@ -3803,7 +4088,19 @@ app.delete("/cash/expenses/:id", requireAdmin(async (c: any) => {
 // GET /api/cash/commissions
 app.get("/cash/commissions", requireAdmin(async (c: any) => {
   const rows = await db
-    .select({ id: commissionEntries.id, date: commissionEntries.date, amount: commissionEntries.amount, companyId: commissionEntries.companyId, companyName: companies.name, notes: commissionEntries.notes, createdAt: commissionEntries.createdAt })
+    .select({
+      id: commissionEntries.id,
+      date: commissionEntries.date,
+      amount: commissionEntries.amount,
+      companyId: commissionEntries.companyId,
+      companyName: companies.name,
+      notes: commissionEntries.notes,
+      paymentMethod: commissionEntries.paymentMethod,
+      periodMonth: commissionEntries.periodMonth,
+      status: commissionEntries.status,
+      createdBy: commissionEntries.createdBy,
+      createdAt: commissionEntries.createdAt,
+    })
     .from(commissionEntries)
     .leftJoin(companies, eq(commissionEntries.companyId, companies.id))
     .orderBy(desc(commissionEntries.date))
@@ -3813,12 +4110,37 @@ app.get("/cash/commissions", requireAdmin(async (c: any) => {
 
 // POST /api/cash/commissions
 app.post("/cash/commissions", requireAdmin(async (c: any) => {
+  const user = c.get("cajaUser") || c.get("user");
   const body = await c.req.json();
+
+  if (!body.date || !CAJA_DATE_RE.test(body.date) || !cajaIsRealDate(body.date))
+    return c.json({ error: "Fecha inválida. Formato esperado: YYYY-MM-DD" }, 400);
+
+  const amount = Number(body.amount);
+  if (isNaN(amount) || amount <= 0)
+    return c.json({ error: "El monto debe ser mayor a cero" }, 400);
+
+  const paymentMethod = body.paymentMethod ?? "transferencia";
+  if (!["efectivo", "transferencia"].includes(paymentMethod))
+    return c.json({ error: "paymentMethod inválido. Valores: efectivo | transferencia" }, 400);
+
+  const periodMonth = body.periodMonth ?? null;
+  if (periodMonth !== null && !CAJA_MONTH_RE.test(periodMonth))
+    return c.json({ error: "periodMonth inválido. Formato esperado: YYYY-MM (ej. 2025-06)" }, 400);
+
+  const status = body.status ?? "registrado";
+  if (!["registrado", "anulado"].includes(status))
+    return c.json({ error: "status inválido. Valores: registrado | anulado" }, 400);
+
   const result = await db.insert(commissionEntries).values({
     companyId: body.companyId ? Number(body.companyId) : null,
     date: body.date,
-    amount: Number(body.amount),
+    amount,
     notes: body.notes || null,
+    paymentMethod,
+    periodMonth,
+    status,
+    createdBy: user?.id ?? null,
   }).returning().get();
   return c.json(result, 201);
 }));
@@ -3827,21 +4149,50 @@ app.post("/cash/commissions", requireAdmin(async (c: any) => {
 app.put("/cash/commissions/:id", requireAdmin(async (c: any) => {
   const id = Number(c.req.param("id"));
   const body = await c.req.json();
+
+  if (!body.date || !CAJA_DATE_RE.test(body.date) || !cajaIsRealDate(body.date))
+    return c.json({ error: "Fecha inválida. Formato esperado: YYYY-MM-DD" }, 400);
+
+  const amount = Number(body.amount);
+  if (isNaN(amount) || amount <= 0)
+    return c.json({ error: "El monto debe ser mayor a cero" }, 400);
+
+  const paymentMethod = body.paymentMethod ?? "transferencia";
+  if (!["efectivo", "transferencia"].includes(paymentMethod))
+    return c.json({ error: "paymentMethod inválido. Valores: efectivo | transferencia" }, 400);
+
+  const periodMonth = body.periodMonth ?? null;
+  if (periodMonth !== null && !CAJA_MONTH_RE.test(periodMonth))
+    return c.json({ error: "periodMonth inválido. Formato esperado: YYYY-MM" }, 400);
+
+  const status = body.status ?? "registrado";
+  if (!["registrado", "anulado"].includes(status))
+    return c.json({ error: "status inválido. Valores: registrado | anulado" }, 400);
+
   const result = await db.update(commissionEntries).set({
     companyId: body.companyId ? Number(body.companyId) : null,
     date: body.date,
-    amount: Number(body.amount),
+    amount,
     notes: body.notes || null,
+    paymentMethod,
+    periodMonth,
+    status,
   }).where(eq(commissionEntries.id, id)).returning().get();
   if (!result) return c.json({ error: "No encontrado" }, 404);
   return c.json(result);
 }));
 
-// DELETE /api/cash/commissions/:id
+// DELETE /api/cash/commissions/:id — soft-delete: marca status = 'anulado'.
+// Se preserva el historial ahora que existe el campo status; el DELETE físico
+// quedaría sin audit trail y rompería cálculos retrospectivos.
 app.delete("/cash/commissions/:id", requireAdmin(async (c: any) => {
   const id = Number(c.req.param("id"));
-  await db.delete(commissionEntries).where(eq(commissionEntries.id, id));
-  return c.json({ ok: true });
+  const result = await db.update(commissionEntries)
+    .set({ status: "anulado" })
+    .where(eq(commissionEntries.id, id))
+    .returning().get();
+  if (!result) return c.json({ error: "No encontrado" }, 404);
+  return c.json({ ok: true, anulado: true });
 }));
 
 // ─── IVA ─────────────────────────────────────────────────────────────────────
