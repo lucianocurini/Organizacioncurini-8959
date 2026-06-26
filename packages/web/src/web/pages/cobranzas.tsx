@@ -63,6 +63,8 @@ interface PaymentRow {
     periodMonth: string | null;
     notes: string | null;
     status: string;
+    rendered: number;
+    hasSurcharge: boolean;
   };
   policy: { id: number; policyNumber: string } | null;
   insured: { id: number; name: string } | null;
@@ -72,6 +74,7 @@ interface PaymentRow {
 interface PolicyOption {
   policy: { id: number; policyNumber: string };
   insured: { name: string } | null;
+  company: { id: number; name: string } | null;
 }
 
 interface Stats {
@@ -90,6 +93,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
   const [saving, setSaving] = useState(false);
   const [manualMode, setManualMode] = useState(false);
   const [installments, setInstallments] = useState<any[]>([]);
+  const [applyProntoPagoSurcharge, setApplyProntoPagoSurcharge] = useState(true);
   const [form, setForm] = useState({
     policyId: "",
     installmentId: "",
@@ -124,10 +128,12 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
         notes: editing.payment.notes || "",
         status: editing.payment.status,
       });
+      setApplyProntoPagoSurcharge(editing.payment.hasSurcharge);
       if (pId) api.get(`/api/policies/${pId}/installments`).then(setInstallments).catch(() => setInstallments([]));
     } else {
       setManualMode(false);
       setInstallments([]);
+      setApplyProntoPagoSurcharge(true);
       setForm({
         policyId: "", installmentId: "", manualPayer: "", manualPolicyNumber: "", manualCompany: "",
         amount: "", paymentMethod: "efectivo",
@@ -189,14 +195,31 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
       body.manualPolicyNumber = null;
       body.manualCompany = null;
     }
+    const isRivadaviaBody = manualMode
+      ? form.manualCompany.toLowerCase().includes("rivadavia")
+      : (selectedPolicy?.company?.name?.toLowerCase().includes("rivadavia") ?? false);
+    const isOwnMethodBody = ["efectivo", "transferencia", "cheque"].includes(form.paymentMethod);
+    if (isRivadaviaBody && isOwnMethodBody) {
+      body.applyProntoPagoSurcharge = applyProntoPagoSurcharge;
+    }
     try {
       if (editing) await api.put(`/api/payments/${editing.payment.id}`, body);
       else await api.post("/api/payments", body);
       toast.success(editing ? "Pago actualizado" : "Pago imputado");
       onSaved(); onClose();
-    } catch { toast.error("Error al guardar"); }
+    } catch (err: any) {
+      const msg = err?.message || "";
+      toast.error(msg.includes("rendido") ? msg : "Error al guardar");
+    }
     setSaving(false);
   }
+
+  const isRendered = !!(editing && editing.payment.rendered === 1);
+  const isRivadaviaSrc = manualMode
+    ? form.manualCompany.toLowerCase().includes("rivadavia")
+    : (selectedPolicy?.company?.name?.toLowerCase().includes("rivadavia") ?? false);
+  const isOwnMethodSrc = ["efectivo", "transferencia", "cheque"].includes(form.paymentMethod);
+  const showSurchargeCheckbox = isRivadaviaSrc && isOwnMethodSrc;
 
   if (!open) return null;
 
@@ -209,6 +232,11 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
           <button onClick={onClose} className="text-gray-400 hover:text-white transition-colors"><X className="w-5 h-5" /></button>
         </div>
         <div className="p-6 space-y-4 max-h-[80vh] overflow-y-auto">
+          {isRendered && (
+            <div className="p-3 bg-amber-900/20 border border-amber-500/20 rounded-lg">
+              <p className="text-xs text-amber-400">Este pago ya fue rendido. Solo podés editar las notas.</p>
+            </div>
+          )}
 
           {/* Toggle manual/póliza */}
           <div className="flex rounded-lg border border-[#2d3748] overflow-hidden text-sm">
@@ -353,6 +381,27 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
             </div>
           </div>
 
+          {/* Recargo Pronto Pago (solo Rivadavia + método propio) */}
+          {showSurchargeCheckbox && (
+            isRendered ? (
+              <div className="p-3 bg-purple-900/20 border border-purple-500/20 rounded-lg">
+                <span className="text-xs text-purple-400">
+                  Recargo Pronto Pago: {editing?.payment.hasSurcharge ? "aplicado ($800)" : "no aplicado"}
+                </span>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 p-3 bg-purple-900/20 border border-purple-500/20 rounded-lg cursor-pointer"
+                onClick={() => setApplyProntoPagoSurcharge(v => !v)}>
+                <input type="checkbox" id="pp-surcharge" checked={applyProntoPagoSurcharge}
+                  onChange={e => setApplyProntoPagoSurcharge(e.target.checked)}
+                  className="w-4 h-4 accent-purple-500" />
+                <label htmlFor="pp-surcharge" className="text-xs text-purple-300 cursor-pointer">
+                  Registrar recargo Pronto Pago ($800) — Rivadavia
+                </label>
+              </div>
+            )
+          )}
+
           {/* Fechas */}
           <div className="grid grid-cols-2 gap-4">
             <div>
@@ -425,9 +474,14 @@ function CobranzasTab() {
 
   async function handleDelete(id: number) {
     if (!confirm("¿Eliminar este pago?")) return;
-    await api.delete(`/api/payments/${id}`);
-    toast.success("Pago eliminado");
-    load();
+    try {
+      await api.delete(`/api/payments/${id}`);
+      toast.success("Pago eliminado");
+      load();
+    } catch (err: any) {
+      const msg = err?.message || "";
+      toast.error(msg.includes("rendido") ? msg : "Error al eliminar el pago");
+    }
   }
 
   const filtered = payments.filter(r => {
@@ -743,8 +797,7 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
   const [canal, setCanal] = useState("directo");
   const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
   const [notes, setNotes] = useState("");
-  const [prontoPagoSurcharge, setProntoPagoSurcharge] = useState("800");
-  const [breakdown, setBreakdown] = useState({ efectivo: "", transferencia: "", cheque: "", pronto_pago: "" });
+  const [breakdown, setBreakdown] = useState({ efectivo: "", transferencia: "", cheque: "" });
   const [debtorItems, setDebtorItems] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
 
@@ -803,15 +856,22 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
     setManualItems(prev => prev.filter(i => i._uid !== uid));
   }
 
-  const selectedCobradas = pending.filter(i => selected.has(key(i)));
+  const pendingVisible = pending.filter((i: any) => i.entryType !== "pronto_pago_surcharge");
+  const selectedCobradas = pendingVisible.filter((i: any) => selected.has(key(i)));
   const selectedItems = [...selectedCobradas, ...manualItems];
   const totalSeleccionado = selectedItems.reduce((s, i) => s + i.amount, 0);
   const totalBreakdown = (Number(breakdown.efectivo) || 0) + (Number(breakdown.transferencia) || 0) +
-    (Number(breakdown.cheque) || 0) + (Number(breakdown.pronto_pago) || 0);
-  const rivadaviaItems = selectedItems.filter(i => i.companyName?.toLowerCase().includes("rivadavia"));
-  const surchargeTotal = canal === "pronto_pago" ? rivadaviaItems.length * (Number(prontoPagoSurcharge) || 0) : 0;
+    (Number(breakdown.cheque) || 0);
+  const autoSurchargeItems = canal === "pronto_pago"
+    ? selectedCobradas.filter((i: any) => i.source === "payment" && i.hasSurcharge)
+    : [];
+  const rivadaviaNoSurchargeItems = canal === "pronto_pago"
+    ? selectedCobradas.filter((i: any) => i.source === "payment" && !i.hasSurcharge && (i.companyName as string | undefined)?.toLowerCase().includes("rivadavia"))
+    : [];
+  const autoSurchargeTotal = autoSurchargeItems.length * 800;
+  const expectedTotal = totalSeleccionado + autoSurchargeTotal;
 
-  const filteredPending = pending.filter(i => {
+  const filteredPending = pendingVisible.filter((i: any) => {
     if (!search) return true;
     const q = search.toLowerCase();
     return i.clientName?.toLowerCase().includes(q) || i.policyNumber?.toLowerCase().includes(q) ||
@@ -820,8 +880,8 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
 
   // Agrupar por método para mostrar separador
   const DIRECTO = ["transferencia_compania", "link_pago"];
-  const propios = filteredPending.filter(i => !DIRECTO.includes(i.paymentMethod));
-  const directos = filteredPending.filter(i => DIRECTO.includes(i.paymentMethod));
+  const propios = filteredPending.filter((i: any) => !DIRECTO.includes(i.paymentMethod));
+  const directos = filteredPending.filter((i: any) => DIRECTO.includes(i.paymentMethod));
 
   async function save() {
     if (selectedItems.length === 0) { toast.error("Seleccioná al menos una cuota"); return; }
@@ -831,14 +891,13 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
       if (Number(breakdown.efectivo) > 0) bd.efectivo = Number(breakdown.efectivo);
       if (Number(breakdown.transferencia) > 0) bd.transferencia = Number(breakdown.transferencia);
       if (Number(breakdown.cheque) > 0) bd.cheque = Number(breakdown.cheque);
-      if (Number(breakdown.pronto_pago) > 0) bd.pronto_pago = Number(breakdown.pronto_pago);
 
       await api.post("/api/remittances", {
         date,
         canal,
         notes: notes || null,
         paymentBreakdown: bd,
-        prontoPagoSurcharge: canal === "pronto_pago" ? Number(prontoPagoSurcharge) || 0 : 0,
+        prontoPagoSurcharge: canal === "pronto_pago" ? 800 : 0,
         items: selectedItems.map(i => ({
           source: i.source,
           sourceId: i.sourceId,
@@ -853,7 +912,7 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
       toast.success("Rendición registrada");
       onSaved();
       onClose();
-    } catch { toast.error("Error al guardar rendición"); }
+    } catch (err: any) { toast.error(err?.message || "Error al guardar rendición"); }
     setSaving(false);
   }
 
@@ -891,7 +950,7 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
 
                 {loadingPending ? (
                   <div className="text-center py-6 text-white/30 text-sm">Cargando cobros pendientes...</div>
-                ) : pending.length === 0 ? (
+                ) : pendingVisible.length === 0 ? (
                   <div className="text-center py-6 text-white/30 text-sm">No hay cobros pendientes de rendir.</div>
                 ) : (
                   <div className="space-y-3">
@@ -920,6 +979,9 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                                   <span className={cn("text-xs px-1.5 py-0.5 rounded border", METHOD_COLORS[item.paymentMethod] || "text-gray-400 border-gray-500/30")}>
                                     {METHOD_LABELS[item.paymentMethod] || item.paymentMethod}
                                   </span>
+                                  {item.hasSurcharge && canal === "pronto_pago" && (
+                                    <span className="block text-xs text-purple-400 mt-0.5">+$800 PP</span>
+                                  )}
                                 </div>
                                 {sel && (
                                   <button type="button" onClick={e => { e.stopPropagation(); toggleDebtor(item); }}
@@ -1083,19 +1145,22 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                 </div>
               </div>
 
-              {canal === "pronto_pago" && (
+              {canal === "pronto_pago" && autoSurchargeItems.length > 0 && (
                 <div className="bg-purple-900/20 border border-purple-500/20 rounded-lg p-3 flex items-center gap-3">
                   <AlertCircle size={16} className="text-purple-400 shrink-0" />
-                  <div className="flex-1">
-                    <p className="text-xs text-purple-300">Cargo extra por cuota en Pronto Pago</p>
-                    <p className="text-xs text-white/40">Se suma al total rendido</p>
+                  <div>
+                    <p className="text-xs text-purple-300">Recargo Pronto Pago: $800 por pago de Rivadavia</p>
+                    <p className="text-xs text-white/40">Se incluye automáticamente al confirmar</p>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-white/50">$</span>
-                    <input type="number" value={prontoPagoSurcharge} onChange={e => setProntoPagoSurcharge(e.target.value)}
-                      className="w-20 px-2 py-1 bg-white/5 border border-white/10 rounded text-sm text-white text-right focus:outline-none focus:border-purple-500" />
-                    <span className="text-xs text-white/40">por cuota</span>
-                  </div>
+                </div>
+              )}
+
+              {rivadaviaNoSurchargeItems.length > 0 && (
+                <div className="bg-yellow-900/20 border border-yellow-500/30 rounded-lg p-3 flex items-center gap-3">
+                  <AlertCircle size={16} className="text-yellow-400 shrink-0" />
+                  <p className="text-xs text-yellow-300">
+                    Hay {rivadaviaNoSurchargeItems.length} pago{rivadaviaNoSurchargeItems.length > 1 ? "s" : ""} de Rivadavia sin recargo Pronto Pago registrado. No se sumarán $800 automáticamente.
+                  </p>
                 </div>
               )}
 
@@ -1103,18 +1168,17 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
               <div>
                 <label className="text-xs text-white/50 mb-2 block">Cómo se paga a la compañía (puede mezclar métodos)</label>
                 <div className="grid grid-cols-2 gap-3">
-                  {[
+                  {([
                     { k: "efectivo", label: "Efectivo", color: "text-green-400" },
                     { k: "transferencia", label: "Transferencia", color: "text-blue-400" },
                     { k: "cheque", label: "Cheque", color: "text-yellow-400" },
-                    { k: "pronto_pago", label: "Pronto Pago", color: "text-purple-400" },
-                  ].map(({ k, label, color }) => (
+                  ] as { k: keyof typeof breakdown; label: string; color: string }[]).map(({ k, label, color }) => (
                     <div key={k}>
                       <label className={cn("text-xs mb-1 block", color)}>{label}</label>
                       <div className="flex items-center gap-1">
                         <span className="text-xs text-white/40">$</span>
                         <input type="number" placeholder="0"
-                          value={(breakdown as any)[k]} onChange={e => setBreakdown(b => ({ ...b, [k]: e.target.value }))}
+                          value={breakdown[k]} onChange={e => setBreakdown(b => ({ ...b, [k]: e.target.value }))}
                           className="flex-1 px-2 py-1.5 bg-white/5 border border-white/10 rounded-lg text-sm text-white focus:outline-none focus:border-blue-500" />
                       </div>
                     </div>
@@ -1122,17 +1186,17 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                 </div>
                 <div className="mt-3 flex justify-between items-center text-sm">
                   <span className="text-white/40">Total a rendir:</span>
-                  <span className={cn("font-bold", Math.abs(totalBreakdown - totalSeleccionado) > 1 ? "text-red-400" : "text-green-400")}>
+                  <span className={cn("font-bold", Math.abs(totalBreakdown - expectedTotal) > 1 ? "text-red-400" : "text-green-400")}>
                     {fmt(totalBreakdown)}
-                    {Math.abs(totalBreakdown - totalSeleccionado) > 1 && (
-                      <span className="text-xs font-normal text-red-400/70 ml-2">(cuotas: {fmt(totalSeleccionado)})</span>
+                    {Math.abs(totalBreakdown - expectedTotal) > 1 && (
+                      <span className="text-xs font-normal text-red-400/70 ml-2">(esperado: {fmt(expectedTotal)})</span>
                     )}
                   </span>
                 </div>
-                {canal === "pronto_pago" && (
+                {canal === "pronto_pago" && autoSurchargeItems.length > 0 && (
                   <div className="mt-1 flex justify-between items-center text-xs text-white/40">
-                    <span>Cargo extra Pronto Pago ({rivadaviaItems.length} cuotas Rivadavia × {"$"}{prontoPagoSurcharge}):</span>
-                    <span className="text-purple-400">+{fmt(surchargeTotal)}</span>
+                    <span>Recargo PP ({autoSurchargeItems.length} cuotas × $800 — auto-incluido):</span>
+                    <span className="text-purple-400">+{fmt(autoSurchargeTotal)}</span>
                   </div>
                 )}
               </div>
@@ -1254,7 +1318,7 @@ function RendicionesTab() {
       <div className="grid grid-cols-3 gap-4">
         {[
           { label: "Total rendido", value: fmt(totalRendido), color: "text-blue-400", bg: "bg-blue-900/20 border-blue-500/20" },
-          { label: "Cuotas rendidas", value: String(totalCuotas), color: "text-white", bg: "bg-white/5 border-white/10" },
+          { label: "Ítems rendidos", value: String(totalCuotas), color: "text-white", bg: "bg-white/5 border-white/10" },
           { label: "Adeudado en rendiciones", value: fmt(totalAdeudado), color: "text-red-400", bg: "bg-red-900/20 border-red-500/20" },
         ].map(({ label, value, color, bg }) => (
           <div key={label} className={cn("rounded-lg border px-4 py-3", bg)}>
@@ -1304,7 +1368,7 @@ function RendicionesTab() {
                       </span>
                     </div>
                     <div>
-                      <p className="text-xs text-white/40">{r.itemCount} cuotas{r.adeudadoCount > 0 ? ` · ${r.adeudadoCount} adeudadas` : ""}</p>
+                      <p className="text-xs text-white/40">{r.itemCount} ítem{r.itemCount !== 1 ? "s" : ""}{r.adeudadoCount > 0 ? ` · ${r.adeudadoCount} adeudados` : ""}</p>
                       <p className="text-sm font-semibold text-white">{fmt(r.totalAmount)}</p>
                     </div>
                     <div>

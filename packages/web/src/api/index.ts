@@ -37,6 +37,9 @@ import { parseElNorteTxtV2 } from "../lib/parsers/el-norte-v2";
 
 const app = new Hono().basePath("/api");
 
+const SURCHARGE_AMOUNT = 800;
+const SURCHARGE_OWN_METHODS = ["efectivo", "transferencia", "cheque"] as const;
+
 // ─── Auth Middleware ───────────────────────────────────────────────────────────
 async function getUser(c: any) {
   const sessionId = c.req.header("x-session-id");
@@ -623,16 +626,53 @@ app.get("/payments", requireAuth(async (c: any) => {
   if (status) results = results.filter((r) => r.payment.status === status);
   if (from) results = results.filter((r) => r.payment.paymentDate >= from);
   if (to) results = results.filter((r) => r.payment.paymentDate <= to);
-  return c.json(results, 200);
+  const paymentIds = results.map(r => r.payment.id);
+  const surchargeSet = new Set<number>();
+  if (paymentIds.length > 0) {
+    const sRows = await db.select({ paymentId: cashEntries.paymentId })
+      .from(cashEntries)
+      .where(and(inArray(cashEntries.paymentId, paymentIds), eq(cashEntries.entryType, "pronto_pago_surcharge")))
+      .all();
+    for (const s of sRows) { if (s.paymentId != null) surchargeSet.add(s.paymentId); }
+  }
+  return c.json(results.map(r => ({ ...r, payment: { ...r.payment, hasSurcharge: surchargeSet.has(r.payment.id) } })), 200);
 }));
 
 app.post("/payments", requireAuth(async (c: any) => {
   const user = c.get("user");
   const body = await c.req.json();
   const hasPolicyId = body.policyId != null && body.policyId !== "";
-  const [payment] = await db
-    .insert(payments)
-    .values({
+  const paymentStatus = body.status || "confirmado";
+
+  // Resolve company/insured from DB (never trust frontend for surcharge decision)
+  let resolvedCompany: string | null = null;
+  let resolvedClient: string | null = null;
+  let resolvedPolicyNumber: string | null = null;
+  if (hasPolicyId) {
+    const pRow = await db.select({
+      companyName: companies.name,
+      insuredName: insureds.name,
+      policyNumber: policies.policyNumber,
+    }).from(policies)
+      .innerJoin(companies, eq(policies.companyId, companies.id))
+      .innerJoin(insureds, eq(policies.insuredId, insureds.id))
+      .where(eq(policies.id, Number(body.policyId))).get();
+    resolvedCompany = pRow?.companyName ?? null;
+    resolvedClient = pRow?.insuredName ?? null;
+    resolvedPolicyNumber = pRow?.policyNumber ?? null;
+  } else {
+    resolvedCompany = body.manualCompany ?? null;
+    resolvedClient = body.manualPayer ?? null;
+    resolvedPolicyNumber = body.manualPolicyNumber ?? null;
+  }
+
+  const isRivadavia = resolvedCompany?.toLowerCase().includes("rivadavia") ?? false;
+  const isOwnMethod = (SURCHARGE_OWN_METHODS as readonly string[]).includes(body.paymentMethod);
+  const isConfirmed = paymentStatus === "confirmado";
+  const shouldCreateSurcharge = isRivadavia && isOwnMethod && isConfirmed && body.applyProntoPagoSurcharge !== false;
+
+  const [payment] = await db.transaction(async (tx) => {
+    const [p] = await tx.insert(payments).values({
       policyId: hasPolicyId ? Number(body.policyId) : null,
       installmentId: body.installmentId ? Number(body.installmentId) : null,
       manualPayer: body.manualPayer || null,
@@ -643,25 +683,52 @@ app.post("/payments", requireAuth(async (c: any) => {
       paymentDate: body.paymentDate,
       periodMonth: body.periodMonth || null,
       notes: body.notes || null,
-      status: body.status || "confirmado",
+      status: paymentStatus,
       createdBy: user.id,
-    })
-    .returning();
-  // If linked to installment, mark it as pagada
-  if (body.installmentId && (body.status || "confirmado") === "confirmado") {
-    await db.update(policyInstallments).set({ status: "pagada" }).where(eq(policyInstallments.id, Number(body.installmentId)));
-  }
+    }).returning();
+
+    if (body.installmentId && isConfirmed) {
+      await tx.update(policyInstallments).set({ status: "pagada" })
+        .where(eq(policyInstallments.id, Number(body.installmentId)));
+    }
+
+    if (shouldCreateSurcharge) {
+      const existing = await db.select({ id: cashEntries.id }).from(cashEntries)
+        .where(and(eq(cashEntries.paymentId, p.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).get();
+      if (!existing) {
+        await tx.insert(cashEntries).values({
+          clientName: resolvedClient ?? "—",
+          policyNumber: resolvedPolicyNumber ?? null,
+          companyName: resolvedCompany ?? null,
+          amount: SURCHARGE_AMOUNT,
+          paymentMethod: body.paymentMethod,
+          paymentDate: body.paymentDate,
+          entryType: "pronto_pago_surcharge",
+          paymentId: p.id,
+          rendered: 0,
+          notes: "Recargo Pronto Pago Rivadavia",
+          createdBy: user.id,
+        });
+      }
+    }
+
+    return [p];
+  });
+
   return c.json(payment, 201);
 }));
 
 app.put("/payments/:id", requireAuth(async (c: any) => {
   const body = await c.req.json();
   const id = Number(c.req.param("id"));
+
+  const current = await db.select().from(payments).where(eq(payments.id, id)).get();
+  if (!current) return c.json({ error: "Pago no encontrado" }, 404);
+
   const update: any = {};
-  const fields = ["policyId", "installmentId", "manualPayer", "manualPolicyNumber", "manualCompany", "amount", "paymentMethod", "paymentDate", "periodMonth", "notes", "status"];
-  for (const f of fields) {
-    if (f in body) update[f] = body[f];
-  }
+  const fields = ["policyId", "installmentId", "manualPayer", "manualPolicyNumber", "manualCompany",
+    "amount", "paymentMethod", "paymentDate", "periodMonth", "notes", "status"];
+  for (const f of fields) { if (f in body) update[f] = body[f]; }
   if ("policyId" in update && (update.policyId === "" || update.policyId == null)) {
     update.policyId = null;
   } else if ("policyId" in update) {
@@ -672,12 +739,117 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
   } else if ("installmentId" in update) {
     update.installmentId = Number(update.installmentId);
   }
-  const [payment] = await db.update(payments).set(update).where(eq(payments.id, id)).returning();
+
+  const CONTABLE = ["amount", "paymentMethod", "paymentDate", "policyId", "installmentId", "manualCompany", "status"];
+  const hasContableChange = CONTABLE.some(f => f in update);
+  if (current.rendered && hasContableChange) {
+    return c.json({ error: "Este pago ya fue rendido. Anulá la rendición primero." }, 409);
+  }
+
+  // Read existing surcharge before transaction
+  const existingSurcharge = await db.select().from(cashEntries)
+    .where(and(eq(cashEntries.paymentId, id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).get();
+
+  if (body.applyProntoPagoSurcharge === false && existingSurcharge?.rendered) {
+    return c.json({ error: "El recargo ya fue rendido. Anulá la rendición primero." }, 409);
+  }
+
+  // Effective values after update (for surcharge sync/creation)
+  const effectivePolicyId = ("policyId" in update ? update.policyId : current.policyId) as number | null;
+  const effectivePaymentMethod = ("paymentMethod" in update ? update.paymentMethod : current.paymentMethod) as string;
+  const effectivePaymentDate = ("paymentDate" in update ? update.paymentDate : current.paymentDate) as string;
+  const effectiveStatus = ("status" in update ? update.status : current.status) as string;
+
+  // Resolve company/insured (needed unless we're only deleting the surcharge)
+  let resolvedCompany: string | null = null;
+  let resolvedClient: string | null = null;
+  let resolvedPolicyNumber: string | null = null;
+  if (body.applyProntoPagoSurcharge !== false) {
+    if (effectivePolicyId) {
+      const pRow = await db.select({
+        companyName: companies.name,
+        insuredName: insureds.name,
+        policyNumber: policies.policyNumber,
+      }).from(policies)
+        .innerJoin(companies, eq(policies.companyId, companies.id))
+        .innerJoin(insureds, eq(policies.insuredId, insureds.id))
+        .where(eq(policies.id, effectivePolicyId)).get();
+      resolvedCompany = pRow?.companyName ?? null;
+      resolvedClient = pRow?.insuredName ?? null;
+      resolvedPolicyNumber = pRow?.policyNumber ?? null;
+    } else {
+      resolvedCompany = ("manualCompany" in update ? update.manualCompany : current.manualCompany) ?? null;
+      resolvedClient = ("manualPayer" in update ? update.manualPayer : current.manualPayer) ?? null;
+      resolvedPolicyNumber = ("manualPolicyNumber" in update ? update.manualPolicyNumber : current.manualPolicyNumber) ?? null;
+    }
+  }
+
+  const [payment] = await db.transaction(async (tx) => {
+    const [p] = await tx.update(payments).set(update).where(eq(payments.id, id)).returning();
+
+    if (body.applyProntoPagoSurcharge === false) {
+      if (existingSurcharge) {
+        await tx.delete(cashEntries).where(eq(cashEntries.id, existingSurcharge.id));
+      }
+    } else if (body.applyProntoPagoSurcharge === true) {
+      const isRivadavia = resolvedCompany?.toLowerCase().includes("rivadavia") ?? false;
+      const isOwnMethod = (SURCHARGE_OWN_METHODS as readonly string[]).includes(effectivePaymentMethod);
+      if (isRivadavia && isOwnMethod && effectiveStatus !== "anulado") {
+        if (!existingSurcharge) {
+          await tx.insert(cashEntries).values({
+            clientName: resolvedClient ?? "—",
+            policyNumber: resolvedPolicyNumber ?? null,
+            companyName: resolvedCompany ?? null,
+            amount: SURCHARGE_AMOUNT,
+            paymentMethod: effectivePaymentMethod,
+            paymentDate: effectivePaymentDate,
+            entryType: "pronto_pago_surcharge",
+            paymentId: id,
+            rendered: 0,
+            notes: "Recargo Pronto Pago Rivadavia",
+            createdBy: p.createdBy,
+          });
+        } else if (!existingSurcharge.rendered) {
+          await tx.update(cashEntries).set({
+            paymentMethod: effectivePaymentMethod,
+            paymentDate: effectivePaymentDate,
+            clientName: resolvedClient ?? "—",
+            policyNumber: resolvedPolicyNumber ?? null,
+            companyName: resolvedCompany ?? null,
+          }).where(eq(cashEntries.id, existingSurcharge.id));
+        }
+      }
+    } else {
+      // applyProntoPagoSurcharge absent: sync descriptive fields on existing unrendered surcharge
+      if (existingSurcharge && !existingSurcharge.rendered && hasContableChange) {
+        await tx.update(cashEntries).set({
+          paymentMethod: effectivePaymentMethod,
+          paymentDate: effectivePaymentDate,
+          clientName: resolvedClient ?? existingSurcharge.clientName,
+          policyNumber: resolvedPolicyNumber ?? existingSurcharge.policyNumber,
+          companyName: resolvedCompany ?? existingSurcharge.companyName,
+        }).where(eq(cashEntries.id, existingSurcharge.id));
+      }
+    }
+
+    return [p];
+  });
+
   return c.json(payment, 200);
 }));
 
 app.delete("/payments/:id", requireAuth(async (c: any) => {
-  await db.delete(payments).where(eq(payments.id, Number(c.req.param("id"))));
+  const id = Number(c.req.param("id"));
+  const current = await db.select({ id: payments.id, rendered: payments.rendered })
+    .from(payments).where(eq(payments.id, id)).get();
+  if (!current) return c.json({ error: "Pago no encontrado" }, 404);
+  if (current.rendered) return c.json({ error: "Este pago ya fue rendido. Anulá la rendición primero." }, 409);
+  await db.transaction(async (tx) => {
+    await tx.delete(cashEntries).where(
+      and(eq(cashEntries.paymentId, id), eq(cashEntries.entryType, "pronto_pago_surcharge"), eq(cashEntries.rendered, 0))
+    );
+    await tx.delete(payments).where(eq(payments.id, id));
+  });
   return c.json({ ok: true }, 200);
 }));
 
@@ -3713,9 +3885,53 @@ app.post("/remittances", requireAdmin(async (c: any) => {
   // body: { date, canal, notes, paymentBreakdown, prontoPagoSurcharge, items: [{source, sourceId, amount, debtorStatus, clientName, policyNumber, companyName, paymentMethod}] }
   const user = c.get("user");
   try {
-    const totalAmount = (body.items || []).reduce((s: number, i: any) => s + (i.amount || 0), 0);
+    const items: any[] = body.items || [];
     const breakdown = body.paymentBreakdown || {};
-    const totalPaid = Object.values(breakdown).reduce((s: number, v: any) => s + (Number(v) || 0), 0);
+    const totalBase: number = items.reduce((s: number, i: any) => s + (i.amount || 0), 0);
+    const totalPaid: number = Object.values(breakdown).reduce((s: number, v: any) => s + (Number(v) || 0), 0);
+
+    // GUARD: reject any item that is a surcharge cash_entry (must be auto-included by backend only)
+    const cashEntryIds = items
+      .filter((i: any) => i.source === "cash_entry" && i.sourceId != null)
+      .map((i: any) => i.sourceId as number);
+    if (cashEntryIds.length > 0) {
+      const surchargeCheck = await db.select({ id: cashEntries.id }).from(cashEntries)
+        .where(and(inArray(cashEntries.id, cashEntryIds), eq(cashEntries.entryType, "pronto_pago_surcharge")))
+        .all();
+      if (surchargeCheck.length > 0) {
+        return c.json({ error: "No se puede incluir manualmente un recargo Pronto Pago. El backend lo agrega automáticamente por paymentId." }, 400);
+      }
+    }
+
+    // PRE-VALIDATION: batch-lookup surcharge entries for pronto_pago rendiciones (before transaction)
+    let surchargeExtra = 0;
+    const surchargeMap = new Map<number, any>(); // paymentId → cash_entry row
+    if (body.canal === "pronto_pago") {
+      const paymentSourceIds = items
+        .filter((i: any) => i.source === "payment" && i.sourceId != null)
+        .map((i: any) => i.sourceId as number);
+      if (paymentSourceIds.length > 0) {
+        const sRows = await db.select().from(cashEntries)
+          .where(and(
+            inArray(cashEntries.paymentId, paymentSourceIds),
+            eq(cashEntries.entryType, "pronto_pago_surcharge"),
+            eq(cashEntries.rendered, 0),
+          )).all();
+        for (const s of sRows) {
+          if (s.paymentId != null) {
+            surchargeMap.set(s.paymentId, s);
+            surchargeExtra += s.amount;
+          }
+        }
+      }
+    }
+
+    const finalTotalAmount = totalBase + surchargeExtra;
+    if (Math.abs(totalPaid - finalTotalAmount) > 1) {
+      return c.json({
+        error: `El desglose declarado ($${Math.round(totalPaid)}) no coincide con el total a rendir ($${Math.round(finalTotalAmount)}).`,
+      }, 400);
+    }
 
     const remId = await db.transaction(async (tx) => {
       // Crear rendición
@@ -3725,7 +3941,7 @@ app.post("/remittances", requireAdmin(async (c: any) => {
         notes: body.notes || null,
         paymentBreakdown: JSON.stringify(breakdown),
         prontoPagoSurcharge: body.prontoPagoSurcharge || 0,
-        totalAmount,
+        totalAmount: finalTotalAmount,
         totalPaid: totalPaid as number,
         status: "confirmada",
         createdBy: user?.id || null,
@@ -3733,7 +3949,7 @@ app.post("/remittances", requireAdmin(async (c: any) => {
       }).returning();
 
       // Insertar items y marcar fuentes como rendidas
-      for (const item of (body.items || [])) {
+      for (const item of items) {
         await tx.insert(remittanceItems).values({
           remittanceId: rem.id,
           source: item.source,
@@ -3747,7 +3963,6 @@ app.post("/remittances", requireAdmin(async (c: any) => {
           createdAt: new Date(),
         });
 
-        // Marcar la fuente como rendida
         if (item.source === "payment") {
           await tx.update(payments).set({ rendered: 1, renderedAt: new Date() })
             .where(eq(payments.id, item.sourceId));
@@ -3755,10 +3970,27 @@ app.post("/remittances", requireAdmin(async (c: any) => {
           await tx.update(cashEntries).set({ rendered: 1, renderedAt: new Date() })
             .where(eq(cashEntries.id, item.sourceId));
         } else if (item.source === "installment") {
-          // Cuota no cobrada rendida a compañía: marcar como rendida sin cambiar status ni crear payment
           await tx.update(policyInstallments).set({ rendered: 1, renderedAt: new Date() })
             .where(eq(policyInstallments.id, item.sourceId));
         }
+      }
+
+      // Auto-incluir recargos pronto_pago (canal=pronto_pago únicamente)
+      for (const [, surcharge] of surchargeMap) {
+        await tx.insert(remittanceItems).values({
+          remittanceId: rem.id,
+          source: "cash_entry",
+          sourceId: surcharge.id,
+          amount: surcharge.amount,
+          debtorStatus: "pagado",
+          clientName: surcharge.clientName,
+          policyNumber: surcharge.policyNumber,
+          companyName: surcharge.companyName,
+          paymentMethod: surcharge.paymentMethod,
+          createdAt: new Date(),
+        });
+        await tx.update(cashEntries).set({ rendered: 1, renderedAt: new Date() })
+          .where(eq(cashEntries.id, surcharge.id));
       }
 
       return rem.id;
@@ -3873,6 +4105,16 @@ app.get("/remittances/pending", requireAdmin(async (c: any) => {
     .orderBy(desc(cashEntries.paymentDate))
     .all();
 
+  const pendingPaymentIds = pendingPayments.map((p: any) => p.id as number);
+  const surchargePmtSet = new Set<number>();
+  if (pendingPaymentIds.length > 0) {
+    const sRows = await db.select({ paymentId: cashEntries.paymentId })
+      .from(cashEntries)
+      .where(and(inArray(cashEntries.paymentId, pendingPaymentIds), eq(cashEntries.entryType, "pronto_pago_surcharge"), eq(cashEntries.rendered, 0)))
+      .all();
+    for (const s of sRows) { if (s.paymentId != null) surchargePmtSet.add(s.paymentId); }
+  }
+
   const result = [
     ...pendingPayments.map((p: any) => ({
       source: "payment" as const,
@@ -3884,6 +4126,7 @@ app.get("/remittances/pending", requireAdmin(async (c: any) => {
       policyNumber: p.policyNumber || p.manualPolicyNumber || "—",
       companyName: p.companyName || p.manualCompany || "—",
       notes: p.notes,
+      hasSurcharge: surchargePmtSet.has(p.id),
     })),
     ...pendingEntries.map((e: any) => ({
       source: "cash_entry" as const,
@@ -3895,6 +4138,7 @@ app.get("/remittances/pending", requireAdmin(async (c: any) => {
       policyNumber: e.policyNumber || "—",
       companyName: e.companyName || "—",
       notes: e.notes,
+      entryType: e.entryType,
     })),
   ].sort((a, b) => b.paymentDate.localeCompare(a.paymentDate));
 
