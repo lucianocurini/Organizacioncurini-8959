@@ -308,26 +308,39 @@ app.get("/policies/:id/installments", requireAuth(async (c: any) => {
   return c.json(rows, 200);
 }));
 
-// Generate installments for a policy (replaces existing ones)
+// Generate installments for a policy — only for new policies without existing installments
 app.post("/policies/:id/installments/generate", requireAuth(async (c: any) => {
   const policyId = Number(c.req.param("id"));
   const body = await c.req.json();
-  // body.installments = array of { number, dueDate, amount, notes? }
-  // Delete existing
-  await db.delete(policyInstallments).where(eq(policyInstallments.policyId, policyId));
+  // 409 if installments already exist — prevents accidental destruction of historical data
+  const existing = await db
+    .select({ id: policyInstallments.id })
+    .from(policyInstallments)
+    .where(eq(policyInstallments.policyId, policyId))
+    .limit(1)
+    .get();
+  if (existing) {
+    return c.json({
+      error: "Esta póliza ya tiene cuotas. La regeneración debe realizarse desde la administración de cuotas.",
+    }, 409);
+  }
   if (!body.installments?.length) return c.json([], 200);
-  const inserted = await db
-    .insert(policyInstallments)
-    .values(body.installments.map((inst: any) => ({
-      policyId,
-      number: inst.number,
-      dueDate: inst.dueDate,
-      amount: Number(inst.amount),
-      status: "pendiente",
-      notes: inst.notes || null,
-    })))
-    .returning();
-  return c.json(inserted, 201);
+  const rows = await db.transaction(async (tx) => {
+    const inserted = await tx
+      .insert(policyInstallments)
+      .values(body.installments.map((inst: any) => ({
+        policyId,
+        number: inst.number,
+        dueDate: inst.dueDate,
+        amount: Number(inst.amount),
+        status: "pendiente",
+        notes: inst.notes || null,
+      })))
+      .returning();
+    await tx.update(policies).set({ installments: body.installments.length }).where(eq(policies.id, policyId));
+    return inserted;
+  });
+  return c.json(rows, 201);
 }));
 
 // Update a single installment
@@ -349,6 +362,14 @@ app.put("/installments/:id", requireAuth(async (c: any) => {
 app.post("/policies", requireAuth(async (c: any) => {
   const user = c.get("user");
   const body = await c.req.json();
+  // Normalize and validate billingCycle
+  if (!body.billingCycle) body.billingCycle = null;
+  else if (!["mensual", "trimestral", "cuatrimestral", "semestral"].includes(body.billingCycle))
+    return c.json({ error: `Frecuencia de refacturación inválida: "${body.billingCycle}"` }, 400);
+  // Normalize and validate vigencyPeriod
+  if (!body.vigencyPeriod) body.vigencyPeriod = null;
+  else if (!["anual", "semestral", "cuatrimestral"].includes(body.vigencyPeriod))
+    return c.json({ error: `Período de vigencia inválido: "${body.vigencyPeriod}"` }, 400);
   const today = new Date().toISOString().split("T")[0];
   const daysToEnd = Math.ceil(
     (new Date(body.endDate).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24)
@@ -368,6 +389,18 @@ app.post("/policies", requireAuth(async (c: any) => {
 
 app.put("/policies/:id", requireAuth(async (c: any) => {
   const body = await c.req.json();
+  // Normalize and validate billingCycle
+  if ("billingCycle" in body) {
+    if (!body.billingCycle) body.billingCycle = null;
+    else if (!["mensual", "trimestral", "cuatrimestral", "semestral"].includes(body.billingCycle))
+      return c.json({ error: `Frecuencia de refacturación inválida: "${body.billingCycle}"` }, 400);
+  }
+  // Normalize and validate vigencyPeriod
+  if ("vigencyPeriod" in body) {
+    if (!body.vigencyPeriod) body.vigencyPeriod = null;
+    else if (!["anual", "semestral", "cuatrimestral"].includes(body.vigencyPeriod))
+      return c.json({ error: `Período de vigencia inválido: "${body.vigencyPeriod}"` }, 400);
+  }
   const today = new Date().toISOString().split("T")[0];
   const daysToEnd = Math.ceil(
     (new Date(body.endDate).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24)

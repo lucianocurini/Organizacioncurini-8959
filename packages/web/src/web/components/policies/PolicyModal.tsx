@@ -40,41 +40,33 @@ const EMPTY_VEHICLE: FleetVehicle = {
 };
 
 // ─── Installment helpers ──────────────────────────────────────────────────────
-const CYCLE_MONTHS_MAP: Record<string, number> = {
-  mensual: 1,
-  trimestral: 3,
-  cuatrimestral: 4,
-  semestral: 6,
-  anual: 12,
-};
+// Default installment count by vigency period
+const VIGENCY_DEFAULT_COUNT: Record<string, number> = { anual: 12, semestral: 6, cuatrimestral: 4 };
 
-const VIGENCY_MONTHS_MAP: Record<string, number> = {
-  anual: 12,
-  semestral: 6,
-  cuatrimestral: 4,
-};
-
-function calcInstallmentsCount(vigencyPeriod: string, billingCycle: string): number {
-  const vigMonths = VIGENCY_MONTHS_MAP[vigencyPeriod] ?? 12;
-  const cycleMonths = CYCLE_MONTHS_MAP[billingCycle] ?? 1;
-  return Math.max(1, Math.round(vigMonths / cycleMonths));
-}
-
+// Handles end-of-month overflow: Jan 31 + 1 month → Feb 28/29, not Mar 3
 function addMonthsToDate(dateStr: string, months: number): string {
   const d = new Date(dateStr + "T12:00:00");
+  const day = d.getDate();
+  d.setDate(1);
   d.setMonth(d.getMonth() + months);
+  const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+  d.setDate(Math.min(day, lastDay));
   return d.toISOString().split("T")[0];
 }
 
-function generateInstallments(startDate: string, billingCycle: string, count: number, amount: number) {
-  const months = CYCLE_MONTHS_MAP[billingCycle];
-  if (!months || !count || !startDate || !amount) return [];
+// One installment per month from startDate — billingCycle does not participate
+function generateMonthly(startDate: string, count: number, amount: number): InstRow[] {
+  if (!startDate || count < 1) return [];
   return Array.from({ length: count }, (_, i) => ({
     number: i + 1,
-    dueDate: addMonthsToDate(startDate, i * months),
-    amount,
+    dueDate: addMonthsToDate(startDate, i),
+    amount: amount || 0,
     notes: "",
   }));
+}
+
+function renumber(rows: InstRow[]): InstRow[] {
+  return rows.map((r, i) => ({ ...r, number: i + 1 }));
 }
 
 // ─── PersonForm sub-component ─────────────────────────────────────────────────
@@ -201,6 +193,8 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
   const [insuredQ, setInsuredQ] = useState("");
   const [installmentRows, setInstallmentRows] = useState<InstRow[]>([]);
   const [showInstallments, setShowInstallments] = useState(false);
+  const [installmentCount, setInstallmentCount] = useState(!isEdit ? 12 : 0);
+  const [installmentsDirty, setInstallmentsDirty] = useState(false);
 
   // Renewal search state
   const [renewalQ, setRenewalQ] = useState("");
@@ -381,33 +375,37 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
     toast.success(`Datos cargados desde póliza ${p.policyNumber}`);
   }
 
-  const set = (key: string, val: string) => setForm(f => {
-    const next = { ...f, [key]: val };
-    // Auto-fill end date when vigencyPeriod or startDate changes
-    if ((key === "vigencyPeriod" || key === "startDate") && next.vigencyPeriod !== "anual" && next.startDate) {
-      next.endDate = calcEndDate(next.startDate, next.vigencyPeriod);
+  const set = (key: string, val: string) => {
+    setForm(f => {
+      const next = { ...f, [key]: val };
+      if ((key === "vigencyPeriod" || key === "startDate") && next.vigencyPeriod !== "anual" && next.startDate) {
+        next.endDate = calcEndDate(next.startDate, next.vigencyPeriod);
+      }
+      if (key === "type") next.coverageType = "";
+      return next;
+    });
+    if (!isEdit) {
+      if (key === "vigencyPeriod" && !installmentsDirty) {
+        const suggested = VIGENCY_DEFAULT_COUNT[val];
+        if (suggested) {
+          setInstallmentCount(suggested);
+          if (form.startDate) setInstallmentRows(generateMonthly(form.startDate, suggested, Number(form.monthlyFee) || 0));
+        }
+      } else if (key === "startDate" && !installmentsDirty && installmentCount > 0) {
+        setInstallmentRows(generateMonthly(val, installmentCount, Number(form.monthlyFee) || 0));
+      } else if (key === "monthlyFee" && !installmentsDirty && installmentCount > 0 && form.startDate) {
+        setInstallmentRows(generateMonthly(form.startDate, installmentCount, Number(val) || 0));
+      }
     }
-    // Reset coverageType when type changes
-    if (key === "type") next.coverageType = "";
-    return next;
-  });
+  };
 
-  // Auto-generate installment rows when key fields change
-  const canGenerate = !!(form.startDate && form.billingCycle && form.monthlyFee);
-  const autoInstallmentsCount = (form.billingCycle && form.vigencyPeriod)
-    ? calcInstallmentsCount(form.vigencyPeriod, form.billingCycle)
-    : 0;
+  // New policy: generate initial installment rows on mount (12 default for anual vigency)
   useEffect(() => {
-    if (!canGenerate || !autoInstallmentsCount) { setInstallmentRows([]); return; }
-    const generated = generateInstallments(
-      form.startDate,
-      form.billingCycle,
-      autoInstallmentsCount,
-      Number(form.monthlyFee)
-    );
-    setInstallmentRows(generated);
-    if (generated.length > 0) setShowInstallments(true);
-  }, [form.startDate, form.billingCycle, form.vigencyPeriod, form.monthlyFee]);
+    if (!isEdit) {
+      const today = new Date().toISOString().split("T")[0];
+      setInstallmentRows(generateMonthly(today, 12, 0));
+    }
+  }, []);
 
   const filteredInsureds = insureds.filter(i =>
     i.name.toLowerCase().includes(insuredQ.toLowerCase()) ||
@@ -426,7 +424,9 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
         sumInsured: form.sumInsured ? Number(form.sumInsured) : null,
         monthlyFee: form.monthlyFee ? Number(form.monthlyFee) : null,
         deductible: form.deductible ? Number(form.deductible) : null,
-        installments: autoInstallmentsCount || null,
+        billingCycle: form.billingCycle || null,
+        vigencyPeriod: form.vigencyPeriod || null,
+        installments: isEdit ? (form.installments ? Number(form.installments) : null) : (installmentRows.length || null),
         vehicleYear: form.vehicleYear ? Number(form.vehicleYear) : null,
         motoYear: form.motoYear ? Number(form.motoYear) : null,
         renewedFromId: renewedFrom ? renewedFrom.policy.id : null,
@@ -434,10 +434,6 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
       };
       if (isEdit) {
         await api.put(`/api/policies/${initial.policy.id}`, payload);
-        // Regenerate installments if they were modified
-        if (installmentRows.length > 0) {
-          await api.post(`/api/policies/${initial.policy.id}/installments/generate`, { installments: installmentRows });
-        }
         // Sync insured persons for accidentes/ART (delete all, re-add)
         if (form.type === "accidentes" || form.type === "art" || form.type === "vida") {
           const existing: any[] = await api.get(`/api/policies/${initial.policy.id}/insured-persons`);
@@ -714,7 +710,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
           {/* Montos */}
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className={labelClass}>Cuota Mensual (ARS)</label>
+              <label className={labelClass}>Importe por cuota (ARS)</label>
               <input className={inputClass} type="number" value={form.monthlyFee} onChange={e => set("monthlyFee", e.target.value)} placeholder="4500" />
             </div>
             <div>
@@ -728,27 +724,38 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
               <label className={labelClass}>Suma Asegurada (ARS)</label>
               <input className={inputClass} type="number" value={form.sumInsured} onChange={e => set("sumInsured", e.target.value)} placeholder="2500000" />
             </div>
-            <div>
-              <label className={labelClass}>Cantidad de Cuotas</label>
-              <div className={`${inputClass} bg-[#0d1424] text-gray-400 cursor-default select-none`}>
-                {autoInstallmentsCount
-                  ? <span className="text-white font-medium">{autoInstallmentsCount} cuota{autoInstallmentsCount !== 1 ? "s" : ""} <span className="text-gray-500 font-normal text-xs">(auto)</span></span>
-                  : <span className="text-gray-600">Seleccioná ciclo y vigencia</span>}
+            {!isEdit && (
+              <div>
+                <label className={labelClass}>Cantidad de cuotas</label>
+                <input
+                  className={inputClass}
+                  type="number"
+                  min="1"
+                  value={installmentCount || ""}
+                  placeholder="12"
+                  onChange={e => {
+                    const n = Math.max(1, Number(e.target.value) || 1);
+                    setInstallmentCount(n);
+                    if (form.startDate) {
+                      setInstallmentRows(generateMonthly(form.startDate, n, Number(form.monthlyFee) || 0));
+                      setInstallmentsDirty(false);
+                    }
+                  }}
+                />
               </div>
-            </div>
+            )}
           </div>
 
           {/* Refacturación + Tipo de Pago */}
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className={labelClass}>Refacturación</label>
+              <label className={labelClass}>Frecuencia de refacturación</label>
               <select className={inputClass} value={form.billingCycle} onChange={e => set("billingCycle", e.target.value)}>
                 <option value="">Sin refacturación</option>
                 <option value="mensual">Mensual</option>
                 <option value="trimestral">Trimestral</option>
                 <option value="cuatrimestral">Cuatrimestral</option>
                 <option value="semestral">Semestral</option>
-                <option value="anual">Anual</option>
               </select>
             </div>
             <div>
@@ -799,7 +806,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
                 <label className="flex items-center gap-2 cursor-pointer select-none">
                   <span className="text-xs text-gray-400">Póliza de Flota</span>
                   <div
-                    onClick={() => { set("isFleet", !form.isFleet); setFleetVehicles([]); setAddingVehicle(false); }}
+                    onClick={() => { setForm(f => ({ ...f, isFleet: !f.isFleet })); setFleetVehicles([]); setAddingVehicle(false); }}
                     className={`relative w-10 h-5 rounded-full transition-colors ${form.isFleet ? "bg-blue-500" : "bg-gray-600"}`}
                   >
                     <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${form.isFleet ? "translate-x-5" : "translate-x-0.5"}`} />
@@ -1065,57 +1072,124 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
             </div>
           )}
 
-          {/* Installments preview */}
-          {installmentRows.length > 0 && (
+          {/* Plan de cuotas — solo pólizas nuevas */}
+          {!isEdit && installmentRows.length > 0 && (
             <div className="border border-amber-500/20 rounded-xl bg-amber-500/5">
-              <button
-                type="button"
-                onClick={() => setShowInstallments(!showInstallments)}
-                className="w-full flex items-center justify-between px-4 py-3 text-left"
-              >
-                <div className="flex items-center gap-2">
+              <div className="w-full flex items-center justify-between px-4 py-3">
+                <button
+                  type="button"
+                  onClick={() => setShowInstallments(!showInstallments)}
+                  className="flex items-center gap-2"
+                >
                   <ListOrdered className="w-4 h-4 text-amber-400" />
                   <span className="text-xs font-medium text-amber-400 uppercase tracking-wider">
-                    Plan de cuotas — {installmentRows.length} cuotas
+                    Plan de cuotas — {installmentRows.length} cuota{installmentRows.length !== 1 ? "s" : ""}
                   </span>
+                </button>
+                <div className="flex items-center gap-3">
+                  {installmentsDirty && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setInstallmentRows(generateMonthly(form.startDate, installmentCount, Number(form.monthlyFee) || 0));
+                        setInstallmentsDirty(false);
+                      }}
+                      className="text-xs text-orange-400 hover:text-orange-300 transition-colors"
+                      title="Regenerar reemplazará las ediciones manuales"
+                    >
+                      ↺ Regenerar
+                    </button>
+                  )}
+                  <span className="text-xs text-gray-500 select-none">{showInstallments ? "▲ Ocultar" : "▼ Ver"}</span>
                 </div>
-                <span className="text-xs text-gray-500">{showInstallments ? "▲ Ocultar" : "▼ Ver"}</span>
-              </button>
+              </div>
+              {installmentsDirty && (
+                <p className="px-4 pb-1 text-xs text-orange-400/70">
+                  Editadas manualmente · "Regenerar" vuelve al calendario mensual
+                </p>
+              )}
               {showInstallments && (
                 <div className="px-4 pb-4 space-y-2">
-                  <div className="grid grid-cols-[40px_1fr_1fr_1fr] gap-2 text-xs text-gray-500 pb-1">
+                  <div className="grid grid-cols-[28px_1fr_1fr_1fr_28px] gap-2 text-xs text-gray-500 pb-1">
                     <span>#</span>
                     <span>Vencimiento</span>
                     <span>Importe (ARS)</span>
                     <span>Nota</span>
+                    <span />
                   </div>
                   {installmentRows.map((row, i) => (
-                    <div key={i} className="grid grid-cols-[40px_1fr_1fr_1fr] gap-2 items-center">
-                      <span className="text-xs text-gray-500 font-mono">{row.number}</span>
+                    <div key={i} className="grid grid-cols-[28px_1fr_1fr_1fr_28px] gap-2 items-center">
+                      <span className="text-xs text-gray-500 font-mono text-center">{row.number}</span>
                       <input
                         type="date"
                         value={row.dueDate}
-                        onChange={e => setInstallmentRows(rows => rows.map((r, j) => j === i ? { ...r, dueDate: e.target.value } : r))}
+                        onChange={e => {
+                          setInstallmentRows(rows => rows.map((r, j) => j === i ? { ...r, dueDate: e.target.value } : r));
+                          setInstallmentsDirty(true);
+                        }}
                         className="px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500"
                       />
                       <input
                         type="number"
                         value={row.amount}
-                        onChange={e => setInstallmentRows(rows => rows.map((r, j) => j === i ? { ...r, amount: Number(e.target.value) } : r))}
+                        onChange={e => {
+                          setInstallmentRows(rows => rows.map((r, j) => j === i ? { ...r, amount: Number(e.target.value) } : r));
+                          setInstallmentsDirty(true);
+                        }}
                         className="px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500"
                       />
                       <input
                         type="text"
                         value={row.notes}
-                        onChange={e => setInstallmentRows(rows => rows.map((r, j) => j === i ? { ...r, notes: e.target.value } : r))}
+                        onChange={e => {
+                          setInstallmentRows(rows => rows.map((r, j) => j === i ? { ...r, notes: e.target.value } : r));
+                          setInstallmentsDirty(true);
+                        }}
                         placeholder="Opcional..."
                         className="px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500 placeholder-gray-600"
                       />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const newRows = renumber(installmentRows.filter((_, j) => j !== i));
+                          setInstallmentRows(newRows);
+                          setInstallmentCount(newRows.length);
+                          setInstallmentsDirty(true);
+                        }}
+                        className="text-gray-600 hover:text-red-400 transition-colors flex items-center justify-center"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
                     </div>
                   ))}
-                  <p className="text-xs text-gray-600 pt-1">Podés editar fecha e importe de cada cuota individualmente antes de guardar.</p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const last = installmentRows[installmentRows.length - 1];
+                      const nextDate = last?.dueDate ? addMonthsToDate(last.dueDate, 1) : (form.startDate || "");
+                      const newRow: InstRow = { number: installmentRows.length + 1, dueDate: nextDate, amount: Number(form.monthlyFee) || 0, notes: "" };
+                      setInstallmentRows(rows => [...rows, newRow]);
+                      setInstallmentCount(c => c + 1);
+                      setInstallmentsDirty(true);
+                    }}
+                    className="flex items-center gap-1 text-xs text-amber-400/70 hover:text-amber-400 transition-colors mt-1"
+                  >
+                    <Plus className="w-3.5 h-3.5" /> Agregar cuota
+                  </button>
+                  {installmentRows.some(r => !r.amount) && (
+                    <p className="text-xs text-yellow-500/70 pt-1">Algunas cuotas tienen importe $0. Verificá antes de guardar.</p>
+                  )}
                 </div>
               )}
+            </div>
+          )}
+
+          {/* Cuotas existentes — mensaje informativo en modo edición */}
+          {isEdit && (
+            <div className="border border-[#1f2937] rounded-xl px-4 py-3 bg-[#0d1424]">
+              <p className="text-xs text-gray-500">
+                Las cuotas existentes se administran por separado y no se modifican al guardar la póliza.
+              </p>
             </div>
           )}
 
