@@ -89,6 +89,7 @@ export const payments = sqliteTable("payments", {
   rendered: integer("rendered").notNull().default(0), // 0 = en cartera, 1 = rendido
   renderedAt: integer("rendered_at", { mode: "timestamp" }),
   installmentId: integer("installment_id").references(() => policyInstallments.id),
+  dueDate: text("due_date"),
   createdBy: integer("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });

@@ -404,8 +404,13 @@ function StatsSection({ stats, view }: { stats: any[]; view: "mensual" | "histor
           <p className="text-lg font-bold text-orange-400">{totalRendido.toLocaleString("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 0 })}</p>
         </div>
         <div className="bg-white/5 rounded-xl p-4">
-          <p className="text-xs text-white/40 mb-1">En cartera</p>
+          <p className="text-xs text-white/40 mb-1">
+            {view === "mensual" ? "En cartera del mes" : "En cartera total"}
+          </p>
           <p className="text-lg font-bold text-blue-400">{enCartera.toLocaleString("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 0 })}</p>
+          <p className="text-xs text-white/25 mt-0.5">
+            {view === "mensual" ? "Cobrado menos rendido dentro del mes seleccionado" : "Cobrado menos rendido en el período"}
+          </p>
         </div>
       </div>
 
@@ -942,8 +947,9 @@ export default function CajaPage() {
                     <p className="text-lg font-bold text-orange-400">{fmt(summary.totalRendido)}</p>
                   </div>
                   <div className="bg-white/5 rounded-xl p-4">
-                    <p className="text-xs text-white/40 mb-1">Pendiente de rendir</p>
+                    <p className="text-xs text-white/40 mb-1">Pendiente total de rendir</p>
                     <p className="text-lg font-bold text-blue-400">{fmt(summary.cajaNeta.total)}</p>
+                    <p className="text-xs text-white/25 mt-0.5">Saldo acumulado de cuentas propias aún no rendido</p>
                   </div>
                   <div className="bg-white/5 rounded-xl p-4">
                     <p className="text-xs text-white/40 mb-1">Adeudados</p>

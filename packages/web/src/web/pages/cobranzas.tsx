@@ -54,6 +54,7 @@ interface PaymentRow {
   payment: {
     id: number;
     policyId: number | null;
+    installmentId: number | null;
     manualPayer: string | null;
     manualPolicyNumber: string | null;
     manualCompany: string | null;
@@ -65,6 +66,7 @@ interface PaymentRow {
     status: string;
     rendered: number;
     hasSurcharge: boolean;
+    dueDate: string | null;
   };
   policy: { id: number; policyNumber: string } | null;
   insured: { id: number; name: string } | null;
@@ -103,6 +105,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
     amount: "",
     paymentMethod: "efectivo",
     paymentDate: new Date().toISOString().split("T")[0],
+    dueDate: "",
     periodMonth: "",
     notes: "",
     status: "confirmado",
@@ -117,13 +120,14 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
       const pId = editing.payment.policyId ? String(editing.payment.policyId) : "";
       setForm({
         policyId: pId,
-        installmentId: (editing.payment as any).installmentId ? String((editing.payment as any).installmentId) : "",
+        installmentId: editing.payment.installmentId ? String(editing.payment.installmentId) : "",
         manualPayer: editing.payment.manualPayer || "",
         manualPolicyNumber: editing.payment.manualPolicyNumber || "",
         manualCompany: editing.payment.manualCompany || "",
         amount: String(editing.payment.amount),
         paymentMethod: editing.payment.paymentMethod,
         paymentDate: editing.payment.paymentDate,
+        dueDate: editing.payment.dueDate || "",
         periodMonth: editing.payment.periodMonth || "",
         notes: editing.payment.notes || "",
         status: editing.payment.status,
@@ -138,7 +142,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
         policyId: "", installmentId: "", manualPayer: "", manualPolicyNumber: "", manualCompany: "",
         amount: "", paymentMethod: "efectivo",
         paymentDate: new Date().toISOString().split("T")[0],
-        periodMonth: "", notes: "", status: "confirmado",
+        dueDate: "", periodMonth: "", notes: "", status: "confirmado",
       });
     }
   }, [open, editing]);
@@ -178,6 +182,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
       amount: Number(form.amount),
       paymentMethod: form.paymentMethod,
       paymentDate: form.paymentDate,
+      dueDate: form.dueDate || null,
       periodMonth: form.periodMonth || null,
       notes: form.notes || null,
       status: form.status,
@@ -294,7 +299,12 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
                     onChange={e => {
                       const id = e.target.value;
                       const inst = installments.find((i: any) => String(i.id) === id);
-                      setForm(f => ({ ...f, installmentId: id, amount: inst ? String(inst.amount) : f.amount }));
+                      setForm(f => ({
+                        ...f,
+                        installmentId: id,
+                        amount: inst ? String(inst.amount) : f.amount,
+                        dueDate: id ? (inst?.dueDate ?? "") : "",
+                      }));
                     }}
                     className="w-full px-3 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-blue-500"
                   >
@@ -407,13 +417,31 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
             <div>
               <label className="block text-xs text-gray-400 mb-1">Fecha de pago *</label>
               <input type="date" value={form.paymentDate} onChange={e => setForm(f => ({ ...f, paymentDate: e.target.value }))}
-                className="w-full px-3 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-blue-500" />
+                disabled={isRendered}
+                className="w-full px-3 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-blue-500 disabled:opacity-50" />
             </div>
             <div>
               <label className="block text-xs text-gray-400 mb-1">Período (mes)</label>
               <input type="month" value={form.periodMonth} onChange={e => setForm(f => ({ ...f, periodMonth: e.target.value }))}
                 className="w-full px-3 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-blue-500" />
             </div>
+          </div>
+
+          {/* Vencimiento de cuota */}
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">Vencimiento de cuota</label>
+            <input
+              type="date"
+              value={form.dueDate}
+              onChange={e => setForm(f => ({ ...f, dueDate: e.target.value }))}
+              disabled={isRendered || !!form.installmentId}
+              className="w-full px-3 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-blue-500 disabled:opacity-50"
+            />
+            {form.installmentId ? (
+              <p className="text-xs text-blue-400/60 mt-1">Tomado de la cuota vinculada</p>
+            ) : (
+              <p className="text-xs text-gray-500 mt-1">Opcional — fecha límite para rendir esta cuota</p>
+            )}
           </div>
 
           {/* Estado */}
@@ -671,10 +699,14 @@ function CobranzasTab() {
                       </span>
                     </div>
                     <div className="flex items-center gap-4 text-xs text-gray-400">
-                      <span>Fecha: {new Date(r.payment.paymentDate + "T12:00:00").toLocaleDateString("es-AR")}</span>
+                      <span>Cobrado: {new Date(r.payment.paymentDate + "T12:00:00").toLocaleDateString("es-AR")}</span>
                       {r.payment.periodMonth && (
                         <span>Período: {new Date(r.payment.periodMonth + "-02").toLocaleDateString("es-AR", { month: "short", year: "numeric" })}</span>
                       )}
+                    </div>
+                    <div className="flex items-center gap-1 text-xs">
+                      <span className="text-gray-400">Vence:</span>
+                      <DueDateBadge dueDate={r.payment.dueDate} showNull />
                     </div>
                     {r.payment.notes && <p className="text-xs text-gray-400">{r.payment.notes}</p>}
                     <div className="flex items-center gap-2 pt-1">
@@ -700,7 +732,8 @@ function CobranzasTab() {
                     <th className="text-left px-3 py-3 font-medium">Período</th>
                     <th className="text-left px-3 py-3 font-medium">Método</th>
                     <th className="text-right px-3 py-3 font-medium">Importe</th>
-                    <th className="text-left px-3 py-3 font-medium">Fecha</th>
+                    <th className="text-left px-3 py-3 font-medium">Cobrado</th>
+                    <th className="text-left px-3 py-3 font-medium">Vencimiento</th>
                     <th className="text-left px-3 py-3 font-medium">Estado</th>
                     <th className="text-left px-3 py-3 font-medium">Notas</th>
                     <th className="px-5 py-3" />
@@ -741,6 +774,9 @@ function CobranzasTab() {
                           {new Date(r.payment.paymentDate + "T12:00:00").toLocaleDateString("es-AR")}
                         </td>
                         <td className="px-3 py-3">
+                          <DueDateBadge dueDate={r.payment.dueDate} showNull />
+                        </td>
+                        <td className="px-3 py-3">
                           <span className={cn("px-2 py-0.5 rounded text-xs border", STATUS_COLORS[r.payment.status] || "text-gray-400 border-gray-500/30")}>
                             {r.payment.status.charAt(0).toUpperCase() + r.payment.status.slice(1)}
                           </span>
@@ -772,6 +808,45 @@ function CobranzasTab() {
     <PaymentModal open={modalOpen} onClose={() => { setModalOpen(false); setEditing(null); }}
       onSaved={load} editing={editing} />
     </React.Fragment>
+  );
+}
+
+// ─── Helpers de fecha de vencimiento ──────────────────────────────────────────
+function localTodayYMD(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function fmtDueDate(iso: string): string {
+  const [y, m, d] = iso.split("-");
+  return `${d}/${m}/${y}`;
+}
+
+function DueDateBadge({ dueDate, showNull = false }: { dueDate: string | null; showNull?: boolean }) {
+  if (!dueDate) {
+    if (showNull) return <span className="text-[10px] text-white/25">Sin vencimiento</span>;
+    return null;
+  }
+  const today = localTodayYMD();
+  if (dueDate < today) {
+    return (
+      <span className="inline-flex items-center text-[10px] px-1.5 py-0.5 rounded border bg-red-900/30 border-red-500/40 text-red-400 shrink-0">
+        Vencida
+      </span>
+    );
+  }
+  if (dueDate === today) {
+    return (
+      <span className="inline-flex items-center text-[10px] px-1.5 py-0.5 rounded border bg-yellow-900/30 border-yellow-500/40 text-yellow-400 shrink-0">
+        Vence hoy
+      </span>
+    );
+  }
+  return (
+    <span className="text-[10px] text-white/30 shrink-0">Vence: {fmtDueDate(dueDate)}</span>
   );
 }
 
@@ -972,7 +1047,10 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                                 </div>
                                 <div className="flex-1 min-w-0">
                                   <p className="text-sm text-white truncate">{item.clientName}</p>
-                                  <p className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {item.paymentDate}</p>
+                                  <div className="flex items-center gap-2 flex-wrap mt-0.5">
+                                    <span className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {item.paymentDate}</span>
+                                    <DueDateBadge dueDate={item.dueDate ?? null} />
+                                  </div>
                                 </div>
                                 <div className="text-right shrink-0">
                                   <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>
@@ -1013,7 +1091,10 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                                 </div>
                                 <div className="flex-1 min-w-0">
                                   <p className="text-sm text-white truncate">{item.clientName}</p>
-                                  <p className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {item.paymentDate}</p>
+                                  <div className="flex items-center gap-2 flex-wrap mt-0.5">
+                                    <span className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {item.paymentDate}</span>
+                                    <DueDateBadge dueDate={item.dueDate ?? null} />
+                                  </div>
                                 </div>
                                 <div className="text-right shrink-0">
                                   <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>

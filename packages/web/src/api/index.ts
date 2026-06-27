@@ -635,7 +635,14 @@ app.get("/payments", requireAuth(async (c: any) => {
       .all();
     for (const s of sRows) { if (s.paymentId != null) surchargeSet.add(s.paymentId); }
   }
-  return c.json(results.map(r => ({ ...r, payment: { ...r.payment, hasSurcharge: surchargeSet.has(r.payment.id) } })), 200);
+  return c.json(results.map(r => ({
+    ...r,
+    payment: {
+      ...r.payment,
+      hasSurcharge: surchargeSet.has(r.payment.id),
+      dueDate: (r.installment?.dueDate ?? r.payment.dueDate ?? null) as string | null,
+    },
+  })), 200);
 }));
 
 app.post("/payments", requireAuth(async (c: any) => {
@@ -643,6 +650,10 @@ app.post("/payments", requireAuth(async (c: any) => {
   const body = await c.req.json();
   const hasPolicyId = body.policyId != null && body.policyId !== "";
   const paymentStatus = body.status || "confirmado";
+
+  if (body.dueDate && !/^\d{4}-\d{2}-\d{2}$/.test(body.dueDate)) {
+    return c.json({ error: "Formato de fecha de vencimiento inválido. Use YYYY-MM-DD." }, 400);
+  }
 
   // Resolve company/insured from DB (never trust frontend for surcharge decision)
   let resolvedCompany: string | null = null;
@@ -684,6 +695,8 @@ app.post("/payments", requireAuth(async (c: any) => {
       periodMonth: body.periodMonth || null,
       notes: body.notes || null,
       status: paymentStatus,
+      // dueDate: solo para pagos sin installment; con installment la fuente es policy_installments
+      dueDate: body.installmentId ? null : (body.dueDate || null),
       createdBy: user.id,
     }).returning();
 
@@ -727,7 +740,7 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
 
   const update: any = {};
   const fields = ["policyId", "installmentId", "manualPayer", "manualPolicyNumber", "manualCompany",
-    "amount", "paymentMethod", "paymentDate", "periodMonth", "notes", "status"];
+    "amount", "paymentMethod", "paymentDate", "periodMonth", "notes", "status", "dueDate"];
   for (const f of fields) { if (f in body) update[f] = body[f]; }
   if ("policyId" in update && (update.policyId === "" || update.policyId == null)) {
     update.policyId = null;
@@ -739,11 +752,22 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
   } else if ("installmentId" in update) {
     update.installmentId = Number(update.installmentId);
   }
+  if ("dueDate" in update && !update.dueDate) {
+    update.dueDate = null;
+  } else if ("dueDate" in update && !/^\d{4}-\d{2}-\d{2}$/.test(update.dueDate)) {
+    return c.json({ error: "Formato de fecha de vencimiento inválido. Use YYYY-MM-DD." }, 400);
+  }
 
-  const CONTABLE = ["amount", "paymentMethod", "paymentDate", "policyId", "installmentId", "manualCompany", "status"];
+  const CONTABLE = ["amount", "paymentMethod", "paymentDate", "policyId", "installmentId", "manualCompany", "status", "dueDate"];
   const hasContableChange = CONTABLE.some(f => f in update);
   if (current.rendered && hasContableChange) {
     return c.json({ error: "Este pago ya fue rendido. Anulá la rendición primero." }, 409);
+  }
+
+  // Enforce: si el payment resultante tiene installmentId, payments.dueDate debe ser null
+  const effectiveInstallmentId = "installmentId" in update ? update.installmentId : current.installmentId;
+  if (effectiveInstallmentId != null) {
+    update.dueDate = null;
   }
 
   // Read existing surcharge before transaction
@@ -4090,11 +4114,14 @@ app.get("/remittances/pending", requireAdmin(async (c: any) => {
       insuredName: insureds.name,
       policyNumber: policies.policyNumber,
       companyName: companies.name,
+      installmentDueDate: policyInstallments.dueDate,
+      paymentDueDate: payments.dueDate,
     })
     .from(payments)
     .leftJoin(policies, eq(payments.policyId, policies.id))
     .leftJoin(insureds, eq(policies.insuredId, insureds.id))
     .leftJoin(companies, eq(policies.companyId, companies.id))
+    .leftJoin(policyInstallments, eq(payments.installmentId, policyInstallments.id))
     .where(and(eq(payments.rendered, 0), eq(payments.status, "confirmado")))
     .orderBy(desc(payments.paymentDate))
     .all();
@@ -4122,6 +4149,7 @@ app.get("/remittances/pending", requireAdmin(async (c: any) => {
       amount: p.amount,
       paymentMethod: p.paymentMethod,
       paymentDate: p.paymentDate,
+      dueDate: (p.installmentDueDate as string | null) ?? (p.paymentDueDate as string | null) ?? null,
       clientName: p.insuredName || p.manualPayer || "—",
       policyNumber: p.policyNumber || p.manualPolicyNumber || "—",
       companyName: p.companyName || p.manualCompany || "—",
@@ -4134,6 +4162,7 @@ app.get("/remittances/pending", requireAdmin(async (c: any) => {
       amount: e.amount,
       paymentMethod: e.paymentMethod,
       paymentDate: e.paymentDate,
+      dueDate: (e.dueDate as string | null) ?? null,
       clientName: e.clientName,
       policyNumber: e.policyNumber || "—",
       companyName: e.companyName || "—",
