@@ -3201,7 +3201,7 @@ function requireAdmin(handler: any) {
     const session = await db.select().from(sessions).where(eq(sessions.id, sessionId)).get();
     if (!session) return c.json({ error: "Sesión inválida" }, 401);
     const usr = await db.select().from(users).where(eq(users.id, session.userId)).get();
-    if (!usr || usr.role !== "admin") return c.json({ error: "Solo administradores" }, 403);
+    if (!usr || usr.role !== "admin") return c.json({ error: "No tenés permisos para acceder a Caja." }, 403);
     c.set("cajaUser", usr);
     return handler(c);
   });
@@ -4237,21 +4237,15 @@ app.get("/remittances/adeudados", requireAdmin(async (c: any) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // GET /api/cash/expenses
-// requireAuth: usuarios comunes pueden ver gasto_operativo; sueldos solo admins.
-app.get("/cash/expenses", requireAuth(async (c: any) => {
-  const user = c.get("user");
-  const isAdmin = user.role === "admin";
-  let rows = await db.select().from(cashExpenses).orderBy(desc(cashExpenses.date)).all();
-  if (!isAdmin) rows = rows.filter((e: any) => e.type !== "sueldo");
+app.get("/cash/expenses", requireAdmin(async (c: any) => {
+  const rows = await db.select().from(cashExpenses).orderBy(desc(cashExpenses.date)).all();
   return c.json(rows);
 }));
 
 // POST /api/cash/expenses
-// Acceso: cualquier usuario autenticado puede crear gasto_operativo.
-// Sueldos requieren admin. payeeName y salaryPeriod son obligatorios para sueldo.
-app.post("/cash/expenses", requireAuth(async (c: any) => {
-  const user = c.get("user");
-  const isAdmin = user.role === "admin";
+app.post("/cash/expenses", requireAdmin(async (c: any) => {
+  const user = c.get("cajaUser");
+  const isAdmin = true;
   const body = await c.req.json();
 
   if (!body.date || !CAJA_DATE_RE.test(body.date) || !cajaIsRealDate(body.date))
@@ -4309,9 +4303,9 @@ app.post("/cash/expenses", requireAuth(async (c: any) => {
 }));
 
 // PUT /api/cash/expenses/:id
-app.put("/cash/expenses/:id", requireAuth(async (c: any) => {
+app.put("/cash/expenses/:id", requireAdmin(async (c: any) => {
   const user = c.get("user");
-  const isAdmin = user.role === "admin";
+  const isAdmin = true;
   const id = Number(c.req.param("id"));
   const body = await c.req.json();
 
@@ -4376,10 +4370,9 @@ app.put("/cash/expenses/:id", requireAuth(async (c: any) => {
 }));
 
 // DELETE /api/cash/expenses/:id — soft-delete: marca status = 'anulado'.
-// Para sueldos requiere admin. Preserva historial de caja propia.
-app.delete("/cash/expenses/:id", requireAuth(async (c: any) => {
+app.delete("/cash/expenses/:id", requireAdmin(async (c: any) => {
   const user = c.get("user");
-  const isAdmin = user.role === "admin";
+  const isAdmin = true;
   const id = Number(c.req.param("id"));
   const existing = await db.select().from(cashExpenses).where(eq(cashExpenses.id, id)).get();
   if (!existing) return c.json({ error: "No encontrado" }, 404);

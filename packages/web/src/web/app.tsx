@@ -60,7 +60,9 @@ function ProtectedRoutes() {
       <Route path="/siniestros/:id" component={SiniestroDetail} />
       <Route path="/tareas" component={Tareas} />
       <Route path="/importar" component={Importar} />
-      <Route path="/caja" component={Caja} />
+      <Route path="/caja">
+        {user?.role === "admin" ? <Caja /> : <Redirect to="/" />}
+      </Route>
       <Route path="/login">
         <Redirect to="/" />
       </Route>

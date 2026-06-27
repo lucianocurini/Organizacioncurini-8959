@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { AppLayout } from "@/components/layout/AppLayout";
+import { useAuth } from "@/lib/auth";
 import { api } from "@/lib/api";
 import { toast } from "sonner";
 import {
@@ -1928,6 +1929,8 @@ function GastosTab() {
 
 // ─── Contenedor principal con tabs ───────────────────────────────────────────
 export default function Cobranzas() {
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
   const [tab, setTab] = useState<"cobranzas" | "rendiciones" | "adeudados" | "transferencias" | "gastos">("cobranzas");
 
   return (
@@ -1948,7 +1951,7 @@ export default function Cobranzas() {
             { key: "transferencias", label: "Transf. Compañía", icon: Building2 },
             { key: "rendiciones", label: "Rendiciones", icon: ReceiptText },
             { key: "adeudados", label: "Adeudados", icon: AlertCircle },
-            { key: "gastos", label: "Gastos", icon: ShoppingCart },
+            ...(isAdmin ? [{ key: "gastos", label: "Gastos", icon: ShoppingCart }] : []),
           ].map(({ key, label, icon: Icon }) => (
             <button key={key} onClick={() => setTab(key as any)}
               className={cn("flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-all",
