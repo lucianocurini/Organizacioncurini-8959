@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from "react";
 import { AppLayout } from "@/components/layout/AppLayout";
-import { useAuth } from "@/lib/auth";
 import { api } from "@/lib/api";
 import { toast } from "sonner";
 import {
@@ -1811,7 +1810,7 @@ function GastosTab() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-white font-semibold text-base">Gastos registrados</h2>
-          <p className="text-gray-400 text-xs mt-0.5">Se descuentan del saldo en caja</p>
+          <p className="text-gray-400 text-xs mt-0.5">Gastos operativos registrados</p>
         </div>
         <button onClick={openNew} className="flex items-center gap-2 px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded-lg text-sm font-medium transition-colors">
           <Plus size={15} /> Nuevo gasto
@@ -1929,8 +1928,6 @@ function GastosTab() {
 
 // ─── Contenedor principal con tabs ───────────────────────────────────────────
 export default function Cobranzas() {
-  const { user } = useAuth();
-  const isAdmin = user?.role === "admin";
   const [tab, setTab] = useState<"cobranzas" | "rendiciones" | "adeudados" | "transferencias" | "gastos">("cobranzas");
 
   return (
@@ -1951,7 +1948,7 @@ export default function Cobranzas() {
             { key: "transferencias", label: "Transf. Compañía", icon: Building2 },
             { key: "rendiciones", label: "Rendiciones", icon: ReceiptText },
             { key: "adeudados", label: "Adeudados", icon: AlertCircle },
-            ...(isAdmin ? [{ key: "gastos", label: "Gastos", icon: ShoppingCart }] : []),
+            { key: "gastos", label: "Gastos", icon: ShoppingCart },
           ].map(({ key, label, icon: Icon }) => (
             <button key={key} onClick={() => setTab(key as any)}
               className={cn("flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-all",

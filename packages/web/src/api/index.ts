@@ -4237,15 +4237,19 @@ app.get("/remittances/adeudados", requireAdmin(async (c: any) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // GET /api/cash/expenses
-app.get("/cash/expenses", requireAdmin(async (c: any) => {
-  const rows = await db.select().from(cashExpenses).orderBy(desc(cashExpenses.date)).all();
+app.get("/cash/expenses", requireAuth(async (c: any) => {
+  const user = c.get("user");
+  const isAdmin = user?.role === "admin";
+  const rows = isAdmin
+    ? await db.select().from(cashExpenses).orderBy(desc(cashExpenses.date)).all()
+    : await db.select().from(cashExpenses).where(eq(cashExpenses.type, "gasto_operativo")).orderBy(desc(cashExpenses.date)).all();
   return c.json(rows);
 }));
 
 // POST /api/cash/expenses
-app.post("/cash/expenses", requireAdmin(async (c: any) => {
-  const user = c.get("cajaUser");
-  const isAdmin = true;
+app.post("/cash/expenses", requireAuth(async (c: any) => {
+  const user = c.get("user");
+  const isAdmin = user?.role === "admin";
   const body = await c.req.json();
 
   if (!body.date || !CAJA_DATE_RE.test(body.date) || !cajaIsRealDate(body.date))
@@ -4303,9 +4307,9 @@ app.post("/cash/expenses", requireAdmin(async (c: any) => {
 }));
 
 // PUT /api/cash/expenses/:id
-app.put("/cash/expenses/:id", requireAdmin(async (c: any) => {
+app.put("/cash/expenses/:id", requireAuth(async (c: any) => {
   const user = c.get("user");
-  const isAdmin = true;
+  const isAdmin = user?.role === "admin";
   const id = Number(c.req.param("id"));
   const body = await c.req.json();
 
@@ -4370,9 +4374,9 @@ app.put("/cash/expenses/:id", requireAdmin(async (c: any) => {
 }));
 
 // DELETE /api/cash/expenses/:id — soft-delete: marca status = 'anulado'.
-app.delete("/cash/expenses/:id", requireAdmin(async (c: any) => {
+app.delete("/cash/expenses/:id", requireAuth(async (c: any) => {
   const user = c.get("user");
-  const isAdmin = true;
+  const isAdmin = user?.role === "admin";
   const id = Number(c.req.param("id"));
   const existing = await db.select().from(cashExpenses).where(eq(cashExpenses.id, id)).get();
   if (!existing) return c.json({ error: "No encontrado" }, 404);
