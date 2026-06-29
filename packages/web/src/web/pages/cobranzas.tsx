@@ -50,6 +50,8 @@ const STATUS_COLORS: Record<string, string> = {
   anulado: "bg-red-500/20 text-red-400 border-red-500/30",
 };
 
+const PP_SURCHARGE = 800;
+
 interface PaymentRow {
   payment: {
     id: number;
@@ -940,10 +942,15 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
   const autoSurchargeItems = canal === "pronto_pago"
     ? selectedCobradas.filter((i: any) => i.source === "payment" && i.hasSurcharge)
     : [];
+  const manualSurchargeItems = canal === "pronto_pago"
+    ? manualItems.filter((i: any) =>
+        String(i.companyName ?? "").trim().toLowerCase().includes("rivadavia"))
+    : [];
   const rivadaviaNoSurchargeItems = canal === "pronto_pago"
     ? selectedCobradas.filter((i: any) => i.source === "payment" && !i.hasSurcharge && (i.companyName as string | undefined)?.toLowerCase().includes("rivadavia"))
     : [];
-  const autoSurchargeTotal = autoSurchargeItems.length * 800;
+  const totalSurchargeCount = autoSurchargeItems.length + manualSurchargeItems.length;
+  const autoSurchargeTotal = totalSurchargeCount * PP_SURCHARGE;
   const expectedTotal = totalSeleccionado + autoSurchargeTotal;
 
   const filteredPending = pendingVisible.filter((i: any) => {
@@ -1191,6 +1198,9 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                           <div className="text-right shrink-0">
                             <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>
                             <span className="text-xs text-orange-400 border border-orange-500/30 bg-orange-900/20 px-1.5 py-0.5 rounded">Adeudado</span>
+                            {canal === "pronto_pago" && String(item.companyName ?? "").trim().toLowerCase().includes("rivadavia") && (
+                              <span className="block text-xs text-purple-400 mt-0.5">+${PP_SURCHARGE} PP</span>
+                            )}
                           </div>
                           <button
                             type="button"
@@ -1226,11 +1236,13 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                 </div>
               </div>
 
-              {canal === "pronto_pago" && autoSurchargeItems.length > 0 && (
+              {canal === "pronto_pago" && totalSurchargeCount > 0 && (
                 <div className="bg-purple-900/20 border border-purple-500/20 rounded-lg p-3 flex items-center gap-3">
                   <AlertCircle size={16} className="text-purple-400 shrink-0" />
                   <div>
-                    <p className="text-xs text-purple-300">Recargo Pronto Pago: $800 por pago de Rivadavia</p>
+                    <p className="text-xs text-purple-300">
+                      Recargo Pronto Pago: {totalSurchargeCount} cuota{totalSurchargeCount !== 1 ? "s" : ""} × ${PP_SURCHARGE} = {fmt(autoSurchargeTotal)}
+                    </p>
                     <p className="text-xs text-white/40">Se incluye automáticamente al confirmar</p>
                   </div>
                 </div>
@@ -1274,9 +1286,9 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                     )}
                   </span>
                 </div>
-                {canal === "pronto_pago" && autoSurchargeItems.length > 0 && (
+                {canal === "pronto_pago" && totalSurchargeCount > 0 && (
                   <div className="mt-1 flex justify-between items-center text-xs text-white/40">
-                    <span>Recargo PP ({autoSurchargeItems.length} cuotas × $800 — auto-incluido):</span>
+                    <span>Recargo PP ({totalSurchargeCount} cuota{totalSurchargeCount !== 1 ? "s" : ""} × ${PP_SURCHARGE} — auto-incluido):</span>
                     <span className="text-purple-400">+{fmt(autoSurchargeTotal)}</span>
                   </div>
                 )}

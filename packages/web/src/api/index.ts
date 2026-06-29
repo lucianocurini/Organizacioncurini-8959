@@ -3981,6 +3981,12 @@ app.post("/remittances", requireAdmin(async (c: any) => {
           }
         }
       }
+      // Recargo por manual_debt de Rivadavia (sin cash_entry previo — se suma al total de la rendición)
+      const manualDebtRivadaviaCount = items.filter((item: any) =>
+        item.source === "manual_debt" &&
+        String(item.companyName ?? "").trim().toLowerCase().includes("rivadavia")
+      ).length;
+      surchargeExtra += manualDebtRivadaviaCount * SURCHARGE_AMOUNT;
     }
 
     const finalTotalAmount = totalBase + surchargeExtra;
