@@ -101,7 +101,7 @@ export default function Polizas() {
       toast.success("Póliza eliminada");
       load();
     } catch (e: any) {
-      toast.error(e.message);
+      toast.error(e?.message || "No se pudo eliminar la póliza.");
     }
     setDeleteId(null);
   };
@@ -109,10 +109,12 @@ export default function Polizas() {
   const handleBulkDelete = async () => {
     setDeleting(true);
     let ok = 0;
+    let blocked = 0;
     for (const id of selected) {
-      try { await api.delete(`/api/policies/${id}`); ok++; } catch {}
+      try { await api.delete(`/api/policies/${id}`); ok++; } catch { blocked++; }
     }
-    toast.success(`${ok} póliza${ok !== 1 ? "s" : ""} eliminada${ok !== 1 ? "s" : ""}`);
+    if (ok > 0) toast.success(`${ok} póliza${ok !== 1 ? "s" : ""} eliminada${ok !== 1 ? "s" : ""}`);
+    if (blocked > 0) toast.error(`${blocked} póliza${blocked !== 1 ? "s" : ""} no pudo${blocked !== 1 ? "ron" : ""} eliminarse (tienen movimientos asociados).`);
     setSelected(new Set());
     setShowBulkConfirm(false);
     setDeleting(false);

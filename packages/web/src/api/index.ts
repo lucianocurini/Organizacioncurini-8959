@@ -420,8 +420,89 @@ app.put("/policies/:id", requireAuth(async (c: any) => {
 }));
 
 app.delete("/policies/:id", requireAuth(async (c: any) => {
-  await db.delete(policies).where(eq(policies.id, Number(c.req.param("id"))));
-  return c.json({ ok: true }, 200);
+  const id = Number(c.req.param("id"));
+  if (!Number.isInteger(id) || id <= 0) {
+    return c.json({ error: "ID de póliza inválido." }, 400);
+  }
+
+  const existing = await db.select({ id: policies.id }).from(policies).where(eq(policies.id, id)).get();
+  if (!existing) return c.json({ error: "La póliza ya no existe" }, 404);
+
+  const BLOCK_MSG = "No se puede eliminar la póliza porque tiene pagos, cuotas pagadas o rendidas, rendiciones, siniestros o envíos asociados.";
+
+  // Obtener ids de cuotas para checks transitivos
+  const instRows = await db.select({ id: policyInstallments.id }).from(policyInstallments)
+    .where(eq(policyInstallments.policyId, id)).all();
+  const installmentIds = instRows.map(r => r.id);
+
+  // Pagos directos por policyId
+  const directPay = await db.select({ id: payments.id }).from(payments)
+    .where(eq(payments.policyId, id)).get();
+  if (directPay) return c.json({ error: BLOCK_MSG }, 409);
+
+  // Cuotas pagadas o rendidas
+  const pagada = await db.select({ id: policyInstallments.id }).from(policyInstallments)
+    .where(and(eq(policyInstallments.policyId, id), eq(policyInstallments.status, "pagada"))).get();
+  if (pagada) return c.json({ error: BLOCK_MSG }, 409);
+
+  const rendered = await db.select({ id: policyInstallments.id }).from(policyInstallments)
+    .where(and(eq(policyInstallments.policyId, id), eq(policyInstallments.rendered, 1))).get();
+  if (rendered) return c.json({ error: BLOCK_MSG }, 409);
+
+  if (installmentIds.length > 0) {
+    // Pagos vinculados por installmentId
+    const payByInst = await db.select({ id: payments.id }).from(payments)
+      .where(inArray(payments.installmentId, installmentIds)).get();
+    if (payByInst) return c.json({ error: BLOCK_MSG }, 409);
+
+    // Remittance items source=installment
+    const remByInst = await db.select({ id: remittanceItems.id }).from(remittanceItems)
+      .where(and(eq(remittanceItems.source, "installment"), inArray(remittanceItems.sourceId, installmentIds))).get();
+    if (remByInst) return c.json({ error: BLOCK_MSG }, 409);
+  }
+
+  // Siniestros
+  const claim = await db.select({ id: claims.id }).from(claims)
+    .where(eq(claims.policyId, id)).get();
+  if (claim) return c.json({ error: BLOCK_MSG }, 409);
+
+  // Envíos
+  const delivery = await db.select({ id: deliveries.id }).from(deliveries)
+    .where(eq(deliveries.policyId, id)).get();
+  if (delivery) return c.json({ error: BLOCK_MSG }, 409);
+
+  // Conteos para respuesta
+  const [rebRows, persRows, vehRows] = await Promise.all([
+    db.select({ id: rebillings.id }).from(rebillings).where(eq(rebillings.policyId, id)).all(),
+    db.select({ id: policyInsuredPersons.id }).from(policyInsuredPersons).where(eq(policyInsuredPersons.policyId, id)).all(),
+    db.select({ id: policyFleetVehicles.id }).from(policyFleetVehicles).where(eq(policyFleetVehicles.policyId, id)).all(),
+  ]);
+
+  try {
+    await db.transaction(async (tx) => {
+      if (installmentIds.length > 0)
+        await tx.delete(policyInstallments).where(eq(policyInstallments.policyId, id));
+      if (rebRows.length > 0)
+        await tx.delete(rebillings).where(eq(rebillings.policyId, id));
+      if (persRows.length > 0)
+        await tx.delete(policyInsuredPersons).where(eq(policyInsuredPersons.policyId, id));
+      if (vehRows.length > 0)
+        await tx.delete(policyFleetVehicles).where(eq(policyFleetVehicles.policyId, id));
+      await tx.delete(policies).where(eq(policies.id, id));
+    });
+    return c.json({
+      ok: true,
+      deleted: {
+        installments: installmentIds.length,
+        rebillings: rebRows.length,
+        insuredPersons: persRows.length,
+        fleetVehicles: vehRows.length,
+      },
+    });
+  } catch (e: any) {
+    console.error("[DELETE /policies/:id]", e?.message, e);
+    return c.json({ error: "No se pudo eliminar la póliza." }, 500);
+  }
 }));
 
 // ─── DASHBOARD STATS ──────────────────────────────────────────────────────────
