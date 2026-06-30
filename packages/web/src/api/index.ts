@@ -62,6 +62,7 @@ function requireAuth(handler: Function) {
   return async (c: any) => {
     const user = await getUser(c);
     if (!user) return c.json({ error: "No autorizado" }, 401);
+    if (user.active === 0) return c.json({ error: "Usuario suspendido. Contactá al administrador." }, 403);
     c.set("user", user);
     return handler(c);
   };
@@ -115,6 +116,7 @@ app.post("/auth/logout", async (c) => {
 app.get("/auth/me", async (c) => {
   const user = await getUser(c);
   if (!user) return c.json({ error: "No autorizado" }, 401);
+  if (user.active === 0) return c.json({ error: "Usuario suspendido. Contactá al administrador." }, 403);
   return c.json({ user: { id: user.id, name: user.name, email: user.email, role: user.role } }, 200);
 });
 
@@ -3991,7 +3993,7 @@ app.get("/cash/stats", requireAdmin(async (c: any) => {
 // ─── RENDICIONES ─────────────────────────────────────────────────────────────
 
 // GET /api/remittances — listar rendiciones con totales
-app.get("/remittances", requireAdmin(async (c: any) => {
+app.get("/remittances", requireAuth(async (c: any) => {
   const all = await db.select().from(remittances).orderBy(desc(remittances.date)).all();
   // Para cada rendición traer cantidad de items
   const result = await Promise.all(all.map(async (r: any) => {
@@ -4010,7 +4012,7 @@ app.get("/remittances", requireAdmin(async (c: any) => {
 }));
 
 // GET /api/remittances/:id/items — detalle de items de una rendición
-app.get("/remittances/:id/items", requireAdmin(async (c: any) => {
+app.get("/remittances/:id/items", requireAuth(async (c: any) => {
   const id = Number(c.req.param("id"));
   const items = await db.select().from(remittanceItems)
     .where(eq(remittanceItems.remittanceId, id)).all();
@@ -4018,7 +4020,7 @@ app.get("/remittances/:id/items", requireAdmin(async (c: any) => {
 }));
 
 // POST /api/remittances — crear nueva rendición
-app.post("/remittances", requireAdmin(async (c: any) => {
+app.post("/remittances", requireAuth(async (c: any) => {
   const body = await c.req.json();
   // body: { date, canal, notes, paymentBreakdown, prontoPagoSurcharge, items: [{source, sourceId, amount, debtorStatus, clientName, policyNumber, companyName, paymentMethod}] }
   const user = c.get("user");
@@ -4173,7 +4175,7 @@ app.delete("/remittances/:id", requireAdmin(async (c: any) => {
 }));
 
 // PATCH /api/remittances/items/:id/paid — marcar adeudado como cobrado
-app.patch("/remittances/items/:id/paid", requireAdmin(async (c: any) => {
+app.patch("/remittances/items/:id/paid", requireAuth(async (c: any) => {
   const id = Number(c.req.param("id"));
   await db.update(remittanceItems).set({ debtorStatus: "pagado", paidAt: new Date() })
     .where(eq(remittanceItems.id, id));
@@ -4182,7 +4184,7 @@ app.patch("/remittances/items/:id/paid", requireAdmin(async (c: any) => {
 
 // GET /api/remittances/uncollected — cuotas no cobradas y no rendidas (para rendir sin cobro previo)
 // Filtros opcionales: ?insured=&policy=&company=&month=YYYY-MM
-app.get("/remittances/uncollected", requireAdmin(async (c: any) => {
+app.get("/remittances/uncollected", requireAuth(async (c: any) => {
   const { insured: insuredQ, policy: policyQ, company: companyQ, month } = c.req.query();
 
   let rows = await db
@@ -4218,7 +4220,7 @@ app.get("/remittances/uncollected", requireAdmin(async (c: any) => {
 }));
 
 // GET /api/remittances/pending — cobros aún no rendidos (para seleccionar al crear rendición)
-app.get("/remittances/pending", requireAdmin(async (c: any) => {
+app.get("/remittances/pending", requireAuth(async (c: any) => {
   // payments no rendidos y confirmados
   const pendingPayments = await db
     .select({
@@ -4295,7 +4297,7 @@ app.get("/remittances/pending", requireAdmin(async (c: any) => {
 }));
 
 // GET /api/remittances/adeudados — items adeudados no cobrados aún
-app.get("/remittances/adeudados", requireAdmin(async (c: any) => {
+app.get("/remittances/adeudados", requireAuth(async (c: any) => {
   const items = await db.select({
     id: remittanceItems.id,
     remittanceId: remittanceItems.remittanceId,

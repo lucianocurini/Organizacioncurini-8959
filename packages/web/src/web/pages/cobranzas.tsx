@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { api } from "@/lib/api";
+import { useAuth } from "../lib/auth";
 import { toast } from "sonner";
 import {
   DollarSign, Plus, Search, TrendingUp, CreditCard,
@@ -1358,6 +1359,7 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
 
 // ─── Tab Rendiciones ──────────────────────────────────────────────────────────
 function RendicionesTab() {
+  const { user } = useAuth();
   const [rendiciones, setRendiciones] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
@@ -1371,7 +1373,14 @@ function RendicionesTab() {
     try {
       const data = await api.get("/api/remittances");
       setRendiciones(data);
-    } catch { toast.error("Error al cargar rendiciones"); }
+    } catch (err: any) {
+      const msg = err?.message || "";
+      if (msg.includes("permisos") || msg.includes("autorizado") || msg.includes("Forbidden")) {
+        toast.error("Sin permisos para acceder a rendiciones");
+      } else {
+        toast.error("Error al cargar rendiciones");
+      }
+    }
     setLoading(false);
   }
 
@@ -1476,10 +1485,12 @@ function RendicionesTab() {
                         {BREAKDOWN_LABELS[m] || m}: {fmt(Number(v))}
                       </span>
                     ))}
-                    <button onClick={e => { e.stopPropagation(); handleDelete(r.id); }}
-                      className="p-1.5 text-white/20 hover:text-red-400 transition-colors">
-                      <Trash2 size={14} />
-                    </button>
+                    {user?.role === "admin" && (
+                      <button onClick={e => { e.stopPropagation(); handleDelete(r.id); }}
+                        className="p-1.5 text-white/20 hover:text-red-400 transition-colors">
+                        <Trash2 size={14} />
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -1940,6 +1951,7 @@ function GastosTab() {
 
 // ─── Contenedor principal con tabs ───────────────────────────────────────────
 export default function Cobranzas() {
+  const { user } = useAuth();
   const [tab, setTab] = useState<"cobranzas" | "rendiciones" | "adeudados" | "transferencias" | "gastos">("cobranzas");
 
   return (
@@ -1961,7 +1973,8 @@ export default function Cobranzas() {
             { key: "rendiciones", label: "Rendiciones", icon: ReceiptText },
             { key: "adeudados", label: "Adeudados", icon: AlertCircle },
             { key: "gastos", label: "Gastos", icon: ShoppingCart },
-          ].map(({ key, label, icon: Icon }) => (
+          ].filter(t => t.key !== "transferencias" || user?.role === "admin")
+          .map(({ key, label, icon: Icon }) => (
             <button key={key} onClick={() => setTab(key as any)}
               className={cn("flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-all",
                 tab === key ? "bg-blue-600 text-white" : "text-white/40 hover:text-white")}>
