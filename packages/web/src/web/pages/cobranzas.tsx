@@ -1817,12 +1817,12 @@ function GastosTab() {
   }
 
   async function handleDelete(id: number) {
-    if (!confirm("¿Eliminar este gasto?")) return;
+    if (!confirm("¿Anular este gasto?")) return;
     try {
       await api.delete(`/api/cash/expenses/${id}`);
-      toast.success("Gasto eliminado");
-      load();
-    } catch { toast.error("Error eliminando"); }
+      toast.success("Gasto anulado");
+      await load();
+    } catch (e: any) { toast.error(e?.message || "Error al anular el gasto"); }
   }
 
   const total = gastos.reduce((s, g) => s + g.amount, 0);

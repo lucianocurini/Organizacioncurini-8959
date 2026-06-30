@@ -4330,8 +4330,8 @@ app.get("/cash/expenses", requireAuth(async (c: any) => {
   const user = c.get("user");
   const isAdmin = user?.role === "admin";
   const rows = isAdmin
-    ? await db.select().from(cashExpenses).orderBy(desc(cashExpenses.date)).all()
-    : await db.select().from(cashExpenses).where(eq(cashExpenses.type, "gasto_operativo")).orderBy(desc(cashExpenses.date)).all();
+    ? await db.select().from(cashExpenses).where(ne(cashExpenses.status, "anulado")).orderBy(desc(cashExpenses.date)).all()
+    : await db.select().from(cashExpenses).where(and(eq(cashExpenses.type, "gasto_operativo"), ne(cashExpenses.status, "anulado"))).orderBy(desc(cashExpenses.date)).all();
   return c.json(rows);
 }));
 
