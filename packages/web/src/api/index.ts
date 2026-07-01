@@ -2387,12 +2387,54 @@ async function enResolveInsured(p: any, userId: number): Promise<number> {
   return ni.id;
 }
 
-async function enInsertInstallments(policyId: number, insts: any[]) {
+function normalizePremiumCents(premium: number | null | undefined): number {
+  return Math.round((premium ?? 0) * 100);
+}
+
+async function enCheckDuplicateRebilling(
+  policyId: number, billingStart: string, billingEnd: string, premium: number | null | undefined
+): Promise<boolean> {
+  const rows = await db.select({ premium: rebillings.premium })
+    .from(rebillings)
+    .where(and(
+      eq(rebillings.policyId, policyId),
+      eq(rebillings.billingStart, billingStart),
+      eq(rebillings.billingEnd, billingEnd),
+    ))
+    .all();
+  const targetCents = normalizePremiumCents(premium);
+  return rows.some(r => normalizePremiumCents(r.premium) === targetCents);
+}
+
+function enDeduplicateBatch(policiesArr: any[]): { deduped: any[]; inBatchDuplicates: number } {
+  const seen = new Set<string>();
+  const deduped: any[] = [];
+  let inBatchDuplicates = 0;
+  for (const p of policiesArr) {
+    const key = [
+      String(p.policyNumber || "").trim(),
+      String(p.startDate || ""),
+      String(p.endDate || ""),
+      normalizePremiumCents(p.premium),
+      String(p.movType || "").toUpperCase().trim(),
+    ].join("|");
+    if (seen.has(key)) {
+      inBatchDuplicates++;
+    } else {
+      seen.add(key);
+      deduped.push(p);
+    }
+  }
+  return { deduped, inBatchDuplicates };
+}
+
+async function enInsertInstallments(policyId: number, insts: any[]): Promise<number> {
   for (const inst of insts) {
     await db.insert(policyInstallments).values({
       policyId, number: inst.number, dueDate: inst.dueDate, amount: inst.amount, status: "pendiente",
     });
   }
+  return insts.length;
 }
 
 function enResolveTypeAndStatus(p: any): { polType: string; status: string } {
@@ -2434,6 +2476,7 @@ function enResolveTypeAndStatus(p: any): { polType: string; status: string } {
 type ImportCounts = {
   imported: number; rebillings: number; endosos: number;
   anulaciones: number; duplicados: number; revisar: number; skipped: number;
+  installmentsCreated: number;
   errors: string[];
 };
 
@@ -2459,15 +2502,26 @@ async function enImportOne(p: any, companyId: number, userId: number, counts: Im
   if (mov.includes("ENDOSO")) {
     const existing = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
     if (existing) {
-      await db.insert(rebillings).values({
-        policyId: existing.id, billingStart: p.startDate, billingEnd: p.endDate,
-        premium: p.premium || null, sumInsured: p.sumInsured || null,
-        notes: `Importado de El Norte v2. Endoso ${p.endoso || ""}`, createdBy: userId,
-      });
-      if (p.installments?.length > 0) await enInsertInstallments(existing.id, p.installments);
+      if (await enCheckDuplicateRebilling(existing.id, p.startDate, p.endDate, p.premium)) {
+        counts.duplicados++;
+        return;
+      }
       const { status } = enResolveTypeAndStatus(p);
-      await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
+      const installmentValues = (p.installments || []).map((inst: any) => ({
+        policyId: existing.id, number: inst.number, dueDate: inst.dueDate,
+        amount: inst.amount, status: "pendiente" as const,
+      }));
+      await db.transaction(async (tx) => {
+        await tx.insert(rebillings).values({
+          policyId: existing.id, billingStart: p.startDate, billingEnd: p.endDate,
+          premium: p.premium || null, sumInsured: p.sumInsured || null,
+          notes: `Importado de El Norte v2. Endoso ${p.endoso || ""}`, createdBy: userId,
+        });
+        if (installmentValues.length > 0) await tx.insert(policyInstallments).values(installmentValues);
+        await tx.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
+      });
       counts.endosos++;
+      counts.installmentsCreated += installmentValues.length;
     } else {
       counts.revisar++;
     }
@@ -2477,47 +2531,65 @@ async function enImportOne(p: any, companyId: number, userId: number, counts: Im
   if (mov.includes("PRORROGA")) {
     const existing = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
     if (existing) {
-      await db.insert(rebillings).values({
-        policyId: existing.id, billingStart: p.startDate, billingEnd: p.endDate,
-        premium: p.premium || null, sumInsured: p.sumInsured || null,
-        notes: `Importado de El Norte v2. Prórroga endoso ${p.endoso || ""}`, createdBy: userId,
-      });
-      if (p.installments?.length > 0) await enInsertInstallments(existing.id, p.installments);
+      if (await enCheckDuplicateRebilling(existing.id, p.startDate, p.endDate, p.premium)) {
+        counts.duplicados++;
+        return;
+      }
       const { status } = enResolveTypeAndStatus(p);
-      await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
+      const installmentValues = (p.installments || []).map((inst: any) => ({
+        policyId: existing.id, number: inst.number, dueDate: inst.dueDate,
+        amount: inst.amount, status: "pendiente" as const,
+      }));
+      await db.transaction(async (tx) => {
+        await tx.insert(rebillings).values({
+          policyId: existing.id, billingStart: p.startDate, billingEnd: p.endDate,
+          premium: p.premium || null, sumInsured: p.sumInsured || null,
+          notes: `Importado de El Norte v2. Prórroga endoso ${p.endoso || ""}`, createdBy: userId,
+        });
+        if (installmentValues.length > 0) await tx.insert(policyInstallments).values(installmentValues);
+        await tx.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
+      });
       counts.rebillings++;
+      counts.installmentsCreated += installmentValues.length;
       return;
     }
     if (p._baseStartDate) {
       const insuredId = await enResolveInsured(p, userId);
-      const { polType } = enResolveTypeAndStatus(p);
+      const { polType, status } = enResolveTypeAndStatus(p);
       const isMoto = polType === "motovehiculo";
-      const [basePol] = await db.insert(policies).values({
-        policyNumber: String(p.policyNumber), type: polType, status: "vencida", companyId, insuredId,
-        premium: p._basePremium || p.premium || null, sumInsured: p._baseSumInsured || p.sumInsured || null,
-        coverageType: p._baseCoverage || p.coverageLabel || null,
-        startDate: p._baseStartDate, endDate: p._baseEndDate || p.startDate, isRebilling: 0,
-        vehicleBrand: !isMoto ? (p.vehicleBrand || null) : null,
-        vehicleModel: !isMoto ? (p.vehicleModel || null) : null,
-        vehicleYear: !isMoto ? (p.vehicleYear || null) : null,
-        vehiclePlate: !isMoto ? (p.vehiclePlate || null) : null,
-        motoBrand: isMoto ? (p.vehicleBrand || null) : null,
-        motoModel: isMoto ? (p.vehicleModel || null) : null,
-        motoYear: isMoto ? (p.vehicleYear || null) : null,
-        motoPlate: isMoto ? (p.vehiclePlate || null) : null,
-        motoEngine: isMoto ? (p.engineNumber || null) : null,
-        notes: p._baseNotes || "Póliza base creada al importar prórroga El Norte",
-        createdBy: userId,
-      }).returning({ id: policies.id });
-      const { status } = enResolveTypeAndStatus(p);
-      await db.insert(rebillings).values({
-        policyId: basePol.id, billingStart: p.startDate, billingEnd: p.endDate,
-        premium: p.premium || null, sumInsured: p.sumInsured || null,
-        notes: `Importado de El Norte v2. Prórroga endoso ${p.endoso || ""}`, createdBy: userId,
+      const installmentsData = (p.installments || []).map((inst: any) => ({
+        number: inst.number, dueDate: inst.dueDate, amount: inst.amount, status: "pendiente" as const,
+      }));
+      await db.transaction(async (tx) => {
+        const [bp] = await tx.insert(policies).values({
+          policyNumber: String(p.policyNumber), type: polType, status: "vencida", companyId, insuredId,
+          premium: p._basePremium || p.premium || null, sumInsured: p._baseSumInsured || p.sumInsured || null,
+          coverageType: p._baseCoverage || p.coverageLabel || null,
+          startDate: p._baseStartDate, endDate: p._baseEndDate || p.startDate, isRebilling: 0,
+          vehicleBrand: !isMoto ? (p.vehicleBrand || null) : null,
+          vehicleModel: !isMoto ? (p.vehicleModel || null) : null,
+          vehicleYear: !isMoto ? (p.vehicleYear || null) : null,
+          vehiclePlate: !isMoto ? (p.vehiclePlate || null) : null,
+          motoBrand: isMoto ? (p.vehicleBrand || null) : null,
+          motoModel: isMoto ? (p.vehicleModel || null) : null,
+          motoYear: isMoto ? (p.vehicleYear || null) : null,
+          motoPlate: isMoto ? (p.vehiclePlate || null) : null,
+          motoEngine: isMoto ? (p.engineNumber || null) : null,
+          notes: p._baseNotes || "Póliza base creada al importar prórroga El Norte",
+          createdBy: userId,
+        }).returning({ id: policies.id });
+        await tx.insert(rebillings).values({
+          policyId: bp.id, billingStart: p.startDate, billingEnd: p.endDate,
+          premium: p.premium || null, sumInsured: p.sumInsured || null,
+          notes: `Importado de El Norte v2. Prórroga endoso ${p.endoso || ""}`, createdBy: userId,
+        });
+        await tx.update(policies).set({ endDate: p.endDate, status, premium: p.premium || null }).where(eq(policies.id, bp.id));
+        if (installmentsData.length > 0) {
+          await tx.insert(policyInstallments).values(installmentsData.map(inst => ({ ...inst, policyId: bp.id })));
+        }
       });
-      await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || null }).where(eq(policies.id, basePol.id));
-      if (p.installments?.length > 0) await enInsertInstallments(basePol.id, p.installments);
       counts.rebillings++;
+      counts.installmentsCreated += installmentsData.length;
       return;
     }
   }
@@ -2593,6 +2665,39 @@ async function enInsertImportLog(values: typeof importLogs.$inferInsert): Promis
   }
 }
 
+function isSqliteBusy(e: any): boolean {
+  const code = String(e?.code ?? "");
+  const msg  = String(e?.message ?? "");
+  return code.includes("SQLITE_BUSY") || msg.includes("SQLITE_BUSY");
+}
+
+export async function withImportLogRetry(
+  doInsert: () => Promise<number | null>,
+  retryDelays: number[] = [100, 250, 500],
+): Promise<{ logId: number | null; logWarning?: string }> {
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+    if (attempt > 0) await new Promise(r => setTimeout(r, retryDelays[attempt - 1]));
+    try {
+      const logId = await doInsert();
+      return { logId };
+    } catch (e: any) {
+      lastError = e;
+      if (!isSqliteBusy(e)) break; // errores no-BUSY no se reintentan
+    }
+  }
+
+  // Log interno sin exponer SQL, credenciales ni stack trace
+  const safeCode = String(lastError?.code ?? String(lastError?.message ?? "").split("\n")[0]).substring(0, 120);
+  console.error("[importLog] No se pudo registrar el log de importación:", safeCode);
+
+  return {
+    logId: null,
+    logWarning: "La importación se completó, pero no pudo registrarse el archivo como procesado.",
+  };
+}
+
 // ── POST /import/el-norte/preview ─────────────────────────────────────────────
 app.post("/import/el-norte/preview", requireAuth(async (c: any) => {
   const body = await c.req.json();
@@ -2606,13 +2711,31 @@ app.post("/import/el-norte/preview", requireAuth(async (c: any) => {
 app.post("/import/el-norte/confirm", requireAuth(async (c: any) => {
   const user = c.get("user");
   const body = await c.req.json();
-  const parsedPolicies: any[] = body.policies || [];
-  if (!parsedPolicies.length) return c.json({ error: "Sin pólizas" }, 400);
+  const rawPolicies: any[] = body.policies || [];
+  if (!rawPolicies.length) return c.json({ error: "Sin pólizas" }, 400);
+
+  // Pre-check: si este gmailMessageId ya fue procesado, omitir completamente
+  if (body.gmailMessageId) {
+    const alreadyLogged = await db.select({ id: importLogs.id })
+      .from(importLogs)
+      .where(eq(importLogs.gmailMessageId, body.gmailMessageId))
+      .get();
+    if (alreadyLogged) {
+      return c.json({
+        imported: 0, rebillings: 0, endosos: 0, anulaciones: 0,
+        duplicados: 0, revisar: 0, skipped: 0, installmentsCreated: 0,
+        errors: [], gmailAlreadyProcessed: true, logId: alreadyLogged.id,
+      }, 200);
+    }
+  }
+
+  // Deduplicar movimientos repetidos dentro del mismo array antes de tocar la DB
+  const { deduped: parsedPolicies, inBatchDuplicates } = enDeduplicateBatch(rawPolicies);
 
   const companyId = await enGetOrCreateCompany();
   const counts: ImportCounts = {
     imported: 0, rebillings: 0, endosos: 0, anulaciones: 0,
-    duplicados: 0, revisar: 0, skipped: 0, errors: [],
+    duplicados: inBatchDuplicates, revisar: 0, skipped: 0, installmentsCreated: 0, errors: [],
   };
 
   for (const p of parsedPolicies) {
@@ -2625,7 +2748,7 @@ app.post("/import/el-norte/confirm", requireAuth(async (c: any) => {
   }
 
   const logStatus = counts.errors.length === 0 ? "ok" : counts.imported + counts.rebillings > 0 ? "partial" : "error";
-  const logId = await enInsertImportLog({
+  const { logId, logWarning } = await withImportLogRetry(() => enInsertImportLog({
     source: "manual",
     filename: body.filename || null,
     gmailMessageId: body.gmailMessageId || null,
@@ -2640,9 +2763,9 @@ app.post("/import/el-norte/confirm", requireAuth(async (c: any) => {
     skipped: counts.skipped,
     errors: JSON.stringify(counts.errors),
     createdBy: user.id,
-  });
+  }));
 
-  return c.json({ ...counts, logId }, 200);
+  return c.json({ ...counts, logId, ...(logWarning ? { logWarning } : {}) }, 200);
 }));
 
 // ── POST /gmail/el-norte/latest ───────────────────────────────────────────────
@@ -2725,6 +2848,7 @@ app.post("/gmail/el-norte/batch-import", requireAuth(async (c: any) => {
     status: "running" as const, phase: "Iniciando...",
     totalMails: 0, processed: 0, imported: 0, rebillings: 0,
     endosos: 0, anulaciones: 0, duplicados: 0, revisar: 0, skipped: 0,
+    gmailSkipped: 0, installmentsCreated: 0,
     errors: [] as string[], startedAt: Date.now(),
   };
   elNorteJobs.set(jobId, job);
@@ -2746,11 +2870,20 @@ app.post("/gmail/el-norte/batch-import", requireAuth(async (c: any) => {
         job.phase = `Procesando ${i + 1}/${msgs.length}: ${subject.slice(0, 40)}`;
         const att = findTxtAttachment(msg);
         if (!att) { job.errors.push(`Mail "${subject}": sin adjunto TXT`); job.skipped++; continue; }
+
+        // Pre-check gmailMessageId ANTES de descargar el adjunto
+        const alreadyProcessed = await db.select({ id: importLogs.id })
+          .from(importLogs)
+          .where(eq(importLogs.gmailMessageId, msg.id))
+          .get();
+        if (alreadyProcessed) { job.gmailSkipped++; job.processed++; continue; }
+
         try {
           const content = await gmailDownloadAttachment(msg.id, att.attachmentId);
-          const { policies: parsed, errors: parseErrs } = parseElNorteTxtV2(content);
+          const { policies: parsedRaw, errors: parseErrs } = parseElNorteTxtV2(content);
           if (parseErrs.length) parseErrs.forEach(e => job.errors.push(`[parse] ${e}`));
-          const counts: ImportCounts = { imported: 0, rebillings: 0, endosos: 0, anulaciones: 0, duplicados: 0, revisar: 0, skipped: 0, errors: [] };
+          const { deduped: parsed, inBatchDuplicates } = enDeduplicateBatch(parsedRaw);
+          const counts: ImportCounts = { imported: 0, rebillings: 0, endosos: 0, anulaciones: 0, duplicados: inBatchDuplicates, revisar: 0, skipped: 0, installmentsCreated: 0, errors: [] };
           for (const p of parsed) {
             try { await enImportOne(p, companyId, user.id, counts); } catch (e: any) { counts.errors.push(`Póliza ${p.policyNumber}: ${e.message}`); counts.skipped++; }
           }
@@ -2761,6 +2894,7 @@ app.post("/gmail/el-norte/batch-import", requireAuth(async (c: any) => {
           job.duplicados += counts.duplicados;
           job.revisar += counts.revisar;
           job.skipped += counts.skipped;
+          job.installmentsCreated += counts.installmentsCreated;
           if (counts.errors.length) counts.errors.forEach(e => job.errors.push(e));
           await enInsertImportLog({
             source: "gmail", filename: att.filename, gmailMessageId: msg.id,
@@ -2797,6 +2931,7 @@ app.post("/gmail/el-norte/daily", requireAuth(async (c: any) => {
     status: "running" as const, phase: "Iniciando...",
     totalMails: 0, processed: 0, imported: 0, rebillings: 0,
     endosos: 0, anulaciones: 0, duplicados: 0, revisar: 0, skipped: 0,
+    gmailSkipped: 0, installmentsCreated: 0,
     errors: [] as string[], startedAt: Date.now(),
   };
   elNorteJobs.set(jobId, job);
@@ -2815,11 +2950,20 @@ app.post("/gmail/el-norte/daily", requireAuth(async (c: any) => {
         const subject = msg.payload?.headers?.find((h: any) => h.name === "Subject")?.value || "sin-asunto";
         const att = findTxtAttachment(msg);
         if (!att) { job.skipped++; continue; }
+
+        // Pre-check gmailMessageId ANTES de descargar el adjunto
+        const alreadyProcessed = await db.select({ id: importLogs.id })
+          .from(importLogs)
+          .where(eq(importLogs.gmailMessageId, msg.id))
+          .get();
+        if (alreadyProcessed) { job.gmailSkipped++; job.processed++; continue; }
+
         try {
           const content = await gmailDownloadAttachment(msg.id, att.attachmentId);
-          const { policies: parsed, errors: parseErrs } = parseElNorteTxtV2(content);
+          const { policies: parsedRaw, errors: parseErrs } = parseElNorteTxtV2(content);
           if (parseErrs.length) parseErrs.forEach(e => job.errors.push(`[parse] ${e}`));
-          const counts: ImportCounts = { imported: 0, rebillings: 0, endosos: 0, anulaciones: 0, duplicados: 0, revisar: 0, skipped: 0, errors: [] };
+          const { deduped: parsed, inBatchDuplicates } = enDeduplicateBatch(parsedRaw);
+          const counts: ImportCounts = { imported: 0, rebillings: 0, endosos: 0, anulaciones: 0, duplicados: inBatchDuplicates, revisar: 0, skipped: 0, installmentsCreated: 0, errors: [] };
           for (const p of parsed) {
             try { await enImportOne(p, companyId, user.id, counts); } catch (e: any) { counts.errors.push(`Póliza ${p.policyNumber}: ${e.message}`); counts.skipped++; }
           }
@@ -2830,6 +2974,7 @@ app.post("/gmail/el-norte/daily", requireAuth(async (c: any) => {
           job.duplicados += counts.duplicados;
           job.revisar += counts.revisar;
           job.skipped += counts.skipped;
+          job.installmentsCreated += counts.installmentsCreated;
           if (counts.errors.length) counts.errors.forEach(e => job.errors.push(e));
           await enInsertImportLog({
             source: "gmail", filename: att.filename, gmailMessageId: msg.id,
