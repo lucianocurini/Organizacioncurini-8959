@@ -4,9 +4,10 @@ import { AppLayout } from "@/components/layout/AppLayout";
 import { formatCurrency, formatDate, daysUntil, POLICY_TYPES, STATUS_TYPES, COVERAGE_LABELS, cn } from "@/lib/utils";
 import { Link, useLocation } from "wouter";
 import {
-  Plus, Search, Download, Trash2, Edit, Eye, ChevronUp, ChevronDown, Car, Home, ShieldCheck, Briefcase, FileText, Upload, Bike, HeartPulse, Zap, Scale, HardHat, Flame, CheckSquare, Square, X, ChevronLeft, ChevronRight
+  Plus, Search, Download, Trash2, ChevronUp, ChevronDown, Car, Home, ShieldCheck, Briefcase, FileText, Upload, Bike, HeartPulse, Zap, Scale, HardHat, Flame, CheckSquare, Square, X, ChevronLeft, ChevronRight
 } from "lucide-react";
 import { PolicyModal } from "@/components/policies/PolicyModal";
+import { PolicyActions } from "@/components/policies/PolicyActions";
 import { ImportModal } from "@/components/policies/ImportModal";
 import { toast } from "sonner";
 
@@ -39,8 +40,6 @@ export default function Polizas() {
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [showModal, setShowModal] = useState(false);
   const [showImport, setShowImport] = useState(false);
-  const [editPolicy, setEditPolicy] = useState<any>(null);
-  const [deleteId, setDeleteId] = useState<number | null>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [showBulkConfirm, setShowBulkConfirm] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -94,17 +93,6 @@ export default function Polizas() {
 
   const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
   const paged = sorted.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
-
-  const handleDelete = async (id: number) => {
-    try {
-      await api.delete(`/api/policies/${id}`);
-      toast.success("Póliza eliminada");
-      load();
-    } catch (e: any) {
-      toast.error(e?.message || "No se pudo eliminar la póliza.");
-    }
-    setDeleteId(null);
-  };
 
   const handleBulkDelete = async () => {
     setDeleting(true);
@@ -190,7 +178,7 @@ export default function Polizas() {
             <button onClick={() => setShowImport(true)} className="flex items-center gap-2 px-3 py-2 bg-[#1f2937] border border-[#374151] text-gray-300 text-sm rounded-lg hover:text-white hover:border-gray-500 transition-all">
               <Upload className="w-4 h-4" /> <span className="hidden sm:inline">Importar</span>
             </button>
-            <button onClick={() => { setEditPolicy(null); setShowModal(true); }} className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium transition-all whitespace-nowrap">
+            <button onClick={() => setShowModal(true)} className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium transition-all whitespace-nowrap">
               <Plus className="w-4 h-4" /> <span className="hidden sm:inline">Nueva Póliza</span><span className="sm:hidden">Nueva</span>
             </button>
           </div>
@@ -299,18 +287,8 @@ export default function Polizas() {
                   </div>
                 </div>
 
-                <div className="flex items-center justify-end gap-1 pt-2 border-t border-[#1f2937]">
-                  <Link href={`/polizas/${row.policy.id}`}>
-                    <a className="flex items-center gap-1 px-3 py-1.5 text-xs text-gray-300 hover:text-white hover:bg-[#1f2937] rounded-md transition-all">
-                      <Eye className="w-3.5 h-3.5" /> Ver
-                    </a>
-                  </Link>
-                  <button onClick={() => { setEditPolicy(row); setShowModal(true); }} className="flex items-center gap-1 px-3 py-1.5 text-xs text-gray-300 hover:text-blue-400 hover:bg-[#1f2937] rounded-md transition-all">
-                    <Edit className="w-3.5 h-3.5" /> Editar
-                  </button>
-                  <button onClick={() => setDeleteId(row.policy.id)} className="flex items-center gap-1 px-3 py-1.5 text-xs text-gray-300 hover:text-red-400 hover:bg-[#1f2937] rounded-md transition-all">
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
+                <div className="flex items-center justify-end pt-2 border-t border-[#1f2937]">
+                  <PolicyActions policyId={row.policy.id} onChanged={load} />
                 </div>
               </div>
             );
@@ -425,19 +403,7 @@ export default function Polizas() {
                         {row.policy.premium && !row.policy.monthlyFee && <p className="text-sm font-mono text-gray-300 truncate">{formatCurrency(row.policy.premium)}</p>}
                       </td>
                       <td className="py-2.5 px-3 sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
-                        <div className="flex items-center justify-end gap-1">
-                          <Link href={`/polizas/${row.policy.id}`}>
-                            <a className="p-1.5 text-gray-400 hover:text-white hover:bg-[#1f2937] rounded-md transition-all" title="Ver detalles">
-                              <Eye className="w-4 h-4" />
-                            </a>
-                          </Link>
-                          <button onClick={() => { setEditPolicy(row); setShowModal(true); }} className="p-1.5 text-gray-400 hover:text-blue-400 hover:bg-[#1f2937] rounded-md transition-all" title="Editar">
-                            <Edit className="w-4 h-4" />
-                          </button>
-                          <button onClick={() => setDeleteId(row.policy.id)} className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-[#1f2937] rounded-md transition-all" title="Eliminar">
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
+                        <PolicyActions policyId={row.policy.id} onChanged={load} />
                       </td>
                     </tr>
                   );
@@ -485,20 +451,6 @@ export default function Polizas() {
         )}
       </div>
 
-      {/* Delete confirm */}
-      {deleteId !== null && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
-          <div className="bg-[#111827] border border-[#1f2937] rounded-xl p-6 max-w-sm w-full">
-            <h3 className="text-white font-semibold mb-2" style={{ fontFamily: "Syne, sans-serif" }}>¿Eliminar póliza?</h3>
-            <p className="text-gray-400 text-sm mb-5">Esta acción no se puede deshacer.</p>
-            <div className="flex gap-3">
-              <button onClick={() => setDeleteId(null)} className="flex-1 py-2 bg-[#1f2937] text-gray-300 text-sm rounded-lg hover:bg-[#374151] transition-all">Cancelar</button>
-              <button onClick={() => handleDelete(deleteId)} className="flex-1 py-2 bg-red-600 hover:bg-red-700 text-white text-sm rounded-lg transition-all">Eliminar</button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Bulk delete confirm */}
       {showBulkConfirm && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
@@ -523,9 +475,9 @@ export default function Polizas() {
 
       {showModal && (
         <PolicyModal
-          initial={editPolicy}
-          onClose={() => { setShowModal(false); setEditPolicy(null); }}
-          onSaved={() => { setShowModal(false); setEditPolicy(null); load(); }}
+          initial={null}
+          onClose={() => setShowModal(false)}
+          onSaved={() => { setShowModal(false); load(); }}
         />
       )}
 

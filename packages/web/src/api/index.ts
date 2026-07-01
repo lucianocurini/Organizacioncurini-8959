@@ -3457,6 +3457,51 @@ function reportIsRenovationImported(notes: string | null): boolean {
   return n.includes("movimiento: renovacion") || n.includes("mov: renovacion");
 }
 
+// Bien asegurado: mismo detalle descriptivo que polizas.tsx/poliza-detail.tsx usan por tipo.
+// No sustituye por el ramo — si el tipo no tiene campos propios, devuelve null (el frontend muestra "—").
+interface ReportAssetFields {
+  type: string;
+  isFleet: number | boolean | null;
+  vehicleBrand: string | null;
+  vehicleModel: string | null;
+  vehicleYear: number | null;
+  vehiclePlate: string | null;
+  motoBrand: string | null;
+  motoModel: string | null;
+  motoYear: number | null;
+  motoPlate: string | null;
+  propertyAddress: string | null;
+  businessName: string | null;
+  businessActivity: string | null;
+}
+
+function reportInsuredAsset(row: ReportAssetFields, policyId: number, fleetCounts: Map<number, number>): string | null {
+  if (row.type === "automotor") {
+    if (row.isFleet) {
+      const count = fleetCounts.get(policyId) ?? 0;
+      return count > 0 ? `Flota: ${count} vehículo${count !== 1 ? "s" : ""}` : "Flota";
+    }
+    const desc = [row.vehicleBrand, row.vehicleModel, row.vehicleYear ? String(row.vehicleYear) : null]
+      .filter(Boolean).join(" ");
+    const plate = row.vehiclePlate ? `${desc ? " · " : ""}${row.vehiclePlate}` : "";
+    return (desc + plate) || null;
+  }
+  if (row.type === "motovehiculo") {
+    const desc = [row.motoBrand, row.motoModel, row.motoYear ? String(row.motoYear) : null]
+      .filter(Boolean).join(" ");
+    const plate = row.motoPlate ? `${desc ? " · " : ""}${row.motoPlate}` : "";
+    return (desc + plate) || null;
+  }
+  if (row.type === "hogar") {
+    return row.propertyAddress || null;
+  }
+  if (row.type === "comercial") {
+    if (row.businessName && row.businessActivity) return `${row.businessName} (${row.businessActivity})`;
+    return row.businessName || row.businessActivity || null;
+  }
+  return null;
+}
+
 app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
   const {
     month,
@@ -3516,6 +3561,18 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
       policyCompanyId: policies.companyId,
       insuredName: insureds.name,
       companyName: companies.name,
+      isFleet: policies.isFleet,
+      vehicleBrand: policies.vehicleBrand,
+      vehicleModel: policies.vehicleModel,
+      vehicleYear: policies.vehicleYear,
+      vehiclePlate: policies.vehiclePlate,
+      motoBrand: policies.motoBrand,
+      motoModel: policies.motoModel,
+      motoYear: policies.motoYear,
+      motoPlate: policies.motoPlate,
+      propertyAddress: policies.propertyAddress,
+      businessName: policies.businessName,
+      businessActivity: policies.businessActivity,
     })
     .from(rebillings)
     .innerJoin(policies, eq(rebillings.policyId, policies.id))
@@ -3530,24 +3587,6 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     )
     .orderBy(asc(rebillings.billingStart), sql`MIN(${rebillings.id})`)
     .all();
-
-  let rebillingRows = rebRaw.map((r) => ({
-    rebillingId: Number(r.rebillingId),
-    policyId: Number(r.policyId),
-    policyNumber: String(r.policyNumber),
-    insuredName: String(r.insuredName),
-    companyName: String(r.companyName),
-    type: String(r.policyType),
-    billingStart: String(r.billingStart),
-    billingEnd: String(r.billingEnd),
-    premium: r.premium != null ? Number(r.premium) : null,
-    monthlyFee: r.monthlyFee != null ? Number(r.monthlyFee) : null,
-    policyOriginalStart: String(r.policyOriginalStart),
-    billingCycle: r.billingCycle ? String(r.billingCycle) : null,
-    rebillingType: reportRebillingType(r.notes as string | null),
-    duplicateCount: Number(r.duplicateCount),
-    extraDuplicateRows: Number(r.duplicateCount) - 1,
-  }));
 
   // ── 2. Policies starting in month ──
   const polConditions: any[] = [
@@ -3565,11 +3604,24 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
       startDate: policies.startDate,
       endDate: policies.endDate,
       premium: policies.premium,
+      monthlyFee: policies.monthlyFee,
       notes: policies.notes,
       renewedFromId: policies.renewedFromId,
       companyId: policies.companyId,
       insuredName: insureds.name,
       companyName: companies.name,
+      isFleet: policies.isFleet,
+      vehicleBrand: policies.vehicleBrand,
+      vehicleModel: policies.vehicleModel,
+      vehicleYear: policies.vehicleYear,
+      vehiclePlate: policies.vehiclePlate,
+      motoBrand: policies.motoBrand,
+      motoModel: policies.motoModel,
+      motoYear: policies.motoYear,
+      motoPlate: policies.motoPlate,
+      propertyAddress: policies.propertyAddress,
+      businessName: policies.businessName,
+      businessActivity: policies.businessActivity,
     })
     .from(policies)
     .innerJoin(insureds, eq(policies.insuredId, insureds.id))
@@ -3577,6 +3629,45 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     .where(and(...polConditions))
     .orderBy(asc(policies.startDate))
     .all();
+
+  // ── Bien asegurado: conteo de flota en un solo query batched (sin N+1) ──
+  const fleetPolicyIds = [
+    ...rebRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
+    ...polRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
+  ];
+  const fleetCounts = new Map<number, number>();
+  if (fleetPolicyIds.length > 0) {
+    const fleetRows = await db
+      .select({ policyId: policyFleetVehicles.policyId, count: sql<number>`COUNT(*)` })
+      .from(policyFleetVehicles)
+      .where(inArray(policyFleetVehicles.policyId, fleetPolicyIds))
+      .groupBy(policyFleetVehicles.policyId)
+      .all();
+    for (const fr of fleetRows) fleetCounts.set(Number(fr.policyId), Number(fr.count));
+  }
+
+  let rebillingRows = rebRaw.map((r) => ({
+    rebillingId: Number(r.rebillingId),
+    policyId: Number(r.policyId),
+    policyNumber: String(r.policyNumber),
+    insuredName: String(r.insuredName),
+    companyName: String(r.companyName),
+    type: String(r.policyType),
+    billingStart: String(r.billingStart),
+    billingEnd: String(r.billingEnd),
+    premium: r.premium != null ? Number(r.premium) : null,
+    monthlyFee: r.monthlyFee != null ? Number(r.monthlyFee) : null,
+    policyOriginalStart: String(r.policyOriginalStart),
+    billingCycle: r.billingCycle ? String(r.billingCycle) : null,
+    rebillingType: reportRebillingType(r.notes as string | null),
+    duplicateCount: Number(r.duplicateCount),
+    extraDuplicateRows: Number(r.duplicateCount) - 1,
+    insuredAsset: reportInsuredAsset(
+      { ...r, type: String(r.policyType) } as ReportAssetFields,
+      Number(r.policyId),
+      fleetCounts,
+    ),
+  }));
 
   // Lookup old policies for renewedFromId
   const renewedFromIds = polRaw
@@ -3613,8 +3704,10 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
         startDate: p.startDate,
         endDate: p.endDate,
         premium: p.premium != null ? Number(p.premium) : null,
+        monthlyFee: p.monthlyFee != null ? Number(p.monthlyFee) : null,
         renewedFromPolicyNumber: old?.policyNumber ?? null,
         renewedFromEndDate: old?.endDate ?? null,
+        insuredAsset: reportInsuredAsset(p as ReportAssetFields, Number(p.policyId), fleetCounts),
       });
     } else if (reportIsRenovationImported(notes)) {
       renovationsImported.push({
@@ -3626,7 +3719,9 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
         startDate: p.startDate,
         endDate: p.endDate,
         premium: p.premium != null ? Number(p.premium) : null,
+        monthlyFee: p.monthlyFee != null ? Number(p.monthlyFee) : null,
         sourceImporter: reportSourceImporter(notes),
+        insuredAsset: reportInsuredAsset(p as ReportAssetFields, Number(p.policyId), fleetCounts),
       });
     } else {
       const importer = reportSourceImporter(notes);
@@ -3639,9 +3734,11 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
         startDate: p.startDate,
         endDate: p.endDate,
         premium: p.premium != null ? Number(p.premium) : null,
+        monthlyFee: p.monthlyFee != null ? Number(p.monthlyFee) : null,
         movementType: "new_policy" as const,
         sourceImporter: importer,
         classificationReason: reportClassificationReason(notes, importer),
+        insuredAsset: reportInsuredAsset(p as ReportAssetFields, Number(p.policyId), fleetCounts),
       });
     }
   }

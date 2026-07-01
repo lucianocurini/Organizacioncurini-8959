@@ -7,7 +7,7 @@ import { test, expect, beforeAll, afterAll, describe } from "bun:test";
 import app from "../index";
 import { database as db } from "../database/index";
 import {
-  users, sessions, policies, rebillings, companies, insureds,
+  users, sessions, policies, rebillings, companies, insureds, policyFleetVehicles,
 } from "../database/schema";
 import { eq, inArray } from "drizzle-orm";
 
@@ -49,6 +49,18 @@ async function mkPolicy(opts: {
   type?: string;
   notes?: string | null;
   renewedFromId?: number;
+  vehicleBrand?: string | null;
+  vehicleModel?: string | null;
+  vehicleYear?: number | null;
+  vehiclePlate?: string | null;
+  isFleet?: number;
+  motoBrand?: string | null;
+  motoModel?: string | null;
+  motoYear?: number | null;
+  motoPlate?: string | null;
+  propertyAddress?: string | null;
+  businessName?: string | null;
+  businessActivity?: string | null;
 }): Promise<number> {
   const [p] = await db.insert(policies).values({
     policyNumber: opts.num,
@@ -62,6 +74,18 @@ async function mkPolicy(opts: {
     createdBy: userId,
     notes: opts.notes ?? null,
     renewedFromId: opts.renewedFromId ?? null,
+    vehicleBrand: opts.vehicleBrand ?? null,
+    vehicleModel: opts.vehicleModel ?? null,
+    vehicleYear: opts.vehicleYear ?? null,
+    vehiclePlate: opts.vehiclePlate ?? null,
+    isFleet: opts.isFleet ?? 0,
+    motoBrand: opts.motoBrand ?? null,
+    motoModel: opts.motoModel ?? null,
+    motoYear: opts.motoYear ?? null,
+    motoPlate: opts.motoPlate ?? null,
+    propertyAddress: opts.propertyAddress ?? null,
+    businessName: opts.businessName ?? null,
+    businessActivity: opts.businessActivity ?? null,
   }).returning({ id: policies.id });
   policyIdsToClean.push(p!.id);
   return p!.id;
@@ -140,6 +164,7 @@ afterAll(async () => {
     await db.delete(rebillings).where(inArray(rebillings.id, rebillingIdsToClean)).catch(() => {});
   }
   if (policyIdsToClean.length) {
+    await db.delete(policyFleetVehicles).where(inArray(policyFleetVehicles.policyId, policyIdsToClean)).catch(() => {});
     await db.delete(policies).where(inArray(policies.id, policyIdsToClean)).catch(() => {});
   }
   const me = await db.select({ id: users.id }).from(users).where(eq(users.email, USER_EMAIL)).get();
@@ -500,6 +525,171 @@ describe("Caso L — filtros: companyId, type, movementType, rebillingType, q", 
     const body = await (await callReport(M, { q: "test-rm-l-en" })).json();
     expect(body.newPolicies.some((p: any) => p.policyId === polElNorteId)).toBe(true);
     expect(body.newPolicies.some((p: any) => p.policyId === polRivId)).toBe(false);
+  });
+});
+
+// ── Caso N — Bien asegurado (insuredAsset) ────────────────────────────────────
+
+describe("Caso N — Bien asegurado por tipo de póliza", () => {
+  test("automotor con datos de vehículo → insuredAsset en rebillings, renovationsConfirmed, renovationsImported y newPolicies", async () => {
+    // Alta (newPolicies)
+    const polAlta = await mkPolicy({
+      num: "TEST-RM-N-ALTA",
+      companyId: coElNorteId,
+      startDate: `${M}-01`,
+      notes: null,
+      vehicleBrand: "Toyota",
+      vehicleModel: "Corolla",
+      vehicleYear: 2020,
+      vehiclePlate: "AB123CD",
+    });
+
+    // Refacturación (rebillings) sobre una póliza base con datos de vehículo
+    const polBase = await mkPolicy({
+      num: "TEST-RM-N-BASE",
+      companyId: coElNorteId,
+      startDate: `${M}-01`,
+      notes: "Importado de El Norte v2 | Movimiento: ALTA",
+      vehicleBrand: "Ford",
+      vehicleModel: "Fiesta",
+      vehiclePlate: "XY987ZW",
+    });
+    await mkReb({
+      policyId: polBase,
+      billingStart: `${M_ADJ}-01`,
+      notes: "Importado de El Norte v2 | Prórroga",
+    });
+
+    // Renovación confirmada (renovationsConfirmed) → toma el bien de la póliza NUEVA
+    const polOld = await mkPolicy({
+      num: "TEST-RM-N-OLD",
+      companyId: coCoopId,
+      startDate: `2026-01-01`,
+      endDate: `${M}-01`,
+      notes: null,
+      vehicleBrand: "Viejo",
+      vehicleModel: "Modelo",
+      vehiclePlate: "OLD001",
+    });
+    const polNew = await mkPolicy({
+      num: "TEST-RM-N-NEW",
+      companyId: coCoopId,
+      startDate: `${M}-01`,
+      notes: null,
+      renewedFromId: polOld,
+      vehicleBrand: "Honda",
+      vehicleModel: "Civic",
+      vehiclePlate: "NEW002",
+    });
+
+    // Renovación importada (renovationsImported)
+    const polImportada = await mkPolicy({
+      num: "TEST-RM-N-IMP",
+      companyId: coRivadaviaId,
+      startDate: `${M}-01`,
+      notes: "Importado de Rivadavia | Movimiento: RENOVACION",
+      vehicleBrand: "Chevrolet",
+      vehicleModel: "Onix",
+      vehiclePlate: "IMP003",
+    });
+
+    const body = await (await callReport(M_ADJ)).json();
+    const bodyM = await (await callReport(M)).json();
+
+    const rowAlta = bodyM.newPolicies.find((p: any) => p.policyId === polAlta);
+    expect(rowAlta.insuredAsset).toBe("Toyota Corolla 2020 · AB123CD");
+
+    const rowReb = body.rebillings.find((r: any) => r.policyId === polBase);
+    expect(rowReb.insuredAsset).toBe("Ford Fiesta · XY987ZW");
+
+    const rowConfirmed = bodyM.renovationsConfirmed.find((p: any) => p.policyId === polNew);
+    expect(rowConfirmed.insuredAsset).toBe("Honda Civic · NEW002");
+
+    const rowImported = bodyM.renovationsImported.find((p: any) => p.policyId === polImportada);
+    expect(rowImported.insuredAsset).toBe("Chevrolet Onix · IMP003");
+  });
+
+  test("póliza sin bien asegurado (tipo sin campos propios) → insuredAsset null y frontend mostraría '—'", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-N-NOASSET",
+      companyId: coElNorteId,
+      type: "accidentes",
+      startDate: `${M}-01`,
+      notes: null,
+    });
+
+    const body = await (await callReport(M)).json();
+    const row = body.newPolicies.find((p: any) => p.policyId === polId);
+    expect(row).toBeDefined();
+    expect(row.insuredAsset).toBeNull();
+  });
+
+  test("automotor de flota sin vehículos cargados → 'Flota'; con vehículos → 'Flota: N vehículos'", async () => {
+    const polSinVeh = await mkPolicy({
+      num: "TEST-RM-N-FLEET-EMPTY",
+      companyId: coElNorteId,
+      startDate: `${M}-01`,
+      notes: null,
+      isFleet: 1,
+    });
+    const polConVeh = await mkPolicy({
+      num: "TEST-RM-N-FLEET-FULL",
+      companyId: coElNorteId,
+      startDate: `${M}-01`,
+      notes: null,
+      isFleet: 1,
+    });
+    await db.insert(policyFleetVehicles).values([
+      { policyId: polConVeh, brand: "Toyota", model: "Hilux" },
+      { policyId: polConVeh, brand: "Ford", model: "Ranger" },
+    ]);
+
+    const body = await (await callReport(M)).json();
+    expect(body.newPolicies.find((p: any) => p.policyId === polSinVeh).insuredAsset).toBe("Flota");
+    expect(body.newPolicies.find((p: any) => p.policyId === polConVeh).insuredAsset).toBe("Flota: 2 vehículos");
+  });
+
+  test("hogar usa propertyAddress; comercial usa businessName + businessActivity", async () => {
+    const polHogar = await mkPolicy({
+      num: "TEST-RM-N-HOGAR",
+      companyId: coElNorteId,
+      type: "hogar",
+      startDate: `${M}-01`,
+      notes: null,
+      propertyAddress: "Av. Siempre Viva 742",
+    });
+    const polComercial = await mkPolicy({
+      num: "TEST-RM-N-COMERCIAL",
+      companyId: coElNorteId,
+      type: "comercial",
+      startDate: `${M}-01`,
+      notes: null,
+      businessName: "Ferretería El Tornillo",
+      businessActivity: "Venta de materiales",
+    });
+
+    const body = await (await callReport(M)).json();
+    expect(body.newPolicies.find((p: any) => p.policyId === polHogar).insuredAsset).toBe("Av. Siempre Viva 742");
+    expect(body.newPolicies.find((p: any) => p.policyId === polComercial).insuredAsset)
+      .toBe("Ferretería El Tornillo (Venta de materiales)");
+  });
+
+  test("no expone DNI, dirección personal, teléfono ni email del asegurado", async () => {
+    const body = await (await callReport(M)).json();
+    const json = JSON.stringify(body);
+    expect(json.toLowerCase()).not.toContain('"dni"');
+    expect(json.toLowerCase()).not.toContain('"phone"');
+    expect(json.toLowerCase()).not.toContain('"email"');
+    // "address" del asegurado no debe exponerse (propertyAddress del bien sí es intencional)
+    expect(json).not.toContain('"address"');
+  });
+
+  test("filtros y totales previos siguen funcionando con insuredAsset presente", async () => {
+    const body = await (await callReport(M)).json();
+    expect(body.totals.newPoliciesCount).toBe(body.newPolicies.length);
+    expect(body.totals.rebillingsCount).toBe(body.rebillings.length);
+    expect(body.totals.renovationsConfirmedCount).toBe(body.renovationsConfirmed.length);
+    expect(body.totals.renovationsImportedCount).toBe(body.renovationsImported.length);
   });
 });
 

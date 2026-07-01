@@ -7,6 +7,7 @@ import {
   FileText, TrendingUp, Plus, Copy, BarChart3,
 } from "lucide-react";
 import * as XLSX from "xlsx";
+import { PolicyActions } from "@/components/policies/PolicyActions";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -26,6 +27,7 @@ interface RebillingRow {
   rebillingType: string;
   duplicateCount: number;
   extraDuplicateRows: number;
+  insuredAsset: string | null;
 }
 
 interface RenovationConfirmedRow {
@@ -37,8 +39,10 @@ interface RenovationConfirmedRow {
   startDate: string;
   endDate: string;
   premium: number | null;
+  monthlyFee: number | null;
   renewedFromPolicyNumber: string | null;
   renewedFromEndDate: string | null;
+  insuredAsset: string | null;
 }
 
 interface RenovationImportedRow {
@@ -50,7 +54,9 @@ interface RenovationImportedRow {
   startDate: string;
   endDate: string;
   premium: number | null;
+  monthlyFee: number | null;
   sourceImporter: string;
+  insuredAsset: string | null;
 }
 
 interface NewPolicyRow {
@@ -62,9 +68,11 @@ interface NewPolicyRow {
   startDate: string;
   endDate: string;
   premium: number | null;
+  monthlyFee: number | null;
   movementType: string;
   sourceImporter: string;
   classificationReason: string;
+  insuredAsset: string | null;
 }
 
 interface ReportTotals {
@@ -184,6 +192,11 @@ function TypeBadge({ type }: { type: string }) {
   );
 }
 
+function AssetCell({ value }: { value: string | null }) {
+  if (!value) return <span className="text-gray-600 text-xs">—</span>;
+  return <span className="text-sm text-gray-300 whitespace-normal break-words">{value}</span>;
+}
+
 // ── Table header ──────────────────────────────────────────────────────────────
 
 function Th({ children, className }: { children: React.ReactNode; className?: string }) {
@@ -194,9 +207,9 @@ function Th({ children, className }: { children: React.ReactNode; className?: st
   );
 }
 
-function Td({ children, className }: { children: React.ReactNode; className?: string }) {
+function Td({ children, className, style }: { children: React.ReactNode; className?: string; style?: React.CSSProperties }) {
   return (
-    <td className={cn("py-3 px-3 text-sm text-gray-300 align-top", className)}>
+    <td className={cn("py-3 px-3 text-sm text-gray-300 align-top", className)} style={style}>
       {children}
     </td>
   );
@@ -297,6 +310,7 @@ function exportExcel(data: ReportData, activeFilters: string) {
   const rebRows = data.rebillings.map((r) => ({
     "N° Póliza": r.policyNumber,
     "Asegurado": r.insuredName,
+    "Bien asegurado": r.insuredAsset ?? "",
     "Compañía": r.companyName,
     "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
     "Inicio refact.": r.billingStart,
@@ -316,6 +330,7 @@ function exportExcel(data: ReportData, activeFilters: string) {
       "Tipo renovación": "Confirmada",
       "N° Póliza": r.policyNumber,
       "Asegurado": r.insuredName,
+      "Bien asegurado": r.insuredAsset ?? "",
       "Compañía": r.companyName,
       "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
       "Inicio vigencia": r.startDate,
@@ -329,6 +344,7 @@ function exportExcel(data: ReportData, activeFilters: string) {
       "Tipo renovación": "Importada",
       "N° Póliza": r.policyNumber,
       "Asegurado": r.insuredName,
+      "Bien asegurado": r.insuredAsset ?? "",
       "Compañía": r.companyName,
       "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
       "Inicio vigencia": r.startDate,
@@ -345,6 +361,7 @@ function exportExcel(data: ReportData, activeFilters: string) {
   const altasRows = data.newPolicies.map((r) => ({
     "N° Póliza": r.policyNumber,
     "Asegurado": r.insuredName,
+    "Bien asegurado": r.insuredAsset ?? "",
     "Compañía": r.companyName,
     "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
     "Inicio vigencia": r.startDate,
@@ -371,6 +388,7 @@ function exportCSV(data: ReportData) {
       "Subtipo": REBILLING_TYPE_LABELS[r.rebillingType] ?? r.rebillingType,
       "N° Póliza": r.policyNumber,
       "Asegurado": r.insuredName,
+      "Bien asegurado": r.insuredAsset ?? "",
       "Compañía": r.companyName,
       "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
       "Fecha inicio": r.billingStart,
@@ -388,6 +406,7 @@ function exportCSV(data: ReportData) {
       "Subtipo": "",
       "N° Póliza": r.policyNumber,
       "Asegurado": r.insuredName,
+      "Bien asegurado": r.insuredAsset ?? "",
       "Compañía": r.companyName,
       "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
       "Fecha inicio": r.startDate,
@@ -405,6 +424,7 @@ function exportCSV(data: ReportData) {
       "Subtipo": "",
       "N° Póliza": r.policyNumber,
       "Asegurado": r.insuredName,
+      "Bien asegurado": r.insuredAsset ?? "",
       "Compañía": r.companyName,
       "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
       "Fecha inicio": r.startDate,
@@ -422,6 +442,7 @@ function exportCSV(data: ReportData) {
       "Subtipo": "",
       "N° Póliza": r.policyNumber,
       "Asegurado": r.insuredName,
+      "Bien asegurado": r.insuredAsset ?? "",
       "Compañía": r.companyName,
       "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
       "Fecha inicio": r.startDate,
@@ -455,11 +476,13 @@ function exportCSV(data: ReportData) {
 const PRINT_STYLES = `
 @media print {
   @page { size: A4 landscape; margin: 1cm; }
-  body { background: white !important; color: black !important; }
+  body { background: white !important; color: black !important; font-size: 10px; }
   .no-print { display: none !important; }
+  .col-actions { display: none !important; }
   .print-card { border: 1px solid #ccc !important; background: white !important; break-inside: avoid; }
-  .print-section { border: 1px solid #ccc !important; background: white !important; break-inside: auto; margin-bottom: 1cm; }
-  .print-section table { page-break-inside: auto; }
+  .print-section { border: 1px solid #ccc !important; background: white !important; break-inside: auto; margin-bottom: 0.6cm; }
+  .print-section table { page-break-inside: auto; font-size: 9px; }
+  .print-section th, .print-section td { padding: 4px 6px !important; }
   .print-section tr { page-break-inside: avoid; }
   thead { display: table-header-group; }
   a { color: inherit !important; text-decoration: none !important; }
@@ -526,7 +549,7 @@ export default function ReporteMes() {
   return (
     <AppLayout>
       <style dangerouslySetInnerHTML={{ __html: PRINT_STYLES }} />
-      <div className="p-4 lg:p-8">
+      <div className="p-4 lg:p-6">
 
         {/* Header */}
         <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 mb-6 no-print">
@@ -720,36 +743,53 @@ export default function ReporteMes() {
               count={data.rebillings.length}
               empty="Sin refacturaciones para este período."
             >
-              <table className="w-full">
+              <table className="w-full table-fixed" style={{ minWidth: 1420 }}>
+                <colgroup>
+                  <col style={{ width: 90 }} />
+                  <col style={{ width: 110 }} />
+                  <col style={{ width: 130 }} />
+                  <col style={{ width: 140 }} />
+                  <col style={{ width: 220 }} />
+                  <col style={{ width: 90 }} />
+                  <col style={{ width: 90 }} />
+                  <col style={{ width: 100 }} />
+                  <col style={{ width: 100 }} />
+                  <col style={{ width: 110 }} />
+                  <col style={{ width: 110 }} />
+                  <col style={{ width: 110 }} />
+                </colgroup>
                 <thead className="border-b border-[#1f2937] bg-[#0d1424]">
                   <tr>
+                    <Th>Inicio refact.</Th>
+                    <Th>Compañía</Th>
                     <Th>N° Póliza</Th>
                     <Th>Asegurado</Th>
-                    <Th>Compañía</Th>
-                    <Th>Ramo</Th>
-                    <Th>Inicio refact.</Th>
+                    <Th>Bien asegurado</Th>
+                    <Th>Tipo</Th>
                     <Th>Fin refact.</Th>
                     <Th>Premio</Th>
-                    <Th>Tipo</Th>
+                    <Th>Cuota mensual</Th>
+                    <Th>Subtipo</Th>
+                    <Th>Duplicados</Th>
+                    <Th className="col-actions text-right sticky right-0 bg-[#0d1424]">Acciones</Th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#1f2937]">
                   {data.rebillings.map((r) => (
                     <tr key={`${r.rebillingId}`} className="hover:bg-[#0d1424]/50 transition-colors">
-                      <Td>
-                        <span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span>
-                      </Td>
-                      <Td>{r.insuredName}</Td>
-                      <Td className="text-gray-400">{r.companyName}</Td>
-                      <Td><TypeBadge type={r.type} /></Td>
                       <Td className="font-mono text-xs">{formatDate(r.billingStart)}</Td>
+                      <Td className="text-gray-400">{r.companyName}</Td>
+                      <Td><span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span></Td>
+                      <Td>{r.insuredName}</Td>
+                      <Td className="whitespace-normal break-words"><AssetCell value={r.insuredAsset} /></Td>
+                      <Td><TypeBadge type={r.type} /></Td>
                       <Td className="font-mono text-xs">{formatDate(r.billingEnd)}</Td>
                       <Td className="font-medium text-white">{formatCurrency(r.premium)}</Td>
-                      <Td>
-                        <div className="flex flex-wrap gap-1">
-                          <RebillingTypeBadge type={r.rebillingType} />
-                          <DuplicateBadge count={r.duplicateCount} />
-                        </div>
+                      <Td className="text-gray-300">{r.monthlyFee != null ? formatCurrency(r.monthlyFee) : <span className="text-gray-600 text-xs">—</span>}</Td>
+                      <Td><RebillingTypeBadge type={r.rebillingType} /></Td>
+                      <Td>{r.duplicateCount > 1 ? <DuplicateBadge count={r.duplicateCount} /> : <span className="text-gray-600 text-xs">—</span>}</Td>
+                      <Td className="col-actions sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
+                        <PolicyActions policyId={r.policyId} onChanged={load} />
                       </Td>
                     </tr>
                   ))}
@@ -763,33 +803,54 @@ export default function ReporteMes() {
               count={data.renovationsConfirmed.length}
               empty="Sin renovaciones confirmadas este mes."
             >
-              <table className="w-full">
+              <table className="w-full table-fixed" style={{ minWidth: 1370 }}>
+                <colgroup>
+                  <col style={{ width: 90 }} />
+                  <col style={{ width: 110 }} />
+                  <col style={{ width: 130 }} />
+                  <col style={{ width: 140 }} />
+                  <col style={{ width: 220 }} />
+                  <col style={{ width: 90 }} />
+                  <col style={{ width: 90 }} />
+                  <col style={{ width: 100 }} />
+                  <col style={{ width: 100 }} />
+                  <col style={{ width: 190 }} />
+                  <col style={{ width: 110 }} />
+                </colgroup>
                 <thead className="border-b border-[#1f2937] bg-[#0d1424]">
                   <tr>
+                    <Th>Inicio vigencia</Th>
+                    <Th>Compañía</Th>
                     <Th>N° Póliza</Th>
                     <Th>Asegurado</Th>
-                    <Th>Compañía</Th>
-                    <Th>Ramo</Th>
-                    <Th>Inicio vigencia</Th>
+                    <Th>Bien asegurado</Th>
+                    <Th>Tipo</Th>
                     <Th>Fin vigencia</Th>
                     <Th>Premio</Th>
+                    <Th>Cuota mensual</Th>
                     <Th>Renueva a</Th>
+                    <Th className="col-actions text-right sticky right-0 bg-[#0d1424]">Acciones</Th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#1f2937]">
                   {data.renovationsConfirmed.map((r) => (
                     <tr key={r.policyId} className="hover:bg-[#0d1424]/50 transition-colors">
+                      <Td className="font-mono text-xs">{formatDate(r.startDate)}</Td>
+                      <Td className="text-gray-400">{r.companyName}</Td>
                       <Td><span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span></Td>
                       <Td>{r.insuredName}</Td>
-                      <Td className="text-gray-400">{r.companyName}</Td>
+                      <Td className="whitespace-normal break-words"><AssetCell value={r.insuredAsset} /></Td>
                       <Td><TypeBadge type={r.type} /></Td>
-                      <Td className="font-mono text-xs">{formatDate(r.startDate)}</Td>
                       <Td className="font-mono text-xs">{formatDate(r.endDate)}</Td>
                       <Td className="font-medium text-white">{formatCurrency(r.premium)}</Td>
+                      <Td className="text-gray-300">{r.monthlyFee != null ? formatCurrency(r.monthlyFee) : <span className="text-gray-600 text-xs">—</span>}</Td>
                       <Td>
                         {r.renewedFromPolicyNumber
                           ? <span className="font-mono text-xs text-gray-400">{r.renewedFromPolicyNumber} (vto. {formatDate(r.renewedFromEndDate)})</span>
                           : <span className="text-gray-600 text-xs">—</span>}
+                      </Td>
+                      <Td className="col-actions sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
+                        <PolicyActions policyId={r.policyId} onChanged={load} />
                       </Td>
                     </tr>
                   ))}
@@ -803,30 +864,51 @@ export default function ReporteMes() {
               count={data.renovationsImported.length}
               empty="Sin renovaciones importadas este mes."
             >
-              <table className="w-full">
+              <table className="w-full table-fixed" style={{ minWidth: 1370 }}>
+                <colgroup>
+                  <col style={{ width: 90 }} />
+                  <col style={{ width: 110 }} />
+                  <col style={{ width: 130 }} />
+                  <col style={{ width: 140 }} />
+                  <col style={{ width: 220 }} />
+                  <col style={{ width: 90 }} />
+                  <col style={{ width: 90 }} />
+                  <col style={{ width: 100 }} />
+                  <col style={{ width: 100 }} />
+                  <col style={{ width: 190 }} />
+                  <col style={{ width: 110 }} />
+                </colgroup>
                 <thead className="border-b border-[#1f2937] bg-[#0d1424]">
                   <tr>
+                    <Th>Inicio vigencia</Th>
+                    <Th>Compañía</Th>
                     <Th>N° Póliza</Th>
                     <Th>Asegurado</Th>
-                    <Th>Compañía</Th>
-                    <Th>Ramo</Th>
-                    <Th>Inicio vigencia</Th>
+                    <Th>Bien asegurado</Th>
+                    <Th>Tipo</Th>
                     <Th>Fin vigencia</Th>
                     <Th>Premio</Th>
+                    <Th>Cuota mensual</Th>
                     <Th>Importador</Th>
+                    <Th className="col-actions text-right sticky right-0 bg-[#0d1424]">Acciones</Th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#1f2937]">
                   {data.renovationsImported.map((r) => (
                     <tr key={r.policyId} className="hover:bg-[#0d1424]/50 transition-colors">
+                      <Td className="font-mono text-xs">{formatDate(r.startDate)}</Td>
+                      <Td className="text-gray-400">{r.companyName}</Td>
                       <Td><span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span></Td>
                       <Td>{r.insuredName}</Td>
-                      <Td className="text-gray-400">{r.companyName}</Td>
+                      <Td className="whitespace-normal break-words"><AssetCell value={r.insuredAsset} /></Td>
                       <Td><TypeBadge type={r.type} /></Td>
-                      <Td className="font-mono text-xs">{formatDate(r.startDate)}</Td>
                       <Td className="font-mono text-xs">{formatDate(r.endDate)}</Td>
                       <Td className="font-medium text-white">{formatCurrency(r.premium)}</Td>
+                      <Td className="text-gray-300">{r.monthlyFee != null ? formatCurrency(r.monthlyFee) : <span className="text-gray-600 text-xs">—</span>}</Td>
                       <Td className="text-gray-400 text-xs">{importerLabel(r.sourceImporter)}</Td>
+                      <Td className="col-actions sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
+                        <PolicyActions policyId={r.policyId} onChanged={load} />
+                      </Td>
                     </tr>
                   ))}
                 </tbody>
@@ -839,34 +921,55 @@ export default function ReporteMes() {
               count={data.newPolicies.length}
               empty="Sin altas este mes."
             >
-              <table className="w-full">
+              <table className="w-full table-fixed" style={{ minWidth: 1370 }}>
+                <colgroup>
+                  <col style={{ width: 90 }} />
+                  <col style={{ width: 110 }} />
+                  <col style={{ width: 130 }} />
+                  <col style={{ width: 140 }} />
+                  <col style={{ width: 220 }} />
+                  <col style={{ width: 90 }} />
+                  <col style={{ width: 90 }} />
+                  <col style={{ width: 100 }} />
+                  <col style={{ width: 100 }} />
+                  <col style={{ width: 190 }} />
+                  <col style={{ width: 110 }} />
+                </colgroup>
                 <thead className="border-b border-[#1f2937] bg-[#0d1424]">
                   <tr>
+                    <Th>Inicio vigencia</Th>
+                    <Th>Compañía</Th>
                     <Th>N° Póliza</Th>
                     <Th>Asegurado</Th>
-                    <Th>Compañía</Th>
-                    <Th>Ramo</Th>
-                    <Th>Inicio vigencia</Th>
+                    <Th>Bien asegurado</Th>
+                    <Th>Tipo</Th>
                     <Th>Fin vigencia</Th>
                     <Th>Premio</Th>
+                    <Th>Cuota mensual</Th>
                     <Th>Origen</Th>
+                    <Th className="col-actions text-right sticky right-0 bg-[#0d1424]">Acciones</Th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#1f2937]">
                   {data.newPolicies.map((r) => (
                     <tr key={r.policyId} className="hover:bg-[#0d1424]/50 transition-colors">
+                      <Td className="font-mono text-xs">{formatDate(r.startDate)}</Td>
+                      <Td className="text-gray-400">{r.companyName}</Td>
                       <Td><span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span></Td>
                       <Td>{r.insuredName}</Td>
-                      <Td className="text-gray-400">{r.companyName}</Td>
+                      <Td className="whitespace-normal break-words"><AssetCell value={r.insuredAsset} /></Td>
                       <Td><TypeBadge type={r.type} /></Td>
-                      <Td className="font-mono text-xs">{formatDate(r.startDate)}</Td>
                       <Td className="font-mono text-xs">{formatDate(r.endDate)}</Td>
                       <Td className="font-medium text-white">{formatCurrency(r.premium)}</Td>
+                      <Td className="text-gray-300">{r.monthlyFee != null ? formatCurrency(r.monthlyFee) : <span className="text-gray-600 text-xs">—</span>}</Td>
                       <Td>
                         <div className="flex flex-wrap gap-1 items-center">
                           <span className="text-xs text-gray-400">{importerLabel(r.sourceImporter)}</span>
                           <AltaBadge reason={r.classificationReason} />
                         </div>
+                      </Td>
+                      <Td className="col-actions sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
+                        <PolicyActions policyId={r.policyId} onChanged={load} />
                       </Td>
                     </tr>
                   ))}
