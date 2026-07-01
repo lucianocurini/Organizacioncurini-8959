@@ -179,6 +179,11 @@ export default function Polizas() {
             </p>
           </div>
           <div className="flex items-center gap-2">
+            <Link href="/reporte-mes">
+              <a className="flex items-center gap-2 px-3 py-2 bg-[#1f2937] border border-[#374151] text-gray-300 text-sm rounded-lg hover:text-white hover:border-gray-500 transition-all">
+                <FileText className="w-4 h-4" /> <span className="hidden sm:inline">Reporte mensual</span>
+              </a>
+            </Link>
             <button onClick={exportToCSV} className="flex items-center gap-2 px-3 py-2 bg-[#1f2937] border border-[#374151] text-gray-300 text-sm rounded-lg hover:text-white hover:border-gray-500 transition-all">
               <Download className="w-4 h-4" /> <span className="hidden sm:inline">Exportar CSV</span>
             </button>

@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { eq, like, or, desc, asc, and, inArray, lte, gte, isNull, ne } from "drizzle-orm";
+import { eq, like, or, desc, asc, and, inArray, lte, gte, isNull, ne, lt, sql } from "drizzle-orm";
 import { database as db } from "./database/index";
 import {
   users,
@@ -3209,7 +3209,7 @@ app.post("/import/ssn-gde", requireAuth(async (c: any) => {
     companyId = existingCo.id;
   } else {
     const [nc] = await db.insert(companies).values({ name: "Rivadavia" }).returning({ id: companies.id });
-    companyId = nc.id;
+    companyId = nc!.id;
   }
 
   async function ssnResolveInsured(p: any): Promise<number> {
@@ -3221,7 +3221,7 @@ app.post("/import/ssn-gde", requireAuth(async (c: any) => {
       name: p.insuredName, dni: p.insuredDni ? String(p.insuredDni) : null,
       email: null, phone: null, address: p.insuredAddress || null, createdBy: user.id,
     }).returning({ id: insureds.id });
-    return ni.id;
+    return ni!.id;
   }
 
   function ssnResolveTypeAndStatus(p: any): { polType: string; status: string } {
@@ -3233,7 +3233,7 @@ app.post("/import/ssn-gde", requireAuth(async (c: any) => {
     else if (vt === "integral_comercio") polType = "integral_comercio";
     else                                 polType = "automotor";
     const today = new Date().toISOString().split("T")[0];
-    const daysToEnd = Math.ceil((new Date(p.endDate).getTime() - new Date(today).getTime()) / 86400000);
+    const daysToEnd = Math.ceil((new Date(p.endDate as string).getTime() - new Date(today).getTime()) / 86400000);
     let status = "activa";
     if (daysToEnd < 0) status = "vencida";
     else if (daysToEnd <= 30) status = "por_vencer";
@@ -3406,6 +3406,316 @@ app.post("/import/ssn-gde", requireAuth(async (c: any) => {
   }
 
   return c.json({ ...counts, logId, ...(logWarning ? { logWarning } : {}) }, 200);
+}));
+
+// ─── REPORTES ─────────────────────────────────────────────────────────────────
+
+const REPORT_MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+const REPORT_VALID_TYPES = new Set([
+  "automotor","motovehiculo","hogar","accidentes_pasajeros","riesgos_varios",
+  "integral_comercio","accidentes","art","ecomovilidad","comercial",
+  "responsabilidad_civil","cascos","incendio",
+]);
+const REPORT_VALID_MOVEMENT_TYPES = new Set([
+  "rebilling","renovation_confirmed","renovation_imported","new_policy",
+]);
+const REPORT_VALID_REBILLING_TYPES = new Set([
+  "prorroga","endoso","extension_vigencia","renovacion","rehabilitacion","otro",
+]);
+
+function reportRebillingType(notes: string | null): string {
+  const n = (notes ?? "").toLowerCase();
+  if (n.includes("endoso")) return "endoso";
+  if (n.includes("extensión de vigencia") || n.includes("extension de vigencia")) return "extension_vigencia";
+  if (n.includes("prórroga") || n.includes("prorroga")) return "prorroga";
+  if (n.includes("importado de rivadavia")) return "prorroga";
+  if (n.includes("ssn-gde")) return "prorroga";
+  return "otro";
+}
+
+function reportSourceImporter(notes: string | null): string {
+  const n = (notes ?? "").toLowerCase();
+  if (n.includes("el norte v2")) return "el_norte_v2";
+  if (n.includes("ssn-gde")) return "rivadavia_ssn_gde";
+  if (n.includes("rivadavia")) return "rivadavia";
+  if (n.includes("el norte")) return "el_norte_v1";
+  if (n.includes("mercantil andina")) return "mercantil_andina";
+  return "manual";
+}
+
+function reportClassificationReason(notes: string | null, importer: string): string {
+  const n = (notes ?? "").toLowerCase();
+  if (n.includes("refacturacion") && (n.includes("sin base") || n.includes("base no encontrada"))) {
+    return "refacturacion_sin_base";
+  }
+  if (importer === "mercantil_andina") return "sin_antecedente_de_poliza";
+  return "alta_directa";
+}
+
+function reportIsRenovationImported(notes: string | null): boolean {
+  const n = (notes ?? "").toLowerCase();
+  return n.includes("movimiento: renovacion") || n.includes("mov: renovacion");
+}
+
+app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
+  const {
+    month,
+    companyId: companyIdStr,
+    type,
+    movementType,
+    rebillingType,
+    q,
+    sortBy,
+    sortOrder,
+  } = c.req.query();
+
+  if (!month || !REPORT_MONTH_RE.test(month)) {
+    return c.json({ error: "Parámetro month requerido (formato YYYY-MM)" }, 400);
+  }
+
+  const companyId =
+    companyIdStr && /^\d+$/.test(companyIdStr) && Number(companyIdStr) > 0
+      ? Number(companyIdStr)
+      : null;
+  const validType = REPORT_VALID_TYPES.has(type) ? type : null;
+  const validMovementType = REPORT_VALID_MOVEMENT_TYPES.has(movementType) ? movementType : null;
+  const validRebillingType = REPORT_VALID_REBILLING_TYPES.has(rebillingType) ? rebillingType : null;
+  const validSortOrder: "asc" | "desc" = sortOrder === "desc" ? "desc" : "asc";
+  const qLower = q ? String(q).toLowerCase() : null;
+
+  const [yearStr, monthStr] = month.split("-");
+  const year = Number(yearStr);
+  const mon = Number(monthStr);
+  const startDate = `${month}-01`;
+  const nextYear = mon === 12 ? year + 1 : year;
+  const nextMon = mon === 12 ? 1 : mon + 1;
+  const endDateExclusive = `${nextYear}-${String(nextMon).padStart(2, "0")}-01`;
+
+  // ── 1. Rebillings — dedup by (policyId, billingStart, billingEnd, premiumCents) ──
+  const rebConditions: any[] = [
+    gte(rebillings.billingStart, startDate),
+    lt(rebillings.billingStart, endDateExclusive),
+  ];
+  if (companyId) rebConditions.push(eq(policies.companyId, companyId));
+  if (validType) rebConditions.push(eq(policies.type, validType));
+
+  const rebRaw = await db
+    .select({
+      rebillingId: sql<number>`MIN(${rebillings.id})`,
+      policyId: rebillings.policyId,
+      billingStart: rebillings.billingStart,
+      billingEnd: rebillings.billingEnd,
+      premium: rebillings.premium,
+      monthlyFee: rebillings.monthlyFee,
+      notes: rebillings.notes,
+      duplicateCount: sql<number>`COUNT(*)`,
+      policyNumber: policies.policyNumber,
+      policyOriginalStart: policies.startDate,
+      billingCycle: policies.billingCycle,
+      policyType: policies.type,
+      policyCompanyId: policies.companyId,
+      insuredName: insureds.name,
+      companyName: companies.name,
+    })
+    .from(rebillings)
+    .innerJoin(policies, eq(rebillings.policyId, policies.id))
+    .innerJoin(insureds, eq(policies.insuredId, insureds.id))
+    .innerJoin(companies, eq(policies.companyId, companies.id))
+    .where(and(...rebConditions))
+    .groupBy(
+      rebillings.policyId,
+      rebillings.billingStart,
+      rebillings.billingEnd,
+      sql`ROUND(COALESCE(${rebillings.premium}, 0) * 100)`,
+    )
+    .orderBy(asc(rebillings.billingStart), sql`MIN(${rebillings.id})`)
+    .all();
+
+  let rebillingRows = rebRaw.map((r) => ({
+    rebillingId: Number(r.rebillingId),
+    policyId: Number(r.policyId),
+    policyNumber: String(r.policyNumber),
+    insuredName: String(r.insuredName),
+    companyName: String(r.companyName),
+    type: String(r.policyType),
+    billingStart: String(r.billingStart),
+    billingEnd: String(r.billingEnd),
+    premium: r.premium != null ? Number(r.premium) : null,
+    monthlyFee: r.monthlyFee != null ? Number(r.monthlyFee) : null,
+    policyOriginalStart: String(r.policyOriginalStart),
+    billingCycle: r.billingCycle ? String(r.billingCycle) : null,
+    rebillingType: reportRebillingType(r.notes as string | null),
+    duplicateCount: Number(r.duplicateCount),
+    extraDuplicateRows: Number(r.duplicateCount) - 1,
+  }));
+
+  // ── 2. Policies starting in month ──
+  const polConditions: any[] = [
+    gte(policies.startDate, startDate),
+    lt(policies.startDate, endDateExclusive),
+  ];
+  if (companyId) polConditions.push(eq(policies.companyId, companyId));
+  if (validType) polConditions.push(eq(policies.type, validType));
+
+  const polRaw = await db
+    .select({
+      policyId: policies.id,
+      policyNumber: policies.policyNumber,
+      type: policies.type,
+      startDate: policies.startDate,
+      endDate: policies.endDate,
+      premium: policies.premium,
+      notes: policies.notes,
+      renewedFromId: policies.renewedFromId,
+      companyId: policies.companyId,
+      insuredName: insureds.name,
+      companyName: companies.name,
+    })
+    .from(policies)
+    .innerJoin(insureds, eq(policies.insuredId, insureds.id))
+    .innerJoin(companies, eq(policies.companyId, companies.id))
+    .where(and(...polConditions))
+    .orderBy(asc(policies.startDate))
+    .all();
+
+  // Lookup old policies for renewedFromId
+  const renewedFromIds = polRaw
+    .filter((r) => r.renewedFromId != null)
+    .map((r) => r.renewedFromId as number);
+  const oldPoliciesMap = new Map<number, { policyNumber: string; endDate: string }>();
+  if (renewedFromIds.length > 0) {
+    const oldPols = await db
+      .select({ id: policies.id, policyNumber: policies.policyNumber, endDate: policies.endDate })
+      .from(policies)
+      .where(inArray(policies.id, renewedFromIds))
+      .all();
+    for (const op of oldPols) {
+      oldPoliciesMap.set(op.id, { policyNumber: op.policyNumber, endDate: op.endDate });
+    }
+  }
+
+  // Classify policies into sections
+  const renovationsConfirmed: any[] = [];
+  const renovationsImported: any[] = [];
+  const newPolicies: any[] = [];
+
+  for (const p of polRaw) {
+    const notes = p.notes as string | null;
+    const renewedFromId = p.renewedFromId as number | null;
+    if (renewedFromId != null) {
+      const old = oldPoliciesMap.get(renewedFromId);
+      renovationsConfirmed.push({
+        policyId: p.policyId,
+        policyNumber: p.policyNumber,
+        insuredName: p.insuredName,
+        companyName: p.companyName,
+        type: p.type,
+        startDate: p.startDate,
+        endDate: p.endDate,
+        premium: p.premium != null ? Number(p.premium) : null,
+        renewedFromPolicyNumber: old?.policyNumber ?? null,
+        renewedFromEndDate: old?.endDate ?? null,
+      });
+    } else if (reportIsRenovationImported(notes)) {
+      renovationsImported.push({
+        policyId: p.policyId,
+        policyNumber: p.policyNumber,
+        insuredName: p.insuredName,
+        companyName: p.companyName,
+        type: p.type,
+        startDate: p.startDate,
+        endDate: p.endDate,
+        premium: p.premium != null ? Number(p.premium) : null,
+        sourceImporter: reportSourceImporter(notes),
+      });
+    } else {
+      const importer = reportSourceImporter(notes);
+      newPolicies.push({
+        policyId: p.policyId,
+        policyNumber: p.policyNumber,
+        insuredName: p.insuredName,
+        companyName: p.companyName,
+        type: p.type,
+        startDate: p.startDate,
+        endDate: p.endDate,
+        premium: p.premium != null ? Number(p.premium) : null,
+        movementType: "new_policy" as const,
+        sourceImporter: importer,
+        classificationReason: reportClassificationReason(notes, importer),
+      });
+    }
+  }
+
+  // ── 3. Apply filters ──
+  const matchesQ = (r: { policyNumber: string; insuredName: string }) =>
+    !qLower ||
+    r.policyNumber.toLowerCase().includes(qLower) ||
+    r.insuredName.toLowerCase().includes(qLower);
+
+  if (validRebillingType) {
+    rebillingRows = rebillingRows.filter((r) => r.rebillingType === validRebillingType);
+  }
+
+  let filteredRebillings    = validMovementType && validMovementType !== "rebilling"            ? [] : rebillingRows.filter(matchesQ);
+  let filteredConfirmed     = validMovementType && validMovementType !== "renovation_confirmed"  ? [] : renovationsConfirmed.filter(matchesQ);
+  let filteredImported      = validMovementType && validMovementType !== "renovation_imported"   ? [] : renovationsImported.filter(matchesQ);
+  let filteredNew           = validMovementType && validMovementType !== "new_policy"            ? [] : newPolicies.filter(matchesQ);
+
+  // ── 4. Sort ──
+  const VALID_SORT_KEYS_REBILLING = new Set(["billingStart","billingEnd","policyNumber","insuredName","companyName","premium","type","rebillingType"]);
+  const VALID_SORT_KEYS_POLICY    = new Set(["startDate","endDate","policyNumber","insuredName","companyName","premium","type"]);
+
+  function applySortRebilling(arr: typeof filteredRebillings): typeof filteredRebillings {
+    if (!sortBy || !VALID_SORT_KEYS_REBILLING.has(sortBy)) return arr;
+    return [...arr].sort((a, b) => {
+      const va = (a as any)[sortBy] ?? "";
+      const vb = (b as any)[sortBy] ?? "";
+      const cmp = typeof va === "number" ? va - vb : String(va).localeCompare(String(vb));
+      return validSortOrder === "desc" ? -cmp : cmp;
+    });
+  }
+  function applySortPolicy(arr: any[]): any[] {
+    if (!sortBy || !VALID_SORT_KEYS_POLICY.has(sortBy)) return arr;
+    return [...arr].sort((a, b) => {
+      const va = a[sortBy] ?? "";
+      const vb = b[sortBy] ?? "";
+      const cmp = typeof va === "number" ? va - vb : String(va).localeCompare(String(vb));
+      return validSortOrder === "desc" ? -cmp : cmp;
+    });
+  }
+
+  filteredRebillings = applySortRebilling(filteredRebillings);
+  filteredConfirmed  = applySortPolicy(filteredConfirmed);
+  filteredImported   = applySortPolicy(filteredImported);
+  filteredNew        = applySortPolicy(filteredNew);
+
+  // ── 5. Totals ──
+  const rebillingsDuplicateGroups = filteredRebillings.filter((r) => r.duplicateCount > 1).length;
+  const rebillingsExtraRows       = filteredRebillings.reduce((s, r) => s + r.extraDuplicateRows, 0);
+  const totalPremiumRebillings    = filteredRebillings.reduce((s, r) => s + (r.premium ?? 0), 0);
+  const totalPremiumRenovations   =
+    [...filteredConfirmed, ...filteredImported].reduce((s, r) => s + (r.premium ?? 0), 0);
+
+  return c.json({
+    month,
+    rebillings:            filteredRebillings,
+    renovationsConfirmed:  filteredConfirmed,
+    renovationsImported:   filteredImported,
+    newPolicies:           filteredNew,
+    totals: {
+      rebillingsCount:           filteredRebillings.length,
+      rebillingsDuplicateGroups,
+      rebillingsExtraRows,
+      totalPremiumRebillings:    Math.round(totalPremiumRebillings * 100) / 100,
+      renovationsConfirmedCount: filteredConfirmed.length,
+      renovationsImportedCount:  filteredImported.length,
+      totalPremiumRenovations:   Math.round(totalPremiumRenovations * 100) / 100,
+      newPoliciesCount:          filteredNew.length,
+      totalMovements:
+        filteredRebillings.length + filteredConfirmed.length +
+        filteredImported.length + filteredNew.length,
+    },
+  }, 200);
 }));
 
 // ─── CAJA ─────────────────────────────────────────────────────────────────────

@@ -3,7 +3,7 @@ import { useAuth } from "@/lib/auth";
 import {
   LayoutDashboard, FileText, Building2, Users, Car, Home, ShieldCheck, Briefcase,
   LogOut, ChevronRight, Shield, Settings, Bike, HeartPulse, Zap, Scale, HardHat, Flame,
-  DollarSign, Send, AlertTriangle, ClipboardList, Upload, X, Wallet
+  DollarSign, Send, AlertTriangle, ClipboardList, Upload, X, Wallet, BarChart2
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -16,6 +16,7 @@ const navItems = [
   { href: "/envios", icon: Send, label: "Envíos y Entregas" },
   { href: "/siniestros", icon: AlertTriangle, label: "Siniestros" },
   { href: "/tareas", icon: ClipboardList, label: "Tareas" },
+  { href: "/reporte-mes", icon: BarChart2, label: "Reporte mensual" },
 ];
 
 const typeItems = [

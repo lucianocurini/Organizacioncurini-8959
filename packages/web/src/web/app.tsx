@@ -20,6 +20,7 @@ import SiniestroDetail from "./pages/siniestro-detail";
 import Tareas from "./pages/tareas";
 import Importar from "./pages/importar";
 import Caja from "./pages/caja";
+import ReporteMes from "./pages/reporte-mes";
 
 function SeedOnMount() {
   useEffect(() => {
@@ -60,6 +61,7 @@ function ProtectedRoutes() {
       <Route path="/siniestros/:id" component={SiniestroDetail} />
       <Route path="/tareas" component={Tareas} />
       <Route path="/importar" component={Importar} />
+      <Route path="/reporte-mes" component={ReporteMes} />
       <Route path="/caja">
         {user?.role === "admin" ? <Caja /> : <Redirect to="/" />}
       </Route>
