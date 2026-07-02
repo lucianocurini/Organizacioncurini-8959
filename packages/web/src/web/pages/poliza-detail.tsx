@@ -87,13 +87,18 @@ export default function PolizaDetail() {
   const activeRebilling = rebillingsList.find(r => r.billingStart <= today && r.billingEnd >= today);
 
   async function deleteRebilling(id: number) {
-    if (!confirm("¿Eliminar esta refacturación?")) return;
+    if (!confirm("¿Eliminar esta refacturación y sus cuotas pendientes asociadas?")) return;
     try {
-      await api.delete(`/api/rebillings/${id}`);
-      toast.success("Eliminada");
+      const result = await api.delete(`/api/rebillings/${id}`);
+      const n = result?.deleted?.installments ?? 0;
+      toast.success(`Refacturación eliminada. Se eliminaron ${n} cuota${n === 1 ? "" : "s"} pendiente${n === 1 ? "" : "s"}.`);
       load();
     } catch (e: any) {
-      toast.error(e.message);
+      const status = e?.status;
+      if (status === 400) toast.error("Solicitud inválida.");
+      else if (status === 404) toast.error("La refacturación ya no existe.");
+      else if (status === 409) toast.error(e.message || "No se puede eliminar la refacturación.");
+      else toast.error("No se pudo eliminar la refacturación.");
     }
   }
 

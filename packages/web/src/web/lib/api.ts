@@ -11,7 +11,9 @@ async function apiFetch(path: string, options: RequestInit = {}) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: "Error de red" }));
-    throw new Error(err.error || "Error desconocido");
+    const error: any = new Error(err.error || "Error desconocido");
+    error.status = res.status;
+    throw error;
   }
   return res.json();
 }

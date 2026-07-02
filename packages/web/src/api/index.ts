@@ -288,8 +288,49 @@ app.put("/rebillings/:id", requireAuth(async (c: any) => {
 }));
 
 app.delete("/rebillings/:id", requireAuth(async (c: any) => {
-  await db.delete(rebillings).where(eq(rebillings.id, Number(c.req.param("id"))));
-  return c.json({ ok: true }, 200);
+  const id = Number(c.req.param("id"));
+  if (!Number.isInteger(id) || id <= 0) {
+    return c.json({ error: "ID de refacturación inválido." }, 400);
+  }
+
+  const rebilling = await db.select({ id: rebillings.id }).from(rebillings).where(eq(rebillings.id, id)).get();
+  if (!rebilling) return c.json({ error: "La refacturación ya no existe" }, 404);
+
+  const REB_BLOCK_MSG = "No se puede eliminar la refacturación porque tiene cuotas pagadas, rendidas o con movimientos asociados.";
+
+  // Cuotas vinculadas exclusivamente por rebilling_id (nunca por policyId ni rango de fechas).
+  // Refacturaciones históricas sin cuotas vinculadas simplemente devuelven [] acá.
+  const linkedInstallments = await db.select({ id: policyInstallments.id, status: policyInstallments.status, rendered: policyInstallments.rendered })
+    .from(policyInstallments)
+    .where(eq(policyInstallments.rebillingId, id))
+    .all();
+
+  const pagada = linkedInstallments.some((i) => i.status === "pagada");
+  if (pagada) return c.json({ error: REB_BLOCK_MSG }, 409);
+
+  const rendered = linkedInstallments.some((i) => i.rendered === 1);
+  if (rendered) return c.json({ error: REB_BLOCK_MSG }, 409);
+
+  const installmentIds = linkedInstallments.map((i) => i.id);
+  if (installmentIds.length > 0) {
+    const payByInst = await db.select({ id: payments.id }).from(payments)
+      .where(inArray(payments.installmentId, installmentIds)).get();
+    if (payByInst) return c.json({ error: REB_BLOCK_MSG }, 409);
+
+    const remByInst = await db.select({ id: remittanceItems.id }).from(remittanceItems)
+      .where(and(eq(remittanceItems.source, "installment"), inArray(remittanceItems.sourceId, installmentIds))).get();
+    if (remByInst) return c.json({ error: REB_BLOCK_MSG }, 409);
+  }
+
+  const deletedInstallments = await db.transaction(async (tx) => {
+    if (installmentIds.length > 0) {
+      await tx.delete(policyInstallments).where(eq(policyInstallments.rebillingId, id));
+    }
+    await tx.delete(rebillings).where(eq(rebillings.id, id));
+    return installmentIds.length;
+  });
+
+  return c.json({ ok: true, deleted: { rebilling: 1, installments: deletedInstallments } }, 200);
 }));
 
 // ─── INSTALLMENTS ─────────────────────────────────────────────────────────────
@@ -1499,15 +1540,16 @@ app.post("/import/el-norte", requireAuth(async (c: any) => {
     return ni.id;
   }
 
-  // Helper: insertar cuotas
-  async function insertInstallments(policyId: number, installments: any[]) {
+  // Helper: insertar cuotas. rebillingId=null → cuota base; con valor → generada por esa refacturación.
+  async function insertInstallments(exec: any, policyId: number, installments: any[], rebillingId: number | null = null) {
     for (const inst of installments) {
-      await db.insert(policyInstallments).values({
+      await exec.insert(policyInstallments).values({
         policyId,
         number: inst.number,
         dueDate: inst.dueDate,
         amount: inst.amount,
         status: "pendiente",
+        rebillingId,
       });
     }
   }
@@ -1557,21 +1599,21 @@ app.post("/import/el-norte", requireAuth(async (c: any) => {
       if (mov.includes("PRORROGA")) {
         const existing = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
         if (existing) {
-          // Agregar como rebilling
-          await db.insert(rebillings).values({
-            policyId: existing.id,
-            billingStart: p.startDate,
-            billingEnd: p.endDate,
-            premium: p.premium || null,
-            sumInsured: p.sumInsured || null,
-            notes: `Importado de El Norte. Prórroga endoso ${p.endoso || ""}`,
-            createdBy: user.id,
+          // Rebilling + cuotas en una única transacción: si falla una cuota, no queda rebilling.
+          await db.transaction(async (tx) => {
+            const [reb] = await tx.insert(rebillings).values({
+              policyId: existing.id,
+              billingStart: p.startDate,
+              billingEnd: p.endDate,
+              premium: p.premium || null,
+              sumInsured: p.sumInsured || null,
+              notes: `Importado de El Norte. Prórroga endoso ${p.endoso || ""}`,
+              createdBy: user.id,
+            }).returning({ id: rebillings.id });
+            if (p.installments?.length > 0) await insertInstallments(tx, existing.id, p.installments, reb!.id);
+            const { status } = resolveTypeAndStatus(p);
+            await tx.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
           });
-          // Actualizar cuotas si hay
-          if (p.installments?.length > 0) await insertInstallments(existing.id, p.installments);
-          // Actualizar endDate y status de la póliza
-          const { status } = resolveTypeAndStatus(p);
-          await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
           results.rebillings++;
           continue;
         }
@@ -1607,21 +1649,23 @@ app.post("/import/el-norte", requireAuth(async (c: any) => {
             createdBy: user.id,
           }).returning({ id: policies.id });
 
-          // 2. Agregar la prórroga como rebilling encima de la base
+          // 2. Agregar la prórroga como rebilling encima de la base (rebilling + cuotas en una transacción)
           const basePolId = basePolRows[0]!.id;
           const { status } = resolveTypeAndStatus(p);
-          await db.insert(rebillings).values({
-            policyId: basePolId,
-            billingStart: p.startDate,
-            billingEnd: p.endDate,
-            premium: p.premium || null,
-            sumInsured: p.sumInsured || null,
-            notes: `Importado de El Norte. Prórroga endoso ${p.endoso || ""}`,
-            createdBy: user.id,
+          await db.transaction(async (tx) => {
+            const [reb] = await tx.insert(rebillings).values({
+              policyId: basePolId,
+              billingStart: p.startDate,
+              billingEnd: p.endDate,
+              premium: p.premium || null,
+              sumInsured: p.sumInsured || null,
+              notes: `Importado de El Norte. Prórroga endoso ${p.endoso || ""}`,
+              createdBy: user.id,
+            }).returning({ id: rebillings.id });
+            // Actualizar estado de la póliza base con datos de la prórroga
+            await tx.update(policies).set({ endDate: p.endDate, status, premium: p.premium || null }).where(eq(policies.id, basePolId));
+            if (p.installments?.length > 0) await insertInstallments(tx, basePolId, p.installments, reb!.id);
           });
-          // Actualizar estado de la póliza base con datos de la prórroga
-          await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || null }).where(eq(policies.id, basePolId));
-          if (p.installments?.length > 0) await insertInstallments(basePolId, p.installments);
           results.rebillings++;
           continue;
         }
@@ -1666,7 +1710,7 @@ app.post("/import/el-norte", requireAuth(async (c: any) => {
         createdBy: user.id,
       }).returning({ id: policies.id });
 
-      if (p.installments?.length > 0) await insertInstallments(newPolicy.id, p.installments);
+      if (p.installments?.length > 0) await insertInstallments(db, newPolicy.id, p.installments, null);
 
       isRebilling ? results.rebillings++ : results.imported++;
 
@@ -1717,10 +1761,10 @@ app.post("/import/rivadavia", requireAuth(async (c: any) => {
     return ni.id;
   }
 
-  async function insertInstallments(policyId: number, installments: any[]) {
+  async function insertInstallments(exec: any, policyId: number, installments: any[], rebillingId: number | null = null) {
     for (const inst of installments) {
-      await db.insert(policyInstallments).values({
-        policyId, number: inst.number, dueDate: inst.dueDate, amount: inst.amount, status: "pendiente",
+      await exec.insert(policyInstallments).values({
+        policyId, number: inst.number, dueDate: inst.dueDate, amount: inst.amount, status: "pendiente", rebillingId,
       });
     }
   }
@@ -1800,16 +1844,18 @@ app.post("/import/rivadavia", requireAuth(async (c: any) => {
           }
         }
         if (existing) {
-          await db.insert(rebillings).values({
-            policyId: existing.id,
-            billingStart: p.startDate, billingEnd: p.endDate,
-            premium: p.premium || null, sumInsured: p.sumInsured || null,
-            notes: `Importado de Rivadavia`,
-            createdBy: user.id,
+          await db.transaction(async (tx) => {
+            const [reb] = await tx.insert(rebillings).values({
+              policyId: existing.id,
+              billingStart: p.startDate, billingEnd: p.endDate,
+              premium: p.premium || null, sumInsured: p.sumInsured || null,
+              notes: `Importado de Rivadavia`,
+              createdBy: user.id,
+            }).returning({ id: rebillings.id });
+            if (p.installments?.length > 0) await insertInstallments(tx, existing.id, p.installments, reb!.id);
+            const { status } = resolveTypeAndStatus(p);
+            await tx.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
           });
-          if (p.installments?.length > 0) await insertInstallments(existing.id, p.installments);
-          const { status } = resolveTypeAndStatus(p);
-          await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
           if (existing.type === "automotor" && p.insuredDni) {
             batchAutomotorMap.set(`${p.insuredDni}|${p.startDate}|${p.endDate}`, existing.id);
           }
@@ -1843,13 +1889,15 @@ app.post("/import/rivadavia", requireAuth(async (c: any) => {
           }).returning({ id: policies.id });
           const basePolId = basePolRows[0]!.id;
           const { status } = resolveTypeAndStatus(p);
-          await db.insert(rebillings).values({
-            policyId: basePolId, billingStart: p.startDate, billingEnd: p.endDate,
-            premium: p.premium || null, sumInsured: p.sumInsured || null,
-            notes: `Importado de Rivadavia`, createdBy: user.id,
+          await db.transaction(async (tx) => {
+            const [reb] = await tx.insert(rebillings).values({
+              policyId: basePolId, billingStart: p.startDate, billingEnd: p.endDate,
+              premium: p.premium || null, sumInsured: p.sumInsured || null,
+              notes: `Importado de Rivadavia`, createdBy: user.id,
+            }).returning({ id: rebillings.id });
+            await tx.update(policies).set({ endDate: p.endDate, status, premium: p.premium || null }).where(eq(policies.id, basePolId));
+            if (p.installments?.length > 0) await insertInstallments(tx, basePolId, p.installments, reb!.id);
           });
-          await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || null }).where(eq(policies.id, basePolId));
-          if (p.installments?.length > 0) await insertInstallments(basePolId, p.installments);
           if (polType === "automotor" && p.insuredDni) {
             batchAutomotorMap.set(`${p.insuredDni}|${p.startDate}|${p.endDate}`, basePolId);
           }
@@ -1889,7 +1937,7 @@ app.post("/import/rivadavia", requireAuth(async (c: any) => {
         createdBy: user.id,
       }).returning({ id: policies.id });
 
-      if (p.installments?.length > 0) await insertInstallments(newPolicy.id, p.installments);
+      if (p.installments?.length > 0) await insertInstallments(db, newPolicy.id, p.installments, null);
       if (polType === "automotor" && p.insuredDni) {
         batchAutomotorMap.set(`${p.insuredDni}|${p.startDate}|${p.endDate}`, newPolicy!.id);
       }
@@ -1931,16 +1979,18 @@ app.post("/import/rivadavia", requireAuth(async (c: any) => {
           }
         }
         if (existing) {
-          await db.insert(rebillings).values({
-            policyId: existing.id,
-            billingStart: p.startDate, billingEnd: p.endDate,
-            premium: p.premium || null, sumInsured: p.sumInsured || null,
-            notes: `Importado de Rivadavia`,
-            createdBy: user.id,
+          await db.transaction(async (tx) => {
+            const [reb] = await tx.insert(rebillings).values({
+              policyId: existing.id,
+              billingStart: p.startDate, billingEnd: p.endDate,
+              premium: p.premium || null, sumInsured: p.sumInsured || null,
+              notes: `Importado de Rivadavia`,
+              createdBy: user.id,
+            }).returning({ id: rebillings.id });
+            if (p.installments?.length > 0) await insertInstallments(tx, existing.id, p.installments, reb!.id);
+            const { status } = resolveTypeAndStatus(p);
+            await tx.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
           });
-          if (p.installments?.length > 0) await insertInstallments(existing.id, p.installments);
-          const { status } = resolveTypeAndStatus(p);
-          await db.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
           results.rebillings++;
           continue;
         }
@@ -1980,7 +2030,7 @@ app.post("/import/rivadavia", requireAuth(async (c: any) => {
         createdBy: user.id,
       }).returning({ id: policies.id });
 
-      if (p.installments?.length > 0) await insertInstallments(newPolicy.id, p.installments);
+      if (p.installments?.length > 0) await insertInstallments(db, newPolicy.id, p.installments, null);
       isRebilling ? results.rebillings++ : results.imported++;
 
     } catch (e: any) {
@@ -2428,10 +2478,10 @@ function enDeduplicateBatch(policiesArr: any[]): { deduped: any[]; inBatchDuplic
   return { deduped, inBatchDuplicates };
 }
 
-async function enInsertInstallments(policyId: number, insts: any[]): Promise<number> {
+async function enInsertInstallments(policyId: number, insts: any[], rebillingId: number | null = null): Promise<number> {
   for (const inst of insts) {
     await db.insert(policyInstallments).values({
-      policyId, number: inst.number, dueDate: inst.dueDate, amount: inst.amount, status: "pendiente",
+      policyId, number: inst.number, dueDate: inst.dueDate, amount: inst.amount, status: "pendiente", rebillingId,
     });
   }
   return insts.length;
@@ -2512,12 +2562,14 @@ async function enImportOne(p: any, companyId: number, userId: number, counts: Im
         amount: inst.amount, status: "pendiente" as const,
       }));
       await db.transaction(async (tx) => {
-        await tx.insert(rebillings).values({
+        const [reb] = await tx.insert(rebillings).values({
           policyId: existing.id, billingStart: p.startDate, billingEnd: p.endDate,
           premium: p.premium || null, sumInsured: p.sumInsured || null,
           notes: `Importado de El Norte v2. Endoso ${p.endoso || ""}`, createdBy: userId,
-        });
-        if (installmentValues.length > 0) await tx.insert(policyInstallments).values(installmentValues);
+        }).returning({ id: rebillings.id });
+        if (installmentValues.length > 0) {
+          await tx.insert(policyInstallments).values(installmentValues.map(v => ({ ...v, rebillingId: reb!.id })));
+        }
         await tx.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
       });
       counts.endosos++;
@@ -2541,12 +2593,14 @@ async function enImportOne(p: any, companyId: number, userId: number, counts: Im
         amount: inst.amount, status: "pendiente" as const,
       }));
       await db.transaction(async (tx) => {
-        await tx.insert(rebillings).values({
+        const [reb] = await tx.insert(rebillings).values({
           policyId: existing.id, billingStart: p.startDate, billingEnd: p.endDate,
           premium: p.premium || null, sumInsured: p.sumInsured || null,
           notes: `Importado de El Norte v2. Prórroga endoso ${p.endoso || ""}`, createdBy: userId,
-        });
-        if (installmentValues.length > 0) await tx.insert(policyInstallments).values(installmentValues);
+        }).returning({ id: rebillings.id });
+        if (installmentValues.length > 0) {
+          await tx.insert(policyInstallments).values(installmentValues.map(v => ({ ...v, rebillingId: reb!.id })));
+        }
         await tx.update(policies).set({ endDate: p.endDate, status, premium: p.premium || existing.premium }).where(eq(policies.id, existing.id));
       });
       counts.rebillings++;
@@ -2578,14 +2632,14 @@ async function enImportOne(p: any, companyId: number, userId: number, counts: Im
           notes: p._baseNotes || "Póliza base creada al importar prórroga El Norte",
           createdBy: userId,
         }).returning({ id: policies.id });
-        await tx.insert(rebillings).values({
+        const [reb] = await tx.insert(rebillings).values({
           policyId: bp.id, billingStart: p.startDate, billingEnd: p.endDate,
           premium: p.premium || null, sumInsured: p.sumInsured || null,
           notes: `Importado de El Norte v2. Prórroga endoso ${p.endoso || ""}`, createdBy: userId,
-        });
+        }).returning({ id: rebillings.id });
         await tx.update(policies).set({ endDate: p.endDate, status, premium: p.premium || null }).where(eq(policies.id, bp.id));
         if (installmentsData.length > 0) {
-          await tx.insert(policyInstallments).values(installmentsData.map(inst => ({ ...inst, policyId: bp.id })));
+          await tx.insert(policyInstallments).values(installmentsData.map(inst => ({ ...inst, policyId: bp.id, rebillingId: reb!.id })));
         }
       });
       counts.rebillings++;

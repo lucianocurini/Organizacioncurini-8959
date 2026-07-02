@@ -191,6 +191,8 @@ export const policyInstallments = sqliteTable("policy_installments", {
   notes: text("notes"),
   rendered: integer("rendered").notNull().default(0), // 1 = rendida a compañía sin cobrar al asegurado
   renderedAt: integer("rendered_at", { mode: "timestamp" }),
+  // null = cuota base de la póliza; con valor = generada por esa refacturación puntual
+  rebillingId: integer("rebilling_id").references(() => rebillings.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
 
