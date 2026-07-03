@@ -7,29 +7,11 @@ import { ArrowLeft, Edit, Car, Home, ShieldCheck, Briefcase, FileText, Calendar,
 import { PolicyModal } from "@/components/policies/PolicyModal";
 import { RebillingModal } from "@/components/policies/RebillingModal";
 import { toast } from "sonner";
+import { buildInstallmentPlan, InstallmentPlanError } from "../../lib/installments/plan";
 
 const typeIcons: Record<string, any> = {
   automotor: Car, motovehiculo: Bike, ecomovilidad: Zap, hogar: Home, accidentes: ShieldCheck, art: HeartPulse, comercial: Briefcase, responsabilidad_civil: Scale, cascos: HardHat, incendio: Flame,
 };
-
-const CYCLE_MONTHS: Record<string, number> = {
-  mensual: 1, trimestral: 3, cuatrimestral: 4, semestral: 6, anual: 12,
-};
-const VIGENCY_MONTHS: Record<string, number> = {
-  anual: 12, semestral: 6, cuatrimestral: 4,
-};
-function calcCount(vigencyPeriod: string, billingCycle: string): number {
-  const v = VIGENCY_MONTHS[vigencyPeriod] ?? 12;
-  const c = CYCLE_MONTHS[billingCycle] ?? 1;
-  return Math.max(1, Math.round(v / c));
-}
-
-function addMonths(dateStr: string, months: number): string {
-  const d = new Date(dateStr);
-  d.setMonth(d.getMonth() + months);
-  d.setDate(d.getDate() - 1);
-  return d.toISOString().split("T")[0];
-}
 
 export default function PolizaDetail() {
   const params = useParams<{ id: string }>();
@@ -41,7 +23,14 @@ export default function PolizaDetail() {
   const [editingInstallment, setEditingInstallment] = useState<number | null>(null);
   const [instEdit, setInstEdit] = useState<Record<number, { dueDate: string; amount: number; notes: string; status: string }>>({});
   const [showGenForm, setShowGenForm] = useState(false);
-  const [genForm, setGenForm] = useState<{ billingCycle: string; monthlyFee: string; startDate: string }>({ billingCycle: "", monthlyFee: "", startDate: "" });
+  // Cantidad de cuotas e importe son siempre entradas explícitas — nunca se
+  // infieren de billingCycle/vigencyPeriod. El período facturado (periodStart/
+  // periodEnd) es el que realmente se está facturando, no necesariamente la
+  // vigencia completa de la póliza.
+  const [genForm, setGenForm] = useState<{
+    rebillingId: string; periodStart: string; periodEnd: string;
+    installmentCount: string; amount: string; firstDueDate: string;
+  }>({ rebillingId: "", periodStart: "", periodEnd: "", installmentCount: "", amount: "", firstDueDate: "" });
 
   // Destino del botón "volver": el origen (p.ej. Reporte mensual con sus filtros)
   // si vino con un returnTo interno válido, o el listado general como fallback seguro.
@@ -80,7 +69,6 @@ export default function PolizaDetail() {
   const hasRebilling = true; // todas las pólizas pueden tener refacturaciones
 
   // Compute next billing start date
-  const months = CYCLE_MONTHS[p.billingCycle] ?? 0;
   let nextStart = p.startDate;
   if (rebillingsList.length > 0) {
     const last = rebillingsList[0]; // desc order
@@ -195,6 +183,7 @@ export default function PolizaDetail() {
             } />
             <InfoRow label="Vigencia desde" value={formatDate(p.startDate)} />
             <InfoRow label="Vigencia hasta" value={formatDate(p.endDate)} />
+            <InfoRow label="Próxima refacturación" value={p.nextRebillingDate ? formatDate(p.nextRebillingDate) : undefined} />
             {hasRebilling && (
               <>
                 <div className="border-t border-[#1f2937] my-2" />
@@ -257,10 +246,6 @@ export default function PolizaDetail() {
         {/* ─── Cuotas ──────────────────────────────────────────────────────── */}
         {(() => {
           const installmentsList: any[] = row.installments ?? [];
-          const installmentsCount = p.billingCycle
-            ? calcCount(p.vigencyPeriod || "anual", p.billingCycle)
-            : (p.installments || null);
-          const canGenerate = p.monthlyFee && p.billingCycle && p.startDate;
           const STATUS_COLOR: Record<string, string> = {
             pendiente: "bg-yellow-500/20 text-yellow-400 border-yellow-500/30",
             pagada: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
@@ -270,17 +255,58 @@ export default function PolizaDetail() {
             pendiente: Clock, pagada: CheckCircle2, vencida: AlertCircle,
           };
 
-          const doGenerate = async (cycle: string, fee: number, count: number, start: string) => {
-            const cycleMonths = CYCLE_MONTHS[cycle] ?? 1;
-            const generated = Array.from({ length: count }, (_, i) => {
-              const d = new Date(start);
-              d.setMonth(d.getMonth() + i * cycleMonths);
-              return { number: i + 1, dueDate: d.toISOString().split("T")[0], amount: fee, notes: "" };
+          // Precarga el período desde la refacturación activa (si existe), o desde
+          // la vigencia de la póliza. Cantidad de cuotas e importe quedan vacíos:
+          // son siempre una entrada explícita, nunca un valor sugerido/automático.
+          const openGenForm = () => {
+            const source = activeRebilling ?? null;
+            setGenForm({
+              rebillingId: source ? String(source.id) : "",
+              periodStart: source?.billingStart || p.startDate || "",
+              periodEnd: source?.billingEnd || p.endDate || "",
+              installmentCount: "",
+              amount: source?.monthlyFee ? String(source.monthlyFee) : (p.monthlyFee ? String(p.monthlyFee) : ""),
+              firstDueDate: "",
             });
-            await api.post(`/api/policies/${p.id}/installments/generate`, { installments: generated });
-            toast.success("Cuotas generadas");
-            setShowGenForm(false);
-            load();
+            setShowGenForm(true);
+          };
+
+          // Única función de cálculo (buildInstallmentPlan): el período facturado
+          // (periodStart/periodEnd) es el que se está facturando de verdad, no
+          // necesariamente la vigencia completa de la póliza.
+          const doGenerate = async () => {
+            const count = Number(genForm.installmentCount);
+            const fee = Number(genForm.amount);
+            if (!genForm.periodStart || !genForm.periodEnd || !count || !fee) {
+              toast.error("Completá período, cantidad de cuotas e importe.");
+              return;
+            }
+            let plan;
+            try {
+              plan = buildInstallmentPlan({
+                periodStart: genForm.periodStart,
+                periodEnd: genForm.periodEnd,
+                periodAmount: fee * count,
+                installmentCount: count,
+                firstDueDate: genForm.firstDueDate || undefined,
+              });
+            } catch (e: any) {
+              toast.error(e instanceof InstallmentPlanError ? e.message : "Datos de período inválidos.");
+              return;
+            }
+            for (const w of plan.warnings) toast.warning(w);
+            try {
+              // rebillingId sólo se usa localmente para precargar el período/importe
+              // desde el desplegable — no viaja al backend (fuera de alcance de Etapa 2).
+              await api.post(`/api/policies/${p.id}/installments/generate`, {
+                installments: plan.installments,
+              });
+              toast.success("Cuotas generadas");
+              setShowGenForm(false);
+              load();
+            } catch (e: any) {
+              toast.error(e?.message || "Error al generar cuotas");
+            }
           };
 
           return (
@@ -298,70 +324,98 @@ export default function PolizaDetail() {
                     {installmentsList.filter((i: any) => i.status === "vencida").length} vencidas
                   </span>
                 )}
-                <div className="ml-auto flex items-center gap-2">
-                  <button
-                    onClick={async () => {
-                      if (canGenerate) {
-                        try { await doGenerate(p.billingCycle, p.monthlyFee, installmentsCount, p.startDate); }
-                        catch { toast.error("Error al generar cuotas"); }
-                      } else {
-                        setGenForm({ billingCycle: p.billingCycle || "", monthlyFee: p.monthlyFee ? String(p.monthlyFee) : "", startDate: p.startDate || "" });
-                        setShowGenForm(v => !v);
-                      }
-                    }}
-                    className="text-xs px-3 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-lg hover:bg-amber-500/20 transition-all flex items-center gap-1.5"
-                  >
-                    <Plus className="w-3 h-3" />
-                    {installmentsList.length > 0 ? "Regenerar" : "Generar cuotas"}
-                  </button>
-                </div>
+                {installmentsList.length === 0 && (
+                  <div className="ml-auto flex items-center gap-2">
+                    <button
+                      onClick={openGenForm}
+                      className="text-xs px-3 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-lg hover:bg-amber-500/20 transition-all flex items-center gap-1.5"
+                    >
+                      <Plus className="w-3 h-3" /> Generar cuotas
+                    </button>
+                  </div>
+                )}
               </div>
 
-              {/* Inline generate form when policy is missing billing data */}
+              {installmentsList.length > 0 && (
+                <p className="text-xs text-gray-600 mb-3">
+                  Esta póliza ya tiene cuotas cargadas — no se generan ni se borran automáticamente para no afectar
+                  pagos y rendiciones existentes. Para agregar cuotas de una nueva refacturación, hacelo desde la
+                  administración de cuotas.
+                </p>
+              )}
+
+              {/* Formulario de generación: período facturado explícito, cantidad de cuotas explícita */}
               {showGenForm && (
                 <div className="mb-3 bg-[#111827] border border-amber-500/20 rounded-xl p-4">
-                  <p className="text-xs text-amber-400 font-medium mb-3">Completá los datos para generar las cuotas</p>
-                  <div className="grid grid-cols-2 gap-3 mb-3">
-                    <div>
-                      <label className="text-xs text-gray-500 block mb-1">Ciclo de facturación</label>
-                      <select value={genForm.billingCycle} onChange={e => setGenForm(f => ({ ...f, billingCycle: e.target.value }))}
-                        className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500">
-                        <option value="">Seleccioná...</option>
-                        <option value="mensual">Mensual</option>
-                        <option value="trimestral">Trimestral</option>
-                        <option value="cuatrimestral">Cuatrimestral</option>
-                        <option value="semestral">Semestral</option>
-                        <option value="anual">Anual</option>
+                  <p className="text-xs text-amber-400 font-medium mb-3">Período a facturar</p>
+                  {rebillingsList.length > 0 && (
+                    <div className="mb-3">
+                      <label className="text-xs text-gray-500 block mb-1">Refacturación asociada</label>
+                      <select
+                        value={genForm.rebillingId}
+                        onChange={e => {
+                          const id = e.target.value;
+                          const reb = rebillingsList.find((r: any) => String(r.id) === id);
+                          setGenForm(f => ({
+                            ...f,
+                            rebillingId: id,
+                            periodStart: reb?.billingStart ?? f.periodStart,
+                            periodEnd: reb?.billingEnd ?? f.periodEnd,
+                            amount: reb?.monthlyFee ? String(reb.monthlyFee) : f.amount,
+                          }));
+                        }}
+                        className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500"
+                      >
+                        <option value="">Cuotas base (sin refacturación)</option>
+                        {rebillingsList.map((r: any) => (
+                          <option key={r.id} value={r.id}>{formatDate(r.billingStart)} → {formatDate(r.billingEnd)}</option>
+                        ))}
                       </select>
                     </div>
+                  )}
+                  <div className="grid grid-cols-2 gap-3 mb-3">
                     <div>
-                      <label className="text-xs text-gray-500 block mb-1">Cant. cuotas</label>
-                      <div className="w-full px-2 py-1.5 bg-[#0d1424] border border-[#374151] rounded text-xs">
-                        {genForm.billingCycle
-                          ? <span className="text-white font-medium">{calcCount(p.vigencyPeriod || "anual", genForm.billingCycle)} cuotas <span className="text-gray-500">(auto)</span></span>
-                          : <span className="text-gray-600">Seleccioná ciclo</span>}
-                      </div>
+                      <label className="text-xs text-gray-500 block mb-1">Período desde *</label>
+                      <input type="date" value={genForm.periodStart} onChange={e => setGenForm(f => ({ ...f, periodStart: e.target.value }))}
+                        className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500" />
                     </div>
                     <div>
-                      <label className="text-xs text-gray-500 block mb-1">Importe por cuota (ARS)</label>
-                      <input type="number" value={genForm.monthlyFee} onChange={e => setGenForm(f => ({ ...f, monthlyFee: e.target.value }))}
+                      <label className="text-xs text-gray-500 block mb-1">Período hasta *</label>
+                      <input type="date" value={genForm.periodEnd} onChange={e => setGenForm(f => ({ ...f, periodEnd: e.target.value }))}
+                        className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500" />
+                    </div>
+                    <div>
+                      <label className="text-xs text-gray-500 block mb-1">Cantidad de cuotas *</label>
+                      <input type="number" min="1" value={genForm.installmentCount}
+                        onChange={e => setGenForm(f => ({ ...f, installmentCount: e.target.value }))}
+                        placeholder="Ej: 3"
+                        className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500" />
+                    </div>
+                    <div>
+                      <label className="text-xs text-gray-500 block mb-1">Importe por cuota (ARS) *</label>
+                      <input type="number" value={genForm.amount} onChange={e => setGenForm(f => ({ ...f, amount: e.target.value }))}
                         placeholder="0.00"
                         className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500" />
                     </div>
-                    <div>
-                      <label className="text-xs text-gray-500 block mb-1">Fecha primera cuota</label>
-                      <input type="date" value={genForm.startDate} onChange={e => setGenForm(f => ({ ...f, startDate: e.target.value }))}
+                    <div className="col-span-2">
+                      <label className="text-xs text-gray-500 block mb-1">Fecha primera cuota (opcional)</label>
+                      <input type="date" value={genForm.firstDueDate}
+                        onChange={e => setGenForm(f => ({ ...f, firstDueDate: e.target.value }))}
                         className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500" />
+                      <p className="text-[11px] text-gray-600 mt-1">
+                        Si se deja vacío, se usa el inicio del período{genForm.periodStart ? ` (${formatDate(genForm.periodStart)})` : ""}.
+                      </p>
                     </div>
                   </div>
+                  {genForm.installmentCount && genForm.amount && (
+                    <p className="text-xs text-gray-500 mb-3">
+                      Total a facturar en el período: <span className="text-white font-medium">
+                        {formatCurrency(Number(genForm.amount) * Number(genForm.installmentCount || 0))}
+                      </span>
+                    </p>
+                  )}
                   <div className="flex gap-2">
-                    <button
-                      onClick={async () => {
-                        if (!genForm.billingCycle || !genForm.monthlyFee || !genForm.startDate) { toast.error("Completá todos los campos"); return; }
-                        const count = calcCount(p.vigencyPeriod || "anual", genForm.billingCycle);
-                        try { await doGenerate(genForm.billingCycle, Number(genForm.monthlyFee), count, genForm.startDate); }
-                        catch { toast.error("Error al generar cuotas"); }
-                      }}
+                    <button onClick={doGenerate}
                       className="text-xs px-3 py-1.5 bg-amber-500 text-black font-medium rounded-lg hover:bg-amber-400 transition-all"
                     >Generar</button>
                     <button onClick={() => setShowGenForm(false)}

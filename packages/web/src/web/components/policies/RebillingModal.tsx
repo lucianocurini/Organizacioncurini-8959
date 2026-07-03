@@ -3,6 +3,7 @@ import { api } from "@/lib/api";
 import { toast } from "sonner";
 import { X, RefreshCw } from "lucide-react";
 import { formatDate } from "@/lib/utils";
+import { addCalendarMonths, addCalendarDays, isValidCalendarDate } from "../../../lib/installments/plan";
 
 interface Props {
   policy: any;
@@ -11,13 +12,12 @@ interface Props {
   onSaved: () => void;
 }
 
+// Sugiere el fin de período como (inicio + N meses) - 1 día, en fechas
+// calendario puras — sin pasar por Date+zona horaria local (evita
+// desplazamientos por UTC en fechas como 31 de enero o fin de febrero).
 function addMonths(dateStr: string, months: number): string {
-  if (!dateStr || !months) return "";
-  const d = new Date(dateStr);
-  if (isNaN(d.getTime())) return "";
-  d.setMonth(d.getMonth() + months);
-  d.setDate(d.getDate() - 1);
-  return d.toISOString().split("T")[0];
+  if (!dateStr || !months || !isValidCalendarDate(dateStr)) return "";
+  return addCalendarDays(addCalendarMonths(dateStr, months), -1);
 }
 
 const CYCLE_MONTHS: Record<string, number> = {

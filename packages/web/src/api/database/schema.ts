@@ -48,6 +48,7 @@ export const policies = sqliteTable("policies", {
   paymentMethod: text("payment_method"), // manual | cbu | tarjeta_credito
   startDate: text("start_date").notNull(),
   endDate: text("end_date").notNull(),
+  nextRebillingDate: text("next_rebilling_date"), // próxima refacturación estimada — manual, independiente de start/end
   notes: text("notes"),
   // Automotor specific
   vehicleBrand: text("vehicle_brand"),

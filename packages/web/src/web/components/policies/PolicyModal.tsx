@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from "react";
 import { api } from "@/lib/api";
 import { X, Loader2, ListOrdered, Search, RefreshCw, ChevronRight, Plus, Trash2, UserCheck, Car } from "lucide-react";
 import { toast } from "sonner";
+import { buildInstallmentPlan, addCalendarMonths } from "../../../lib/installments/plan";
 
 // ─── Insured Person ───────────────────────────────────────────────────────────
 interface InsuredPerson {
@@ -40,29 +41,42 @@ const EMPTY_VEHICLE: FleetVehicle = {
 };
 
 // ─── Installment helpers ──────────────────────────────────────────────────────
-// Default installment count by vigency period
+// Default installment count by vigency period — solo una sugerencia inicial,
+// editable (ver "Cantidad de cuotas" en el form); nunca se usa como entrada
+// silenciosa del cálculo real, que corre siempre por buildInstallmentPlan.
 const VIGENCY_DEFAULT_COUNT: Record<string, number> = { anual: 12, semestral: 6, cuatrimestral: 4 };
 
-// Handles end-of-month overflow: Jan 31 + 1 month → Feb 28/29, not Mar 3
-function addMonthsToDate(dateStr: string, months: number): string {
-  const d = new Date(dateStr + "T12:00:00");
-  const day = d.getDate();
-  d.setDate(1);
-  d.setMonth(d.getMonth() + months);
-  const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
-  d.setDate(Math.min(day, lastDay));
-  return d.toISOString().split("T")[0];
-}
-
-// One installment per month from startDate — billingCycle does not participate
-function generateMonthly(startDate: string, count: number, amount: number): InstRow[] {
-  if (!startDate || count < 1) return [];
-  return Array.from({ length: count }, (_, i) => ({
-    number: i + 1,
-    dueDate: addMonthsToDate(startDate, i),
-    amount: amount || 0,
-    notes: "",
-  }));
+// Plan de cuotas mensuales para el alta de una póliza nueva. El período
+// facturado es SIEMPRE startDate/endDate tal como los completó el usuario
+// (la vigencia) — nunca se estima un periodEnd a partir de installmentCount.
+//
+// Diagnóstico (Etapa 2): al momento del alta, PolicyModal no tiene un campo
+// de "período facturado" distinto de la vigencia — esa distinción sólo
+// existe más adelante, en poliza-detail.tsx, cuando ya existe una
+// refacturación puntual (rebillings.billingStart/billingEnd) creada desde
+// RebillingModal. Una póliza nueva no puede tener todavía una refacturación,
+// así que la única fecha de fin disponible en este formulario es endDate.
+//
+// endDate es un campo `required` del formulario — para poder enviarlo el
+// usuario ya tuvo que completarlo (a mano si vigencyPeriod = "anual", o
+// automáticamente vía calcEndDate si es semestral/cuatrimestral). Mientras
+// no esté completo no hay período real que previsualizar: no se inventa
+// uno, se devuelve una previsualización vacía.
+function planMonthlyInstallments(startDate: string, endDate: string, count: number, monthlyFee: number): InstRow[] {
+  if (!startDate || !endDate || count < 1) return [];
+  try {
+    const { installments } = buildInstallmentPlan({
+      periodStart: startDate,
+      periodEnd: endDate,
+      periodAmount: (monthlyFee || 0) * count,
+      installmentCount: count,
+    });
+    return installments.map((i) => ({ number: i.number, dueDate: i.dueDate, amount: i.amount, notes: "" }));
+  } catch {
+    // Fechas inconsistentes (fin < inicio) o la cantidad de cuotas pedida no
+    // entra en la vigencia cargada — no se previsualiza ningún plan parcial.
+    return [];
+  }
 }
 
 function renumber(rows: InstRow[]): InstRow[] {
@@ -232,6 +246,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
     vigencyPeriod: "anual",
     startDate: new Date().toISOString().split("T")[0],
     endDate: "",
+    nextRebillingDate: "",
     notes: "",
     // Automotor
     vehicleBrand: "",
@@ -301,6 +316,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
         vigencyPeriod: p.vigencyPeriod || "anual",
         startDate: p.startDate || "",
         endDate: p.endDate || "",
+        nextRebillingDate: p.nextRebillingDate || "",
         notes: p.notes || "",
         vehicleBrand: p.vehicleBrand || "",
         vehicleModel: p.vehicleModel || "",
@@ -385,27 +401,35 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
       return next;
     });
     if (!isEdit) {
+      // endDate puede haber cambiado recién arriba (calcEndDate, para
+      // semestral/cuatrimestral) — `form.endDate` todavía tiene el valor
+      // viejo en este punto porque setForm es asíncrono. Se recalcula acá
+      // con la misma lógica para no previsualizar con una fecha de fin
+      // desactualizada (nunca se infiere periodEnd desde installmentCount).
       if (key === "vigencyPeriod" && !installmentsDirty) {
         const suggested = VIGENCY_DEFAULT_COUNT[val];
         if (suggested) {
           setInstallmentCount(suggested);
-          if (form.startDate) setInstallmentRows(generateMonthly(form.startDate, suggested, Number(form.monthlyFee) || 0));
+          const newEndDate = val !== "anual" && form.startDate ? calcEndDate(form.startDate, val) : form.endDate;
+          if (form.startDate) setInstallmentRows(planMonthlyInstallments(form.startDate, newEndDate, suggested, Number(form.monthlyFee) || 0));
         }
       } else if (key === "startDate" && !installmentsDirty && installmentCount > 0) {
-        setInstallmentRows(generateMonthly(val, installmentCount, Number(form.monthlyFee) || 0));
+        const newEndDate = form.vigencyPeriod !== "anual" ? calcEndDate(val, form.vigencyPeriod) : form.endDate;
+        setInstallmentRows(planMonthlyInstallments(val, newEndDate, installmentCount, Number(form.monthlyFee) || 0));
+      } else if (key === "endDate" && !installmentsDirty && installmentCount > 0 && form.startDate) {
+        setInstallmentRows(planMonthlyInstallments(form.startDate, val, installmentCount, Number(form.monthlyFee) || 0));
       } else if (key === "monthlyFee" && !installmentsDirty && installmentCount > 0 && form.startDate) {
-        setInstallmentRows(generateMonthly(form.startDate, installmentCount, Number(val) || 0));
+        setInstallmentRows(planMonthlyInstallments(form.startDate, form.endDate, installmentCount, Number(val) || 0));
       }
     }
   };
 
-  // New policy: generate initial installment rows on mount (12 default for anual vigency)
-  useEffect(() => {
-    if (!isEdit) {
-      const today = new Date().toISOString().split("T")[0];
-      setInstallmentRows(generateMonthly(today, 12, 0));
-    }
-  }, []);
+  // Nota: antes había un useEffect al montar que generaba 12 cuotas
+  // "de muestra" usando hoy como periodStart y un periodEnd estimado desde
+  // installmentCount. Se retira: al abrir el modal, endDate todavía está
+  // vacío (vigencyPeriod arranca en "anual", que exige llenarlo a mano), así
+  // que ya no hay un período real para previsualizar — installmentRows queda
+  // en su estado inicial ([]) hasta que el usuario complete Desde/Hasta.
 
   const filteredInsureds = insureds.filter(i =>
     i.name.toLowerCase().includes(insuredQ.toLowerCase()) ||
@@ -426,6 +450,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
         deductible: form.deductible ? Number(form.deductible) : null,
         billingCycle: form.billingCycle || null,
         vigencyPeriod: form.vigencyPeriod || null,
+        nextRebillingDate: form.nextRebillingDate || null,
         installments: isEdit ? (form.installments ? Number(form.installments) : null) : (installmentRows.length || null),
         vehicleYear: form.vehicleYear ? Number(form.vehicleYear) : null,
         motoYear: form.motoYear ? Number(form.motoYear) : null,
@@ -737,7 +762,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
                     const n = Math.max(1, Number(e.target.value) || 1);
                     setInstallmentCount(n);
                     if (form.startDate) {
-                      setInstallmentRows(generateMonthly(form.startDate, n, Number(form.monthlyFee) || 0));
+                      setInstallmentRows(planMonthlyInstallments(form.startDate, form.endDate, n, Number(form.monthlyFee) || 0));
                       setInstallmentsDirty(false);
                     }
                   }}
@@ -795,6 +820,20 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
                 La fecha de fin se calculó automáticamente según el período seleccionado.
               </p>
             )}
+            <div className="grid grid-cols-3 gap-3">
+              <div className="col-span-1">
+                <label className={labelClass}>Próxima refacturación</label>
+                <input
+                  className={inputClass}
+                  type="date"
+                  value={form.nextRebillingDate}
+                  onChange={e => set("nextRebillingDate", e.target.value)}
+                />
+              </div>
+            </div>
+            <p className="text-xs text-gray-500">
+              Opcional. Es una fecha manual de referencia — no genera ninguna refacturación automáticamente.
+            </p>
           </div>
 
           {/* Automotor fields */}
@@ -1091,7 +1130,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
                     <button
                       type="button"
                       onClick={() => {
-                        setInstallmentRows(generateMonthly(form.startDate, installmentCount, Number(form.monthlyFee) || 0));
+                        setInstallmentRows(planMonthlyInstallments(form.startDate, form.endDate, installmentCount, Number(form.monthlyFee) || 0));
                         setInstallmentsDirty(false);
                       }}
                       className="text-xs text-orange-400 hover:text-orange-300 transition-colors"
@@ -1166,7 +1205,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
                     type="button"
                     onClick={() => {
                       const last = installmentRows[installmentRows.length - 1];
-                      const nextDate = last?.dueDate ? addMonthsToDate(last.dueDate, 1) : (form.startDate || "");
+                      const nextDate = last?.dueDate ? addCalendarMonths(last.dueDate, 1) : (form.startDate || "");
                       const newRow: InstRow = { number: installmentRows.length + 1, dueDate: nextDate, amount: Number(form.monthlyFee) || 0, notes: "" };
                       setInstallmentRows(rows => [...rows, newRow]);
                       setInstallmentCount(c => c + 1);

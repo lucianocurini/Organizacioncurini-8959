@@ -34,6 +34,7 @@ import {
   gmailConfigured,
 } from "../lib/gmail-client";
 import { parseElNorteTxtV2 } from "../lib/parsers/el-norte-v2";
+import { isValidCalendarDate } from "../lib/installments/plan";
 
 const app = new Hono().basePath("/api");
 
@@ -413,6 +414,10 @@ app.post("/policies", requireAuth(async (c: any) => {
   if (!body.vigencyPeriod) body.vigencyPeriod = null;
   else if (!["anual", "semestral", "cuatrimestral"].includes(body.vigencyPeriod))
     return c.json({ error: `Período de vigencia inválido: "${body.vigencyPeriod}"` }, 400);
+  // Normalize and validate nextRebillingDate: nullable, fecha real, nunca texto arbitrario.
+  if (!body.nextRebillingDate) body.nextRebillingDate = null;
+  else if (!isValidCalendarDate(body.nextRebillingDate))
+    return c.json({ error: `Próxima fecha de refacturación inválida: "${body.nextRebillingDate}"` }, 400);
   const today = new Date().toISOString().split("T")[0];
   const daysToEnd = Math.ceil(
     (new Date(body.endDate).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24)
@@ -443,6 +448,12 @@ app.put("/policies/:id", requireAuth(async (c: any) => {
     if (!body.vigencyPeriod) body.vigencyPeriod = null;
     else if (!["anual", "semestral", "cuatrimestral"].includes(body.vigencyPeriod))
       return c.json({ error: `Período de vigencia inválido: "${body.vigencyPeriod}"` }, 400);
+  }
+  // Normalize and validate nextRebillingDate — solo si se envía (edición parcial no la toca).
+  if ("nextRebillingDate" in body) {
+    if (!body.nextRebillingDate) body.nextRebillingDate = null;
+    else if (!isValidCalendarDate(body.nextRebillingDate))
+      return c.json({ error: `Próxima fecha de refacturación inválida: "${body.nextRebillingDate}"` }, 400);
   }
   const today = new Date().toISOString().split("T")[0];
   const daysToEnd = Math.ceil(
