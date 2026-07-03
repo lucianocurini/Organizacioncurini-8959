@@ -1,7 +1,9 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { useLocation } from "wouter";
 import { api } from "@/lib/api";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { formatCurrency, formatDate, POLICY_TYPES, cn } from "@/lib/utils";
+import { buildReportQuery, buildReportPath, parseReportFilters } from "@/lib/report-filters";
 import {
   ChevronLeft, ChevronRight, Download, Printer, Search, X, RefreshCw,
   FileText, TrendingUp, Plus, Copy, BarChart3,
@@ -493,29 +495,49 @@ const PRINT_STYLES = `
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function ReporteMes() {
-  const [month, setMonth] = useState(currentMonth);
-  const [companyFilter, setCompanyFilter] = useState("");
-  const [typeFilter, setTypeFilter] = useState("");
-  const [movementTypeFilter, setMovementTypeFilter] = useState("");
-  const [rebillingTypeFilter, setRebillingTypeFilter] = useState("");
-  const [q, setQ] = useState("");
+  // El estado inicial se lee una sola vez de la URL actual (query string),
+  // con fallback seguro a valores por defecto ante parámetros ausentes/inválidos.
+  const initialFiltersRef = useRef<ReturnType<typeof parseReportFilters> | null>(null);
+  if (!initialFiltersRef.current) {
+    initialFiltersRef.current = parseReportFilters(window.location.search, currentMonth());
+  }
+  const initial = initialFiltersRef.current;
+
+  const [, navigate] = useLocation();
+  const [month, setMonth] = useState(initial.month);
+  const [companyFilter, setCompanyFilter] = useState(initial.companyId);
+  const [typeFilter, setTypeFilter] = useState(initial.type);
+  const [movementTypeFilter, setMovementTypeFilter] = useState(initial.movementType);
+  const [rebillingTypeFilter, setRebillingTypeFilter] = useState(initial.rebillingType);
+  const [q, setQ] = useState(initial.q);
   const [data, setData] = useState<ReportData | null>(null);
   const [loading, setLoading] = useState(false);
   const [companies, setCompanies] = useState<{ id: number; name: string }[]>([]);
+
+  // Filtros actuales en la forma que usan tanto la query string como la API.
+  const currentFilters = { month, companyId: companyFilter, type: typeFilter, movementType: movementTypeFilter, rebillingType: rebillingTypeFilter, q };
+  // Ruta completa del reporte con el estado actual — se usa como returnTo al navegar a una póliza.
+  const currentReportPath = buildReportPath(currentFilters);
 
   useEffect(() => {
     api.get("/api/companies").then((c: any[]) => setCompanies(c)).catch(() => {});
   }, []);
 
+  // Mantiene la query string sincronizada con los filtros (reemplaza la entrada
+  // de historial en vez de apilarla, para no llenar el historial por cada tecla/filtro).
+  useEffect(() => {
+    const query = buildReportQuery(currentFilters);
+    const currentSearch = window.location.search.replace(/^\?/, "");
+    if (query !== currentSearch) {
+      navigate(`/reporte-mes?${query}`, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [month, companyFilter, typeFilter, movementTypeFilter, rebillingTypeFilter, q]);
+
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const params = new URLSearchParams({ month });
-      if (companyFilter) params.set("companyId", companyFilter);
-      if (typeFilter) params.set("type", typeFilter);
-      if (movementTypeFilter) params.set("movementType", movementTypeFilter);
-      if (rebillingTypeFilter) params.set("rebillingType", rebillingTypeFilter);
-      if (q.trim()) params.set("q", q.trim());
+      const params = buildReportQuery(currentFilters);
       const result = await api.get(`/api/reports/renewals-rebillings?${params}`);
       setData(result);
     } catch {
@@ -523,6 +545,7 @@ export default function ReporteMes() {
     } finally {
       setLoading(false);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [month, companyFilter, typeFilter, movementTypeFilter, rebillingTypeFilter, q]);
 
   useEffect(() => { load(); }, [load]);
@@ -789,7 +812,7 @@ export default function ReporteMes() {
                       <Td><RebillingTypeBadge type={r.rebillingType} /></Td>
                       <Td>{r.duplicateCount > 1 ? <DuplicateBadge count={r.duplicateCount} /> : <span className="text-gray-600 text-xs">—</span>}</Td>
                       <Td className="col-actions sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
-                        <PolicyActions policyId={r.policyId} onChanged={load} />
+                        <PolicyActions policyId={r.policyId} onChanged={load} returnTo={currentReportPath} />
                       </Td>
                     </tr>
                   ))}
@@ -850,7 +873,7 @@ export default function ReporteMes() {
                           : <span className="text-gray-600 text-xs">—</span>}
                       </Td>
                       <Td className="col-actions sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
-                        <PolicyActions policyId={r.policyId} onChanged={load} />
+                        <PolicyActions policyId={r.policyId} onChanged={load} returnTo={currentReportPath} />
                       </Td>
                     </tr>
                   ))}
@@ -907,7 +930,7 @@ export default function ReporteMes() {
                       <Td className="text-gray-300">{r.monthlyFee != null ? formatCurrency(r.monthlyFee) : <span className="text-gray-600 text-xs">—</span>}</Td>
                       <Td className="text-gray-400 text-xs">{importerLabel(r.sourceImporter)}</Td>
                       <Td className="col-actions sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
-                        <PolicyActions policyId={r.policyId} onChanged={load} />
+                        <PolicyActions policyId={r.policyId} onChanged={load} returnTo={currentReportPath} />
                       </Td>
                     </tr>
                   ))}
@@ -969,7 +992,7 @@ export default function ReporteMes() {
                         </div>
                       </Td>
                       <Td className="col-actions sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
-                        <PolicyActions policyId={r.policyId} onChanged={load} />
+                        <PolicyActions policyId={r.policyId} onChanged={load} returnTo={currentReportPath} />
                       </Td>
                     </tr>
                   ))}

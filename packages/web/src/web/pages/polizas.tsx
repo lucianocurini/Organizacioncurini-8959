@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { api } from "@/lib/api";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { formatCurrency, formatDate, daysUntil, POLICY_TYPES, STATUS_TYPES, COVERAGE_LABELS, cn } from "@/lib/utils";
@@ -10,6 +10,7 @@ import { PolicyModal } from "@/components/policies/PolicyModal";
 import { PolicyActions } from "@/components/policies/PolicyActions";
 import { ImportModal } from "@/components/policies/ImportModal";
 import { toast } from "sonner";
+import { buildPoliziasQuery, buildPoliziasPath, parsePoliziasFilters, type PoliziasSortKey } from "@/lib/polizas-filters";
 
 interface PolicyRow {
   policy: any;
@@ -21,29 +22,38 @@ const typeIcons: Record<string, any> = {
   automotor: Car, motovehiculo: Bike, ecomovilidad: Zap, hogar: Home, accidentes: ShieldCheck, art: HeartPulse, comercial: Briefcase, responsabilidad_civil: Scale, cascos: HardHat, incendio: Flame,
 };
 
-type SortKey = "policyNumber" | "insured" | "company" | "type" | "status" | "endDate" | "premium";
+type SortKey = PoliziasSortKey;
 
 const PAGE_SIZE = 50;
 
 export default function Polizas() {
-  const [location] = useLocation();
-  const searchParams = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : new URLSearchParams();
-  const initialType = searchParams.get("type") || "";
-  const initialStatus = searchParams.get("status") || "";
+  // El estado inicial se lee una sola vez de la URL actual (query string),
+  // con fallback seguro a valores por defecto ante parámetros ausentes/inválidos.
+  const initialFiltersRef = useRef<ReturnType<typeof parsePoliziasFilters> | null>(null);
+  if (!initialFiltersRef.current) {
+    initialFiltersRef.current = parsePoliziasFilters(window.location.search);
+  }
+  const initial = initialFiltersRef.current;
 
+  const [, navigate] = useLocation();
   const [rows, setRows] = useState<PolicyRow[]>([]);
   const [loading, setLoading] = useState(true);
-  const [q, setQ] = useState("");
-  const [typeFilter, setTypeFilter] = useState(initialType);
-  const [statusFilter, setStatusFilter] = useState(initialStatus);
-  const [sortKey, setSortKey] = useState<SortKey>("endDate");
-  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const [q, setQ] = useState(initial.q);
+  const [typeFilter, setTypeFilter] = useState(initial.type);
+  const [statusFilter, setStatusFilter] = useState(initial.status);
+  const [sortKey, setSortKey] = useState<SortKey>(initial.sortBy);
+  const [sortDir, setSortDir] = useState<"asc" | "desc">(initial.sortOrder);
   const [showModal, setShowModal] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [showBulkConfirm, setShowBulkConfirm] = useState(false);
   const [deleting, setDeleting] = useState(false);
-  const [page, setPage] = useState(1);
+  const [page, setPage] = useState(initial.page);
+
+  // Filtros/orden/página actuales en la forma que usan la query string y la API.
+  const currentFilters = { q, type: typeFilter, status: statusFilter, sortBy: sortKey, sortOrder: sortDir, page };
+  // Ruta completa del listado con el estado actual — se usa como returnTo al navegar a una póliza.
+  const currentListPath = buildPoliziasPath(currentFilters);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -61,13 +71,24 @@ export default function Polizas() {
 
   useEffect(() => { load(); }, [load]);
 
-  useEffect(() => { setPage(1); }, [q, typeFilter, statusFilter, sortKey, sortDir]);
-
+  // Mantiene la query string sincronizada con filtros, orden y página
+  // (reemplaza la entrada de historial en vez de apilarla).
   useEffect(() => {
-    const sp = new URLSearchParams(window.location.search);
-    setTypeFilter(sp.get("type") || "");
-    setStatusFilter(sp.get("status") || "");
-  }, [location]);
+    const query = buildPoliziasQuery(currentFilters);
+    const currentSearch = window.location.search.replace(/^\?/, "");
+    if (query !== currentSearch) {
+      navigate(`/polizas?${query}`, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [q, typeFilter, statusFilter, sortKey, sortDir, page]);
+
+  // Vuelve a la página 1 cuando cambian filtros u orden — pero no en el primer
+  // render, para no perder una página persistida en la URL (?page=2) al volver.
+  const isFirstFilterRender = useRef(true);
+  useEffect(() => {
+    if (isFirstFilterRender.current) { isFirstFilterRender.current = false; return; }
+    setPage(1);
+  }, [q, typeFilter, statusFilter, sortKey, sortDir]);
 
   const handleSort = (key: SortKey) => {
     if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
@@ -88,7 +109,8 @@ export default function Polizas() {
     }
     if (va < vb) return sortDir === "asc" ? -1 : 1;
     if (va > vb) return sortDir === "asc" ? 1 : -1;
-    return 0;
+    // Desempate estable: id descendente.
+    return b.policy.id - a.policy.id;
   });
 
   const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
@@ -288,7 +310,7 @@ export default function Polizas() {
                 </div>
 
                 <div className="flex items-center justify-end pt-2 border-t border-[#1f2937]">
-                  <PolicyActions policyId={row.policy.id} onChanged={load} />
+                  <PolicyActions policyId={row.policy.id} onChanged={load} returnTo={currentListPath} />
                 </div>
               </div>
             );
@@ -403,7 +425,7 @@ export default function Polizas() {
                         {row.policy.premium && !row.policy.monthlyFee && <p className="text-sm font-mono text-gray-300 truncate">{formatCurrency(row.policy.premium)}</p>}
                       </td>
                       <td className="py-2.5 px-3 sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
-                        <PolicyActions policyId={row.policy.id} onChanged={load} />
+                        <PolicyActions policyId={row.policy.id} onChanged={load} returnTo={currentListPath} />
                       </td>
                     </tr>
                   );

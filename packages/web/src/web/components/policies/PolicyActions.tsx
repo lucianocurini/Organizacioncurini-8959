@@ -3,16 +3,23 @@ import { Link } from "wouter";
 import { Eye, Edit, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
+import { isSafeReturnTo } from "@/lib/utils";
 import { PolicyModal } from "@/components/policies/PolicyModal";
 
 interface Props {
   policyId: number;
   onChanged?: () => void;
+  // Ruta a la que volver al cerrar el detalle (p.ej. el Reporte mensual con sus
+  // filtros). Solo se aplica si es una ruta interna válida — ver isSafeReturnTo.
+  returnTo?: string;
 }
 
 // Acciones de póliza (Ver / Editar / Eliminar) compartidas entre Pólizas y Reporte mensual.
 // Mismos endpoints, mismos permisos y mismas confirmaciones que el módulo Pólizas.
-export function PolicyActions({ policyId, onChanged }: Props) {
+export function PolicyActions({ policyId, onChanged, returnTo }: Props) {
+  const viewHref = isSafeReturnTo(returnTo)
+    ? `/polizas/${policyId}?returnTo=${encodeURIComponent(returnTo)}`
+    : `/polizas/${policyId}`;
   const [showModal, setShowModal] = useState(false);
   const [editData, setEditData] = useState<{ policy: any; company: any; insured: any } | null>(null);
   const [loadingEdit, setLoadingEdit] = useState(false);
@@ -45,7 +52,7 @@ export function PolicyActions({ policyId, onChanged }: Props) {
   return (
     <>
       <div className="flex items-center justify-end gap-1">
-        <Link href={`/polizas/${policyId}`}>
+        <Link href={viewHref}>
           <a className="p-1.5 text-gray-400 hover:text-white hover:bg-[#1f2937] rounded-md transition-all" title="Ver detalles">
             <Eye className="w-4 h-4" />
           </a>

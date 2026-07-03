@@ -16,6 +16,21 @@ export function formatDate(dateStr: string | null | undefined): string {
   return `${d}/${m}/${y}`;
 }
 
+// Rutas internas a las que un botón "volver" puede redirigir. Cualquier otro
+// valor (URL externa, protocol-relative, esquema no-http) se considera inseguro.
+const SAFE_RETURN_PREFIXES = ["/reporte-mes", "/polizas"] as const;
+
+export function isSafeReturnTo(path: string | null | undefined): path is string {
+  if (!path) return false;
+  if (!path.startsWith("/") || path.startsWith("//") || path.startsWith("/\\")) return false;
+  return SAFE_RETURN_PREFIXES.some(
+    (prefix) => path === prefix
+      || path.startsWith(`${prefix}/`)
+      || path.startsWith(`${prefix}?`)
+      || path.startsWith(`${prefix}#`)
+  );
+}
+
 export function daysUntil(dateStr: string): number {
   const today = new Date();
   today.setHours(0, 0, 0, 0);

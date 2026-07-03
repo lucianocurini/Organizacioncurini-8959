@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { AppLayout } from "@/components/layout/AppLayout";
-import { formatCurrency, formatDate, daysUntil, POLICY_TYPES, STATUS_TYPES, COVERAGE_LABELS, cn } from "@/lib/utils";
+import { formatCurrency, formatDate, daysUntil, POLICY_TYPES, STATUS_TYPES, COVERAGE_LABELS, cn, isSafeReturnTo } from "@/lib/utils";
 import { Link, useParams } from "wouter";
 import { ArrowLeft, Edit, Car, Home, ShieldCheck, Briefcase, FileText, Calendar, Building2, User, Bike, HeartPulse, Zap, Scale, HardHat, Flame, RefreshCw, Plus, Pencil, Trash2, ListOrdered, CheckCircle2, Clock, AlertCircle } from "lucide-react";
 import { PolicyModal } from "@/components/policies/PolicyModal";
@@ -42,6 +42,13 @@ export default function PolizaDetail() {
   const [instEdit, setInstEdit] = useState<Record<number, { dueDate: string; amount: number; notes: string; status: string }>>({});
   const [showGenForm, setShowGenForm] = useState(false);
   const [genForm, setGenForm] = useState<{ billingCycle: string; monthlyFee: string; startDate: string }>({ billingCycle: "", monthlyFee: "", startDate: "" });
+
+  // Destino del botón "volver": el origen (p.ej. Reporte mensual con sus filtros)
+  // si vino con un returnTo interno válido, o el listado general como fallback seguro.
+  const [backHref] = useState(() => {
+    const raw = new URLSearchParams(window.location.search).get("returnTo");
+    return isSafeReturnTo(raw) ? raw : "/polizas";
+  });
 
   const load = () => {
     setLoading(true);
@@ -107,7 +114,7 @@ export default function PolizaDetail() {
       <div className="p-4 lg:p-8 max-w-4xl">
         {/* Header */}
         <div className="flex items-center gap-3 sm:gap-4 mb-6">
-          <Link href="/polizas">
+          <Link href={backHref}>
             <a className="p-2 text-gray-400 hover:text-white hover:bg-[#1f2937] rounded-lg transition-all flex-shrink-0">
               <ArrowLeft className="w-5 h-5" />
             </a>
