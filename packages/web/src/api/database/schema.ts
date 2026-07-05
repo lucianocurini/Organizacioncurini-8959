@@ -95,6 +95,23 @@ export const payments = sqliteTable("payments", {
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
 
+// Etapa 3A: desglose por medio de pago de un mismo payment. Todo payment,
+// incluso de un solo medio, tiene siempre al menos una fila acá (ver
+// migración 0019 y src/lib/migrations/apply-0019-payment-splits.ts).
+// payments.amount/paymentMethod NO cambian de significado — siguen siendo el
+// total y el método resumen; esta tabla es información aditiva.
+// CHECK amount_cents > 0 y el índice por payment_id se declaran en la
+// migración 0019 (este proyecto no usa los helpers index()/check() de
+// Drizzle — ver 0015_caja_propia.sql y 0017_installments_rebilling_id.sql).
+export const paymentSplits = sqliteTable("payment_splits", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  paymentId: integer("payment_id").notNull().references(() => payments.id),
+  method: text("method").notNull(), // mismo vocabulario libre que payments.paymentMethod
+  amountCents: integer("amount_cents").notNull(),
+  notes: text("notes"),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
 export const deliveries = sqliteTable("deliveries", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   policyId: integer("policy_id").references(() => policies.id), // nullable — envío manual sin póliza

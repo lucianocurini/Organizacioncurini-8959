@@ -8,6 +8,7 @@ import {
   policies,
   sessions,
   payments,
+  paymentSplits,
   deliveries,
   rebillings,
   claims,
@@ -36,6 +37,8 @@ import {
 import { parseElNorteTxtV2 } from "../lib/parsers/el-norte-v2";
 import { isValidCalendarDate, buildInstallmentPlan, InstallmentPlanError } from "../lib/installments/plan";
 import { classifyInstallmentsForRebuild, runInstallmentRebuildTransaction, RebuildConflictError, PolicyNotFoundError } from "../lib/installments/rebuild";
+import { validateAndNormalizeSplits, SplitValidationError } from "../lib/payments/splits";
+import { recalculateInstallmentPaymentStatus } from "../lib/payments/installment-status";
 
 const app = new Hono().basePath("/api");
 
@@ -897,12 +900,25 @@ app.get("/payments", requireAuth(async (c: any) => {
   if (to) results = results.filter((r) => r.payment.paymentDate <= to);
   const paymentIds = results.map(r => r.payment.id);
   const surchargeSet = new Set<number>();
+  const splitsByPayment = new Map<number, { method: string; amountCents: number; notes: string | null }[]>();
   if (paymentIds.length > 0) {
     const sRows = await db.select({ paymentId: cashEntries.paymentId })
       .from(cashEntries)
       .where(and(inArray(cashEntries.paymentId, paymentIds), eq(cashEntries.entryType, "pronto_pago_surcharge")))
       .all();
     for (const s of sRows) { if (s.paymentId != null) surchargeSet.add(s.paymentId); }
+
+    // Etapa 3A: splits solo de forma aditiva — no reemplaza amount/paymentMethod.
+    const splitRows = await db.select({
+      paymentId: paymentSplits.paymentId, method: paymentSplits.method,
+      amountCents: paymentSplits.amountCents, notes: paymentSplits.notes,
+    }).from(paymentSplits).where(inArray(paymentSplits.paymentId, paymentIds))
+      .orderBy(asc(paymentSplits.id)).all();
+    for (const s of splitRows) {
+      const arr = splitsByPayment.get(s.paymentId) ?? [];
+      arr.push({ method: s.method, amountCents: s.amountCents, notes: s.notes });
+      splitsByPayment.set(s.paymentId, arr);
+    }
   }
   return c.json(results.map(r => ({
     ...r,
@@ -910,6 +926,7 @@ app.get("/payments", requireAuth(async (c: any) => {
       ...r.payment,
       hasSurcharge: surchargeSet.has(r.payment.id),
       dueDate: (r.installment?.dueDate ?? r.payment.dueDate ?? null) as string | null,
+      splits: splitsByPayment.get(r.payment.id) ?? [],
     },
   })), 200);
 }));
@@ -919,10 +936,34 @@ app.post("/payments", requireAuth(async (c: any) => {
   const body = await c.req.json();
   const hasPolicyId = body.policyId != null && body.policyId !== "";
   const paymentStatus = body.status || "confirmado";
+  const isConfirmed = paymentStatus === "confirmado";
 
   if (body.dueDate && !/^\d{4}-\d{2}-\d{2}$/.test(body.dueDate)) {
     return c.json({ error: "Formato de fecha de vencimiento inválido. Use YYYY-MM-DD." }, 400);
   }
+
+  // Etapa 3A: todo payment nuevo tiene siempre >=1 payment_splits. El frontend
+  // actual no envía `splits` — se arma internamente un único split desde
+  // paymentMethod/amount, igual que antes. Medios combinados (>=2 splits)
+  // todavía no están habilitados: se rechazan explícitamente con 400.
+  if (Array.isArray(body.splits) && body.splits.length >= 2) {
+    return c.json({ error: "Los medios de pago combinados todavía no están habilitados en esta etapa." }, 400);
+  }
+  const rawSplits = Array.isArray(body.splits) && body.splits.length > 0
+    ? body.splits
+    : [{ method: body.paymentMethod, amount: Number(body.amount), notes: null }];
+
+  let normalizedSplits;
+  try {
+    normalizedSplits = validateAndNormalizeSplits({ paymentAmount: Number(body.amount), splits: rawSplits });
+  } catch (e: any) {
+    if (e instanceof SplitValidationError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+  // paymentMethod del padre = método del único split validado (nunca el
+  // body.paymentMethod crudo) — garantiza por construcción que ambos
+  // coincidan, incluso si el caller mandó body.splits con un método distinto.
+  const resolvedPaymentMethod = normalizedSplits.splits[0]!.method;
 
   // Resolve company/insured from DB (never trust frontend for surcharge decision)
   let resolvedCompany: string | null = null;
@@ -947,9 +988,44 @@ app.post("/payments", requireAuth(async (c: any) => {
   }
 
   const isRivadavia = resolvedCompany?.toLowerCase().includes("rivadavia") ?? false;
-  const isOwnMethod = (SURCHARGE_OWN_METHODS as readonly string[]).includes(body.paymentMethod);
-  const isConfirmed = paymentStatus === "confirmado";
+  const isOwnMethod = (SURCHARGE_OWN_METHODS as readonly string[]).includes(resolvedPaymentMethod);
   const shouldCreateSurcharge = isRivadavia && isOwnMethod && isConfirmed && body.applyProntoPagoSurcharge !== false;
+
+  // La cuota indicada debe existir siempre que se envíe installmentId, sin
+  // importar el status — una FK inválida no la rechaza la base (foreign_keys
+  // no está activado acá), así que se valida a mano. Si también viene
+  // policyId, deben pertenecer a la misma póliza (evita marcar por error la
+  // cuota de otra póliza con un id equivocado).
+  let installmentRow: { id: number; amount: number; policyId: number; status: string } | null = null;
+  if (body.installmentId) {
+    installmentRow = await db.select({
+      id: policyInstallments.id, amount: policyInstallments.amount,
+      policyId: policyInstallments.policyId, status: policyInstallments.status,
+    }).from(policyInstallments).where(eq(policyInstallments.id, Number(body.installmentId))).get() ?? null;
+    if (!installmentRow) return c.json({ error: "La cuota indicada no existe." }, 404);
+    if (hasPolicyId && installmentRow.policyId !== Number(body.policyId)) {
+      return c.json({ error: "La cuota indicada no pertenece a la póliza indicada." }, 400);
+    }
+  }
+
+  // Importe vs. cuota: solo aplica a pagos confirmados vinculados a una cuota.
+  // No existe pago parcial todavía — el importe confirmado debe coincidir
+  // exactamente en centavos con el importe de la cuota (ver diagnóstico:
+  // el recargo Pronto Pago se modela aparte, en cashEntries, nunca se suma a
+  // payments.amount — no hay excepción real que justifique aceptar un
+  // importe distinto acá). Tampoco se acepta un segundo pago confirmado sobre
+  // una cuota que ya está "pagada" — evita duplicar el cobro de una cuota.
+  if (installmentRow && isConfirmed) {
+    if (installmentRow.status === "pagada") {
+      return c.json({ error: "La cuota indicada ya está pagada." }, 409);
+    }
+    const expectedCents = Math.round(installmentRow.amount * 100);
+    if (normalizedSplits.totalCents !== expectedCents) {
+      return c.json({
+        error: `El importe del pago ($${(normalizedSplits.totalCents / 100).toFixed(2)}) no coincide con el importe de la cuota ($${(expectedCents / 100).toFixed(2)}). Los pagos parciales todavía no están habilitados.`,
+      }, 400);
+    }
+  }
 
   const [payment] = await db.transaction(async (tx) => {
     const [p] = await tx.insert(payments).values({
@@ -959,7 +1035,7 @@ app.post("/payments", requireAuth(async (c: any) => {
       manualPolicyNumber: body.manualPolicyNumber || null,
       manualCompany: body.manualCompany || null,
       amount: Number(body.amount),
-      paymentMethod: body.paymentMethod,
+      paymentMethod: resolvedPaymentMethod,
       paymentDate: body.paymentDate,
       periodMonth: body.periodMonth || null,
       notes: body.notes || null,
@@ -968,6 +1044,10 @@ app.post("/payments", requireAuth(async (c: any) => {
       dueDate: body.installmentId ? null : (body.dueDate || null),
       createdBy: user.id,
     }).returning();
+
+    await tx.insert(paymentSplits).values(normalizedSplits.splits.map((s) => ({
+      paymentId: p.id, method: s.method, amountCents: s.amountCents, notes: s.notes,
+    })));
 
     if (body.installmentId && isConfirmed) {
       await tx.update(policyInstallments).set({ status: "pagada" })
@@ -983,7 +1063,7 @@ app.post("/payments", requireAuth(async (c: any) => {
           policyNumber: resolvedPolicyNumber ?? null,
           companyName: resolvedCompany ?? null,
           amount: SURCHARGE_AMOUNT,
-          paymentMethod: body.paymentMethod,
+          paymentMethod: resolvedPaymentMethod,
           paymentDate: body.paymentDate,
           entryType: "pronto_pago_surcharge",
           paymentId: p.id,
@@ -997,7 +1077,8 @@ app.post("/payments", requireAuth(async (c: any) => {
     return [p];
   });
 
-  return c.json(payment, 201);
+  const splitsRows = await db.select().from(paymentSplits).where(eq(paymentSplits.paymentId, payment.id)).all();
+  return c.json({ ...payment, splits: splitsRows }, 201);
 }));
 
 app.put("/payments/:id", requireAuth(async (c: any) => {
@@ -1039,6 +1120,80 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
     update.dueDate = null;
   }
 
+  // Etapa 3A: SIEMPRE debe existir exactamente un split para este payment,
+  // sin importar qué campo se esté editando — si hay cero o más de uno, es
+  // un dato inconsistente y no se inventa ni se corrige solo, se falla.
+  const existingSplitsCheck = await db.select({ id: paymentSplits.id, method: paymentSplits.method, amountCents: paymentSplits.amountCents })
+    .from(paymentSplits).where(eq(paymentSplits.paymentId, id)).all();
+  if (existingSplitsCheck.length !== 1) {
+    return c.json({
+      error: `El pago tiene ${existingSplitsCheck.length} split(s) — se esperaba exactamente 1 en Etapa 3A. No se puede editar de forma segura.`,
+    }, 409);
+  }
+
+  // Etapa 3A: si cambia amount o paymentMethod, el único split existente debe
+  // actualizarse para seguir sumando exactamente el total — se revalida acá
+  // con el mismo helper que usa POST /payments.
+  const effectiveAmount = Number("amount" in update ? update.amount : current.amount);
+  const effectivePaymentMethodForSplit = ("paymentMethod" in update ? update.paymentMethod : current.paymentMethod) as string;
+  const splitFieldsChanged = ("amount" in update) || ("paymentMethod" in update);
+  let normalizedSplitUpdate: ReturnType<typeof validateAndNormalizeSplits> | null = null;
+  if (splitFieldsChanged) {
+    try {
+      normalizedSplitUpdate = validateAndNormalizeSplits({
+        paymentAmount: effectiveAmount,
+        splits: [{ method: effectivePaymentMethodForSplit, amount: effectiveAmount }],
+      });
+    } catch (e: any) {
+      if (e instanceof SplitValidationError) return c.json({ error: e.message }, 400);
+      throw e;
+    }
+  }
+
+  // Si cambia installmentId a un valor no nulo, la nueva cuota debe existir y
+  // (si también hay policyId efectivo) pertenecerle — mismo criterio que POST.
+  const effectivePolicyIdForInstallment = ("policyId" in update ? update.policyId : current.policyId) as number | null;
+  let newInstallmentRow: { id: number; amount: number; policyId: number; status: string } | null = null;
+  if ("installmentId" in update && update.installmentId != null) {
+    newInstallmentRow = await db.select({
+      id: policyInstallments.id, amount: policyInstallments.amount,
+      policyId: policyInstallments.policyId, status: policyInstallments.status,
+    }).from(policyInstallments).where(eq(policyInstallments.id, Number(update.installmentId))).get() ?? null;
+    if (!newInstallmentRow) return c.json({ error: "La cuota indicada no existe." }, 404);
+    if (effectivePolicyIdForInstallment != null && newInstallmentRow.policyId !== effectivePolicyIdForInstallment) {
+      return c.json({ error: "La cuota indicada no pertenece a la póliza indicada." }, 400);
+    }
+  }
+
+  // Importe vs. cuota: mismo criterio que POST — un pago confirmado vinculado
+  // a una cuota debe coincidir exactamente en centavos con el importe de esa
+  // cuota, y esa cuota no puede tener ya otro pago confirmado válido (evita
+  // duplicar el cobro). Solo se revalida si algo relevante cambió.
+  const effectiveStatusForAmountCheck = ("status" in update ? update.status : current.status) as string;
+  const amountVsInstallmentRelevant = ("amount" in update) || ("installmentId" in update) || ("status" in update);
+  if (amountVsInstallmentRelevant && effectiveInstallmentId != null && effectiveStatusForAmountCheck === "confirmado") {
+    const installmentRow = newInstallmentRow ?? await db.select({
+      id: policyInstallments.id, amount: policyInstallments.amount,
+      policyId: policyInstallments.policyId, status: policyInstallments.status,
+    }).from(policyInstallments).where(eq(policyInstallments.id, Number(effectiveInstallmentId))).get();
+    if (!installmentRow) return c.json({ error: "La cuota indicada no existe." }, 404);
+    const expectedCents = Math.round(installmentRow.amount * 100);
+    const gotCents = Math.round(effectiveAmount * 100);
+    if (gotCents !== expectedCents) {
+      return c.json({
+        error: `El importe del pago ($${(gotCents / 100).toFixed(2)}) no coincide con el importe de la cuota ($${(expectedCents / 100).toFixed(2)}). Los pagos parciales todavía no están habilitados.`,
+      }, 400);
+    }
+    if (installmentRow.status === "pagada") {
+      const otherConfirmed = await db.select({ id: payments.id, amount: payments.amount }).from(payments)
+        .where(and(eq(payments.installmentId, installmentRow.id), eq(payments.status, "confirmado"), ne(payments.id, id))).all();
+      const hasOtherValid = otherConfirmed.some((p) => Math.round(p.amount * 100) === expectedCents);
+      if (hasOtherValid) {
+        return c.json({ error: "La cuota indicada ya tiene otro pago confirmado que la cubre." }, 409);
+      }
+    }
+  }
+
   // Read existing surcharge before transaction
   const existingSurcharge = await db.select().from(cashEntries)
     .where(and(eq(cashEntries.paymentId, id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).get();
@@ -1077,8 +1232,31 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
     }
   }
 
+  const oldInstallmentId = current.installmentId;
+  const newInstallmentId = "installmentId" in update ? update.installmentId : current.installmentId;
+  const shouldRecalcInstallment = ("installmentId" in update) || ("status" in update) || ("amount" in update);
+
   const [payment] = await db.transaction(async (tx) => {
     const [p] = await tx.update(payments).set(update).where(eq(payments.id, id)).returning();
+
+    if (normalizedSplitUpdate) {
+      const existingSplits = await tx.select({ id: paymentSplits.id }).from(paymentSplits)
+        .where(eq(paymentSplits.paymentId, id)).all();
+      if (existingSplits.length !== 1) {
+        throw new Error(`El pago ${id} tiene ${existingSplits.length} splits — se esperaba exactamente 1 en Etapa 3A.`);
+      }
+      const onlySplit = normalizedSplitUpdate.splits[0]!;
+      await tx.update(paymentSplits).set({
+        method: onlySplit.method, amountCents: onlySplit.amountCents,
+      }).where(eq(paymentSplits.id, existingSplits[0]!.id));
+    }
+
+    if (shouldRecalcInstallment) {
+      if (oldInstallmentId != null) await recalculateInstallmentPaymentStatus(tx, oldInstallmentId);
+      if (newInstallmentId != null && newInstallmentId !== oldInstallmentId) {
+        await recalculateInstallmentPaymentStatus(tx, newInstallmentId);
+      }
+    }
 
     if (body.applyProntoPagoSurcharge === false) {
       if (existingSurcharge) {
@@ -1128,12 +1306,13 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
     return [p];
   });
 
-  return c.json(payment, 200);
+  const splitsRows = await db.select().from(paymentSplits).where(eq(paymentSplits.paymentId, payment.id)).all();
+  return c.json({ ...payment, splits: splitsRows }, 200);
 }));
 
 app.delete("/payments/:id", requireAuth(async (c: any) => {
   const id = Number(c.req.param("id"));
-  const current = await db.select({ id: payments.id, rendered: payments.rendered })
+  const current = await db.select({ id: payments.id, rendered: payments.rendered, installmentId: payments.installmentId })
     .from(payments).where(eq(payments.id, id)).get();
   if (!current) return c.json({ error: "Pago no encontrado" }, 404);
   if (current.rendered) return c.json({ error: "Este pago ya fue rendido. Anulá la rendición primero." }, 409);
@@ -1141,7 +1320,13 @@ app.delete("/payments/:id", requireAuth(async (c: any) => {
     await tx.delete(cashEntries).where(
       and(eq(cashEntries.paymentId, id), eq(cashEntries.entryType, "pronto_pago_surcharge"), eq(cashEntries.rendered, 0))
     );
+    await tx.delete(paymentSplits).where(eq(paymentSplits.paymentId, id));
     await tx.delete(payments).where(eq(payments.id, id));
+    // Etapa 3A: borrar el pago no debe dejar la cuota "pagada" sin ningún
+    // payment confirmado vinculado — se recalcula tras el borrado.
+    if (current.installmentId != null) {
+      await recalculateInstallmentPaymentStatus(tx, current.installmentId);
+    }
   });
   return c.json({ ok: true }, 200);
 }));
