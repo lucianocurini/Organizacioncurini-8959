@@ -34,7 +34,8 @@ import {
   gmailConfigured,
 } from "../lib/gmail-client";
 import { parseElNorteTxtV2 } from "../lib/parsers/el-norte-v2";
-import { isValidCalendarDate } from "../lib/installments/plan";
+import { isValidCalendarDate, buildInstallmentPlan, InstallmentPlanError } from "../lib/installments/plan";
+import { classifyInstallmentsForRebuild, runInstallmentRebuildTransaction, RebuildConflictError, PolicyNotFoundError } from "../lib/installments/rebuild";
 
 const app = new Hono().basePath("/api");
 
@@ -401,6 +402,106 @@ app.put("/installments/:id", requireAuth(async (c: any) => {
     .where(eq(policyInstallments.id, Number(c.req.param("id"))))
     .returning();
   return c.json(row, 200);
+}));
+
+// Consulta de solo lectura: ¿se puede reconstruir el plan de cuotas de esta póliza?
+// No modifica nada — ver classifyInstallmentsForRebuild (lib/installments/rebuild.ts).
+app.get("/policies/:id/installments/rebuild-check", requireAuth(async (c: any) => {
+  const policyId = Number(c.req.param("id"));
+  if (!Number.isInteger(policyId) || policyId <= 0) {
+    return c.json({ error: "ID de póliza inválido." }, 400);
+  }
+  const policy = await db.select({ id: policies.id }).from(policies).where(eq(policies.id, policyId)).get();
+  if (!policy) return c.json({ error: "La póliza no existe." }, 404);
+
+  // classifyInstallmentsForRebuild también valida existencia por su cuenta
+  // (PolicyNotFoundError) — este catch es la red de seguridad si esa póliza
+  // desaparece entre el chequeo de arriba y esta llamada.
+  try {
+    const result = await classifyInstallmentsForRebuild(db, policyId);
+    return c.json(result, 200);
+  } catch (e: any) {
+    if (e instanceof PolicyNotFoundError) return c.json({ error: "La póliza no existe." }, 404);
+    throw e;
+  }
+}));
+
+// Reconstruye el plan de cuotas de una póliza: borra las cuotas actuales (solo si
+// ninguna tiene actividad real) y las reemplaza por un plan nuevo construido con
+// buildInstallmentPlan. Nunca acepta filas de cuotas prearmadas desde el cliente.
+app.post("/policies/:id/installments/rebuild", requireAuth(async (c: any) => {
+  const policyId = Number(c.req.param("id"));
+  if (!Number.isInteger(policyId) || policyId <= 0) {
+    return c.json({ error: "ID de póliza inválido." }, 400);
+  }
+  const policy = await db.select({ id: policies.id }).from(policies).where(eq(policies.id, policyId)).get();
+  if (!policy) return c.json({ error: "La póliza no existe." }, 404);
+
+  const body = await c.req.json();
+
+  let plan;
+  try {
+    plan = buildInstallmentPlan({
+      periodStart: body.periodStart,
+      periodEnd: body.periodEnd,
+      periodAmount: Number(body.periodAmount),
+      installmentCount: Number(body.installmentCount),
+      firstDueDate: body.firstDueDate || undefined,
+      installmentIntervalMonths: body.installmentIntervalMonths != null ? Number(body.installmentIntervalMonths) : undefined,
+    });
+  } catch (e: any) {
+    if (e instanceof InstallmentPlanError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
+  // Chequeo previo (fuera de la transacción): puramente informativo, para
+  // devolver 409 rápido y evitar abrir una transacción de escritura cuando ya
+  // se sabe que la póliza no es reconstruible. NO autoriza nada por sí mismo —
+  // la única autorización real para borrar es la reclasificación que
+  // runInstallmentRebuildTransaction hace con el cliente transaccional `tx`,
+  // inmediatamente antes del borrado (ver ese archivo).
+  let precheck;
+  try {
+    precheck = await classifyInstallmentsForRebuild(db, policyId);
+  } catch (e: any) {
+    if (e instanceof PolicyNotFoundError) return c.json({ error: "La póliza no existe." }, 404);
+    throw e;
+  }
+  if (precheck.classification === "REQUIRES_MANUAL_REVIEW") {
+    return c.json({
+      error: "La póliza tiene cuotas con actividad — no se puede reconstruir el plan.",
+      blockingInstallments: precheck.blockingInstallments,
+    }, 409);
+  }
+
+  try {
+    const result = await db.transaction(async (tx) =>
+      runInstallmentRebuildTransaction(tx, policyId, plan, {
+        periodStart: body.periodStart,
+        periodEnd: body.periodEnd,
+        periodAmount: Number(body.periodAmount),
+      })
+    );
+
+    return c.json({
+      rebuilt: true,
+      previousCount: result.previousCount,
+      insertedCount: result.insertedRows.length,
+      previousExpectedCount: result.previousExpectedCount,
+      newExpectedCount: result.insertedRows.length,
+      installments: result.insertedRows,
+    }, 200);
+  } catch (e: any) {
+    if (e instanceof RebuildConflictError) {
+      return c.json({
+        error: e.message,
+        blockingInstallments: e.blockingInstallments,
+      }, 409);
+    }
+    if (e instanceof PolicyNotFoundError) return c.json({ error: "La póliza no existe." }, 404);
+    console.error("[POST /policies/:id/installments/rebuild]", e?.message, e);
+    return c.json({ error: "No se pudo reconstruir el plan de cuotas." }, 500);
+  }
 }));
 
 app.post("/policies", requireAuth(async (c: any) => {

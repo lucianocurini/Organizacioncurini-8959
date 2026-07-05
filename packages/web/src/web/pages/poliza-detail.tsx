@@ -3,11 +3,17 @@ import { api } from "@/lib/api";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { formatCurrency, formatDate, daysUntil, POLICY_TYPES, STATUS_TYPES, COVERAGE_LABELS, cn, isSafeReturnTo } from "@/lib/utils";
 import { Link, useParams } from "wouter";
-import { ArrowLeft, Edit, Car, Home, ShieldCheck, Briefcase, FileText, Calendar, Building2, User, Bike, HeartPulse, Zap, Scale, HardHat, Flame, RefreshCw, Plus, Pencil, Trash2, ListOrdered, CheckCircle2, Clock, AlertCircle } from "lucide-react";
+import { ArrowLeft, Edit, Car, Home, ShieldCheck, Briefcase, FileText, Calendar, Building2, User, Bike, HeartPulse, Zap, Scale, HardHat, Flame, RefreshCw, Plus, Pencil, Trash2, ListOrdered, CheckCircle2, Clock, AlertCircle, Loader2, X } from "lucide-react";
 import { PolicyModal } from "@/components/policies/PolicyModal";
 import { RebillingModal } from "@/components/policies/RebillingModal";
 import { toast } from "sonner";
 import { buildInstallmentPlan, InstallmentPlanError } from "../../lib/installments/plan";
+import {
+  compareExpectedVsActual, EXPECTED_VS_ACTUAL_LABELS, shouldShowRebuildButton,
+  decideRebuildUiAction, buildRebuildRequestBody, summarizeRebuildPlan,
+  normalizeRebuildError, canConfirmRebuild,
+  type RebuildBlockingInstallment,
+} from "@/lib/installments-rebuild";
 
 const typeIcons: Record<string, any> = {
   automotor: Car, motovehiculo: Bike, ecomovilidad: Zap, hogar: Home, accidentes: ShieldCheck, art: HeartPulse, comercial: Briefcase, responsabilidad_civil: Scale, cascos: HardHat, incendio: Flame,
@@ -31,6 +37,24 @@ export default function PolizaDetail() {
     rebillingId: string; periodStart: string; periodEnd: string;
     installmentCount: string; amount: string; firstDueDate: string;
   }>({ rebillingId: "", periodStart: "", periodEnd: "", installmentCount: "", amount: "", firstDueDate: "" });
+
+  // ─── Subetapa 2B: reconstrucción segura de un plan de cuotas existente ──────
+  const [rebuildCheck, setRebuildCheck] = useState<{
+    classification: "NO_INSTALLMENTS" | "SAFE_TO_REBUILD" | "REQUIRES_MANUAL_REVIEW";
+    expectedCount: number | null;
+    actualCount: number;
+    mismatched: boolean;
+    blockingInstallments: RebuildBlockingInstallment[];
+  } | null>(null);
+  const [rebuildCheckLoading, setRebuildCheckLoading] = useState(false);
+  const [showRebuildBlocked, setShowRebuildBlocked] = useState(false);
+  const [showRebuildForm, setShowRebuildForm] = useState(false);
+  const [rebuildForm, setRebuildForm] = useState<{
+    rebillingId: string; periodStart: string; periodEnd: string;
+    periodAmount: string; installmentCount: string; firstDueDate: string; installmentIntervalMonths: string;
+  }>({ rebillingId: "", periodStart: "", periodEnd: "", periodAmount: "", installmentCount: "", firstDueDate: "", installmentIntervalMonths: "" });
+  const [rebuildConfirmed, setRebuildConfirmed] = useState(false);
+  const [rebuildSubmitting, setRebuildSubmitting] = useState(false);
 
   // Destino del botón "volver": el origen (p.ej. Reporte mensual con sus filtros)
   // si vino con un returnTo interno válido, o el listado general como fallback seguro.
@@ -255,6 +279,104 @@ export default function PolizaDetail() {
             pendiente: Clock, pagada: CheckCircle2, vencida: AlertCircle,
           };
 
+          // Cuotas esperadas (policies.installments) vs. reales (installmentsList).
+          // null nunca es "no coincide" — no hay nada contra qué comparar (misma
+          // regla que classifyInstallmentsForRebuild en el backend).
+          const expectedCount: number | null = p.installments ?? null;
+          const comparison = compareExpectedVsActual(expectedCount, installmentsList.length);
+          const showRebuildButton = shouldShowRebuildButton(installmentsList.length, comparison);
+
+          // Consulta (o reutiliza) rebuild-check al pulsar "Corregir plan de
+          // cuotas" — no se dispara automáticamente al cargar la página, para
+          // evitar una llamada de red innecesaria en pólizas que nadie va a tocar.
+          const openRebuildReview = async () => {
+            setRebuildCheckLoading(true);
+            try {
+              const result = await api.get(`/api/policies/${p.id}/installments/rebuild-check`);
+              setRebuildCheck(result);
+              if (decideRebuildUiAction(result.classification) === "show_blocked") {
+                setShowRebuildBlocked(true);
+                setShowRebuildForm(false);
+              } else {
+                setShowRebuildBlocked(false);
+                openRebuildForm();
+              }
+            } catch {
+              toast.error("No se pudo consultar el estado del plan de cuotas.");
+            } finally {
+              setRebuildCheckLoading(false);
+            }
+          };
+
+          // Precarga segura: período/importe desde la refacturación activa (o la
+          // seleccionada en el desplegable) si existe; si no, desde la póliza como
+          // sugerencia editable. installmentCount viene de policies.installments
+          // si está definido — nunca se infiere de la vigencia ni del período.
+          const openRebuildForm = () => {
+            const source = activeRebilling ?? null;
+            setRebuildForm({
+              rebillingId: source ? String(source.id) : "",
+              periodStart: source?.billingStart || p.startDate || "",
+              periodEnd: source?.billingEnd || p.endDate || "",
+              periodAmount: source?.premium ? String(source.premium) : (p.premium ? String(p.premium) : ""),
+              installmentCount: p.installments != null ? String(p.installments) : "",
+              firstDueDate: "",
+              installmentIntervalMonths: "",
+            });
+            setRebuildConfirmed(false);
+            setShowRebuildForm(true);
+          };
+
+          // Previsualización local (buildInstallmentPlan) — solo para mensajes y
+          // resumen inmediatos. La validación definitiva es siempre del backend
+          // (reclasifica de nuevo dentro de la transacción antes de borrar).
+          let rebuildPreviewPlan: ReturnType<typeof buildInstallmentPlan> | null = null;
+          let rebuildPreviewError: string | null = null;
+          if (showRebuildForm && rebuildForm.periodStart && rebuildForm.periodEnd && rebuildForm.periodAmount && rebuildForm.installmentCount) {
+            try {
+              rebuildPreviewPlan = buildInstallmentPlan({
+                periodStart: rebuildForm.periodStart,
+                periodEnd: rebuildForm.periodEnd,
+                periodAmount: Number(rebuildForm.periodAmount),
+                installmentCount: Number(rebuildForm.installmentCount),
+                firstDueDate: rebuildForm.firstDueDate || undefined,
+                installmentIntervalMonths: rebuildForm.installmentIntervalMonths ? Number(rebuildForm.installmentIntervalMonths) : undefined,
+              });
+            } catch (e: any) {
+              rebuildPreviewError = e instanceof InstallmentPlanError ? e.message : "Datos de período inválidos.";
+            }
+          }
+          const canConfirm = canConfirmRebuild(!!rebuildPreviewPlan && !rebuildPreviewError, rebuildConfirmed);
+
+          const doRebuild = async () => {
+            if (!rebuildPreviewPlan || rebuildPreviewError) return;
+            setRebuildSubmitting(true);
+            try {
+              const body = buildRebuildRequestBody(rebuildForm);
+              const result = await api.post(`/api/policies/${p.id}/installments/rebuild`, body);
+              toast.success(`Plan de cuotas corregido correctamente (${result.previousCount} → ${result.insertedCount} cuotas).`);
+              // No hace falta mostrar todo esto en la UI, pero queda disponible
+              // para inspección (previousExpectedCount / newExpectedCount incluidos).
+              console.info("[rebuild] resultado:", result);
+              setShowRebuildForm(false);
+              setRebuildCheck(null);
+              load();
+              api.get(`/api/policies/${p.id}/installments/rebuild-check`).then(setRebuildCheck).catch(() => {});
+            } catch (e: any) {
+              const normalized = normalizeRebuildError(e);
+              if (normalized.kind === "blocked") {
+                // No se modifica la lista de cuotas local como si hubiera éxito —
+                // solo se muestra el motivo del bloqueo, tal como lo informa el backend.
+                setRebuildCheck(rc => rc ? { ...rc, classification: "REQUIRES_MANUAL_REVIEW", blockingInstallments: normalized.blockingInstallments } : rc);
+                setShowRebuildForm(false);
+                setShowRebuildBlocked(true);
+              }
+              toast.error(normalized.message);
+            } finally {
+              setRebuildSubmitting(false);
+            }
+          };
+
           // Precarga el período desde la refacturación activa (si existe), o desde
           // la vigencia de la póliza. Cantidad de cuotas e importe quedan vacíos:
           // son siempre una entrada explícita, nunca un valor sugerido/automático.
@@ -324,17 +446,73 @@ export default function PolizaDetail() {
                     {installmentsList.filter((i: any) => i.status === "vencida").length} vencidas
                   </span>
                 )}
-                {installmentsList.length === 0 && (
+                {(installmentsList.length === 0 || showRebuildButton) && (
                   <div className="ml-auto flex items-center gap-2">
-                    <button
-                      onClick={openGenForm}
-                      className="text-xs px-3 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-lg hover:bg-amber-500/20 transition-all flex items-center gap-1.5"
-                    >
-                      <Plus className="w-3 h-3" /> Generar cuotas
-                    </button>
+                    {installmentsList.length === 0 && (
+                      <button
+                        onClick={openGenForm}
+                        className="text-xs px-3 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-lg hover:bg-amber-500/20 transition-all flex items-center gap-1.5"
+                      >
+                        <Plus className="w-3 h-3" /> Generar cuotas
+                      </button>
+                    )}
+                    {showRebuildButton && (
+                      <button
+                        onClick={openRebuildReview}
+                        disabled={rebuildCheckLoading}
+                        className="text-xs px-3 py-1 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded-lg hover:bg-blue-500/20 disabled:opacity-50 transition-all flex items-center gap-1.5"
+                      >
+                        {rebuildCheckLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                        Corregir plan de cuotas
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
+
+              {/* Esperado vs. real — nunca considera expectedCount null como mismatch */}
+              <div className="mb-3 flex items-center gap-2 text-xs flex-wrap">
+                <span className="text-gray-500">Cuotas esperadas: <span className="text-gray-300">{expectedCount ?? "Sin definir"}</span></span>
+                <span className="text-gray-700">·</span>
+                <span className="text-gray-500">Cuotas reales: <span className="text-gray-300">{installmentsList.length}</span></span>
+                <span className={cn(
+                  "px-2 py-0.5 rounded-full border",
+                  comparison.status === "no_coincide" ? "bg-amber-500/10 text-amber-400 border-amber-500/20" :
+                  comparison.status === "coincide" ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" :
+                  "bg-gray-500/10 text-gray-500 border-gray-700"
+                )}>
+                  {comparison.status === "no_coincide" && "⚠ "}{EXPECTED_VS_ACTUAL_LABELS[comparison.status]}
+                </span>
+              </div>
+
+              {/* Revisión bloqueada: cuotas con actividad — no se modificó nada */}
+              {showRebuildBlocked && rebuildCheck?.classification === "REQUIRES_MANUAL_REVIEW" && (
+                <div className="mb-3 bg-red-500/5 border border-red-500/20 rounded-xl p-4">
+                  <div className="flex items-center gap-2 mb-2">
+                    <AlertCircle className="w-4 h-4 text-red-400" />
+                    <p className="text-sm text-red-400 font-medium">No se puede reconstruir automáticamente</p>
+                  </div>
+                  <p className="text-xs text-gray-400 mb-3">
+                    No se modificó ninguna cuota. Estas cuotas tienen actividad registrada y requieren revisión manual
+                    antes de poder reconstruir el plan:
+                  </p>
+                  <div className="space-y-2">
+                    {rebuildCheck.blockingInstallments.map(b => (
+                      <div key={b.id} className="bg-[#111827] border border-red-500/10 rounded-lg px-3 py-2">
+                        <p className="text-xs text-white font-medium">Cuota #{b.number} — vence {formatDate(b.dueDate)}</p>
+                        <ul className="mt-1 space-y-0.5">
+                          {b.reasons.map((r, i) => (
+                            <li key={i} className="text-xs text-gray-400">· {r}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    ))}
+                  </div>
+                  <button onClick={() => setShowRebuildBlocked(false)} className="mt-3 text-xs text-gray-500 hover:text-white transition-colors">
+                    Cerrar
+                  </button>
+                </div>
+              )}
 
               {installmentsList.length > 0 && (
                 <p className="text-xs text-gray-600 mb-3">
@@ -531,6 +709,149 @@ export default function PolizaDetail() {
                   </tbody>
                 </table>
               </div>
+              )}
+
+              {/* Corregir plan de cuotas — modal separado del de "Generar cuotas":
+                  usa exclusivamente POST /installments/rebuild, nunca el endpoint
+                  normal de generación. */}
+              {showRebuildForm && (
+                <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 p-4 overflow-y-auto">
+                  <div className="bg-[#111827] border border-blue-500/30 rounded-2xl w-full max-w-lg my-4">
+                    <div className="flex items-center justify-between px-6 py-4 border-b border-[#1f2937]">
+                      <h2 className="text-lg font-semibold text-white" style={{ fontFamily: "Syne, sans-serif" }}>
+                        Corregir plan de cuotas
+                      </h2>
+                      <button onClick={() => setShowRebuildForm(false)} className="text-gray-400 hover:text-white transition-colors">
+                        <X className="w-5 h-5" />
+                      </button>
+                    </div>
+                    <div className="p-6 space-y-4">
+                      <p className="text-xs text-gray-500">
+                        Esta acción reemplaza el plan de cuotas completo de esta póliza. Usala cuando la cantidad o el
+                        calendario de cuotas quedó desactualizado — no para generar cuotas de una póliza nueva (eso se
+                        hace con "Generar cuotas").
+                      </p>
+
+                      {rebillingsList.length > 0 && (
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">Refacturación asociada</label>
+                          <select
+                            value={rebuildForm.rebillingId}
+                            onChange={e => {
+                              const id = e.target.value;
+                              const reb = rebillingsList.find((r: any) => String(r.id) === id);
+                              setRebuildForm(f => ({
+                                ...f,
+                                rebillingId: id,
+                                periodStart: reb?.billingStart ?? f.periodStart,
+                                periodEnd: reb?.billingEnd ?? f.periodEnd,
+                                periodAmount: reb?.premium ? String(reb.premium) : f.periodAmount,
+                              }));
+                            }}
+                            className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-blue-500"
+                          >
+                            <option value="">Cuotas base (sin refacturación)</option>
+                            {rebillingsList.map((r: any) => (
+                              <option key={r.id} value={r.id}>{formatDate(r.billingStart)} → {formatDate(r.billingEnd)}</option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">Inicio del período *</label>
+                          <input type="date" value={rebuildForm.periodStart}
+                            onChange={e => setRebuildForm(f => ({ ...f, periodStart: e.target.value }))}
+                            className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-blue-500" />
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">Fin del período *</label>
+                          <input type="date" value={rebuildForm.periodEnd}
+                            onChange={e => setRebuildForm(f => ({ ...f, periodEnd: e.target.value }))}
+                            className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-blue-500" />
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">Importe total del período (ARS) *</label>
+                          <input type="number" value={rebuildForm.periodAmount}
+                            onChange={e => setRebuildForm(f => ({ ...f, periodAmount: e.target.value }))}
+                            placeholder="0.00"
+                            className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-blue-500" />
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">Cantidad de cuotas *</label>
+                          <input type="number" min="1" value={rebuildForm.installmentCount}
+                            onChange={e => setRebuildForm(f => ({ ...f, installmentCount: e.target.value }))}
+                            placeholder="Ej: 12"
+                            className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-blue-500" />
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">Primera cuota (opcional)</label>
+                          <input type="date" value={rebuildForm.firstDueDate}
+                            onChange={e => setRebuildForm(f => ({ ...f, firstDueDate: e.target.value }))}
+                            className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-blue-500" />
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">Intervalo en meses (opcional, default 1)</label>
+                          <input type="number" min="1" value={rebuildForm.installmentIntervalMonths}
+                            onChange={e => setRebuildForm(f => ({ ...f, installmentIntervalMonths: e.target.value }))}
+                            placeholder="1"
+                            className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-blue-500" />
+                        </div>
+                      </div>
+
+                      {rebuildPreviewError && (
+                        <p className="text-xs text-red-400">{rebuildPreviewError}</p>
+                      )}
+
+                      {rebuildPreviewPlan && !rebuildPreviewError && (() => {
+                        const summary = summarizeRebuildPlan(installmentsList.length, rebuildPreviewPlan, rebuildForm.periodStart, rebuildForm.periodEnd);
+                        return (
+                          <div className="bg-[#0d1424] border border-blue-500/20 rounded-xl p-4 space-y-1.5 text-xs">
+                            <p className="text-blue-400 font-medium mb-1">Resumen de la reconstrucción</p>
+                            <p className="text-gray-400">Cuotas actuales que serán reemplazadas: <span className="text-white">{summary.previousCount}</span></p>
+                            <p className="text-gray-400">Cuotas nuevas: <span className="text-white">{summary.newCount}</span></p>
+                            <p className="text-gray-400">Importe total: <span className="text-white">{formatCurrency(summary.totalAmount)}</span></p>
+                            <p className="text-gray-400">Período: <span className="text-white">{formatDate(summary.periodStart)} → {formatDate(summary.periodEnd)}</span></p>
+                            <p className="text-gray-400">
+                              Primera cuota: <span className="text-white">{formatDate(summary.firstDueDate)}</span> ·
+                              {" "}Última cuota: <span className="text-white">{formatDate(summary.lastDueDate)}</span>
+                            </p>
+                          </div>
+                        );
+                      })()}
+
+                      <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3">
+                        <p className="text-xs text-amber-400/90">
+                          Esta acción reemplazará únicamente las cuotas pendientes y sin actividad que el sistema
+                          verificó como seguras. No se puede deshacer automáticamente.
+                        </p>
+                      </div>
+
+                      <label className="flex items-start gap-2 cursor-pointer select-none">
+                        <input type="checkbox" checked={rebuildConfirmed}
+                          onChange={e => setRebuildConfirmed(e.target.checked)}
+                          className="mt-0.5" />
+                        <span className="text-xs text-gray-300">Confirmo que revisé el nuevo plan de cuotas</span>
+                      </label>
+
+                      <div className="flex justify-end gap-3 pt-2">
+                        <button type="button" onClick={() => setShowRebuildForm(false)} className="px-4 py-2 bg-[#1f2937] text-gray-300 text-sm rounded-lg hover:bg-[#374151] transition-all">
+                          Cancelar
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!canConfirm || rebuildSubmitting}
+                          onClick={doRebuild}
+                          className="px-5 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium rounded-lg transition-all flex items-center gap-2"
+                        >
+                          {rebuildSubmitting && <Loader2 className="w-4 h-4 animate-spin" />}
+                          Confirmar reconstrucción
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
               )}
             </div>
           );

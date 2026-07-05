@@ -3,6 +3,7 @@ import { api } from "@/lib/api";
 import { X, Loader2, ListOrdered, Search, RefreshCw, ChevronRight, Plus, Trash2, UserCheck, Car } from "lucide-react";
 import { toast } from "sonner";
 import { buildInstallmentPlan, addCalendarMonths } from "../../../lib/installments/plan";
+import { parseExpectedInstallmentsInput } from "@/lib/installments-rebuild";
 
 // ─── Insured Person ───────────────────────────────────────────────────────────
 interface InsuredPerson {
@@ -438,6 +439,17 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    // Cantidad de cuotas esperada (edición): solo actualiza policies.installments,
+    // nunca regenera/borra/inserta cuotas ni llama a ningún endpoint de rebuild.
+    let expectedInstallments: number | null = null;
+    if (isEdit) {
+      const parsed = parseExpectedInstallmentsInput(form.installments);
+      if (parsed.error) {
+        toast.error(parsed.error);
+        return;
+      }
+      expectedInstallments = parsed.value;
+    }
     setLoading(true);
     try {
       const payload: any = {
@@ -451,7 +463,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
         billingCycle: form.billingCycle || null,
         vigencyPeriod: form.vigencyPeriod || null,
         nextRebillingDate: form.nextRebillingDate || null,
-        installments: isEdit ? (form.installments ? Number(form.installments) : null) : (installmentRows.length || null),
+        installments: isEdit ? expectedInstallments : (installmentRows.length || null),
         vehicleYear: form.vehicleYear ? Number(form.vehicleYear) : null,
         motoYear: form.motoYear ? Number(form.motoYear) : null,
         renewedFromId: renewedFrom ? renewedFrom.policy.id : null,
@@ -769,6 +781,28 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
                 />
               </div>
             )}
+            {isEdit && (() => {
+              const expectedParsed = parseExpectedInstallmentsInput(form.installments);
+              return (
+                <div>
+                  <label className={labelClass}>Cantidad de cuotas esperada</label>
+                  <input
+                    className={inputClass}
+                    type="text"
+                    inputMode="numeric"
+                    value={form.installments}
+                    onChange={e => set("installments", e.target.value)}
+                    placeholder="Ej: 12 (vacío si no está definida)"
+                  />
+                  {expectedParsed.error && (
+                    <p className="text-xs text-red-400 mt-1">{expectedParsed.error}</p>
+                  )}
+                  <p className="text-xs text-gray-500 mt-1">
+                    Este valor es informativo. No modifica automáticamente las cuotas existentes.
+                  </p>
+                </div>
+              );
+            })()}
           </div>
 
           {/* Refacturación + Tipo de Pago */}

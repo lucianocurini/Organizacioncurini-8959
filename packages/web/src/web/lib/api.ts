@@ -13,6 +13,7 @@ async function apiFetch(path: string, options: RequestInit = {}) {
     const err = await res.json().catch(() => ({ error: "Error de red" }));
     const error: any = new Error(err.error || "Error desconocido");
     error.status = res.status;
+    error.body = err; // cuerpo JSON completo (p.ej. blockingInstallments en un 409)
     throw error;
   }
   return res.json();
