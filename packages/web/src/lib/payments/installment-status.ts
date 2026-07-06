@@ -20,13 +20,22 @@
 // como funciona hoy el resto del sistema. No modifica datos históricos por
 // su cuenta — si un payment viejo no cumple la condición de importe, esta
 // función simplemente no lo cuenta como válido; no lo corrige ni lo toca.
+//
+// Etapa "Anular póliza": una cuota "no_exigible" (anulación manual de la
+// póliza con effectiveDate <= dueDate, ver src/lib/policies/cancellation.ts)
+// nunca vuelve sola a "pendiente"/"vencida" acá — solo un pago confirmado
+// válido (cubierto por la rama de arriba) puede sacarla de no_exigible. Si
+// ya existiera un pago confirmado válido para una cuota no_exigible, no
+// debería haber sido marcada así por el endpoint de cancelación (que excluye
+// pagadas/rendidas de esa clasificación) — de ocurrir igual, esta función la
+// reconcilia a "pagada" como cualquier otra cuota, sin tratamiento especial.
 
 import { eq, and } from "drizzle-orm";
 import { payments, policyInstallments } from "../../api/database/schema";
 
 export async function recalculateInstallmentPaymentStatus(tx: any, installmentId: number): Promise<void> {
   const installment = await tx
-    .select({ dueDate: policyInstallments.dueDate, amount: policyInstallments.amount })
+    .select({ dueDate: policyInstallments.dueDate, amount: policyInstallments.amount, status: policyInstallments.status })
     .from(policyInstallments)
     .where(eq(policyInstallments.id, installmentId))
     .get();
@@ -45,6 +54,8 @@ export async function recalculateInstallmentPaymentStatus(tx: any, installmentId
     await tx.update(policyInstallments).set({ status: "pagada" }).where(eq(policyInstallments.id, installmentId));
     return;
   }
+
+  if (installment.status === "no_exigible") return; // conserva no_exigible — no hay pago válido que la reactive
 
   const today = new Date().toISOString().split("T")[0];
   const newStatus = installment.dueDate < today ? "vencida" : "pendiente";

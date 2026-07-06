@@ -3,7 +3,7 @@ import { api } from "@/lib/api";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { formatCurrency, formatDate, daysUntil, POLICY_TYPES, STATUS_TYPES, COVERAGE_LABELS, cn, isSafeReturnTo } from "@/lib/utils";
 import { Link, useParams } from "wouter";
-import { ArrowLeft, Edit, Car, Home, ShieldCheck, Briefcase, FileText, Calendar, Building2, User, Bike, HeartPulse, Zap, Scale, HardHat, Flame, RefreshCw, Plus, Pencil, Trash2, ListOrdered, CheckCircle2, Clock, AlertCircle, Loader2, X } from "lucide-react";
+import { ArrowLeft, Edit, Car, Home, ShieldCheck, Briefcase, FileText, Calendar, Building2, User, Bike, HeartPulse, Zap, Scale, HardHat, Flame, RefreshCw, Plus, Pencil, Trash2, ListOrdered, CheckCircle2, Clock, AlertCircle, Loader2, X, Ban } from "lucide-react";
 import { PolicyModal } from "@/components/policies/PolicyModal";
 import { RebillingModal } from "@/components/policies/RebillingModal";
 import { toast } from "sonner";
@@ -14,6 +14,11 @@ import {
   normalizeRebuildError, canConfirmRebuild,
   type RebuildBlockingInstallment,
 } from "@/lib/installments-rebuild";
+import {
+  shouldShowCancelButton, canConfirmCancellation,
+  normalizeCancellationError, shouldRefreshAfterCancelResponse, NON_COLLECTIBLE_STATUS_LABEL,
+  type CancellationFormInput, type CancellationPreviewSummary,
+} from "@/lib/policy-cancellation";
 
 const typeIcons: Record<string, any> = {
   automotor: Car, motovehiculo: Bike, ecomovilidad: Zap, hogar: Home, accidentes: ShieldCheck, art: HeartPulse, comercial: Briefcase, responsabilidad_civil: Scale, cascos: HardHat, incendio: Flame,
@@ -56,6 +61,15 @@ export default function PolizaDetail() {
   const [rebuildConfirmed, setRebuildConfirmed] = useState(false);
   const [rebuildSubmitting, setRebuildSubmitting] = useState(false);
 
+  // ─── Anulación manual de póliza ─────────────────────────────────────────────
+  const [showCancelForm, setShowCancelForm] = useState(false);
+  const [cancelForm, setCancelForm] = useState<CancellationFormInput>({ effectiveDate: "", reason: "", notes: "" });
+  const [cancelConfirmed, setCancelConfirmed] = useState(false);
+  const [cancelPreview, setCancelPreview] = useState<CancellationPreviewSummary | null>(null);
+  const [cancelPreviewLoading, setCancelPreviewLoading] = useState(false);
+  const [cancelPreviewError, setCancelPreviewError] = useState<string | null>(null);
+  const [cancelSubmitting, setCancelSubmitting] = useState(false);
+
   // Destino del botón "volver": el origen (p.ej. Reporte mensual con sus filtros)
   // si vino con un returnTo interno válido, o el listado general como fallback seguro.
   const [backHref] = useState(() => {
@@ -68,6 +82,30 @@ export default function PolizaDetail() {
     api.get(`/api/policies/${params.id}`).then(setRow).finally(() => setLoading(false));
   };
   useEffect(load, [params.id]);
+
+  // Preview de la anulación: se recalcula cada vez que cambia la fecha
+  // efectiva mientras el modal está abierto. No escribe nada — solo informa
+  // (POST /policies/:id/cancel/preview). El motivo/observaciones no afectan
+  // la clasificación de cuotas, así que no disparan un nuevo pedido.
+  useEffect(() => {
+    if (!showCancelForm || !cancelForm.effectiveDate) {
+      setCancelPreview(null);
+      setCancelPreviewError(null);
+      return;
+    }
+    let cancelled = false;
+    setCancelPreviewLoading(true);
+    setCancelPreviewError(null);
+    api.post(`/api/policies/${params.id}/cancel/preview`, { effectiveDate: cancelForm.effectiveDate })
+      .then((result) => { if (!cancelled) setCancelPreview(result); })
+      .catch((e: any) => {
+        if (cancelled) return;
+        setCancelPreview(null);
+        setCancelPreviewError(e?.body?.error || e?.message || "No se pudo calcular la previsualización.");
+      })
+      .finally(() => { if (!cancelled) setCancelPreviewLoading(false); });
+    return () => { cancelled = true; };
+  }, [showCancelForm, cancelForm.effectiveDate, params.id]);
 
   if (loading) return (
     <AppLayout>
@@ -121,6 +159,29 @@ export default function PolizaDetail() {
     }
   }
 
+  const hasValidCancelPreview = !!cancelPreview && !cancelPreviewError;
+  const canConfirmCancel = canConfirmCancellation(cancelForm, hasValidCancelPreview, cancelConfirmed);
+
+  async function doCancelPolicy() {
+    if (!canConfirmCancel) return;
+    setCancelSubmitting(true);
+    try {
+      const res = await api.post(`/api/policies/${p.id}/cancel`, {
+        effectiveDate: cancelForm.effectiveDate,
+        reason: cancelForm.reason.trim(),
+        notes: cancelForm.notes.trim() || undefined,
+      });
+      toast.success(`Póliza anulada. ${res.installments.markedNonCollectible} cuota${res.installments.markedNonCollectible === 1 ? "" : "s"} dejaron de ser exigibles.`);
+      setShowCancelForm(false);
+      if (shouldRefreshAfterCancelResponse(200)) load();
+    } catch (e: any) {
+      const normalized = normalizeCancellationError(e);
+      toast.error(normalized.message);
+    } finally {
+      setCancelSubmitting(false);
+    }
+  }
+
   return (
     <AppLayout>
       <div className="p-4 lg:p-8 max-w-4xl">
@@ -155,13 +216,42 @@ export default function PolizaDetail() {
               )}
             </div>
           </div>
-          <button
-            onClick={() => setShowEdit(true)}
-            className="flex items-center gap-2 px-3 sm:px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium transition-all flex-shrink-0"
-          >
-            <Edit className="w-4 h-4" /> <span className="hidden sm:inline">Editar</span>
-          </button>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {shouldShowCancelButton(p.status) && (
+              <button
+                onClick={() => { setCancelForm({ effectiveDate: "", reason: "", notes: "" }); setCancelConfirmed(false); setCancelPreview(null); setCancelPreviewError(null); setShowCancelForm(true); }}
+                className="flex items-center gap-2 px-3 sm:px-4 py-2 bg-red-600/10 hover:bg-red-600/20 text-red-400 border border-red-500/20 text-sm rounded-lg font-medium transition-all"
+              >
+                <Ban className="w-4 h-4" /> <span className="hidden sm:inline">Anular póliza</span>
+              </button>
+            )}
+            <button
+              onClick={() => setShowEdit(true)}
+              className="flex items-center gap-2 px-3 sm:px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium transition-all"
+            >
+              <Edit className="w-4 h-4" /> <span className="hidden sm:inline">Editar</span>
+            </button>
+          </div>
         </div>
+
+        {/* Datos de la anulación, si la póliza está cancelada */}
+        {p.status === "cancelada" && (
+          <div className="mb-5 bg-gray-500/5 border border-gray-500/20 rounded-xl px-5 py-4 text-sm space-y-1">
+            <p className="text-gray-300 font-medium flex items-center gap-2"><Ban className="w-4 h-4 text-gray-400" /> Póliza anulada</p>
+            {p.cancellationEffectiveDate && (
+              <p className="text-xs text-gray-500">Fecha efectiva: <span className="text-gray-300">{formatDate(p.cancellationEffectiveDate)}</span></p>
+            )}
+            {p.cancellationReason && (
+              <p className="text-xs text-gray-500">Motivo: <span className="text-gray-300">{p.cancellationReason}</span></p>
+            )}
+            {p.cancellationNotes && (
+              <p className="text-xs text-gray-500">Observaciones: <span className="text-gray-300">{p.cancellationNotes}</span></p>
+            )}
+            {row.cancelledByName && (
+              <p className="text-xs text-gray-500">Anulada por: <span className="text-gray-300">{row.cancelledByName}</span></p>
+            )}
+          </div>
+        )}
 
         {/* Vencimiento alert */}
         {days >= 0 && days <= 30 && (
@@ -274,10 +364,15 @@ export default function PolizaDetail() {
             pendiente: "bg-yellow-500/20 text-yellow-400 border-yellow-500/30",
             pagada: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
             vencida: "bg-red-500/20 text-red-400 border-red-500/30",
+            // La póliza fue anulada con effectiveDate <= dueDate de esta cuota
+            // (ver POST /policies/:id/cancel) — visualmente distinto de
+            // pagada/vencida, nunca se confirma un pago sobre esta cuota.
+            no_exigible: "bg-gray-500/20 text-gray-400 border-gray-500/30",
           };
           const STATUS_ICON: Record<string, any> = {
-            pendiente: Clock, pagada: CheckCircle2, vencida: AlertCircle,
+            pendiente: Clock, pagada: CheckCircle2, vencida: AlertCircle, no_exigible: Ban,
           };
+          const STATUS_LABEL: Record<string, string> = { no_exigible: NON_COLLECTIBLE_STATUS_LABEL };
 
           // Cuotas esperadas (policies.installments) vs. reales (installmentsList).
           // null nunca es "no coincide" — no hay nada contra qué comparar (misma
@@ -660,7 +755,7 @@ export default function PolizaDetail() {
                             ) : (
                               <span className={cn("inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs border", STATUS_COLOR[inst.status] || "text-gray-400 border-gray-500/30")}>
                                 <StatusIcon className="w-3 h-3" />
-                                {inst.status.charAt(0).toUpperCase() + inst.status.slice(1)}
+                                {STATUS_LABEL[inst.status] || (inst.status.charAt(0).toUpperCase() + inst.status.slice(1))}
                               </span>
                             )}
                           </td>
@@ -1001,6 +1096,101 @@ export default function PolizaDetail() {
           onClose={() => { setShowRebilling(false); setEditingRebilling(null); }}
           onSaved={() => { setShowRebilling(false); setEditingRebilling(null); load(); }}
         />
+      )}
+
+      {/* Anular póliza — mismo patrón visual que "Corregir plan de cuotas":
+          resumen server-side (preview, nunca escribe nada) + advertencia +
+          checkbox de confirmación obligatorio. */}
+      {showCancelForm && (
+        <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 p-4 overflow-y-auto">
+          <div className="bg-[#111827] border border-red-500/30 rounded-2xl w-full max-w-lg my-4">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-[#1f2937]">
+              <h2 className="text-lg font-semibold text-white" style={{ fontFamily: "Syne, sans-serif" }}>
+                Anular póliza
+              </h2>
+              <button onClick={() => setShowCancelForm(false)} className="text-gray-400 hover:text-white transition-colors">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-6 space-y-4">
+              <p className="text-xs text-gray-500">
+                La póliza no se elimina — conserva todo su historial. Las cuotas pagadas, rendidas y la deuda
+                anterior a la fecha efectiva no se modifican. Las cuotas posteriores a esa fecha dejan de ser exigibles.
+              </p>
+
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Fecha efectiva de anulación *</label>
+                <input type="date" value={cancelForm.effectiveDate}
+                  onChange={e => setCancelForm(f => ({ ...f, effectiveDate: e.target.value }))}
+                  className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-red-500" />
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Motivo *</label>
+                <input type="text" value={cancelForm.reason}
+                  onChange={e => setCancelForm(f => ({ ...f, reason: e.target.value }))}
+                  placeholder="Ej: venta del vehículo"
+                  className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-red-500" />
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Observaciones (opcional)</label>
+                <textarea value={cancelForm.notes}
+                  onChange={e => setCancelForm(f => ({ ...f, notes: e.target.value }))}
+                  rows={2}
+                  className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-red-500" />
+              </div>
+
+              {cancelPreviewLoading && (
+                <p className="text-xs text-gray-500 flex items-center gap-2"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Calculando previsualización…</p>
+              )}
+
+              {cancelPreviewError && !cancelPreviewLoading && (
+                <p className="text-xs text-red-400">{cancelPreviewError}</p>
+              )}
+
+              {cancelPreview && !cancelPreviewError && !cancelPreviewLoading && (
+                <div className="bg-[#0d1424] border border-red-500/20 rounded-xl p-4 space-y-1.5 text-xs">
+                  <p className="text-red-400 font-medium mb-1">Resumen de la anulación</p>
+                  <p className="text-gray-400">Cuotas pagadas (no cambian): <span className="text-white">{cancelPreview.installments.paidUnchanged}</span></p>
+                  <p className="text-gray-400">Cuotas rendidas (no cambian): <span className="text-white">{cancelPreview.installments.renderedUnchanged}</span></p>
+                  <p className="text-gray-400">Deuda anterior que se conserva exigible: <span className="text-white">{cancelPreview.installments.priorDebtUnchanged}</span></p>
+                  <p className="text-gray-400">Cuotas que pasarán a "No exigible": <span className="text-white">{cancelPreview.installments.markedNonCollectible}</span></p>
+                  <p className="text-gray-400">Pagos pendientes de rendir (no se ven afectados): <span className="text-white">{cancelPreview.pendingPaymentsToRender}</span></p>
+                </div>
+              )}
+
+              <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3">
+                <p className="text-xs text-amber-400/90">
+                  Esta acción no tiene rehabilitación automática todavía. Las cuotas futuras marcadas "No exigible"
+                  dejan de poder cobrarse hasta que se revise el caso manualmente.
+                </p>
+              </div>
+
+              <label className="flex items-start gap-2 cursor-pointer select-none">
+                <input type="checkbox" checked={cancelConfirmed}
+                  onChange={e => setCancelConfirmed(e.target.checked)}
+                  className="mt-0.5" />
+                <span className="text-xs text-gray-300">
+                  Confirmo que deseo anular esta póliza y que las cuotas futuras dejarán de ser exigibles.
+                </span>
+              </label>
+
+              <div className="flex justify-end gap-3 pt-2">
+                <button type="button" onClick={() => setShowCancelForm(false)} className="px-4 py-2 bg-[#1f2937] text-gray-300 text-sm rounded-lg hover:bg-[#374151] transition-all">
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  disabled={!canConfirmCancel || cancelSubmitting}
+                  onClick={doCancelPolicy}
+                  className="px-5 py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium rounded-lg transition-all flex items-center gap-2"
+                >
+                  {cancelSubmitting && <Loader2 className="w-4 h-4 animate-spin" />}
+                  Confirmar anulación
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
     </AppLayout>
   );

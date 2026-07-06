@@ -236,6 +236,7 @@ export default function Polizas() {
             <option value="por_vencer">Por vencer</option>
             <option value="vencida">Vencida</option>
             <option value="cancelada">Cancelada</option>
+            <option value="renovada">Renovada</option>
           </select>
           {(typeFilter || statusFilter || q) && (
             <button onClick={() => { setQ(""); setTypeFilter(""); setStatusFilter(""); }} className="px-3 py-2 text-xs text-gray-400 hover:text-white transition-colors">

@@ -57,6 +57,10 @@ export const STATUS_TYPES: Record<string, { label: string; color: string }> = {
   vencida: { label: "Vencida", color: "bg-red-500/15 text-red-400 border-red-500/20" },
   por_vencer: { label: "Por vencer", color: "bg-amber-500/15 text-amber-400 border-amber-500/20" },
   cancelada: { label: "Cancelada", color: "bg-gray-500/15 text-gray-400 border-gray-500/20" },
+  // Se asigna server-side a la póliza anterior al crear una renovación
+  // (ver POST /policies en index.ts) — ya existía como valor real de
+  // policies.status pero no tenía badge de color asignado acá.
+  renovada: { label: "Renovada", color: "bg-violet-500/15 text-violet-400 border-violet-500/20" },
 };
 
 export const COVERAGE_LABELS: Record<string, string> = {

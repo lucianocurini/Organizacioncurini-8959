@@ -73,6 +73,27 @@ export const policies = sqliteTable("policies", {
   createdBy: integer("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
   updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  // Anulación manual (POST /api/policies/:id/cancel) — migración 0020.
+  // status="cancelada" sigue siendo el estado operativo (mismo valor que ya
+  // escriben los importadores); estos campos son auditoría adicional, nunca
+  // cambian el significado de status ni de endDate.
+  // cancellationEffectiveDate: desde cuándo la póliza deja de tener cobertura
+  // real (puede no coincidir ni con endDate ni con la fecha en que se carga).
+  // cancelledAt: cuándo se REGISTRÓ la anulación en el sistema (siempre "ahora"
+  // al momento del POST, nunca editable por el usuario).
+  // cancellationSource: 'manual' | 'importador' | null.
+  //   'manual'     — cargada por un usuario vía el endpoint dedicado.
+  //   'importador' — reservado para cuando los importadores lo completen
+  //                  (deuda futura, no en esta vuelta — ver los 7 call-sites
+  //                  de anulación en index.ts, que hoy no tocan este campo).
+  //   null         — anulaciones históricas sin este campo, o cualquier
+  //                  anulación fuera de los dos flujos anteriores.
+  cancelledAt: integer("cancelled_at", { mode: "timestamp" }),
+  cancellationEffectiveDate: text("cancellation_effective_date"),
+  cancellationReason: text("cancellation_reason"),
+  cancellationNotes: text("cancellation_notes"),
+  cancelledBy: integer("cancelled_by").references(() => users.id),
+  cancellationSource: text("cancellation_source"),
 });
 
 export const payments = sqliteTable("payments", {
@@ -205,7 +226,10 @@ export const policyInstallments = sqliteTable("policy_installments", {
   number: integer("number").notNull(),
   dueDate: text("due_date").notNull(),
   amount: real("amount").notNull(),
-  status: text("status").notNull().default("pendiente"), // pendiente | pagada | vencida
+  status: text("status").notNull().default("pendiente"), // pendiente | pagada | vencida | no_exigible
+  // no_exigible: la póliza dueña fue anulada manualmente (ver policies.cancelledAt)
+  // con effectiveDate <= dueDate — la cuota deja de ser cobrable, pero nunca se
+  // borra ni se confunde con "pagada" (ver src/lib/policies/cancellation.ts).
   notes: text("notes"),
   rendered: integer("rendered").notNull().default(0), // 1 = rendida a compañía sin cobrar al asegurado
   renderedAt: integer("rendered_at", { mode: "timestamp" }),

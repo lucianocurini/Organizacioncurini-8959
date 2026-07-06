@@ -39,6 +39,11 @@ import { isValidCalendarDate, buildInstallmentPlan, InstallmentPlanError } from 
 import { classifyInstallmentsForRebuild, runInstallmentRebuildTransaction, RebuildConflictError, PolicyNotFoundError } from "../lib/installments/rebuild";
 import { validateAndNormalizeSplits, SplitValidationError, classifySplitGroup, isDirectCompanyPaymentMethod, type SplitGroup } from "../lib/payments/splits";
 import { recalculateInstallmentPaymentStatus } from "../lib/payments/installment-status";
+import {
+  validateCancellationEffectiveDate, validatePolicyCancellationState, classifyInstallmentsForCancellation,
+  appendCancellationNote, isInstallmentNonCollectible, PolicyCancellationValidationError, PolicyAlreadyCancelledError,
+  type InstallmentForCancellation,
+} from "../lib/policies/cancellation";
 
 const app = new Hono().basePath("/api");
 
@@ -233,6 +238,16 @@ app.get("/policies/:id", requireAuth(async (c: any) => {
       row.status = "vencida";
     }
   }
+  // Nombre del usuario que anuló (si la póliza fue anulada manualmente y
+  // cancelledBy quedó cargado) — solo para mostrar en el detalle, no cambia
+  // ningún campo de policies.
+  let cancelledByName: string | null = null;
+  if (result.policy.cancelledBy != null) {
+    const cancelledByUser = await db.select({ name: users.name }).from(users)
+      .where(eq(users.id, result.policy.cancelledBy)).get();
+    cancelledByName = cancelledByUser?.name ?? null;
+  }
+
   // Subpólizas accesoria (accidentes_pasajeros con parentPolicyId = id)
   const subPolicies = await db
     .select({ policy: policies, company: companies, insured: insureds })
@@ -241,7 +256,7 @@ app.get("/policies/:id", requireAuth(async (c: any) => {
     .leftJoin(insureds, eq(policies.insuredId, insureds.id))
     .where(eq(policies.parentPolicyId, id));
 
-  return c.json({ ...result, rebillings: policyRebillings, installments: instRows, subPolicies }, 200);
+  return c.json({ ...result, rebillings: policyRebillings, installments: instRows, subPolicies, cancelledByName }, 200);
 }));
 
 // ─── Rebillings ───────────────────────────────────────────────────────────────
@@ -539,7 +554,21 @@ app.post("/policies", requireAuth(async (c: any) => {
 }));
 
 app.put("/policies/:id", requireAuth(async (c: any) => {
+  const id = Number(c.req.param("id"));
   const body = await c.req.json();
+
+  // Cierra la vía lateral: este PUT genérico no gestiona anulaciones. Si el
+  // body trae status="cancelada" (venga cual venga el status actual), o si
+  // la póliza YA está cancelada y el body trae cualquier otro status
+  // (intento de "rehabilitar" por esta vía), se rechaza — la única forma de
+  // anular es POST /policies/:id/cancel, y no hay rehabilitación manual en
+  // esta versión (ver src/lib/policies/cancellation.ts).
+  const current = await db.select({ status: policies.status }).from(policies).where(eq(policies.id, id)).get();
+  if (!current) return c.json({ error: "La póliza no existe." }, 404);
+  if ("status" in body && (body.status === "cancelada" || current.status === "cancelada")) {
+    return c.json({ error: "Las anulaciones deben gestionarse mediante la acción específica \"Anular póliza\"." }, 400);
+  }
+
   // Normalize and validate billingCycle
   if ("billingCycle" in body) {
     if (!body.billingCycle) body.billingCycle = null;
@@ -558,20 +587,28 @@ app.put("/policies/:id", requireAuth(async (c: any) => {
     else if (!isValidCalendarDate(body.nextRebillingDate))
       return c.json({ error: `Próxima fecha de refacturación inválida: "${body.nextRebillingDate}"` }, 400);
   }
-  const today = new Date().toISOString().split("T")[0];
-  const daysToEnd = Math.ceil(
-    (new Date(body.endDate).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24)
-  );
-  if (!body.status || body.status === "activa" || body.status === "por_vencer" || body.status === "vencida") {
-    if (daysToEnd < 0) body.status = "vencida";
-    else if (daysToEnd <= 30) body.status = "por_vencer";
-    else body.status = "activa";
+  // El recálculo automático de status por fecha nunca corre sobre una póliza
+  // cancelada — ya se rechazó arriba cualquier `status` explícito en el body
+  // para ese caso, pero sin este guard este bloque igual recalcularía y
+  // pisaría el status con "activa"/"vencida"/"por_vencer" (vía `!body.status`)
+  // al editar cualquier otro campo (ej. solo `notes`), "rehabilitando"
+  // silenciosamente la póliza sin pasar por ningún endpoint de rehabilitación.
+  if (current.status !== "cancelada") {
+    const today = new Date().toISOString().split("T")[0];
+    const daysToEnd = Math.ceil(
+      (new Date(body.endDate).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24)
+    );
+    if (!body.status || body.status === "activa" || body.status === "por_vencer" || body.status === "vencida") {
+      if (daysToEnd < 0) body.status = "vencida";
+      else if (daysToEnd <= 30) body.status = "por_vencer";
+      else body.status = "activa";
+    }
   }
   body.updatedAt = new Date();
   const [policy] = await db
     .update(policies)
     .set(body)
-    .where(eq(policies.id, Number(c.req.param("id"))))
+    .where(eq(policies.id, id))
     .returning();
   return c.json(policy, 200);
 }));
@@ -659,6 +696,163 @@ app.delete("/policies/:id", requireAuth(async (c: any) => {
   } catch (e: any) {
     console.error("[DELETE /policies/:id]", e?.message, e);
     return c.json({ error: "No se pudo eliminar la póliza." }, 500);
+  }
+}));
+
+// ─── ANULACIÓN MANUAL DE PÓLIZAS ───────────────────────────────────────────────
+// La póliza NUNCA se borra: status pasa a "cancelada" (mismo valor que ya
+// escriben los importadores), conservando todo su historial. Solo las cuotas
+// pendientes/vencidas con dueDate >= effectiveDate dejan de ser exigibles
+// (status="no_exigible") — pagadas, rendidas, y deuda anterior a effectiveDate
+// nunca se tocan. Sin rehabilitación en esta versión (ver diagnóstico).
+// Ver src/lib/policies/cancellation.ts para el detalle de cada validación.
+
+async function countPendingPaymentsToRender(policyId: number, installmentIds: number[]): Promise<number> {
+  const orConditions = installmentIds.length > 0
+    ? or(eq(payments.policyId, policyId), inArray(payments.installmentId, installmentIds))
+    : eq(payments.policyId, policyId);
+  const rows = await db.select({ id: payments.id }).from(payments)
+    .where(and(orConditions, eq(payments.rendered, 0), eq(payments.status, "confirmado")))
+    .all();
+  return rows.length;
+}
+
+// POST /api/policies/:id/cancel/preview — solo lectura, no escribe nada.
+// Muestra exactamente lo que haría POST /cancel con la misma effectiveDate,
+// para que la UI pueda mostrar un resumen antes de pedir confirmación.
+app.post("/policies/:id/cancel/preview", requireAuth(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isInteger(id) || id <= 0) {
+    return c.json({ error: "ID de póliza inválido." }, 400);
+  }
+  const policy = await db.select().from(policies).where(eq(policies.id, id)).get();
+  if (!policy) return c.json({ error: "La póliza no existe." }, 404);
+
+  const body = await c.req.json();
+
+  try {
+    validateCancellationEffectiveDate(body.effectiveDate, { startDate: policy.startDate, endDate: policy.endDate });
+  } catch (e: any) {
+    if (e instanceof PolicyCancellationValidationError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
+  const installmentRows = await db.select({
+    id: policyInstallments.id, dueDate: policyInstallments.dueDate,
+    status: policyInstallments.status, rendered: policyInstallments.rendered,
+  }).from(policyInstallments).where(eq(policyInstallments.policyId, id)).all();
+
+  const classification = classifyInstallmentsForCancellation(installmentRows as InstallmentForCancellation[], body.effectiveDate);
+  const pendingPaymentsToRender = await countPendingPaymentsToRender(id, installmentRows.map((i) => i.id));
+
+  return c.json({
+    policy,
+    effectiveDate: body.effectiveDate,
+    installments: {
+      paidUnchanged: classification.paidUnchanged.length,
+      renderedUnchanged: classification.renderedUnchanged.length,
+      priorDebtUnchanged: classification.priorDebtUnchanged.length,
+      markedNonCollectible: classification.futureNonCollectible.length,
+    },
+    pendingPaymentsToRender,
+  }, 200);
+}));
+
+// POST /api/policies/:id/cancel — anulación real, transaccional.
+app.post("/policies/:id/cancel", requireAuth(async (c: any) => {
+  const user = c.get("user");
+  const id = Number(c.req.param("id"));
+  if (!Number.isInteger(id) || id <= 0) {
+    return c.json({ error: "ID de póliza inválido." }, 400);
+  }
+
+  const body = await c.req.json();
+  if (!body.reason || typeof body.reason !== "string" || !body.reason.trim()) {
+    return c.json({ error: "El motivo de la anulación es obligatorio." }, 400);
+  }
+  const reason = body.reason.trim();
+  const notes = typeof body.notes === "string" && body.notes.trim() ? body.notes.trim() : null;
+
+  // Chequeo previo (fuera de la transacción): informativo, para devolver
+  // 404/409/400 rápido sin abrir una transacción de escritura. La única
+  // autorización real es la re-lectura dentro de la transacción, más abajo
+  // (mismo patrón que /installments/rebuild-check vs. /rebuild).
+  const precheck = await db.select().from(policies).where(eq(policies.id, id)).get();
+  if (!precheck) return c.json({ error: "La póliza no existe." }, 404);
+
+  const stateCheck = validatePolicyCancellationState(precheck.status);
+  if (!stateCheck.valid) return c.json({ error: stateCheck.errorMessage }, 409);
+
+  try {
+    validateCancellationEffectiveDate(body.effectiveDate, { startDate: precheck.startDate, endDate: precheck.endDate });
+  } catch (e: any) {
+    if (e instanceof PolicyCancellationValidationError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
+  try {
+    const result = await db.transaction(async (tx) => {
+      // 1-2. Releer dentro de la transacción y validar que no se canceló
+      // concurrentemente entre el precheck y acá.
+      const current = await tx.select().from(policies).where(eq(policies.id, id)).get();
+      if (!current) throw new PolicyCancellationValidationError("La póliza no existe.");
+      const txStateCheck = validatePolicyCancellationState(current.status);
+      if (!txStateCheck.valid) throw new PolicyAlreadyCancelledError(txStateCheck.errorMessage!);
+
+      // 3. Cargar todas las cuotas de la póliza.
+      const installmentRows = await tx.select({
+        id: policyInstallments.id, dueDate: policyInstallments.dueDate,
+        status: policyInstallments.status, rendered: policyInstallments.rendered,
+      }).from(policyInstallments).where(eq(policyInstallments.policyId, id)).all();
+
+      // 4. Clasificar.
+      const classification = classifyInstallmentsForCancellation(installmentRows as InstallmentForCancellation[], body.effectiveDate);
+
+      // 5. Actualizar policies.
+      const now = new Date();
+      await tx.update(policies).set({
+        status: "cancelada",
+        cancelledAt: now,
+        cancellationEffectiveDate: body.effectiveDate,
+        cancellationReason: reason,
+        cancellationNotes: notes,
+        notes: appendCancellationNote(current.notes, reason, notes),
+        cancelledBy: user.id,
+        cancellationSource: "manual",
+        updatedAt: now,
+      }).where(eq(policies.id, id));
+
+      // 6. Actualizar únicamente las cuotas futuras no cobrables. 7. Todo lo
+      // demás (pagadas, rendidas, deuda anterior, payments, rendiciones,
+      // rebillings, siniestros, tareas) queda intacto — no se toca acá.
+      const nonCollectibleIds = classification.futureNonCollectible.map((i) => i.id);
+      if (nonCollectibleIds.length > 0) {
+        await tx.update(policyInstallments).set({ status: "no_exigible" })
+          .where(inArray(policyInstallments.id, nonCollectibleIds));
+      }
+
+      return { classification, installmentIds: installmentRows.map((i) => i.id) };
+    });
+
+    const updatedPolicy = await db.select().from(policies).where(eq(policies.id, id)).get();
+    const pendingPaymentsToRender = await countPendingPaymentsToRender(id, result.installmentIds);
+
+    return c.json({
+      policy: updatedPolicy,
+      effectiveDate: body.effectiveDate,
+      installments: {
+        paidUnchanged: result.classification.paidUnchanged.length,
+        renderedUnchanged: result.classification.renderedUnchanged.length,
+        priorDebtUnchanged: result.classification.priorDebtUnchanged.length,
+        markedNonCollectible: result.classification.futureNonCollectible.length,
+      },
+      pendingPaymentsToRender,
+    }, 200);
+  } catch (e: any) {
+    if (e instanceof PolicyAlreadyCancelledError) return c.json({ error: e.message }, 409);
+    if (e instanceof PolicyCancellationValidationError) return c.json({ error: e.message }, 404);
+    console.error("[POST /policies/:id/cancel]", e?.message, e);
+    return c.json({ error: "No se pudo anular la póliza." }, 500);
   }
 }));
 
@@ -1027,6 +1221,13 @@ app.post("/payments", requireAuth(async (c: any) => {
     if (hasPolicyId && installmentRow.policyId !== Number(body.policyId)) {
       return c.json({ error: "La cuota indicada no pertenece a la póliza indicada." }, 400);
     }
+    // Anulación manual de la póliza (POST /policies/:id/cancel): esta cuota
+    // vence en o después de la fecha efectiva de anulación y ya no es
+    // exigible. Se bloquea sin importar isConfirmed — ni siquiera un pago
+    // "pendiente" tiene sentido sobre una cuota que la póliza ya no cubre.
+    if (isInstallmentNonCollectible(installmentRow.status)) {
+      return c.json({ error: "La cuota indicada no es exigible: la póliza fue anulada antes de su vencimiento." }, 409);
+    }
   }
 
   // Importe vs. cuota: solo aplica a pagos confirmados vinculados a una cuota.
@@ -1212,6 +1413,11 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
     if (!newInstallmentRow) return c.json({ error: "La cuota indicada no existe." }, 404);
     if (effectivePolicyIdForInstallment != null && newInstallmentRow.policyId !== effectivePolicyIdForInstallment) {
       return c.json({ error: "La cuota indicada no pertenece a la póliza indicada." }, 400);
+    }
+    // Mismo bloqueo que POST /payments: no se puede mover un pago a una cuota
+    // que la anulación de su póliza ya dejó no exigible.
+    if (isInstallmentNonCollectible(newInstallmentRow.status)) {
+      return c.json({ error: "La cuota indicada no es exigible: la póliza fue anulada antes de su vencimiento." }, 409);
     }
   }
 
@@ -5288,6 +5494,7 @@ app.get("/remittances/uncollected", requireAuth(async (c: any) => {
     .innerJoin(companies, eq(policies.companyId, companies.id))
     .where(and(
       ne(policyInstallments.status, "pagada"),
+      ne(policyInstallments.status, "no_exigible"),
       eq(policyInstallments.rendered, 0),
       ne(policies.status, "cancelada"),
     ))

@@ -174,7 +174,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
     (p.insured?.name || "").toLowerCase().includes(policySearch.toLowerCase())
   );
   const selectedPolicy = policies.find(p => String(p.policy.id) === form.policyId);
-  const pendingInstallments = installments.filter((i: any) => i.status !== "pagada" && !i.rendered);
+  const pendingInstallments = installments.filter((i: any) => i.status !== "pagada" && i.status !== "no_exigible" && !i.rendered);
   const selectedInstallment = installments.find((i: any) => String(i.id) === form.installmentId);
 
   // Etapa 3B-2: validación completa de la sección de splits — se usa tanto
