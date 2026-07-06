@@ -9,6 +9,12 @@ import {
   ClipboardList, AlertCircle, ChevronRight, ReceiptText, Building2, Check, ShoppingCart, Save
 } from "lucide-react";
 import { cn, formatCurrency as _fc } from "@/lib/utils";
+import {
+  type PaymentSplitFormRow, createSplitRow, splitsFromPayment,
+  addSplitRow, removeSplitRow, updateSplitRow, computeSplitTotals,
+  validateSplitsForm, splitsToPayload, groupSplitsByMethod,
+} from "@/lib/payment-splits-form";
+import { getPendingItemPaymentGroup } from "@/lib/rendicion-pending";
 
 function formatCurrency(v: number, short = false) {
   if (short) {
@@ -70,6 +76,7 @@ interface PaymentRow {
     rendered: number;
     hasSurcharge: boolean;
     dueDate: string | null;
+    splits: { method: string; amountCents: number; notes: string | null }[];
   };
   policy: { id: number; policyNumber: string } | null;
   insured: { id: number; name: string } | null;
@@ -106,7 +113,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
     manualPolicyNumber: "",
     manualCompany: "",
     amount: "",
-    paymentMethod: "efectivo",
+    splits: [createSplitRow("efectivo")] as PaymentSplitFormRow[],
     paymentDate: new Date().toISOString().split("T")[0],
     dueDate: "",
     periodMonth: "",
@@ -128,7 +135,10 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
         manualPolicyNumber: editing.payment.manualPolicyNumber || "",
         manualCompany: editing.payment.manualCompany || "",
         amount: String(editing.payment.amount),
-        paymentMethod: editing.payment.paymentMethod,
+        // Etapa 3B-2: un combinado SIEMPRE se precarga desde payment.splits
+        // (nunca desde paymentMethod, que puede valer "combinado" y no es un
+        // método real seleccionable en ninguna fila).
+        splits: splitsFromPayment(editing.payment),
         paymentDate: editing.payment.paymentDate,
         dueDate: editing.payment.dueDate || "",
         periodMonth: editing.payment.periodMonth || "",
@@ -143,7 +153,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
       setApplyProntoPagoSurcharge(true);
       setForm({
         policyId: "", installmentId: "", manualPayer: "", manualPolicyNumber: "", manualCompany: "",
-        amount: "", paymentMethod: "efectivo",
+        amount: "", splits: [createSplitRow("efectivo")],
         paymentDate: new Date().toISOString().split("T")[0],
         dueDate: "", periodMonth: "", notes: "", status: "confirmado",
       });
@@ -167,6 +177,21 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
   const pendingInstallments = installments.filter((i: any) => i.status !== "pagada" && !i.rendered);
   const selectedInstallment = installments.find((i: any) => String(i.id) === form.installmentId);
 
+  // Etapa 3B-2: validación completa de la sección de splits — se usa tanto
+  // para el disabled del botón Guardar como (repetida) adentro de handleSave,
+  // para no depender exclusivamente del disabled ante un estado stale.
+  const splitsValidation = validateSplitsForm(form.amount, form.splits);
+  const splitTotals = computeSplitTotals(form.amount, form.splits);
+
+  // Si el grupo deja de ser "own" (ej. el usuario cambia todas las filas a
+  // directo a compañía), el recargo Pronto Pago no puede seguir marcado.
+  useEffect(() => {
+    if (splitsValidation.group !== "own" && applyProntoPagoSurcharge) {
+      setApplyProntoPagoSurcharge(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [splitsValidation.group]);
+
   async function handleSave() {
     if (!manualMode && !form.policyId) {
       toast.error("Seleccioná una póliza o usá imputación manual");
@@ -180,10 +205,18 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
       toast.error("Completá importe y fecha");
       return;
     }
+    // Re-validar acá, no confiar solo en el disabled del botón.
+    const validation = validateSplitsForm(form.amount, form.splits);
+    if (!validation.valid) {
+      toast.error(validation.errorMessage || "Revisá el desglose de medios de pago.");
+      return;
+    }
     setSaving(true);
     const body: any = {
       amount: Number(form.amount),
-      paymentMethod: form.paymentMethod,
+      // El backend decide resolvedPaymentMethod a partir de splits — nunca
+      // se envía paymentMethod="combinado" ni un método suelto acá.
+      splits: splitsToPayload(form.splits),
       paymentDate: form.paymentDate,
       dueDate: form.dueDate || null,
       periodMonth: form.periodMonth || null,
@@ -206,8 +239,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
     const isRivadaviaBody = manualMode
       ? form.manualCompany.toLowerCase().includes("rivadavia")
       : (selectedPolicy?.company?.name?.toLowerCase().includes("rivadavia") ?? false);
-    const isOwnMethodBody = ["efectivo", "transferencia", "cheque"].includes(form.paymentMethod);
-    if (isRivadaviaBody && isOwnMethodBody) {
+    if (isRivadaviaBody && validation.group === "own") {
       body.applyProntoPagoSurcharge = applyProntoPagoSurcharge;
     }
     try {
@@ -217,7 +249,13 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
       onSaved(); onClose();
     } catch (err: any) {
       const msg = err?.message || "";
-      toast.error(msg.includes("rendido") ? msg : "Error al guardar");
+      const status = err?.status;
+      // Los errores 400/409 del backend ya traen un mensaje específico y
+      // útil (mixed, suma inválida, combinado sin splits, rendido, cuota ya
+      // pagada, recargo ya rendido) — se muestra tal cual. El genérico queda
+      // solo para fallos inesperados (5xx, red, sin mensaje).
+      if (msg && status && status < 500) toast.error(msg);
+      else toast.error("Error al guardar pago");
     }
     setSaving(false);
   }
@@ -226,8 +264,10 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
   const isRivadaviaSrc = manualMode
     ? form.manualCompany.toLowerCase().includes("rivadavia")
     : (selectedPolicy?.company?.name?.toLowerCase().includes("rivadavia") ?? false);
-  const isOwnMethodSrc = ["efectivo", "transferencia", "cheque"].includes(form.paymentMethod);
-  const showSurchargeCheckbox = isRivadaviaSrc && isOwnMethodSrc;
+  // Etapa 3B-2: el grupo se decide por los splits reales, no por un único
+  // form.paymentMethod (que ya no existe en el estado). Con grupo "mixed" el
+  // checkbox tampoco se muestra — nunca puede considerarse válido.
+  const showSurchargeCheckbox = isRivadaviaSrc && splitsValidation.group === "own";
 
   if (!open) return null;
 
@@ -365,33 +405,90 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
             </div>
           </div>
 
-          {/* Método */}
+          {/* Medios de pago (splits) — Etapa 3B-2 */}
           <div>
-            <label className="block text-xs text-gray-400 mb-1">Método de pago *</label>
-            <div className="mb-2">
-              <p className="text-xs text-white/30 mb-1.5">Cuentas propias</p>
-              <div className="grid grid-cols-3 gap-2">
-                {["efectivo", "transferencia", "cheque"].map((key) => (
-                  <button key={key} type="button" onClick={() => setForm(f => ({ ...f, paymentMethod: key }))}
-                    className={cn("py-2 px-3 rounded-lg text-sm border transition-all",
-                      form.paymentMethod === key ? METHOD_COLORS[key] : "border-[#2d3748] text-gray-400 hover:text-white hover:bg-[#1a2540]")}>
-                    {METHOD_LABELS[key]}
-                  </button>
-                ))}
-              </div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="block text-xs text-gray-400">Medios de pago *</label>
+              <button type="button"
+                onClick={() => setForm(f => ({ ...f, splits: addSplitRow(f.splits) }))}
+                disabled={isRendered}
+                className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+                + Agregar medio
+              </button>
             </div>
-            <div>
-              <p className="text-xs text-orange-400/60 mb-1.5">Directo a Compañía <span className="text-white/25">(no suma a caja propia)</span></p>
-              <div className="grid grid-cols-2 gap-2">
-                {["transferencia_compania", "link_pago"].map((key) => (
-                  <button key={key} type="button" onClick={() => setForm(f => ({ ...f, paymentMethod: key }))}
-                    className={cn("py-2 px-3 rounded-lg text-sm border transition-all",
-                      form.paymentMethod === key ? METHOD_COLORS[key] : "border-[#2d3748] text-gray-400 hover:text-white hover:bg-[#1a2540]")}>
-                    {METHOD_LABELS[key]}
+
+            <div className="space-y-2">
+              {form.splits.map((split, idx) => (
+                <div key={split.uid} className="flex items-center gap-2">
+                  <label htmlFor={`split-method-${split.uid}`} className="sr-only">
+                    Método del medio de pago {idx + 1}
+                  </label>
+                  <select
+                    id={`split-method-${split.uid}`}
+                    value={split.method}
+                    disabled={isRendered}
+                    onChange={e => setForm(f => ({ ...f, splits: updateSplitRow(f.splits, split.uid, { method: e.target.value }) }))}
+                    className="flex-1 min-w-0 px-2 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-blue-500 disabled:opacity-50"
+                  >
+                    <optgroup label="Cuentas propias">
+                      {["efectivo", "transferencia", "cheque"].map((key) => (
+                        <option key={key} value={key}>{METHOD_LABELS[key]}</option>
+                      ))}
+                    </optgroup>
+                    <optgroup label="Directo a Compañía">
+                      {["transferencia_compania", "link_pago"].map((key) => (
+                        <option key={key} value={key}>{METHOD_LABELS[key]}</option>
+                      ))}
+                    </optgroup>
+                  </select>
+
+                  <label htmlFor={`split-amount-${split.uid}`} className="sr-only">
+                    Importe del medio de pago {idx + 1}
+                  </label>
+                  <div className="relative w-28 shrink-0">
+                    <span className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400 text-xs">$</span>
+                    <input
+                      id={`split-amount-${split.uid}`}
+                      type="number" step="0.01" min="0"
+                      value={split.amount}
+                      disabled={isRendered}
+                      onChange={e => setForm(f => ({ ...f, splits: updateSplitRow(f.splits, split.uid, { amount: e.target.value }) }))}
+                      placeholder="0.00"
+                      className="w-full pl-5 pr-2 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white placeholder-gray-500 outline-none focus:border-blue-500 disabled:opacity-50"
+                    />
+                  </div>
+
+                  <button type="button"
+                    onClick={() => setForm(f => ({ ...f, splits: removeSplitRow(f.splits, split.uid) }))}
+                    disabled={isRendered || form.splits.length <= 1}
+                    aria-label={`Eliminar medio de pago ${idx + 1} (${METHOD_LABELS[split.method] || split.method})`}
+                    className="p-2 text-gray-400 hover:text-red-400 disabled:opacity-30 disabled:cursor-not-allowed transition-colors shrink-0">
+                    <Trash2 className="w-4 h-4" />
                   </button>
-                ))}
-              </div>
+                </div>
+              ))}
             </div>
+
+            {/* Totales / diferencia — todo en centavos, nunca suma directa de floats */}
+            <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-400">
+              <span>Total del cobro: <span className="text-white font-medium">
+                {splitTotals.totalCents != null ? formatCurrency(splitTotals.totalCents / 100) : "—"}
+              </span></span>
+              <span>Distribuido: <span className="text-white font-medium">
+                {formatCurrency(splitTotals.distributedCents / 100)}
+              </span></span>
+              {splitsValidation.group !== "mixed" && splitTotals.diferenciaCents != null && splitTotals.diferenciaCents !== 0 && (
+                <span className={splitTotals.diferenciaCents > 0 ? "text-yellow-400" : "text-red-400"}>
+                  {splitTotals.diferenciaCents > 0
+                    ? `Faltan distribuir ${formatCurrency(splitTotals.diferenciaCents / 100)}`
+                    : `Se excede por ${formatCurrency(Math.abs(splitTotals.diferenciaCents) / 100)}`}
+                </span>
+              )}
+            </div>
+
+            {splitsValidation.group === "mixed" && (
+              <p className="mt-2 text-xs text-red-400" role="alert">{splitsValidation.errorMessage}</p>
+            )}
           </div>
 
           {/* Recargo Pronto Pago (solo Rivadavia + método propio) */}
@@ -471,12 +568,42 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
             className="flex-1 py-2 px-4 rounded-lg border border-[#2d3748] text-gray-400 text-sm hover:text-white hover:bg-[#1a2540] transition-all">
             Cancelar
           </button>
-          <button onClick={handleSave} disabled={saving}
+          <button onClick={handleSave} disabled={saving || !splitsValidation.valid}
             className="flex-1 py-2 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-all disabled:opacity-50">
             {saving ? "Guardando..." : editing ? "Guardar cambios" : "Imputar pago"}
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// Etapa 3B-2: badge de método para la tabla. Un solo split → badge normal,
+// sin cambios visuales. N>1 splits → badge "Combinado" + resumen compacto
+// agrupado por método (sin alterar los splits originales), visible sin abrir
+// edición — sin agregar una columna nueva a la tabla.
+function PaymentMethodBadge({ splits, paymentMethod, compact = false }: {
+  splits: { method: string; amountCents: number }[]; paymentMethod: string; compact?: boolean;
+}) {
+  if (!splits || splits.length <= 1) {
+    const method = splits?.[0]?.method ?? paymentMethod;
+    return (
+      <span className={cn(compact ? "px-2 py-0.5 rounded border" : "px-2 py-0.5 rounded text-xs border",
+        METHOD_COLORS[method] || "text-gray-400 border-gray-500/30")}>
+        {METHOD_LABELS[method] || method}
+      </span>
+    );
+  }
+  const grouped = groupSplitsByMethod(splits);
+  const summary = grouped.map(g => `${METHOD_LABELS[g.method] || g.method} ${formatCurrency(g.amountCents / 100)}`).join(" · ");
+  return (
+    <div className="flex flex-col gap-0.5 min-w-0">
+      <span className="px-2 py-0.5 rounded border bg-indigo-500/20 text-indigo-300 border-indigo-500/30 w-fit">
+        Combinado
+      </span>
+      <span className="text-[10px] text-gray-500 truncate max-w-[220px]" title={summary}>
+        {summary}
+      </span>
     </div>
   );
 }
@@ -523,7 +650,17 @@ function CobranzasTab() {
     } else if (filterVista === "anulados") {
       if (r.payment.status !== "anulado") return false;
     }
-    if (filterMethod && r.payment.paymentMethod !== filterMethod) return false;
+    if (filterMethod) {
+      // Etapa 3B-2: matchea si CUALQUIER split usa ese método — el backend ya
+      // filtra así (GET /payments?method=), esto evita que el filtro local
+      // vuelva a comparar contra payment.paymentMethod (puede ser "combinado").
+      // Fallback legacy a paymentMethod solo si no hay splits cargados.
+      const hasSplits = r.payment.splits && r.payment.splits.length > 0;
+      const matches = hasSplits
+        ? r.payment.splits.some(s => s.method === filterMethod)
+        : r.payment.paymentMethod === filterMethod;
+      if (!matches) return false;
+    }
     if (search) {
       const q = search.toLowerCase();
       const insuredName = (r.insured?.name || r.payment.manualPayer || "").toLowerCase();
@@ -694,9 +831,7 @@ function CobranzasTab() {
                       <p className="text-white font-semibold flex-shrink-0">{formatCurrency(r.payment.amount)}</p>
                     </div>
                     <div className="flex items-center gap-2 flex-wrap text-xs">
-                      <span className={cn("px-2 py-0.5 rounded border", METHOD_COLORS[r.payment.paymentMethod] || "text-gray-400 border-gray-500/30")}>
-                        {METHOD_LABELS[r.payment.paymentMethod] || r.payment.paymentMethod}
-                      </span>
+                      <PaymentMethodBadge splits={r.payment.splits} paymentMethod={r.payment.paymentMethod} compact />
                       <span className={cn("px-2 py-0.5 rounded border", STATUS_COLORS[r.payment.status] || "text-gray-400 border-gray-500/30")}>
                         {r.payment.status.charAt(0).toUpperCase() + r.payment.status.slice(1)}
                       </span>
@@ -768,9 +903,7 @@ function CobranzasTab() {
                             : "—"}
                         </td>
                         <td className="px-3 py-3">
-                          <span className={cn("px-2 py-0.5 rounded text-xs border", METHOD_COLORS[r.payment.paymentMethod] || "text-gray-400 border-gray-500/30")}>
-                            {METHOD_LABELS[r.payment.paymentMethod] || r.payment.paymentMethod}
-                          </span>
+                          <PaymentMethodBadge splits={r.payment.splits} paymentMethod={r.payment.paymentMethod} />
                         </td>
                         <td className="px-3 py-3 text-right text-white font-semibold">{formatCurrency(r.payment.amount)}</td>
                         <td className="px-3 py-3 text-gray-300 text-xs">
@@ -961,10 +1094,18 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
       i.companyName?.toLowerCase().includes(q);
   });
 
-  // Agrupar por método para mostrar separador
-  const DIRECTO = ["transferencia_compania", "link_pago"];
-  const propios = filteredPending.filter((i: any) => !DIRECTO.includes(i.paymentMethod));
-  const directos = filteredPending.filter((i: any) => DIRECTO.includes(i.paymentMethod));
+  // Agrupar por paymentGroup (own/direct_company) para mostrar separador —
+  // Etapa 3B-2: nunca comparar paymentMethod contra una lista de strings
+  // ("combinado" no matchea nada). getPendingItemPaymentGroup ya prioriza
+  // paymentGroup si el backend lo mandó, y solo cae a paymentMethod si no
+  // hay ni paymentGroup ni splits (ver rendicion-pending.ts).
+  const propios = filteredPending.filter((i: any) => getPendingItemPaymentGroup(i) === "own");
+  const directos = filteredPending.filter((i: any) => getPendingItemPaymentGroup(i) === "direct_company");
+  // Defensivo: las reglas de Etapa 3B-1 ya rechazan mixed en POST/PUT
+  // /payments, así que esto no debería ocurrir nunca en datos reales — pero
+  // si un dato inconsistente llegara igual, no se clasifica silenciosamente
+  // como propio ni como directo, se aísla y se advierte.
+  const mixedPendingItems = filteredPending.filter((i: any) => getPendingItemPaymentGroup(i) === "mixed");
 
   async function save() {
     if (selectedItems.length === 0) { toast.error("Seleccioná al menos una cuota"); return; }
@@ -1062,9 +1203,7 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                                 </div>
                                 <div className="text-right shrink-0">
                                   <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>
-                                  <span className={cn("text-xs px-1.5 py-0.5 rounded border", METHOD_COLORS[item.paymentMethod] || "text-gray-400 border-gray-500/30")}>
-                                    {METHOD_LABELS[item.paymentMethod] || item.paymentMethod}
-                                  </span>
+                                  <PaymentMethodBadge splits={item.splits ?? []} paymentMethod={item.paymentMethod} compact />
                                   {item.hasSurcharge && canal === "pronto_pago" && (
                                     <span className="block text-xs text-purple-400 mt-0.5">+$800 PP</span>
                                   )}
@@ -1106,10 +1245,33 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                                 </div>
                                 <div className="text-right shrink-0">
                                   <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>
-                                  <span className={cn("text-xs px-1.5 py-0.5 rounded border", METHOD_COLORS[item.paymentMethod] || "text-gray-400 border-gray-500/30")}>
-                                    {METHOD_LABELS[item.paymentMethod] || item.paymentMethod}
-                                  </span>
+                                  <PaymentMethodBadge splits={item.splits ?? []} paymentMethod={item.paymentMethod} compact />
                                 </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                    {mixedPendingItems.length > 0 && (
+                      <div>
+                        <p className="text-xs text-red-400 uppercase tracking-wider mb-1.5 flex items-center gap-1">
+                          <AlertCircle className="w-3.5 h-3.5" /> Desglose inconsistente — no seleccionable
+                        </p>
+                        <div className="space-y-1">
+                          {mixedPendingItems.map(item => {
+                            const k = key(item);
+                            return (
+                              <div key={k}
+                                className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-red-500/30 bg-red-900/10">
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-sm text-white truncate">{item.clientName}</p>
+                                  <p className="text-xs text-red-400/80">
+                                    Combina medios propios y directos a la compañía en un mismo cobro — no se puede
+                                    clasificar. Revisá este pago antes de rendir.
+                                  </p>
+                                </div>
+                                <p className="text-sm font-semibold text-white shrink-0">{fmt(item.amount)}</p>
                               </div>
                             );
                           })}

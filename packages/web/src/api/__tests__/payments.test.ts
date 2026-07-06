@@ -11,9 +11,9 @@ import app from "../index";
 import { database as db } from "../database/index";
 import {
   users, sessions, policies, companies, insureds, policyInstallments,
-  payments, paymentSplits, remittances, remittanceItems,
+  payments, paymentSplits, remittances, remittanceItems, cashEntries,
 } from "../database/schema";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, and } from "drizzle-orm";
 
 const SESSION_ID = "test-session-pay-splits-001";
 const USER_EMAIL = "test-pay-splits@test.local";
@@ -21,6 +21,7 @@ const PREFIX = "TEST-PAY-SPLITS";
 
 let userId: number;
 let companyId: number;
+let rivadaviaCompanyId: number;
 let insuredId: number;
 const policyIdsToClean: number[] = [];
 const paymentIdsToClean: number[] = [];
@@ -34,6 +35,19 @@ async function mkPolicy(): Promise<number> {
   const [p] = await db.insert(policies).values({
     policyNumber: `${PREFIX}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     type: "automotor", status: "activa", companyId, insuredId,
+    startDate: "2027-01-01", endDate: "2027-12-31", isRebilling: 0, createdBy: userId,
+  }).returning({ id: policies.id });
+  policyIdsToClean.push(p!.id);
+  return p!.id;
+}
+
+// Etapa 3B: póliza sobre una compañía "Rivadavia" — necesaria para los tests
+// de recargo Pronto Pago, que solo aplica cuando la compañía resuelta
+// contiene "rivadavia" (case-insensitive) en su nombre.
+async function mkRivadaviaPolicy(): Promise<number> {
+  const [p] = await db.insert(policies).values({
+    policyNumber: `${PREFIX}-RIV-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    type: "automotor", status: "activa", companyId: rivadaviaCompanyId, insuredId,
     startDate: "2027-01-01", endDate: "2027-12-31", isRebilling: 0, createdBy: userId,
   }).returning({ id: policies.id });
   policyIdsToClean.push(p!.id);
@@ -105,6 +119,9 @@ beforeAll(async () => {
   const existingCo = await db.select({ id: companies.id }).from(companies).where(eq(companies.name, `${PREFIX} Co`)).get();
   companyId = existingCo?.id ?? (await db.insert(companies).values({ name: `${PREFIX} Co` }).returning({ id: companies.id }))[0]!.id;
 
+  const existingRivCo = await db.select({ id: companies.id }).from(companies).where(eq(companies.name, `${PREFIX} Rivadavia Co`)).get();
+  rivadaviaCompanyId = existingRivCo?.id ?? (await db.insert(companies).values({ name: `${PREFIX} Rivadavia Co` }).returning({ id: companies.id }))[0]!.id;
+
   const [ins] = await db.insert(insureds).values({ name: `${PREFIX} Asegurado`, createdBy: userId }).returning({ id: insureds.id });
   insuredId = ins!.id;
 });
@@ -115,6 +132,7 @@ afterAll(async () => {
     await db.delete(remittances).where(inArray(remittances.id, remittanceIdsToClean)).catch(() => {});
   }
   if (paymentIdsToClean.length) {
+    await db.delete(cashEntries).where(inArray(cashEntries.paymentId, paymentIdsToClean)).catch(() => {});
     await db.delete(paymentSplits).where(inArray(paymentSplits.paymentId, paymentIdsToClean)).catch(() => {});
     await db.delete(payments).where(inArray(payments.id, paymentIdsToClean)).catch(() => {});
   }
@@ -209,14 +227,15 @@ describe("Validaciones de POST /payments", () => {
     expect(status).toBe(400);
   });
 
-  test("10. dos o más splits → 400, medios combinados aún no habilitados", async () => {
+  test("10. Etapa 3B: dos splits propios ya no se rechazan — 201, paymentMethod combinado", async () => {
     const { status, body } = await callPost({
       manualPayer: "X", manualPolicyNumber: "MAN-009", manualCompany: "TestCo",
       amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
       splits: [{ method: "efectivo", amount: 500 }, { method: "transferencia", amount: 500 }],
     });
-    expect(status).toBe(400);
-    expect(body.error).toContain("combinados");
+    expect(status).toBe(201);
+    expect(body.paymentMethod).toBe("combinado");
+    expect(body.splits.length).toBe(2);
   });
 });
 
@@ -640,5 +659,590 @@ describe("5 y 20. Rollback transaccional real (tx real, no mocks)", () => {
     const after = await db.select({ id: payments.id }).from(payments).all();
     const newRows = after.filter(r => !beforeIds.has(r.id));
     expect(newRows.length).toBe(0); // el payments insertado en la misma tx también se revirtió
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ETAPA 3B — medios de pago combinados (2+ payment_splits por payment)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("3B.1-10. POST /payments con medios combinados", () => {
+  test("1. dos splits propios (efectivo + transferencia) → 201, combinado, 2 splits", async () => {
+    const { status, body } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-001", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 600 }, { method: "transferencia", amount: 400 }],
+    });
+    expect(status).toBe(201);
+    expect(body.paymentMethod).toBe("combinado");
+    expect(body.splits.length).toBe(2);
+    const rows = await getSplits(body.id);
+    expect(rows.length).toBe(2);
+  });
+
+  test("2. tres splits propios (efectivo + transferencia + cheque) → 201, 3 splits", async () => {
+    const { status, body } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-002", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [
+        { method: "efectivo", amount: 400 },
+        { method: "transferencia", amount: 350 },
+        { method: "cheque", amount: 250 },
+      ],
+    });
+    expect(status).toBe(201);
+    expect(body.paymentMethod).toBe("combinado");
+    expect(body.splits.length).toBe(3);
+  });
+
+  test("3. dos splits directos a compañía (transferencia_compania + link_pago) → 201, combinado", async () => {
+    const { status, body } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-003", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "transferencia_compania", paymentDate: "2027-01-01",
+      splits: [
+        { method: "transferencia_compania", amount: 600 },
+        { method: "link_pago", amount: 400 },
+      ],
+    });
+    expect(status).toBe(201);
+    expect(body.paymentMethod).toBe("combinado");
+    expect(body.splits.length).toBe(2);
+  });
+
+  test("4. mixed (propio + directo a compañía) → 400, sin persistencia", async () => {
+    const before = await db.select({ id: payments.id }).from(payments).all();
+    const { status, body } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-004", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 500 }, { method: "transferencia_compania", amount: 500 }],
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain("No se pueden combinar medios propios con pagos directos a la compañía");
+    const after = await db.select({ id: payments.id }).from(payments).all();
+    expect(after.length).toBe(before.length);
+  });
+
+  test("5. métodos repetidos dentro del mismo grupo se permiten (dos transferencias)", async () => {
+    const { status, body } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-005", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "transferencia", paymentDate: "2027-01-01",
+      splits: [{ method: "transferencia", amount: 400 }, { method: "transferencia", amount: 600 }],
+    });
+    expect(status).toBe(201);
+    expect(body.splits.length).toBe(2);
+    expect(body.splits.every((s: any) => s.method === "transferencia")).toBe(true);
+  });
+
+  test("8. suma combinada menor al total → 400", async () => {
+    const { status } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-008", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 400 }, { method: "transferencia", amount: 400 }],
+    });
+    expect(status).toBe(400);
+  });
+
+  test("9. suma combinada mayor al total → 400", async () => {
+    const { status } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-009", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 700 }, { method: "transferencia", amount: 500 }],
+    });
+    expect(status).toBe(400);
+  });
+
+  test("10. centavos exactos en un combinado de 3 splits (33.33 + 33.33 + 33.34)", async () => {
+    const { status, body } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-010", manualCompany: "TestCo",
+      amount: 100, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [
+        { method: "efectivo", amount: 33.33 },
+        { method: "transferencia", amount: 33.33 },
+        { method: "cheque", amount: 33.34 },
+      ],
+    });
+    expect(status).toBe(201);
+    expect(body.splits.map((s: any) => s.amountCents)).toEqual([3333, 3333, 3334]);
+  });
+});
+
+describe("3B.11-12. Validación contra la cuota con medios combinados", () => {
+  test("11. cuota se marca pagada con el total combinado exacto (2 splits)", async () => {
+    const policyId = await mkPolicy();
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const { status } = await callPost({
+      policyId, installmentId: instId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 600 }, { method: "transferencia", amount: 400 }],
+    });
+    expect(status).toBe(201);
+    const inst = await getInstallment(instId);
+    expect(inst?.status).toBe("pagada");
+  });
+
+  test("12. importe combinado distinto de la cuota → 400, no crea nada ni toca la cuota", async () => {
+    const policyId = await mkPolicy();
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const { status } = await callPost({
+      policyId, installmentId: instId, amount: 900, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 600 }, { method: "transferencia", amount: 300 }],
+    });
+    expect(status).toBe(400);
+    const inst = await getInstallment(instId);
+    expect(inst?.status).toBe("pendiente");
+  });
+});
+
+describe("3B.13-19. PUT /payments/:id con medios combinados", () => {
+  test("13. PUT uno→varios: reemplazo completo, no conserva el id del split viejo", async () => {
+    const { body: created } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-013", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    const originalSplitId = created.splits[0].id;
+
+    const { status, body } = await callPut(created.id, {
+      splits: [{ method: "efectivo", amount: 600 }, { method: "cheque", amount: 400 }],
+    });
+    expect(status).toBe(200);
+    expect(body.paymentMethod).toBe("combinado");
+    expect(body.splits.length).toBe(2);
+    expect(body.splits.some((s: any) => s.id === originalSplitId)).toBe(false);
+  });
+
+  test("14. PUT varios→uno: reemplaza 2 splits por 1, paymentMethod vuelve a un método real", async () => {
+    const { body: created } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-014", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 600 }, { method: "transferencia", amount: 400 }],
+    });
+    expect(created.splits.length).toBe(2);
+
+    const { status, body } = await callPut(created.id, { splits: [{ method: "cheque", amount: 1000 }] });
+    expect(status).toBe(200);
+    expect(body.paymentMethod).toBe("cheque");
+    expect(body.splits.length).toBe(1);
+    const rows = await getSplits(created.id);
+    expect(rows.length).toBe(1);
+  });
+
+  test("15. PUT varios→varios: reemplaza 2 splits por 3 distintos", async () => {
+    const { body: created } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-015", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 600 }, { method: "transferencia", amount: 400 }],
+    });
+    const { status, body } = await callPut(created.id, {
+      splits: [
+        { method: "efectivo", amount: 300 }, { method: "transferencia", amount: 300 }, { method: "cheque", amount: 400 },
+      ],
+    });
+    expect(status).toBe(200);
+    expect(body.splits.length).toBe(3);
+    const rows = await getSplits(created.id);
+    expect(rows.length).toBe(3);
+  });
+
+  test("16. PUT con grupo mixed → 400, conserva los splits anteriores intactos", async () => {
+    const { body: created } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-016", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    const { status } = await callPut(created.id, {
+      splits: [{ method: "efectivo", amount: 500 }, { method: "link_pago", amount: 500 }],
+    });
+    expect(status).toBe(400);
+    const rows = await getSplits(created.id);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.method).toBe("efectivo");
+  });
+
+  test("17. cliente legacy cambia amount sin enviar splits en un combinado → 409, no modifica nada", async () => {
+    const { body: created } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-017", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 600 }, { method: "transferencia", amount: 400 }],
+    });
+    const { status, body } = await callPut(created.id, { amount: 2000 });
+    expect(status).toBe(409);
+    expect(body.error).toContain("desglose completo");
+    const rows = await getSplits(created.id);
+    expect(rows.length).toBe(2);
+    const paymentRow = await db.select({ amount: payments.amount }).from(payments).where(eq(payments.id, created.id)).get();
+    expect(paymentRow?.amount).toBe(1000);
+  });
+
+  test("18. rendered=1 bloquea el envío de splits nuevos", async () => {
+    const { body: created } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-018", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    await db.update(payments).set({ rendered: 1 }).where(eq(payments.id, created.id));
+    const { status } = await callPut(created.id, {
+      splits: [{ method: "efectivo", amount: 500 }, { method: "transferencia", amount: 500 }],
+    });
+    expect(status).toBe(409);
+    const rows = await getSplits(created.id);
+    expect(rows.length).toBe(1);
+  });
+
+  test("19. anular un pago combinado conserva sus splits y recalcula la cuota", async () => {
+    const policyId = await mkPolicy();
+    const instId = await mkInstallment(policyId, 1, "2099-01-01", 1000);
+    const { body: created } = await callPost({
+      policyId, installmentId: instId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 600 }, { method: "transferencia", amount: 400 }],
+    });
+    expect((await getInstallment(instId))?.status).toBe("pagada");
+
+    const { status } = await callPut(created.id, { status: "anulado" });
+    expect(status).toBe(200);
+
+    const rows = await getSplits(created.id);
+    expect(rows.length).toBe(2);
+
+    const inst = await getInstallment(instId);
+    expect(inst?.status).toBe("pendiente");
+  });
+});
+
+describe("3B.20. DELETE con medios combinados", () => {
+  test("20. DELETE borra los 3 splits de un pago combinado y el propio pago", async () => {
+    const { body: created } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-020", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [
+        { method: "efectivo", amount: 400 }, { method: "transferencia", amount: 350 }, { method: "cheque", amount: 250 },
+      ],
+    });
+    expect(created.splits.length).toBe(3);
+
+    const { status } = await callDelete(created.id);
+    expect(status).toBe(200);
+
+    const rows = await getSplits(created.id);
+    expect(rows.length).toBe(0);
+    const paymentRow = await db.select().from(payments).where(eq(payments.id, created.id)).get();
+    expect(paymentRow).toBeUndefined();
+  });
+});
+
+describe("3B.21. Rollback transaccional con 3 splits", () => {
+  test("21. si el tercer split viola el CHECK, se revierte el payment y los otros 2 splits", async () => {
+    const before = await db.select({ id: payments.id }).from(payments).all();
+    const beforeIds = new Set(before.map(r => r.id));
+    let paymentIdAttempted: number | null = null;
+
+    let threw = false;
+    try {
+      await db.transaction(async (tx) => {
+        const [p] = await tx.insert(payments).values({
+          manualPayer: "Rollback 3 Splits", manualPolicyNumber: "MAN-ROLLBACK-3B", manualCompany: "TestCo",
+          amount: 1000, paymentMethod: "combinado", paymentDate: "2027-01-01",
+          status: "confirmado", createdBy: userId,
+        }).returning();
+        paymentIdAttempted = p!.id;
+        await tx.insert(paymentSplits).values({ paymentId: p!.id, method: "efectivo", amountCents: 40000 });
+        await tx.insert(paymentSplits).values({ paymentId: p!.id, method: "transferencia", amountCents: 35000 });
+        // El tercer split viola CHECK(amount_cents > 0) — fallo real de SQLite.
+        await tx.insert(paymentSplits).values({ paymentId: p!.id, method: "cheque", amountCents: 0 });
+      });
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+
+    const after = await db.select({ id: payments.id }).from(payments).all();
+    expect(after.filter(r => !beforeIds.has(r.id)).length).toBe(0);
+
+    if (paymentIdAttempted != null) {
+      const orphanSplits = await db.select().from(paymentSplits).where(eq(paymentSplits.paymentId, paymentIdAttempted)).all();
+      expect(orphanSplits.length).toBe(0); // ni los 2 splits válidos insertados antes del fallo sobreviven
+    }
+  });
+});
+
+describe("3B.22-24. Pronto Pago con medios combinados", () => {
+  test("22. todos los splits propios + Rivadavia → aplica el recargo una sola vez", async () => {
+    const policyId = await mkRivadaviaPolicy();
+    const { body: created } = await callPost({
+      policyId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 600 }, { method: "transferencia", amount: 400 }],
+    });
+    const surcharges = await db.select().from(cashEntries)
+      .where(and(eq(cashEntries.paymentId, created.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surcharges.length).toBe(1);
+    expect(surcharges[0]!.amount).toBe(800);
+  });
+
+  test("23. todos los splits directos a compañía + Rivadavia → NO aplica el recargo", async () => {
+    const policyId = await mkRivadaviaPolicy();
+    const { body: created } = await callPost({
+      policyId, amount: 1000, paymentMethod: "transferencia_compania", paymentDate: "2027-01-01",
+      splits: [{ method: "transferencia_compania", amount: 600 }, { method: "link_pago", amount: 400 }],
+    });
+    const surcharges = await db.select().from(cashEntries)
+      .where(and(eq(cashEntries.paymentId, created.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surcharges.length).toBe(0);
+  });
+
+  test("24. mixed con compañía Rivadavia nunca llega a calcular el recargo (se rechaza antes)", async () => {
+    const policyId = await mkRivadaviaPolicy();
+    const before = await db.select({ id: cashEntries.id }).from(cashEntries)
+      .where(eq(cashEntries.entryType, "pronto_pago_surcharge")).all();
+    const { status } = await callPost({
+      policyId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 500 }, { method: "link_pago", amount: 500 }],
+    });
+    expect(status).toBe(400);
+    const after = await db.select({ id: cashEntries.id }).from(cashEntries)
+      .where(eq(cashEntries.entryType, "pronto_pago_surcharge")).all();
+    expect(after.length).toBe(before.length);
+  });
+});
+
+describe("3B.25-26. GET /payments — filtro por método y stats", () => {
+  test("25. GET /payments?method= matchea por cualquier split de un combinado", async () => {
+    const { body: created } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-025", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 600 }, { method: "cheque", amount: 400 }],
+    });
+    const res = await app.fetch(new Request("http://localhost/api/payments?method=cheque", { headers: authHeaders() }));
+    const list = await res.json();
+    expect(list.some((r: any) => r.payment.id === created.id)).toBe(true);
+  });
+
+  test("26. GET /payments/stats suma por split real, total no se duplica", async () => {
+    const statsBefore = await (await app.fetch(new Request("http://localhost/api/payments/stats", { headers: authHeaders() }))).json();
+
+    const { body: created } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-026", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 600 }, { method: "transferencia", amount: 400 }],
+    });
+    paymentIdsToClean.push(created.id);
+
+    const statsAfter = await (await app.fetch(new Request("http://localhost/api/payments/stats", { headers: authHeaders() }))).json();
+
+    expect(statsAfter.total - statsBefore.total).toBe(1000);
+    expect(statsAfter.byMethod.efectivo - (statsBefore.byMethod.efectivo || 0)).toBe(600);
+    expect(statsAfter.byMethod.transferencia - (statsBefore.byMethod.transferencia || 0)).toBe(400);
+    expect(statsAfter.byMethod.combinadoCount - (statsBefore.byMethod.combinadoCount || 0)).toBe(1);
+  });
+});
+
+describe("3B.27-29. Caja — buckets por método real, sin duplicar el total", () => {
+  test("27-28. cash/summary separa efectivo/cheque por split y no duplica cartera.total", async () => {
+    const before = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
+
+    const { body: created } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-027", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 600 }, { method: "cheque", amount: 400 }],
+    });
+    paymentIdsToClean.push(created.id);
+
+    const after = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
+
+    expect(after.cartera.efectivo - before.cartera.efectivo).toBe(600);
+    expect(after.cartera.cheque - before.cartera.cheque).toBe(400);
+    expect(after.cartera.total - before.cartera.total).toBe(1000);
+  });
+
+  test("29. GET /cash/payments/transferencias muestra solo la porción transferencia_compania de un combinado", async () => {
+    const { body: created } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-029", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "transferencia_compania", paymentDate: "2027-01-01",
+      splits: [{ method: "transferencia_compania", amount: 600 }, { method: "link_pago", amount: 400 }],
+    });
+    const res = await app.fetch(new Request("http://localhost/api/cash/payments/transferencias", { headers: authHeaders() }));
+    const list = await res.json();
+    const row = list.find((r: any) => r.id === created.id);
+    expect(row).toBeDefined();
+    expect(row.amount).toBe(1000);
+    expect(row.transferenciaCompaniaAmount).toBe(600);
+  });
+});
+
+describe("3B.30-31. Rendiciones con medios combinados", () => {
+  test("30. rendir un pago combinado sigue creando un único remittanceItem", async () => {
+    const { body: created } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-030", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 600 }, { method: "transferencia", amount: 400 }],
+    });
+
+    const res = await app.fetch(new Request("http://localhost/api/remittances", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        date: "2027-01-02", canal: "directo",
+        paymentBreakdown: { efectivo: 600, transferencia: 400 },
+        items: [{ source: "payment", sourceId: created.id, amount: 1000, debtorStatus: "pagado" }],
+      }),
+    }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    remittanceIdsToClean.push(body.id);
+
+    const items = await db.select().from(remittanceItems).where(eq(remittanceItems.remittanceId, body.id)).all();
+    expect(items.length).toBe(1);
+    expect(items[0]!.sourceId).toBe(created.id);
+
+    const paymentRow = await db.select({ rendered: payments.rendered }).from(payments).where(eq(payments.id, created.id)).get();
+    expect(paymentRow?.rendered).toBe(1);
+  });
+
+  test("31. GET /remittances/pending expone splits y paymentGroup de un combinado", async () => {
+    const { body: created } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-031", manualCompany: "TestCo",
+      amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 600 }, { method: "transferencia", amount: 400 }],
+    });
+
+    const res = await app.fetch(new Request("http://localhost/api/remittances/pending", { headers: authHeaders() }));
+    const list = await res.json();
+    const row = list.find((r: any) => r.source === "payment" && r.sourceId === created.id);
+    expect(row).toBeDefined();
+    expect(row.paymentGroup).toBe("own");
+    expect(row.splits.length).toBe(2);
+  });
+});
+
+describe("3B.32. Compatibilidad histórica con un solo split", () => {
+  test("32. un payment de un solo split se sigue creando/editando igual que antes de 3B", async () => {
+    const { body: created } = await callPost({
+      manualPayer: "X", manualPolicyNumber: "MAN-3B-032", manualCompany: "TestCo",
+      amount: 500, paymentMethod: "transferencia", paymentDate: "2027-01-01",
+    });
+    expect(created.paymentMethod).toBe("transferencia");
+    expect(created.splits.length).toBe(1);
+
+    const { status, body } = await callPut(created.id, { amount: 700 });
+    expect(status).toBe(200);
+    expect(body.splits.length).toBe(1);
+    expect(body.splits[0].id).toBe(created.splits[0].id);
+  });
+});
+
+// ─── Recargo Pronto Pago como categoría separada en Caja ─────────────────────
+// El cashEntry pronto_pago_surcharge no tiene splits propios (no es un
+// "payment"): su monto fijo ($800) va a cartera.recargosProntoPago, nunca a
+// efectivo/transferencia/cheque — identificado por entryType, no por
+// paymentMethod (que puede valer "combinado").
+
+describe("3B.33-38. Recargo Pronto Pago — categoría separada en Caja", () => {
+  test("33. Rivadavia, un solo medio propio: el payment va a su bucket real, el recargo a recargosProntoPago, total una sola vez cada uno", async () => {
+    const before = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
+
+    const policyId = await mkRivadaviaPolicy();
+    const { body: created } = await callPost({
+      policyId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    paymentIdsToClean.push(created.id);
+
+    const after = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
+
+    expect(after.cartera.efectivo - before.cartera.efectivo).toBe(1000);
+    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(800);
+    expect(after.cartera.total - before.cartera.total).toBe(1800);
+  });
+
+  test("34. Rivadavia combinado efectivo + transferencia: cada split en su bucket, recargo únicamente en recargosProntoPago, nada bajo 'combinado'", async () => {
+    const before = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
+
+    const policyId = await mkRivadaviaPolicy();
+    const { body: created } = await callPost({
+      policyId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 600 }, { method: "transferencia", amount: 400 }],
+    });
+    paymentIdsToClean.push(created.id);
+
+    const after = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
+
+    expect(after.cartera.efectivo - before.cartera.efectivo).toBe(600);
+    expect(after.cartera.transferencia - before.cartera.transferencia).toBe(400);
+    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(800);
+    expect(after.cartera.total - before.cartera.total).toBe(1800); // 600 + 400 + 800, cada uno una vez
+    expect(after.cartera).not.toHaveProperty("combinado");
+  });
+
+  test("35. Rivadavia con métodos directos a compañía: no crea recargo, recargosProntoPago no cambia", async () => {
+    const before = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
+
+    const policyId = await mkRivadaviaPolicy();
+    const { body: created } = await callPost({
+      policyId, amount: 1000, paymentMethod: "transferencia_compania", paymentDate: "2027-01-01",
+    });
+    paymentIdsToClean.push(created.id);
+
+    const surcharges = await db.select().from(cashEntries)
+      .where(and(eq(cashEntries.paymentId, created.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surcharges.length).toBe(0);
+
+    const after = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
+    expect(after.cartera.recargosProntoPago).toBe(before.cartera.recargosProntoPago);
+  });
+
+  test("36. editar con applyProntoPagoSurcharge=false elimina el recargo y actualiza recargosProntoPago", async () => {
+    const policyId = await mkRivadaviaPolicy();
+    const { body: created } = await callPost({
+      policyId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    const surchargesBefore = await db.select().from(cashEntries)
+      .where(and(eq(cashEntries.paymentId, created.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surchargesBefore.length).toBe(1);
+
+    const before = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
+
+    const { status } = await callPut(created.id, { applyProntoPagoSurcharge: false });
+    expect(status).toBe(200);
+
+    const surchargesAfter = await db.select().from(cashEntries)
+      .where(and(eq(cashEntries.paymentId, created.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surchargesAfter.length).toBe(0);
+
+    const after = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
+    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(-800);
+  });
+
+  test("37. anular un pago Rivadavia no deja el recargo activo (se borra aunque no se envíe applyProntoPagoSurcharge)", async () => {
+    const policyId = await mkRivadaviaPolicy();
+    const { body: created } = await callPost({
+      policyId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    const surchargesBefore = await db.select().from(cashEntries)
+      .where(and(eq(cashEntries.paymentId, created.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surchargesBefore.length).toBe(1);
+
+    const before = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
+
+    const { status } = await callPut(created.id, { status: "anulado" });
+    expect(status).toBe(200);
+
+    const surchargesAfter = await db.select().from(cashEntries)
+      .where(and(eq(cashEntries.paymentId, created.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surchargesAfter.length).toBe(0);
+
+    const after = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
+    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(-800);
+  });
+
+  test("38. no duplicación: el total del payment y el recargo se cuentan cada uno exactamente una vez en cartera.total", async () => {
+    const before = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
+
+    const policyId = await mkRivadaviaPolicy();
+    const { body: created } = await callPost({
+      policyId, amount: 2500, paymentMethod: "cheque", paymentDate: "2027-01-01",
+      splits: [{ method: "efectivo", amount: 1000 }, { method: "cheque", amount: 1500 }],
+    });
+    paymentIdsToClean.push(created.id);
+
+    const after = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
+
+    // 2500 (payment, repartido en sus 2 splits) + 800 (recargo) = 3300, ni más ni menos.
+    expect(after.cartera.total - before.cartera.total).toBe(3300);
+    expect(after.cartera.efectivo - before.cartera.efectivo).toBe(1000);
+    expect(after.cartera.cheque - before.cartera.cheque).toBe(1500);
+    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(800);
   });
 });

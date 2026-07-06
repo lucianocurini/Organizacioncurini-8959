@@ -1,10 +1,14 @@
 /**
  * Tests del helper puro de validación/normalización de payment_splits
- * (Etapa 3A). Sin DB, sin HTTP — src/lib/payments/splits.ts.
+ * (Etapa 3A) y de clasificación de grupos de medios (Etapa 3B).
+ * Sin DB, sin HTTP — src/lib/payments/splits.ts.
  */
 
 import { test, expect, describe } from "bun:test";
-import { validateAndNormalizeSplits, SplitValidationError } from "../../lib/payments/splits";
+import {
+  validateAndNormalizeSplits, SplitValidationError,
+  isOwnPaymentMethod, isDirectCompanyPaymentMethod, classifySplitGroup,
+} from "../../lib/payments/splits";
 
 describe("Caso A — un solo medio", () => {
   test("un split que cubre el total exacto es válido", () => {
@@ -200,5 +204,65 @@ describe("Caso N — métodos repetidos dentro de un mismo desglose", () => {
     });
     expect(result.splits.map(s => s.method)).toEqual(["transferencia", "transferencia"]);
     expect(result.totalCents).toBe(100000);
+  });
+});
+
+// ─── Etapa 3B — isOwnPaymentMethod / isDirectCompanyPaymentMethod ────────────
+
+describe("Caso O — clasificación individual de métodos", () => {
+  test("efectivo, transferencia y cheque son propios", () => {
+    expect(isOwnPaymentMethod("efectivo")).toBe(true);
+    expect(isOwnPaymentMethod("transferencia")).toBe(true);
+    expect(isOwnPaymentMethod("cheque")).toBe(true);
+  });
+
+  test("transferencia_compania y link_pago son directos a compañía", () => {
+    expect(isDirectCompanyPaymentMethod("transferencia_compania")).toBe(true);
+    expect(isDirectCompanyPaymentMethod("link_pago")).toBe(true);
+  });
+
+  test("un método propio no es directo a compañía y viceversa", () => {
+    expect(isDirectCompanyPaymentMethod("efectivo")).toBe(false);
+    expect(isOwnPaymentMethod("link_pago")).toBe(false);
+  });
+
+  test("un método fuera de ambas listas (ej. 'combinado') no es ninguno de los dos", () => {
+    expect(isOwnPaymentMethod("combinado")).toBe(false);
+    expect(isDirectCompanyPaymentMethod("combinado")).toBe(false);
+  });
+});
+
+// ─── Etapa 3B — classifySplitGroup ────────────────────────────────────────────
+
+describe("Caso P — classifySplitGroup", () => {
+  test("un solo split propio → 'own'", () => {
+    expect(classifySplitGroup([{ method: "efectivo" }])).toBe("own");
+  });
+
+  test("varios splits propios → 'own'", () => {
+    expect(classifySplitGroup([{ method: "efectivo" }, { method: "transferencia" }, { method: "cheque" }])).toBe("own");
+  });
+
+  test("un solo split directo a compañía → 'direct_company'", () => {
+    expect(classifySplitGroup([{ method: "transferencia_compania" }])).toBe("direct_company");
+  });
+
+  test("varios splits directos a compañía → 'direct_company'", () => {
+    expect(classifySplitGroup([{ method: "transferencia_compania" }, { method: "link_pago" }])).toBe("direct_company");
+  });
+
+  test("mezcla de propio y directo a compañía → 'mixed'", () => {
+    expect(classifySplitGroup([{ method: "efectivo" }, { method: "transferencia_compania" }])).toBe("mixed");
+  });
+
+  test("métodos repetidos del mismo grupo no rompen la clasificación", () => {
+    expect(classifySplitGroup([{ method: "transferencia" }, { method: "transferencia" }])).toBe("own");
+  });
+
+  test("no muta el array ni los objetos de entrada", () => {
+    const input = [{ method: "efectivo" }, { method: "transferencia_compania" }];
+    const inputCopy = JSON.parse(JSON.stringify(input));
+    classifySplitGroup(input);
+    expect(input).toEqual(inputCopy);
   });
 });

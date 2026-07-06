@@ -37,13 +37,12 @@ import {
 import { parseElNorteTxtV2 } from "../lib/parsers/el-norte-v2";
 import { isValidCalendarDate, buildInstallmentPlan, InstallmentPlanError } from "../lib/installments/plan";
 import { classifyInstallmentsForRebuild, runInstallmentRebuildTransaction, RebuildConflictError, PolicyNotFoundError } from "../lib/installments/rebuild";
-import { validateAndNormalizeSplits, SplitValidationError } from "../lib/payments/splits";
+import { validateAndNormalizeSplits, SplitValidationError, classifySplitGroup, isDirectCompanyPaymentMethod, type SplitGroup } from "../lib/payments/splits";
 import { recalculateInstallmentPaymentStatus } from "../lib/payments/installment-status";
 
 const app = new Hono().basePath("/api");
 
 const SURCHARGE_AMOUNT = 800;
-const SURCHARGE_OWN_METHODS = ["efectivo", "transferencia", "cheque"] as const;
 
 // ─── Auth Middleware ───────────────────────────────────────────────────────────
 async function getUser(c: any) {
@@ -894,7 +893,6 @@ app.get("/payments", requireAuth(async (c: any) => {
     .orderBy(desc(payments.createdAt))
     .all();
   if (policyId) results = results.filter((r) => r.payment.policyId === Number(policyId));
-  if (method) results = results.filter((r) => r.payment.paymentMethod === method);
   if (status) results = results.filter((r) => r.payment.status === status);
   if (from) results = results.filter((r) => r.payment.paymentDate >= from);
   if (to) results = results.filter((r) => r.payment.paymentDate <= to);
@@ -920,6 +918,13 @@ app.get("/payments", requireAuth(async (c: any) => {
       splitsByPayment.set(s.paymentId, arr);
     }
   }
+  // Etapa 3B: el filtro `method` matchea si CUALQUIER split del payment usa
+  // ese método — payments.paymentMethod puede valer "combinado" y no
+  // representa ningún método real por sí solo. Se filtra recién acá (con los
+  // splits ya cargados en el query de arriba) para no hacer N+1 consultas.
+  if (method) {
+    results = results.filter((r) => (splitsByPayment.get(r.payment.id) ?? []).some((s) => s.method === method));
+  }
   return c.json(results.map(r => ({
     ...r,
     payment: {
@@ -944,11 +949,11 @@ app.post("/payments", requireAuth(async (c: any) => {
 
   // Etapa 3A: todo payment nuevo tiene siempre >=1 payment_splits. El frontend
   // actual no envía `splits` — se arma internamente un único split desde
-  // paymentMethod/amount, igual que antes. Medios combinados (>=2 splits)
-  // todavía no están habilitados: se rechazan explícitamente con 400.
-  if (Array.isArray(body.splits) && body.splits.length >= 2) {
-    return c.json({ error: "Los medios de pago combinados todavía no están habilitados en esta etapa." }, 400);
-  }
+  // paymentMethod/amount, igual que antes.
+  // Etapa 3B: se habilitan 2+ splits (medios combinados), con la restricción
+  // de que todos deben pertenecer al mismo grupo (own vs. direct_company) —
+  // ver classifySplitGroup. Mezclar ambos grupos se rechaza más abajo, antes
+  // de cualquier escritura.
   const rawSplits = Array.isArray(body.splits) && body.splits.length > 0
     ? body.splits
     : [{ method: body.paymentMethod, amount: Number(body.amount), notes: null }];
@@ -960,10 +965,21 @@ app.post("/payments", requireAuth(async (c: any) => {
     if (e instanceof SplitValidationError) return c.json({ error: e.message }, 400);
     throw e;
   }
-  // paymentMethod del padre = método del único split validado (nunca el
-  // body.paymentMethod crudo) — garantiza por construcción que ambos
-  // coincidan, incluso si el caller mandó body.splits con un método distinto.
-  const resolvedPaymentMethod = normalizedSplits.splits[0]!.method;
+
+  const splitGroup = classifySplitGroup(normalizedSplits.splits);
+  if (splitGroup === "mixed") {
+    return c.json({ error: "No se pueden combinar medios propios con pagos directos a la compañía en un mismo cobro." }, 400);
+  }
+
+  // paymentMethod del padre: con un solo split, su método real (nunca el
+  // body.paymentMethod crudo, garantiza por construcción que coincidan). Con
+  // 2+ splits, "combinado" — un valor resumen solo para mostrar en UI/listas
+  // legacy; ningún cálculo monetario por método debe leer este campo cuando
+  // vale "combinado" (ver GET /payments, stats, Caja: todos suman por
+  // payment_splits, no por payments.paymentMethod).
+  const resolvedPaymentMethod = normalizedSplits.splits.length === 1
+    ? normalizedSplits.splits[0]!.method
+    : "combinado";
 
   // Resolve company/insured from DB (never trust frontend for surcharge decision)
   let resolvedCompany: string | null = null;
@@ -987,9 +1003,14 @@ app.post("/payments", requireAuth(async (c: any) => {
     resolvedPolicyNumber = body.manualPolicyNumber ?? null;
   }
 
+  // Etapa 3B: la calificación para Pronto Pago se decide por el GRUPO de
+  // splits, no por payments.paymentMethod (que puede valer "combinado", un
+  // string que no representa ningún método real). splitGroup ya está
+  // garantizado no-mixed en este punto (se rechazó más arriba), así que
+  // "own" significa "todos los splits son propios".
   const isRivadavia = resolvedCompany?.toLowerCase().includes("rivadavia") ?? false;
-  const isOwnMethod = (SURCHARGE_OWN_METHODS as readonly string[]).includes(resolvedPaymentMethod);
-  const shouldCreateSurcharge = isRivadavia && isOwnMethod && isConfirmed && body.applyProntoPagoSurcharge !== false;
+  const qualifiesForProntoPago = isRivadavia && splitGroup === "own" && isConfirmed;
+  const shouldCreateSurcharge = qualifiesForProntoPago && body.applyProntoPagoSurcharge !== false;
 
   // La cuota indicada debe existir siempre que se envíe installmentId, sin
   // importar el status — una FK inválida no la rechaza la base (foreign_keys
@@ -1109,7 +1130,8 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
   }
 
   const CONTABLE = ["amount", "paymentMethod", "paymentDate", "policyId", "installmentId", "manualCompany", "status", "dueDate"];
-  const hasContableChange = CONTABLE.some(f => f in update);
+  const bodyHasSplits = Array.isArray(body.splits);
+  const hasContableChange = CONTABLE.some(f => f in update) || bodyHasSplits;
   if (current.rendered && hasContableChange) {
     return c.json({ error: "Este pago ya fue rendido. Anulá la rendición primero." }, 409);
   }
@@ -1120,25 +1142,48 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
     update.dueDate = null;
   }
 
-  // Etapa 3A: SIEMPRE debe existir exactamente un split para este payment,
-  // sin importar qué campo se esté editando — si hay cero o más de uno, es
-  // un dato inconsistente y no se inventa ni se corrige solo, se falla.
+  // Etapa 3B: se necesita conocer el desglose actual tanto para decidir si
+  // un edit "legacy" (sin `splits`) es seguro, como para clasificar el grupo
+  // (own/direct_company) cuando ni amount ni paymentMethod cambian.
   const existingSplitsCheck = await db.select({ id: paymentSplits.id, method: paymentSplits.method, amountCents: paymentSplits.amountCents })
     .from(paymentSplits).where(eq(paymentSplits.paymentId, id)).all();
-  if (existingSplitsCheck.length !== 1) {
-    return c.json({
-      error: `El pago tiene ${existingSplitsCheck.length} split(s) — se esperaba exactamente 1 en Etapa 3A. No se puede editar de forma segura.`,
-    }, 409);
-  }
 
-  // Etapa 3A: si cambia amount o paymentMethod, el único split existente debe
-  // actualizarse para seguir sumando exactamente el total — se revalida acá
-  // con el mismo helper que usa POST /payments.
   const effectiveAmount = Number("amount" in update ? update.amount : current.amount);
   const effectivePaymentMethodForSplit = ("paymentMethod" in update ? update.paymentMethod : current.paymentMethod) as string;
   const splitFieldsChanged = ("amount" in update) || ("paymentMethod" in update);
+
   let normalizedSplitUpdate: ReturnType<typeof validateAndNormalizeSplits> | null = null;
-  if (splitFieldsChanged) {
+  let finalSplitGroup: SplitGroup;
+
+  if (bodyHasSplits) {
+    // Reemplazo completo del desglose — se valida entero antes de tocar nada.
+    try {
+      normalizedSplitUpdate = validateAndNormalizeSplits({ paymentAmount: effectiveAmount, splits: body.splits });
+    } catch (e: any) {
+      if (e instanceof SplitValidationError) return c.json({ error: e.message }, 400);
+      throw e;
+    }
+    finalSplitGroup = classifySplitGroup(normalizedSplitUpdate.splits);
+    if (finalSplitGroup === "mixed") {
+      return c.json({ error: "No se pueden combinar medios propios con pagos directos a la compañía en un mismo cobro." }, 400);
+    }
+    // Igual que en POST: con `splits` explícito, el paymentMethod del padre
+    // nunca sale del valor crudo que haya mandado el caller — se deriva.
+    update.paymentMethod = normalizedSplitUpdate.splits.length === 1
+      ? normalizedSplitUpdate.splits[0]!.method
+      : "combinado";
+  } else if (splitFieldsChanged) {
+    // Compatibilidad con clientes que todavía no envían `splits`: solo es
+    // seguro reconstruir un único split si el payment tiene EXACTAMENTE uno
+    // hoy. Si ya es un combinado (o está en un estado 0/2+ inconsistente), no
+    // se puede adivinar cómo redistribuir amount/paymentMethod entre splits
+    // existentes — se rechaza pidiendo el desglose completo, en vez de
+    // corromper silenciosamente un cobro combinado.
+    if (existingSplitsCheck.length !== 1) {
+      return c.json({
+        error: `El pago tiene ${existingSplitsCheck.length} split(s) — para modificar el importe o el método de un cobro combinado debe enviarse el desglose completo (\`splits\`).`,
+      }, 409);
+    }
     try {
       normalizedSplitUpdate = validateAndNormalizeSplits({
         paymentAmount: effectiveAmount,
@@ -1148,6 +1193,11 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
       if (e instanceof SplitValidationError) return c.json({ error: e.message }, 400);
       throw e;
     }
+    finalSplitGroup = classifySplitGroup(normalizedSplitUpdate.splits);
+  } else {
+    // Ni `splits` ni amount/paymentMethod cambian — el grupo se deriva del
+    // desglose actual sin tocarlo (ej. anulación, cambio de notas, etc.).
+    finalSplitGroup = classifySplitGroup(existingSplitsCheck);
   }
 
   // Si cambia installmentId a un valor no nulo, la nueva cuota debe existir y
@@ -1198,15 +1248,18 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
   const existingSurcharge = await db.select().from(cashEntries)
     .where(and(eq(cashEntries.paymentId, id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).get();
 
-  if (body.applyProntoPagoSurcharge === false && existingSurcharge?.rendered) {
-    return c.json({ error: "El recargo ya fue rendido. Anulá la rendición primero." }, 409);
-  }
-
   // Effective values after update (for surcharge sync/creation)
   const effectivePolicyId = ("policyId" in update ? update.policyId : current.policyId) as number | null;
   const effectivePaymentMethod = ("paymentMethod" in update ? update.paymentMethod : current.paymentMethod) as string;
   const effectivePaymentDate = ("paymentDate" in update ? update.paymentDate : current.paymentDate) as string;
   const effectiveStatus = ("status" in update ? update.status : current.status) as string;
+
+  // Un recargo ya rendido no se puede tocar sin anular la rendición primero,
+  // sin importar si la baja viene de applyProntoPagoSurcharge=false o de
+  // anular el payment que lo generó — mismo criterio en ambos casos.
+  if ((body.applyProntoPagoSurcharge === false || effectiveStatus === "anulado") && existingSurcharge?.rendered) {
+    return c.json({ error: "El recargo ya fue rendido. Anulá la rendición primero." }, 409);
+  }
 
   // Resolve company/insured (needed unless we're only deleting the surcharge)
   let resolvedCompany: string | null = null;
@@ -1237,13 +1290,28 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
   const shouldRecalcInstallment = ("installmentId" in update) || ("status" in update) || ("amount" in update);
 
   const [payment] = await db.transaction(async (tx) => {
-    const [p] = await tx.update(payments).set(update).where(eq(payments.id, id)).returning();
+    // `update` puede quedar vacío si el body solo trae applyProntoPagoSurcharge
+    // (sin ningún campo de la tabla payments) — drizzle no acepta un
+    // .set({}) vacío, así que en ese caso no se toca `payments` en absoluto.
+    const [p] = Object.keys(update).length > 0
+      ? await tx.update(payments).set(update).where(eq(payments.id, id)).returning()
+      : [current];
 
-    if (normalizedSplitUpdate) {
+    if (bodyHasSplits && normalizedSplitUpdate) {
+      // Etapa 3B: reemplazo completo del desglose (no diff por id) — se
+      // valida entero antes de la transacción, así que acá solo se aplica.
+      await tx.delete(paymentSplits).where(eq(paymentSplits.paymentId, id));
+      await tx.insert(paymentSplits).values(normalizedSplitUpdate.splits.map((s) => ({
+        paymentId: id, method: s.method, amountCents: s.amountCents, notes: s.notes,
+      })));
+    } else if (normalizedSplitUpdate) {
+      // Compatibilidad legacy (sin `splits`, payment con exactamente 1 split
+      // hoy): se actualiza in-place, no se borra/recrea — conserva el mismo
+      // split.id, igual que en Etapa 3A.
       const existingSplits = await tx.select({ id: paymentSplits.id }).from(paymentSplits)
         .where(eq(paymentSplits.paymentId, id)).all();
       if (existingSplits.length !== 1) {
-        throw new Error(`El pago ${id} tiene ${existingSplits.length} splits — se esperaba exactamente 1 en Etapa 3A.`);
+        throw new Error(`El pago ${id} tiene ${existingSplits.length} splits — se esperaba exactamente 1 para esta ruta de compatibilidad.`);
       }
       const onlySplit = normalizedSplitUpdate.splits[0]!;
       await tx.update(paymentSplits).set({
@@ -1258,14 +1326,26 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
       }
     }
 
-    if (body.applyProntoPagoSurcharge === false) {
+    if (effectiveStatus === "anulado") {
+      // Un pago anulado nunca debe dejar un recargo Pronto Pago activo
+      // colgado (contaría indefinidamente en recargosProntoPago aunque el
+      // cobro que lo originó ya no valga) — se borra sin importar qué mandó
+      // el caller en applyProntoPagoSurcharge. Ya se validó arriba que, si
+      // existe, no está rendido (si lo estuviera, se rechazó con 409 antes
+      // de llegar a la transacción).
+      if (existingSurcharge && !existingSurcharge.rendered) {
+        await tx.delete(cashEntries).where(eq(cashEntries.id, existingSurcharge.id));
+      }
+    } else if (body.applyProntoPagoSurcharge === false) {
       if (existingSurcharge) {
         await tx.delete(cashEntries).where(eq(cashEntries.id, existingSurcharge.id));
       }
     } else if (body.applyProntoPagoSurcharge === true) {
+      // Etapa 3B: calificación por grupo de splits (finalSplitGroup), no por
+      // effectivePaymentMethod — que puede valer "combinado" y no representa
+      // ningún método real. finalSplitGroup ya está garantizado no-mixed.
       const isRivadavia = resolvedCompany?.toLowerCase().includes("rivadavia") ?? false;
-      const isOwnMethod = (SURCHARGE_OWN_METHODS as readonly string[]).includes(effectivePaymentMethod);
-      if (isRivadavia && isOwnMethod && effectiveStatus !== "anulado") {
+      if (isRivadavia && finalSplitGroup === "own" && effectiveStatus !== "anulado") {
         if (!existingSurcharge) {
           await tx.insert(cashEntries).values({
             clientName: resolvedClient ?? "—",
@@ -1334,11 +1414,36 @@ app.delete("/payments/:id", requireAuth(async (c: any) => {
 app.get("/payments/stats", requireAuth(async (c: any) => {
   const all = await db.select({ payment: payments }).from(payments).all();
   const confirmed = all.filter((r) => r.payment.status === "confirmado");
+  // Total general: una sola vez por payment, desde el padre — no se duplica
+  // ni se recalcula desde splits (evita error de redondeo centavo a centavo
+  // acumulado sobre montos en pesos).
   const total = confirmed.reduce((s, r) => s + r.payment.amount, 0);
+
+  // Etapa 3B: byMethod se arma sumando payment_splits.amount_cents, NUNCA
+  // payments.amount — payments.paymentMethod puede valer "combinado" (no es
+  // un método real), y sumar por ahí perdería el importe de cada método real
+  // dentro de un cobro combinado (ver diagnóstico de Etapa 3B, sección 4).
+  const confirmedIds = confirmed.map((r) => r.payment.id);
   const byMethod: Record<string, number> = {};
-  for (const r of confirmed) {
-    byMethod[r.payment.paymentMethod] = (byMethod[r.payment.paymentMethod] || 0) + r.payment.amount;
+  let combinadoCount = 0;
+  if (confirmedIds.length > 0) {
+    const splitRows = await db.select({
+      paymentId: paymentSplits.paymentId, method: paymentSplits.method, amountCents: paymentSplits.amountCents,
+    }).from(paymentSplits).where(inArray(paymentSplits.paymentId, confirmedIds)).all();
+    const splitsCountByPayment = new Map<number, number>();
+    for (const s of splitRows) {
+      byMethod[s.method] = (byMethod[s.method] || 0) + s.amountCents / 100;
+      splitsCountByPayment.set(s.paymentId, (splitsCountByPayment.get(s.paymentId) ?? 0) + 1);
+    }
+    for (const splitCount of splitsCountByPayment.values()) {
+      if (splitCount > 1) combinadoCount++;
+    }
   }
+  // Conteo puramente visual (cuántos payments confirmados son combinados) —
+  // nunca un importe, para no confundirlo con un método real al sumar todo
+  // byMethod.* como si fueran plata.
+  byMethod.combinadoCount = combinadoCount;
+
   const byMonth: Record<string, number> = {};
   for (const r of confirmed) {
     const month = r.payment.paymentDate.substring(0, 7);
@@ -4273,6 +4378,20 @@ app.patch("/cash/payments/:id/render", requireAdmin(async (c: any) => {
 
 // GET /api/cash/payments/transferencias — cobros por transferencia_compania con estado de rendición
 app.get("/cash/payments/transferencias", requireAdmin(async (c: any) => {
+  // Etapa 3B: incluye un payment si tiene AL MENOS un split transferencia_compania
+  // (no solo si payments.paymentMethod === "transferencia_compania", que deja
+  // afuera a un combinado direct_company, ej. transferencia_compania + link_pago).
+  const splitRows = await db.select({
+    paymentId: paymentSplits.paymentId, amountCents: paymentSplits.amountCents,
+  }).from(paymentSplits).where(eq(paymentSplits.method, "transferencia_compania")).all();
+  if (splitRows.length === 0) return c.json([]);
+
+  const portionCentsByPaymentId = new Map<number, number>();
+  for (const s of splitRows) {
+    portionCentsByPaymentId.set(s.paymentId, (portionCentsByPaymentId.get(s.paymentId) ?? 0) + s.amountCents);
+  }
+  const paymentIds = [...portionCentsByPaymentId.keys()];
+
   const rows = await db
     .select({
       id: payments.id,
@@ -4296,10 +4415,19 @@ app.get("/cash/payments/transferencias", requireAdmin(async (c: any) => {
     .leftJoin(policies, eq(payments.policyId, policies.id))
     .leftJoin(insureds, eq(policies.insuredId, insureds.id))
     .leftJoin(companies, eq(policies.companyId, companies.id))
-    .where(eq(payments.paymentMethod, "transferencia_compania"))
+    .where(inArray(payments.id, paymentIds))
     .orderBy(desc(payments.paymentDate))
     .all();
-  return c.json(rows);
+
+  // Ampliación aditiva: `amount` sigue siendo el total del payment
+  // (compatibilidad con consumidores existentes, y coincide con la porción
+  // en el caso de un solo split); `transferenciaCompaniaAmount` es la
+  // porción real de ESTE método — nunca se presenta el total completo del
+  // payment como si fuera todo transferencia_compania.
+  return c.json(rows.map((r) => ({
+    ...r,
+    transferenciaCompaniaAmount: (portionCentsByPaymentId.get(r.id) ?? 0) / 100,
+  })));
 }));
 
 // GET /api/cash/debts — listar adeudados
@@ -4539,6 +4667,29 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   const paymentsInCartera = allPayments.filter((p: any) => !p.rendered);
   const paymentsRendered = allPayments.filter((p: any) => p.rendered);
 
+  // Etapa 3B: los buckets por método real (efectivo/transferencia/cheque/
+  // transferencia_compania/link_pago) deben armarse sumando payment_splits,
+  // nunca payments.paymentMethod — que puede valer "combinado" y no
+  // representa ningún método real. También se usa para clasificar el grupo
+  // (own/direct_company) de cada payment por sus splits reales, en vez de
+  // comparar payments.paymentMethod contra la lista de métodos directos.
+  const allPaymentIdsForSplits = allPayments.map((p: any) => p.id as number);
+  const splitsByPaymentId = new Map<number, { method: string; amountCents: number }[]>();
+  if (allPaymentIdsForSplits.length > 0) {
+    const splitRowsForCash = await db.select({
+      paymentId: paymentSplits.paymentId, method: paymentSplits.method, amountCents: paymentSplits.amountCents,
+    }).from(paymentSplits).where(inArray(paymentSplits.paymentId, allPaymentIdsForSplits)).all();
+    for (const s of splitRowsForCash) {
+      const arr = splitsByPaymentId.get(s.paymentId) ?? [];
+      arr.push({ method: s.method, amountCents: s.amountCents });
+      splitsByPaymentId.set(s.paymentId, arr);
+    }
+  }
+  const paymentGroupById = new Map<number, SplitGroup>();
+  for (const [pid, splits] of splitsByPaymentId) {
+    paymentGroupById.set(pid, classifySplitGroup(splits));
+  }
+
   // Adeudados de rendiciones (cuotas rendidas pero asegurado aún no pagó)
   const remittanceDebtItems = await db.select({
     id: remittanceItems.id,
@@ -4571,25 +4722,48 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   // Métodos que van directo a la compañía (NO a cuentas propias)
   const DIRECTO_COMPANIA = ["transferencia_compania", "link_pago"];
 
-  // Cobrado en cartera propia (sin rendir aún)
-  const cartera = { efectivo: 0, transferencia: 0, cheque: 0, total: 0 };
+  // Cobrado en cartera propia (sin rendir aún). recargosProntoPago es una
+  // categoría separada — el recargo fijo de $800 no es plata cobrada en
+  // efectivo/transferencia/cheque, es un cargo administrativo aparte. Nunca
+  // se le atribuye a un método (ni el primero, ni el de mayor importe, ni
+  // proporcional) — ver decisión de negocio explícita.
+  const cartera = { efectivo: 0, transferencia: 0, cheque: 0, recargosProntoPago: 0, total: 0 };
   // Cobrado directo a la compañía (transf. compañía + links de pago)
   const directoCompania = { transferencia_compania: 0, link_pago: 0, total: 0 };
 
   for (const p of paymentsInCartera) {
-    const m = p.paymentMethod as string;
-    if (DIRECTO_COMPANIA.includes(m)) {
-      if (m === "transferencia_compania") directoCompania.transferencia_compania += p.amount;
-      else if (m === "link_pago") directoCompania.link_pago += p.amount;
+    // El grupo se decide por los splits reales (garantizado no-mixed desde
+    // POST/PUT); el total de cada grupo suma payment.amount UNA sola vez por
+    // payment (no la suma de sus splits), para no depender de precisión
+    // acumulada de centavos ni duplicar nada.
+    const group = paymentGroupById.get(p.id);
+    const splits = splitsByPaymentId.get(p.id) ?? [];
+    if (group === "direct_company") {
       directoCompania.total += p.amount;
+      for (const s of splits) {
+        if (s.method === "transferencia_compania") directoCompania.transferencia_compania += s.amountCents / 100;
+        else if (s.method === "link_pago") directoCompania.link_pago += s.amountCents / 100;
+      }
     } else {
-      if (m === "efectivo") cartera.efectivo += p.amount;
-      else if (m === "transferencia") cartera.transferencia += p.amount;
-      else if (m === "cheque") cartera.cheque += p.amount;
       cartera.total += p.amount;
+      for (const s of splits) {
+        if (s.method === "efectivo") cartera.efectivo += s.amountCents / 100;
+        else if (s.method === "transferencia") cartera.transferencia += s.amountCents / 100;
+        else if (s.method === "cheque") cartera.cheque += s.amountCents / 100;
+      }
     }
   }
   for (const e of manualInCartera) {
+    // El recargo Pronto Pago se identifica por entryType, NUNCA por
+    // paymentMethod (que puede valer "combinado" si el payment que lo generó
+    // tiene 2+ splits propios — cashEntries no tiene su propio desglose por
+    // splits). Va a su propia categoría dentro de cartera, no a
+    // efectivo/transferencia/cheque.
+    if (e.entryType === "pronto_pago_surcharge") {
+      cartera.recargosProntoPago += e.amount;
+      cartera.total += e.amount;
+      continue;
+    }
     const m = e.paymentMethod as string;
     if (DIRECTO_COMPANIA.includes(m)) {
       if (m === "transferencia_compania") directoCompania.transferencia_compania += e.amount;
@@ -4678,6 +4852,7 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   const cajaEfectivo = cartera.efectivo;
   const cajaTransferencia = cartera.transferencia;
   const cajaCheque = cartera.cheque;
+  const cajaRecargosProntoPago = cartera.recargosProntoPago;
   const cajaNeta = cartera.total; // Pendiente de rendir actual
 
   // Diferencia = caja neta - adeudados - gastos (campo conservado sin cambios)
@@ -4696,10 +4871,14 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   if (periodFrom && periodTo) {
     const DIRECTO_COMPANIA_LOCAL = ["transferencia_compania", "link_pago"];
 
-    // Payments confirmados, métodos propios, dentro del período
+    // Payments confirmados, grupo propio, dentro del período. Se clasifica
+    // por los splits reales (paymentGroupById), no por payments.paymentMethod
+    // — un combinado "combinado" con splits direct_company no matchea contra
+    // DIRECTO_COMPANIA_LOCAL por string y quedaría mal incluido acá si se
+    // comparara el paymentMethod crudo.
     const periodPayments = allPayments.filter((p: any) =>
       p.status === "confirmado" &&
-      !DIRECTO_COMPANIA_LOCAL.includes(p.paymentMethod as string) &&
+      paymentGroupById.get(p.id) !== "direct_company" &&
       p.paymentDate >= periodFrom! && p.paymentDate <= periodTo!
     );
 
@@ -4740,6 +4919,7 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
       efectivo: Math.max(0, cajaEfectivo),
       transferencia: Math.max(0, cajaTransferencia),
       cheque: Math.max(0, cajaCheque),
+      recargosProntoPago: Math.max(0, cajaRecargosProntoPago),
       total: cajaNeta,
     },
     rendidoPorMetodo,
@@ -5159,28 +5339,51 @@ app.get("/remittances/pending", requireAuth(async (c: any) => {
 
   const pendingPaymentIds = pendingPayments.map((p: any) => p.id as number);
   const surchargePmtSet = new Set<number>();
+  // Etapa 3B: se expone el desglose de splits y su grupo (own/direct_company)
+  // de forma aditiva — paymentMethod puede seguir siendo "combinado" (útil
+  // para listados legacy), pero el modal de rendición necesita esto para
+  // clasificar correctamente propios vs. directo a compañía sin adivinar a
+  // partir de un string resumen que no representa ningún método real.
+  const splitsByPaymentId = new Map<number, { method: string; amountCents: number; notes: string | null }[]>();
   if (pendingPaymentIds.length > 0) {
     const sRows = await db.select({ paymentId: cashEntries.paymentId })
       .from(cashEntries)
       .where(and(inArray(cashEntries.paymentId, pendingPaymentIds), eq(cashEntries.entryType, "pronto_pago_surcharge"), eq(cashEntries.rendered, 0)))
       .all();
     for (const s of sRows) { if (s.paymentId != null) surchargePmtSet.add(s.paymentId); }
+
+    const splitRows = await db.select({
+      paymentId: paymentSplits.paymentId, method: paymentSplits.method,
+      amountCents: paymentSplits.amountCents, notes: paymentSplits.notes,
+    }).from(paymentSplits).where(inArray(paymentSplits.paymentId, pendingPaymentIds))
+      .orderBy(asc(paymentSplits.id)).all();
+    for (const s of splitRows) {
+      const arr = splitsByPaymentId.get(s.paymentId) ?? [];
+      arr.push({ method: s.method, amountCents: s.amountCents, notes: s.notes });
+      splitsByPaymentId.set(s.paymentId, arr);
+    }
   }
 
   const result = [
-    ...pendingPayments.map((p: any) => ({
-      source: "payment" as const,
-      sourceId: p.id,
-      amount: p.amount,
-      paymentMethod: p.paymentMethod,
-      paymentDate: p.paymentDate,
-      dueDate: (p.installmentDueDate as string | null) ?? (p.paymentDueDate as string | null) ?? null,
-      clientName: p.insuredName || p.manualPayer || "—",
-      policyNumber: p.policyNumber || p.manualPolicyNumber || "—",
-      companyName: p.companyName || p.manualCompany || "—",
-      notes: p.notes,
-      hasSurcharge: surchargePmtSet.has(p.id),
-    })),
+    ...pendingPayments.map((p: any) => {
+      const splits = splitsByPaymentId.get(p.id) ?? [];
+      const paymentGroup: SplitGroup | null = splits.length > 0 ? classifySplitGroup(splits) : null;
+      return {
+        source: "payment" as const,
+        sourceId: p.id,
+        amount: p.amount,
+        paymentMethod: p.paymentMethod,
+        paymentDate: p.paymentDate,
+        dueDate: (p.installmentDueDate as string | null) ?? (p.paymentDueDate as string | null) ?? null,
+        clientName: p.insuredName || p.manualPayer || "—",
+        policyNumber: p.policyNumber || p.manualPolicyNumber || "—",
+        companyName: p.companyName || p.manualCompany || "—",
+        notes: p.notes,
+        hasSurcharge: surchargePmtSet.has(p.id),
+        splits,
+        paymentGroup,
+      };
+    }),
     ...pendingEntries.map((e: any) => ({
       source: "cash_entry" as const,
       sourceId: e.id,
@@ -5193,6 +5396,8 @@ app.get("/remittances/pending", requireAuth(async (c: any) => {
       companyName: e.companyName || "—",
       notes: e.notes,
       entryType: e.entryType,
+      splits: null as null,
+      paymentGroup: (isDirectCompanyPaymentMethod(e.paymentMethod as string) ? "direct_company" : "own") as SplitGroup,
     })),
   ].sort((a, b) => b.paymentDate.localeCompare(a.paymentDate));
 

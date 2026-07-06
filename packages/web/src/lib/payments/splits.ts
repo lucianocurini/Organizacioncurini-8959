@@ -23,6 +23,45 @@ export function isAllowedPaymentMethod(method: string): boolean {
   return ALLOWED_METHODS.has(method);
 }
 
+// Etapa 3B — grupos de medios para la regla "no mezclar propio con directo a
+// compañía en el mismo cobro". Fuente única de verdad: si mañana cambia qué
+// método pertenece a qué grupo, se edita acá y no en cada consumidor.
+export const OWN_METHODS: ReadonlySet<string> = new Set(["efectivo", "transferencia", "cheque"]);
+export const DIRECT_COMPANY_METHODS: ReadonlySet<string> = new Set(["transferencia_compania", "link_pago"]);
+
+export function isOwnPaymentMethod(method: string): boolean {
+  return OWN_METHODS.has(method);
+}
+
+export function isDirectCompanyPaymentMethod(method: string): boolean {
+  return DIRECT_COMPANY_METHODS.has(method);
+}
+
+export type SplitGroup = "own" | "direct_company" | "mixed";
+
+/**
+ * Clasifica un conjunto de splits YA VALIDADOS (métodos permitidos) según a
+ * qué grupo pertenecen todos sus métodos. Métodos repetidos no afectan el
+ * resultado. No muta `splits`. No valida nada más (importes, suma, etc.) —
+ * eso es responsabilidad de validateAndNormalizeSplits, que debe correr
+ * antes. Un método fuera de ambos grupos (no debería pasar si ya se validó
+ * contra ALLOWED_METHODS) se trata como si rompiera la homogeneidad, igual
+ * que un mixed real — no se asume "own" por defecto.
+ */
+export function classifySplitGroup(splits: ReadonlyArray<{ method: string }>): SplitGroup {
+  let sawOwn = false;
+  let sawDirectCompany = false;
+  let sawOther = false;
+  for (const s of splits) {
+    if (OWN_METHODS.has(s.method)) sawOwn = true;
+    else if (DIRECT_COMPANY_METHODS.has(s.method)) sawDirectCompany = true;
+    else sawOther = true;
+  }
+  if (sawOther || (sawOwn && sawDirectCompany)) return "mixed";
+  if (sawDirectCompany) return "direct_company";
+  return "own";
+}
+
 export interface SplitInput {
   method: string;
   amount: number;
