@@ -52,7 +52,7 @@ export function Sidebar({ mobileOpen = false, onClose }: { mobileOpen?: boolean;
 
       <aside
         className={cn(
-          "w-[240px] flex flex-col border-r border-[#1f2937] bg-[#0d1424]",
+          "w-[216px] flex flex-col border-r border-[#1f2937] bg-[#0d1424]",
           // Desktop: fijo dentro del flujo
           "lg:relative lg:translate-x-0 lg:min-h-screen lg:z-auto",
           // Mobile: drawer fijo deslizable

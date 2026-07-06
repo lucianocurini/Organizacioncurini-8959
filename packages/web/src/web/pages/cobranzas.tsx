@@ -585,6 +585,8 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
 function PaymentMethodBadge({ splits, paymentMethod, compact = false }: {
   splits: { method: string; amountCents: number }[]; paymentMethod: string; compact?: boolean;
 }) {
+  // Solo el badge — nunca el resumen de splits acá (eso ensanchaba la tabla,
+  // ver SplitsDetailPanel + el chevron de expansión que lo reemplaza).
   if (!splits || splits.length <= 1) {
     const method = splits?.[0]?.method ?? paymentMethod;
     return (
@@ -594,16 +596,49 @@ function PaymentMethodBadge({ splits, paymentMethod, compact = false }: {
       </span>
     );
   }
-  const grouped = groupSplitsByMethod(splits);
-  const summary = grouped.map(g => `${METHOD_LABELS[g.method] || g.method} ${formatCurrency(g.amountCents / 100)}`).join(" · ");
   return (
-    <div className="flex flex-col gap-0.5 min-w-0">
-      <span className="px-2 py-0.5 rounded border bg-indigo-500/20 text-indigo-300 border-indigo-500/30 w-fit">
-        Combinado
-      </span>
-      <span className="text-[10px] text-gray-500 truncate max-w-[220px]" title={summary}>
-        {summary}
-      </span>
+    <span className={cn(compact ? "px-2 py-0.5 rounded border" : "px-2 py-0.5 rounded text-xs border",
+      "bg-indigo-500/20 text-indigo-300 border-indigo-500/30")}>
+      Combinado
+    </span>
+  );
+}
+
+// Botón de expansión para un payment con 2+ splits — la fila/card arranca
+// cerrada; al abrirla se muestra SplitsDetailPanel debajo, ocupando el ancho
+// disponible en vez de ensanchar la columna de Método.
+function SplitsExpandToggle({ expanded, onToggle }: { expanded: boolean; onToggle: () => void }) {
+  return (
+    <button type="button" onClick={onToggle}
+      aria-label={expanded ? "Ocultar desglose de medios de pago" : "Ver desglose de medios de pago"}
+      aria-expanded={expanded}
+      className="text-gray-400 hover:text-white transition-colors shrink-0">
+      <ChevronDown className={cn("w-3.5 h-3.5 transition-transform", expanded && "rotate-180")} />
+    </button>
+  );
+}
+
+// Detalle expandido de un pago combinado: método + importe agrupado (métodos
+// repetidos se suman) + total distribuido. Es puramente de lectura sobre
+// payment.splits ya cargado — no dispara ningún cálculo ni cambia el payload
+// de edición.
+function SplitsDetailPanel({ splits }: { splits: { method: string; amountCents: number }[] }) {
+  const grouped = groupSplitsByMethod(splits);
+  const totalCents = grouped.reduce((s, g) => s + g.amountCents, 0);
+  return (
+    <div className="rounded-lg border border-[#2d3748] bg-[#0a0f1e] p-3 space-y-1.5 max-w-sm">
+      {grouped.map(g => (
+        <div key={g.method} className="flex items-center justify-between gap-3 text-xs">
+          <span className={cn("px-1.5 py-0.5 rounded border shrink-0", METHOD_COLORS[g.method] || "text-gray-400 border-gray-500/30")}>
+            {METHOD_LABELS[g.method] || g.method}
+          </span>
+          <span className="text-gray-300">{formatCurrency(g.amountCents / 100)}</span>
+        </div>
+      ))}
+      <div className="flex items-center justify-between gap-3 text-xs pt-1.5 border-t border-[#1f2937]">
+        <span className="text-gray-500">Total distribuido</span>
+        <span className="text-white font-medium">{formatCurrency(totalCents / 100)}</span>
+      </div>
     </div>
   );
 }
@@ -617,6 +652,16 @@ function CobranzasTab() {
   const [filterMethod, setFilterMethod] = useState("");
   const [filterVista, setFilterVista] = useState<"pendiente_rendir" | "rendidos" | "anulados" | "todos">("pendiente_rendir");
   const [search, setSearch] = useState("");
+  // Desglose de splits: cerrado por defecto, uno por payment.id — solo UI,
+  // no afecta payload ni cálculos.
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
+  function toggleExpanded(id: number) {
+    setExpandedIds(prev => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id); else n.add(id);
+      return n;
+    });
+  }
 
   async function load() {
     setLoading(true);
@@ -832,10 +877,19 @@ function CobranzasTab() {
                     </div>
                     <div className="flex items-center gap-2 flex-wrap text-xs">
                       <PaymentMethodBadge splits={r.payment.splits} paymentMethod={r.payment.paymentMethod} compact />
+                      {r.payment.splits.length > 1 && (
+                        <SplitsExpandToggle
+                          expanded={expandedIds.has(r.payment.id)}
+                          onToggle={() => toggleExpanded(r.payment.id)}
+                        />
+                      )}
                       <span className={cn("px-2 py-0.5 rounded border", STATUS_COLORS[r.payment.status] || "text-gray-400 border-gray-500/30")}>
                         {r.payment.status.charAt(0).toUpperCase() + r.payment.status.slice(1)}
                       </span>
                     </div>
+                    {r.payment.splits.length > 1 && expandedIds.has(r.payment.id) && (
+                      <SplitsDetailPanel splits={r.payment.splits} />
+                    )}
                     <div className="flex items-center gap-4 text-xs text-gray-400">
                       <span>Cobrado: {new Date(r.payment.paymentDate + "T12:00:00").toLocaleDateString("es-AR")}</span>
                       {r.payment.periodMonth && (
@@ -872,8 +926,8 @@ function CobranzasTab() {
                     <th className="text-right px-3 py-3 font-medium">Importe</th>
                     <th className="text-left px-3 py-3 font-medium">Cobrado</th>
                     <th className="text-left px-3 py-3 font-medium">Vencimiento</th>
-                    <th className="text-left px-3 py-3 font-medium">Estado</th>
-                    <th className="text-left px-3 py-3 font-medium">Notas</th>
+                    <th className="text-left px-2 py-3 font-medium">Estado</th>
+                    <th className="text-left px-2 py-3 font-medium">Notas</th>
                     <th className="px-5 py-3" />
                   </tr>
                 </thead>
@@ -882,8 +936,10 @@ function CobranzasTab() {
                     const isManual = r.payment.policyId == null;
                     const displayPolicyNum = r.policy?.policyNumber || r.payment.manualPolicyNumber || "—";
                     const displayInsured = r.insured?.name || r.payment.manualPayer || "—";
+                    const isExpanded = r.payment.splits.length > 1 && expandedIds.has(r.payment.id);
                     return (
-                      <tr key={r.payment.id} className="border-b border-[#1f2937] hover:bg-[#1a2540]/30 transition-colors">
+                      <React.Fragment key={r.payment.id}>
+                      <tr className="border-b border-[#1f2937] hover:bg-[#1a2540]/30 transition-colors">
                         <td className="px-5 py-3">
                           <div className="flex items-center gap-2">
                             <div>
@@ -903,7 +959,15 @@ function CobranzasTab() {
                             : "—"}
                         </td>
                         <td className="px-3 py-3">
-                          <PaymentMethodBadge splits={r.payment.splits} paymentMethod={r.payment.paymentMethod} />
+                          <div className="flex items-center gap-1.5">
+                            <PaymentMethodBadge splits={r.payment.splits} paymentMethod={r.payment.paymentMethod} />
+                            {r.payment.splits.length > 1 && (
+                              <SplitsExpandToggle
+                                expanded={expandedIds.has(r.payment.id)}
+                                onToggle={() => toggleExpanded(r.payment.id)}
+                              />
+                            )}
+                          </div>
                         </td>
                         <td className="px-3 py-3 text-right text-white font-semibold">{formatCurrency(r.payment.amount)}</td>
                         <td className="px-3 py-3 text-gray-300 text-xs">
@@ -912,12 +976,12 @@ function CobranzasTab() {
                         <td className="px-3 py-3">
                           <DueDateBadge dueDate={r.payment.dueDate} showNull />
                         </td>
-                        <td className="px-3 py-3">
+                        <td className="px-2 py-3">
                           <span className={cn("px-2 py-0.5 rounded text-xs border", STATUS_COLORS[r.payment.status] || "text-gray-400 border-gray-500/30")}>
                             {r.payment.status.charAt(0).toUpperCase() + r.payment.status.slice(1)}
                           </span>
                         </td>
-                        <td className="px-3 py-3 text-gray-400 text-xs max-w-[140px] truncate">{r.payment.notes || "—"}</td>
+                        <td className="px-2 py-3 text-gray-400 text-xs max-w-[90px] truncate">{r.payment.notes || "—"}</td>
                         <td className="px-5 py-3">
                           <div className="flex items-center gap-2 justify-end">
                             <button onClick={() => { setEditing(r); setModalOpen(true); }}
@@ -931,6 +995,14 @@ function CobranzasTab() {
                           </div>
                         </td>
                       </tr>
+                      {isExpanded && (
+                        <tr className="border-b border-[#1f2937] bg-[#0a0f1e]/40">
+                          <td colSpan={9} className="px-5 py-3">
+                            <SplitsDetailPanel splits={r.payment.splits} />
+                          </td>
+                        </tr>
+                      )}
+                      </React.Fragment>
                     );
                   })}
                 </tbody>
