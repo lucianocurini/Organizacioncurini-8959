@@ -114,16 +114,31 @@ export const payments = sqliteTable("payments", {
   dueDate: text("due_date"),
   createdBy: integer("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  // Etapa 4A: NULL para todo payment standalone (histórico o nuevo — sin
+  // cambio de significado). Con valor: este payment es un HIJO de un cobro
+  // múltiple (payment_batches) — sigue representando exactamente una cuota
+  // (installmentId/policyId/amount sin cambios de semántica), pero sus
+  // medios reales NO viven acá — ver comentario de paymentSplits más abajo.
+  batchId: integer("batch_id").references(() => paymentBatches.id),
 });
 
-// Etapa 3A: desglose por medio de pago de un mismo payment. Todo payment,
-// incluso de un solo medio, tiene siempre al menos una fila acá (ver
-// migración 0019 y src/lib/migrations/apply-0019-payment-splits.ts).
+// Etapa 3A: desglose por medio de pago de un mismo payment. Todo payment
+// STANDALONE (batchId IS NULL), incluso de un solo medio, tiene siempre al
+// menos una fila acá (ver migración 0019 y
+// src/lib/migrations/apply-0019-payment-splits.ts).
 // payments.amount/paymentMethod NO cambian de significado — siguen siendo el
 // total y el método resumen; esta tabla es información aditiva.
 // CHECK amount_cents > 0 y el índice por payment_id se declaran en la
 // migración 0019 (este proyecto no usa los helpers index()/check() de
 // Drizzle — ver 0015_caja_propia.sql y 0017_installments_rebilling_id.sql).
+//
+// Etapa 4A — EXCEPCIÓN EXPLÍCITA a "todo payment tiene ≥1 split": un payment
+// HIJO de un batch (payments.batchId NOT NULL) NO tiene ninguna fila acá.
+// Sus medios reales viven una sola vez en payment_batch_splits del batch
+// padre (nunca repartidos artificialmente entre las cuotas que cubre) — ver
+// paymentBatches/paymentBatchSplits más abajo y src/lib/payments/batches.ts.
+// El invariante "≥1 split" sigue vigente sin excepción para todo payment con
+// batchId IS NULL.
 export const paymentSplits = sqliteTable("payment_splits", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   paymentId: integer("payment_id").notNull().references(() => payments.id),
@@ -131,6 +146,86 @@ export const paymentSplits = sqliteTable("payment_splits", {
   amountCents: integer("amount_cents").notNull(),
   notes: text("notes"),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
+// Etapa 4A: encabezado de un cobro que imputa varias cuotas del mismo
+// asegurado (ej. un cheque/resumen que paga varias cuotas juntas). payments
+// sigue representando una cuota individual (ver payments.batchId arriba) —
+// este es el "recibo" real que las agrupa.
+//
+// baseAmountCents      = SUM(payments.amount) de sus hijos.
+// surchargeAmountCents = recargos Pronto Pago aplicables ($800 por cuota
+//                        Rivadavia elegible — nunca por recibo ni por
+//                        póliza — ver src/lib/payments/batches.ts).
+// totalReceivedCents   = baseAmountCents + surchargeAmountCents, y debe
+//                        coincidir exactamente con SUM(paymentBatchSplits).
+// CHECKs (base>0, surcharge>=0, total>0, status enum) e índices se declaran
+// en la migración 0020 (mismo estilo SQL crudo que el resto del proyecto).
+export const paymentBatches = sqliteTable("payment_batches", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  insuredId: integer("insured_id").notNull().references(() => insureds.id),
+  baseAmountCents: integer("base_amount_cents").notNull(),
+  surchargeAmountCents: integer("surcharge_amount_cents").notNull().default(0),
+  totalReceivedCents: integer("total_received_cents").notNull(),
+  paymentDate: text("payment_date").notNull(),
+  status: text("status").notNull().default("confirmado"), // confirmado | anulado
+  notes: text("notes"),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
+// Etapa 4A: medios reales de un payment_batches — una sola vez por medio,
+// nunca repartidos entre las cuotas que el batch cubre (ver comentario de
+// paymentSplits más arriba). method NUNCA es "lote" ni "combinado" (esos son
+// valores de resumen del payment padre/hijo, no medios reales) — mismo
+// vocabulario real que ya usa payment_splits.method. CHECK de método/importe
+// e índices se declaran en la migración 0021.
+export const paymentBatchSplits = sqliteTable("payment_batch_splits", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  batchId: integer("batch_id").notNull().references(() => paymentBatches.id),
+  method: text("method").notNull(),
+  amountCents: integer("amount_cents").notNull(),
+  notes: text("notes"),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
+// Etapa 4B: cheques físicos concretos que componen un payment_batch_splits
+// con method='cheque'. Un split cheque puede estar compuesto por uno o varios
+// received_checks — nunca al revés, y un cheque NUNCA apunta directamente a
+// un payment hijo ni a una cuota (esa relación es siempre indirecta, a
+// través del batch_split -> batch -> payments hijos). SUM(amountCents) de los
+// received_checks de un batchSplitId debe ser exactamente el amountCents de
+// ese payment_batch_splits (ver migración 0022 y
+// src/lib/payments/received-checks.ts).
+//
+// status: en_cartera -> entregado_compania -> cobrado | rechazado
+// (terminales); anulado solo alcanzable desde en_cartera. Deliberadamente sin
+// estado "depositado" en esta etapa. Transiciones válidas se validan en
+// src/lib/payments/received-checks.ts (validateCheckStatusTransition), no acá
+// — el CHECK de la migración 0022 solo restringe el vocabulario posible.
+export const receivedChecks = sqliteTable("received_checks", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  batchSplitId: integer("batch_split_id").notNull().references(() => paymentBatchSplits.id),
+  checkNumber: text("check_number").notNull(),
+  bankName: text("bank_name").notNull(),
+  bankCode: text("bank_code"),
+  drawerName: text("drawer_name"),
+  drawerDocument: text("drawer_document"),
+  issueDate: text("issue_date"),
+  dueDate: text("due_date").notNull(),
+  amountCents: integer("amount_cents").notNull(),
+  currency: text("currency").notNull().default("ARS"),
+  status: text("status").notNull().default("en_cartera"),
+  notes: text("notes"),
+  receivedAt: integer("received_at", { mode: "timestamp" }).notNull(),
+  deliveredAt: integer("delivered_at", { mode: "timestamp" }),
+  clearedAt: integer("cleared_at", { mode: "timestamp" }),
+  rejectedAt: integer("rejected_at", { mode: "timestamp" }),
+  cancelledAt: integer("cancelled_at", { mode: "timestamp" }),
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
 });
 
 export const deliveries = sqliteTable("deliveries", {

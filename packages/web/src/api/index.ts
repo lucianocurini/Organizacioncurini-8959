@@ -9,6 +9,9 @@ import {
   sessions,
   payments,
   paymentSplits,
+  paymentBatches,
+  paymentBatchSplits,
+  receivedChecks,
   deliveries,
   rebillings,
   claims,
@@ -44,6 +47,16 @@ import {
   appendCancellationNote, isInstallmentNonCollectible, PolicyCancellationValidationError, PolicyAlreadyCancelledError,
   type InstallmentForCancellation,
 } from "../lib/policies/cancellation";
+import {
+  normalizeBatchItems, normalizeBatchSplits, validateSameInsured, validateInstallmentsEligibility,
+  calculateBaseAmountCents, resolveBatchSplitGroup, calculateApplicableRivadaviaSurcharges,
+  calculateBatchTotals, validateBatchTotals, PaymentBatchValidationError,
+  SURCHARGE_AMOUNT_CENTS, type BatchInstallmentContext, type NormalizedPaymentBatchSplit,
+} from "../lib/payments/batches";
+import {
+  normalizeReceivedCheck, validateChecksMatchSplit, findPossibleCheckDuplicates,
+  ReceivedCheckValidationError, type NormalizedReceivedCheck,
+} from "../lib/payments/received-checks";
 
 const app = new Hono().basePath("/api");
 
@@ -1333,6 +1346,19 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
   const CONTABLE = ["amount", "paymentMethod", "paymentDate", "policyId", "installmentId", "manualCompany", "status", "dueDate"];
   const bodyHasSplits = Array.isArray(body.splits);
   const hasContableChange = CONTABLE.some(f => f in update) || bodyHasSplits;
+
+  // Etapa 4A: un hijo de un cobro múltiple (payment_batches) no se edita como
+  // si fuera un payment standalone — sus medios reales viven en
+  // payment_batch_splits del batch, no en payment_splits propios, y su
+  // amount/installmentId no se pueden tocar sin dejar baseAmountCents /
+  // totalReceivedCents del batch inconsistentes. Cualquier corrección
+  // monetaria o de cuota debe hacerse administrando el batch completo (no
+  // implementado todavía en 4A — ver src/lib/payments/batches.ts). Las notas
+  // sí se pueden editar sin restricción.
+  if (current.batchId != null && hasContableChange) {
+    return c.json({ error: "Este pago pertenece a un cobro múltiple y debe administrarse desde el cobro completo." }, 409);
+  }
+
   if (current.rendered && hasContableChange) {
     return c.json({ error: "Este pago ya fue rendido. Anulá la rendición primero." }, 409);
   }
@@ -1598,9 +1624,14 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
 
 app.delete("/payments/:id", requireAuth(async (c: any) => {
   const id = Number(c.req.param("id"));
-  const current = await db.select({ id: payments.id, rendered: payments.rendered, installmentId: payments.installmentId })
+  const current = await db.select({ id: payments.id, rendered: payments.rendered, installmentId: payments.installmentId, batchId: payments.batchId })
     .from(payments).where(eq(payments.id, id)).get();
   if (!current) return c.json({ error: "Pago no encontrado" }, 404);
+  // Etapa 4A: no se borra un hijo de batch por separado — ver mismo criterio
+  // en PUT /payments/:id.
+  if (current.batchId != null) {
+    return c.json({ error: "Este pago pertenece a un cobro múltiple y debe administrarse desde el cobro completo." }, 409);
+  }
   if (current.rendered) return c.json({ error: "Este pago ya fue rendido. Anulá la rendición primero." }, 409);
   await db.transaction(async (tx) => {
     await tx.delete(cashEntries).where(
@@ -1615,6 +1646,486 @@ app.delete("/payments/:id", requireAuth(async (c: any) => {
     }
   });
   return c.json({ ok: true }, 200);
+}));
+
+// ─── PAYMENT BATCHES (Etapa 4A/4B) ─────────────────────────────────────────────
+// Experimental — sin UI todavía. Un payment_batch es el encabezado de un
+// cobro que imputa varias cuotas del mismo asegurado en un solo evento real
+// (ej. un cheque que cubre varias cuotas juntas). Cada cuota sigue siendo un
+// payment hijo individual (payments.batchId), sin payment_splits propios —
+// los medios reales viven una sola vez en payment_batch_splits. Ver
+// src/lib/payments/batches.ts para el detalle de cada validación.
+//
+// Etapa 4B agrega received_checks colgando de los splits method='cheque' —
+// ver src/lib/payments/received-checks.ts. Bloqueos vigentes por ausencia
+// deliberada de endpoints (documentado acá para Etapa 4C/4D, que sí los
+// necesitará): no existe PUT/DELETE genérico de payment_batches ni de
+// payment_batch_splits, así que ningún batch ni ningún split con cheques
+// puede anularse/editarse/eliminarse todavía por ninguna vía pública; ningún
+// payment hijo se borra individualmente (ver PUT/DELETE /payments/:id más
+// abajo, que ya rechazan con 409 cualquier cambio monetario o baja de un
+// hijo de batch); y no existe ningún endpoint para cambiar el status de un
+// received_checks ni para entregarlo en una rendición — cuando se
+// implemente, debe usar validateCheckStatusTransition/
+// isCheckAvailableForRemittance de received-checks.ts, nunca escribir status
+// a mano.
+app.post("/payment-batches", requireAuth(async (c: any) => {
+  const user = c.get("user");
+  const body = await c.req.json();
+
+  if (!body.paymentDate || !/^\d{4}-\d{2}-\d{2}$/.test(body.paymentDate)) {
+    return c.json({ error: "Falta o es inválida la fecha de pago (YYYY-MM-DD)." }, 400);
+  }
+  if (body.insuredId == null || body.insuredId === "") {
+    return c.json({ error: "Falta el asegurado." }, 400);
+  }
+
+  // 1. Validación básica de forma (pura, sin tocar la base todavía).
+  let normalizedItems;
+  try {
+    normalizedItems = normalizeBatchItems(body.items);
+  } catch (e: any) {
+    if (e instanceof PaymentBatchValidationError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+  let normalizedSplits;
+  try {
+    normalizedSplits = normalizeBatchSplits(body.splits);
+  } catch (e: any) {
+    if (e instanceof PaymentBatchValidationError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
+  // Etapa 4B: cheques por split cheque. Un split method='cheque' debe traer
+  // ≥1 cheque cuya suma sea exacta al importe del split; ningún otro split
+  // puede traer cheques. Los cheques nunca se vinculan a un payment hijo —
+  // solo al split cheque que representan (ver received-checks.ts).
+  interface SplitWithChecks { split: NormalizedPaymentBatchSplit; checks: NormalizedReceivedCheck[] }
+  let splitsWithChecks: SplitWithChecks[];
+  try {
+    splitsWithChecks = normalizedSplits.map((split, i) => {
+      const rawChecks = body.splits[i]?.checks;
+      if (split.method === "cheque") {
+        if (!Array.isArray(rawChecks) || rawChecks.length === 0) {
+          throw new PaymentBatchValidationError(`El split cheque (medio ${i + 1}) debe incluir al menos un cheque.`);
+        }
+        const checks = rawChecks.map((raw: any, j: number) => normalizeReceivedCheck(raw, `cheque ${j + 1} del medio ${i + 1}`));
+        const totalsCheck = validateChecksMatchSplit(checks, split.amountCents);
+        if (!totalsCheck.valid) throw new PaymentBatchValidationError(totalsCheck.errorMessage!);
+        return { split, checks };
+      }
+      if (Array.isArray(rawChecks) && rawChecks.length > 0) {
+        throw new PaymentBatchValidationError(`El medio ${i + 1} (${split.method}) no puede incluir cheques.`);
+      }
+      return { split, checks: [] };
+    });
+  } catch (e: any) {
+    if (e instanceof PaymentBatchValidationError || e instanceof ReceivedCheckValidationError) {
+      return c.json({ error: e.message }, 400);
+    }
+    throw e;
+  }
+
+  // 2-3. Cargar TODAS las cuotas + sus pólizas/aseguradoras/compañías reales
+  // — nunca se confía en policyId/amount/companyId/insuredId del body.
+  const installmentIds = normalizedItems.map((i) => i.installmentId);
+  const rows = await db.select({
+    installmentId: policyInstallments.id,
+    amount: policyInstallments.amount,
+    installmentStatus: policyInstallments.status,
+    policyId: policies.id,
+    policyNumber: policies.policyNumber,
+    policyStatus: policies.status,
+    insuredId: policies.insuredId,
+    insuredName: insureds.name,
+    companyName: companies.name,
+  }).from(policyInstallments)
+    .innerJoin(policies, eq(policyInstallments.policyId, policies.id))
+    .innerJoin(insureds, eq(policies.insuredId, insureds.id))
+    .innerJoin(companies, eq(policies.companyId, companies.id))
+    .where(inArray(policyInstallments.id, installmentIds))
+    .all();
+
+  if (rows.length !== installmentIds.length) {
+    const foundIds = new Set(rows.map((r) => r.installmentId));
+    const missing = installmentIds.filter((id) => !foundIds.has(id));
+    return c.json({ error: `Las siguientes cuotas no existen: ${missing.join(", ")}.` }, 404);
+  }
+
+  const contexts: BatchInstallmentContext[] = rows.map((r) => ({
+    installmentId: r.installmentId,
+    policyId: r.policyId,
+    insuredId: r.insuredId,
+    amount: r.amount,
+    installmentStatus: r.installmentStatus,
+    policyStatus: r.policyStatus,
+    isRivadavia: (r.companyName ?? "").toLowerCase().includes("rivadavia"),
+  }));
+  const displayByInstallmentId = new Map(rows.map((r) => [r.installmentId, r]));
+
+  // 4. Mismo asegurado real (nunca por nombre/DNI, por insuredId exacto).
+  try {
+    validateSameInsured(contexts);
+  } catch (e: any) {
+    if (e instanceof PaymentBatchValidationError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+  const realInsuredId = contexts[0]!.insuredId;
+  if (realInsuredId !== Number(body.insuredId)) {
+    return c.json({ error: "El asegurado indicado no coincide con el de las cuotas seleccionadas." }, 400);
+  }
+
+  // 5. Estado de cada cuota + ausencia de pago confirmado ya existente.
+  const alreadyPaid = await db.select({ installmentId: payments.installmentId })
+    .from(payments)
+    .where(and(inArray(payments.installmentId, installmentIds), eq(payments.status, "confirmado")))
+    .all();
+  if (alreadyPaid.length > 0) {
+    const ids = alreadyPaid.map((p) => p.installmentId).join(", ");
+    return c.json({ error: `Ya existe un pago confirmado para la(s) cuota(s): ${ids}.` }, 409);
+  }
+  try {
+    validateInstallmentsEligibility(contexts);
+  } catch (e: any) {
+    if (e instanceof PaymentBatchValidationError) return c.json({ error: e.message }, 409);
+    throw e;
+  }
+
+  // 6. Base = suma de las cuotas (importe exacto de cada una, sin parciales
+  // — el body nunca manda un importe por cuota, ver normalizeBatchItems).
+  const baseAmountCents = calculateBaseAmountCents(contexts);
+
+  // 7. Grupo de los medios — mixed se rechaza antes de cualquier escritura.
+  let splitGroup: SplitGroup;
+  try {
+    splitGroup = resolveBatchSplitGroup(normalizedSplits);
+  } catch (e: any) {
+    if (e instanceof PaymentBatchValidationError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
+  // 8. Recargos Pronto Pago aplicables: $800 por cuota Rivadavia, solo si
+  // TODOS los medios son "own" — nunca por recibo ni por póliza.
+  const applyProntoPagoSurcharge = body.applyProntoPagoSurcharge !== false;
+  const applicableSurchargeInstallmentIds = applyProntoPagoSurcharge
+    ? calculateApplicableRivadaviaSurcharges(contexts, splitGroup)
+    : [];
+  const surchargeAmountCents = applicableSurchargeInstallmentIds.length * SURCHARGE_AMOUNT_CENTS;
+
+  // 9. Total recibido = base + recargos.
+  const totals = calculateBatchTotals(baseAmountCents, surchargeAmountCents);
+
+  // 10. La suma de los medios cargados debe coincidir exactamente con el total.
+  const totalsCheck = validateBatchTotals(totals, normalizedSplits);
+  if (!totalsCheck.valid) {
+    return c.json({ error: totalsCheck.errorMessage }, 400);
+  }
+
+  // Detección informativa de posibles cheques duplicados (banco+número contra
+  // toda la cartera existente). Nunca bloquea sola — solo si hay coincidencia
+  // Y el caller no mandó confirmPossibleDuplicates:true. La confirmación NO
+  // saltea ninguna otra validación (ya corrieron todas arriba).
+  const allNewChecks = splitsWithChecks.flatMap((s) => s.checks);
+  if (allNewChecks.length > 0) {
+    const bankNames = [...new Set(allNewChecks.map((chk) => chk.bankName))];
+    const existingChecks = await db.select({
+      id: receivedChecks.id, checkNumber: receivedChecks.checkNumber, bankName: receivedChecks.bankName,
+      amountCents: receivedChecks.amountCents, dueDate: receivedChecks.dueDate, drawerName: receivedChecks.drawerName,
+    }).from(receivedChecks).where(inArray(receivedChecks.bankName, bankNames)).all();
+
+    const duplicates = allNewChecks
+      .map((chk) => ({ bankName: chk.bankName, checkNumber: chk.checkNumber, matches: findPossibleCheckDuplicates(chk, existingChecks) }))
+      .filter((d) => d.matches.length > 0);
+
+    if (duplicates.length > 0 && body.confirmPossibleDuplicates !== true) {
+      return c.json({
+        error: "Se detectaron posibles cheques duplicados (mismo banco y número que cheques ya cargados). Confirmá para continuar.",
+        code: "CHECK_POSSIBLE_DUPLICATE",
+        duplicates,
+      }, 409);
+    }
+  }
+
+  // 11-16. Todo o nada: batch, splits, hijos, recargos y recálculo de cuotas
+  // en una sola transacción real.
+  const batchId = await db.transaction(async (tx) => {
+    const [batch] = await tx.insert(paymentBatches).values({
+      insuredId: realInsuredId,
+      baseAmountCents: totals.baseAmountCents,
+      surchargeAmountCents: totals.surchargeAmountCents,
+      totalReceivedCents: totals.totalReceivedCents,
+      paymentDate: body.paymentDate,
+      status: "confirmado",
+      notes: body.notes || null,
+      createdBy: user.id,
+    }).returning();
+
+    // Splits uno por uno (no bulk) porque cada split cheque necesita su
+    // propio id ya generado antes de poder insertar los cheques que cuelgan
+    // de él — nunca se confía en un id de split que mande el frontend.
+    for (const { split, checks } of splitsWithChecks) {
+      const [insertedSplit] = await tx.insert(paymentBatchSplits).values({
+        batchId: batch!.id, method: split.method, amountCents: split.amountCents, notes: split.notes,
+      }).returning();
+
+      if (checks.length > 0) {
+        await tx.insert(receivedChecks).values(checks.map((chk) => ({
+          batchSplitId: insertedSplit!.id,
+          checkNumber: chk.checkNumber,
+          bankName: chk.bankName,
+          bankCode: chk.bankCode,
+          drawerName: chk.drawerName,
+          drawerDocument: chk.drawerDocument,
+          issueDate: chk.issueDate,
+          dueDate: chk.dueDate,
+          amountCents: chk.amountCents,
+          currency: chk.currency,
+          status: "en_cartera",
+          notes: chk.notes,
+          receivedAt: new Date(),
+          createdBy: user.id,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })));
+      }
+    }
+
+    for (const item of normalizedItems) {
+      const ctx = contexts.find((c) => c.installmentId === item.installmentId)!;
+      const display = displayByInstallmentId.get(item.installmentId)!;
+
+      const [child] = await tx.insert(payments).values({
+        policyId: ctx.policyId,
+        installmentId: ctx.installmentId,
+        amount: ctx.amount,
+        paymentMethod: "lote",
+        paymentDate: body.paymentDate,
+        status: "confirmado",
+        batchId: batch!.id,
+        createdBy: user.id,
+      }).returning();
+
+      if (applicableSurchargeInstallmentIds.includes(item.installmentId)) {
+        await tx.insert(cashEntries).values({
+          clientName: display.insuredName ?? "—",
+          policyNumber: display.policyNumber ?? null,
+          companyName: display.companyName ?? null,
+          amount: SURCHARGE_AMOUNT_CENTS / 100,
+          paymentMethod: "lote",
+          paymentDate: body.paymentDate,
+          entryType: "pronto_pago_surcharge",
+          paymentId: child!.id,
+          rendered: 0,
+          notes: "Recargo Pronto Pago Rivadavia",
+          createdBy: user.id,
+        });
+      }
+
+      await recalculateInstallmentPaymentStatus(tx, ctx.installmentId);
+    }
+
+    return batch!.id;
+  });
+
+  return c.json({ id: batchId }, 201);
+}));
+
+// GET /api/payment-batches/:id — lectura de auditoría (batch + hijos + cuotas
+// + pólizas + compañías + splits + recargos + integridad recalculada). No
+// integra todavía con GET /payments ni con Caja.
+app.get("/payment-batches/:id", requireAuth(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, id)).get();
+  if (!batch) return c.json({ error: "Cobro no encontrado" }, 404);
+
+  const splitsRows = await db.select().from(paymentBatchSplits)
+    .where(eq(paymentBatchSplits.batchId, id)).orderBy(asc(paymentBatchSplits.id)).all();
+
+  // Etapa 4B: cheques de cada split cheque, en una sola consulta (sin N+1).
+  const splitIds = splitsRows.map((s) => s.id);
+  const checksRows = splitIds.length > 0
+    ? await db.select().from(receivedChecks).where(inArray(receivedChecks.batchSplitId, splitIds)).all()
+    : [];
+  const checksBySplitId = new Map<number, typeof checksRows>();
+  for (const chk of checksRows) {
+    const arr = checksBySplitId.get(chk.batchSplitId) ?? [];
+    arr.push(chk);
+    checksBySplitId.set(chk.batchSplitId, arr);
+  }
+  const splitsWithChecksOut = splitsRows.map((s) => ({ ...s, checks: checksBySplitId.get(s.id) ?? [] }));
+
+  const childRows = await db.select({
+    payment: payments, installment: policyInstallments, policy: policies, company: companies,
+  }).from(payments)
+    .leftJoin(policyInstallments, eq(payments.installmentId, policyInstallments.id))
+    .leftJoin(policies, eq(payments.policyId, policies.id))
+    .leftJoin(companies, eq(policies.companyId, companies.id))
+    .where(eq(payments.batchId, id))
+    .all();
+
+  const childIds = childRows.map((r) => r.payment.id);
+  const surcharges = childIds.length > 0
+    ? await db.select().from(cashEntries)
+      .where(and(inArray(cashEntries.paymentId, childIds), eq(cashEntries.entryType, "pronto_pago_surcharge")))
+      .all()
+    : [];
+
+  const baseFromChildren = childRows.reduce((s, r) => s + Math.round(r.payment.amount * 100), 0);
+  const surchargeFromEntries = surcharges.reduce((s, e) => s + Math.round(e.amount * 100), 0);
+  const splitsSum = splitsRows.reduce((s, sp) => s + sp.amountCents, 0);
+
+  // Etapa 4B: integridad cheque-específica. cuequeSplitIds = únicamente los
+  // splits method='cheque' de ESTE batch — la base de comparación de
+  // "checksBelongOnlyToCheckSplits" (ningún cheque debería colgar de otro
+  // split, algo que la FK ya impide, pero se verifica igual como chequeo de
+  // integridad explícito, no solo implícito por construcción).
+  const chequeSplitIds = new Set(splitsRows.filter((s) => s.method === "cheque").map((s) => s.id));
+  const CHECK_VALID_STATUSES = new Set(["en_cartera", "entregado_compania", "cobrado", "rechazado", "anulado"]);
+
+  const checkSplitsHaveChecks = [...chequeSplitIds].every((sid) => (checksBySplitId.get(sid)?.length ?? 0) > 0);
+  const checkAmountsMatchSplits = splitsRows
+    .filter((s) => s.method === "cheque")
+    .every((s) => (checksBySplitId.get(s.id) ?? []).reduce((sum, chk) => sum + chk.amountCents, 0) === s.amountCents);
+  const checksBelongOnlyToCheckSplits = checksRows.every((chk) => chequeSplitIds.has(chk.batchSplitId));
+  const invalidCheckStatuses = checksRows.filter((chk) => !CHECK_VALID_STATUSES.has(chk.status)).map((chk) => chk.id);
+
+  // Posibles duplicados entre los cheques de ESTE batch y toda la cartera
+  // (incluye otros batches) — una sola consulta por los bancos involucrados.
+  let possibleDuplicateChecks: Array<{ checkId: number; matches: ReturnType<typeof findPossibleCheckDuplicates> }> = [];
+  if (checksRows.length > 0) {
+    const bankNames = [...new Set(checksRows.map((chk) => chk.bankName))];
+    const candidates = await db.select().from(receivedChecks).where(inArray(receivedChecks.bankName, bankNames)).all();
+    possibleDuplicateChecks = checksRows
+      .map((chk) => ({ checkId: chk.id, matches: findPossibleCheckDuplicates(chk, candidates.filter((o) => o.id !== chk.id)) }))
+      .filter((d) => d.matches.length > 0);
+  }
+
+  const integrity = {
+    baseMatchesChildren: baseFromChildren === batch.baseAmountCents,
+    surchargeMatchesEntries: surchargeFromEntries === batch.surchargeAmountCents,
+    totalMatchesBasePlusSurcharge: (batch.baseAmountCents + batch.surchargeAmountCents) === batch.totalReceivedCents,
+    splitsMatchTotal: splitsSum === batch.totalReceivedCents,
+    checkSplitsHaveChecks,
+    checkAmountsMatchSplits,
+    checksBelongOnlyToCheckSplits,
+    invalidCheckStatuses,
+    possibleDuplicateChecks,
+  };
+
+  return c.json({ batch, items: childRows, splits: splitsWithChecksOut, surcharges, integrity }, 200);
+}));
+
+// ─── RECEIVED CHECKS — cartera de cheques (Etapa 4B) ───────────────────────────
+// Lectura de solo lectura sobre received_checks. No implementa todavía
+// endpoints para entregar cheques en una rendición ni para cambiar su estado
+// (Etapa 4C/4D) — hasta entonces, ningún cheque puede modificarse ni
+// anularse desde acá; el único punto de escritura es POST /payment-batches.
+app.get("/received-checks", requireAuth(async (c: any) => {
+  const { status, bank, dueFrom, dueTo, batchId, insuredId, companyId } = c.req.query();
+
+  let rows = await db.select({
+    check: receivedChecks, split: paymentBatchSplits, batch: paymentBatches, insured: insureds,
+  }).from(receivedChecks)
+    .innerJoin(paymentBatchSplits, eq(receivedChecks.batchSplitId, paymentBatchSplits.id))
+    .innerJoin(paymentBatches, eq(paymentBatchSplits.batchId, paymentBatches.id))
+    .innerJoin(insureds, eq(paymentBatches.insuredId, insureds.id))
+    .orderBy(desc(receivedChecks.receivedAt))
+    .all();
+
+  if (status) rows = rows.filter((r) => r.check.status === status);
+  if (bank) rows = rows.filter((r) => r.check.bankName.toLowerCase().includes(String(bank).toLowerCase()));
+  if (dueFrom) rows = rows.filter((r) => r.check.dueDate >= dueFrom);
+  if (dueTo) rows = rows.filter((r) => r.check.dueDate <= dueTo);
+  if (batchId) rows = rows.filter((r) => r.batch.id === Number(batchId));
+  if (insuredId) rows = rows.filter((r) => r.insured.id === Number(insuredId));
+
+  // Hijos (payments) de todos los batches involucrados, en una sola consulta
+  // — sin N+1 aunque haya muchos cheques de muchos batches distintos.
+  const batchIds = [...new Set(rows.map((r) => r.batch.id))];
+  const childRows = batchIds.length > 0
+    ? await db.select({ payment: payments, policy: policies, company: companies })
+      .from(payments)
+      .leftJoin(policies, eq(payments.policyId, policies.id))
+      .leftJoin(companies, eq(policies.companyId, companies.id))
+      .where(inArray(payments.batchId, batchIds))
+      .all()
+    : [];
+  const childrenByBatchId = new Map<number, typeof childRows>();
+  for (const row of childRows) {
+    const bId = row.payment.batchId!;
+    const arr = childrenByBatchId.get(bId) ?? [];
+    arr.push(row);
+    childrenByBatchId.set(bId, arr);
+  }
+
+  if (companyId) {
+    const wantedCompanyId = Number(companyId);
+    rows = rows.filter((r) => (childrenByBatchId.get(r.batch.id) ?? []).some((ch) => ch.company?.id === wantedCompanyId));
+  }
+
+  // Posibles duplicados: una sola consulta contra los bancos involucrados,
+  // no una por cheque.
+  const bankNames = [...new Set(rows.map((r) => r.check.bankName))];
+  const duplicateCandidates = bankNames.length > 0
+    ? await db.select().from(receivedChecks).where(inArray(receivedChecks.bankName, bankNames)).all()
+    : [];
+
+  const result = rows.map((r) => {
+    const children = childrenByBatchId.get(r.batch.id) ?? [];
+    const companiesInvolved = [...new Map(children.filter((ch) => ch.company).map((ch) => [ch.company!.id, ch.company])).values()];
+    const possibleDuplicates = findPossibleCheckDuplicates(r.check, duplicateCandidates.filter((o) => o.id !== r.check.id));
+    return {
+      check: r.check,
+      split: r.split,
+      batch: r.batch,
+      insured: r.insured,
+      installments: children.map((ch) => ({
+        paymentId: ch.payment.id, installmentId: ch.payment.installmentId, amount: ch.payment.amount,
+        policyId: ch.policy?.id ?? null, policyNumber: ch.policy?.policyNumber ?? null,
+      })),
+      companies: companiesInvolved,
+      possibleDuplicates,
+    };
+  });
+
+  return c.json(result, 200);
+}));
+
+app.get("/received-checks/:id", requireAuth(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const row = await db.select({
+    check: receivedChecks, split: paymentBatchSplits, batch: paymentBatches, insured: insureds,
+  }).from(receivedChecks)
+    .innerJoin(paymentBatchSplits, eq(receivedChecks.batchSplitId, paymentBatchSplits.id))
+    .innerJoin(paymentBatches, eq(paymentBatchSplits.batchId, paymentBatches.id))
+    .innerJoin(insureds, eq(paymentBatches.insuredId, insureds.id))
+    .where(eq(receivedChecks.id, id)).get();
+  if (!row) return c.json({ error: "Cheque no encontrado" }, 404);
+
+  const childRows = await db.select({ payment: payments, policy: policies, company: companies })
+    .from(payments)
+    .leftJoin(policies, eq(payments.policyId, policies.id))
+    .leftJoin(companies, eq(policies.companyId, companies.id))
+    .where(eq(payments.batchId, row.batch.id))
+    .all();
+  const companiesInvolved = [...new Map(childRows.filter((ch) => ch.company).map((ch) => [ch.company!.id, ch.company])).values()];
+
+  const otherChecksSameBank = await db.select().from(receivedChecks)
+    .where(and(eq(receivedChecks.bankName, row.check.bankName), ne(receivedChecks.id, id))).all();
+  const possibleDuplicates = findPossibleCheckDuplicates(row.check, otherChecksSameBank);
+
+  return c.json({
+    check: row.check,
+    split: row.split,
+    batch: row.batch,
+    insured: row.insured,
+    installments: childRows.map((ch) => ({
+      paymentId: ch.payment.id, installmentId: ch.payment.installmentId, amount: ch.payment.amount,
+      policyId: ch.policy?.id ?? null, policyNumber: ch.policy?.policyNumber ?? null,
+    })),
+    companies: companiesInvolved,
+    possibleDuplicates,
+  }, 200);
 }));
 
 app.get("/payments/stats", requireAuth(async (c: any) => {
