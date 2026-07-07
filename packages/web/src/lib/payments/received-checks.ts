@@ -4,7 +4,7 @@
 //
 // Un cheque NUNCA apunta a un payment hijo ni a una cuota directamente: la
 // relación con la cuota que termina pagando es siempre indirecta, a través
-// de batch_split -> batch -> payments hijos (ver migración 0022). Uno o
+// de batch_split -> batch -> payments hijos (ver migración 0023). Uno o
 // varios cheques pueden componer un mismo split cheque.
 
 import { isValidCalendarDate } from "../installments/plan";

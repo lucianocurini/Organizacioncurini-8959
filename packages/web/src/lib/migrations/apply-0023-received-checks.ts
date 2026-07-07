@@ -1,17 +1,17 @@
-// Lógica reutilizable de la migración 0022 (received_checks).
-// Usada tanto por el script local (packages/web/scripts/apply_0022_local.ts)
-// como por los tests. Depende estructuralmente de payment_batch_splits (0021)
+// Lógica reutilizable de la migración 0023 (received_checks).
+// Usada tanto por el script local (packages/web/scripts/apply_0023_local.ts)
+// como por los tests. Depende estructuralmente de payment_batch_splits (0022)
 // ya aplicada — no la reaplica, solo asume que la tabla existe.
 //
 // Sin backfill: no existe ningún payment_batch_splits histórico con
 // method='cheque' para el que reconstruir cheques. Idempotente — correrla
 // una segunda vez no duplica nada ni falla.
 
-export interface Sql0022Client {
+export interface Sql0023Client {
   execute(sql: string, params?: any[]): Promise<{ rows: any[] }>;
 }
 
-export interface Migration0022Summary {
+export interface Migration0023Summary {
   tableAlreadyExisted: boolean;
   checksCountBefore: number;
   checksCountAfter: number;
@@ -57,20 +57,20 @@ const EXPECTED_COLUMNS = [
   "created_by", "created_at", "updated_at",
 ];
 
-async function tableExists(db: Sql0022Client, name: string): Promise<boolean> {
+async function tableExists(db: Sql0023Client, name: string): Promise<boolean> {
   const r = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", [name]);
   return r.rows.length > 0;
 }
 
-async function countRows(db: Sql0022Client, table: string): Promise<number> {
+async function countRows(db: Sql0023Client, table: string): Promise<number> {
   const r = await db.execute(`SELECT COUNT(*) as c FROM ${table}`);
   return Number(r.rows[0].c);
 }
 
-async function runMigration(db: Sql0022Client): Promise<Migration0022Summary> {
+async function runMigration(db: Sql0023Client): Promise<Migration0023Summary> {
   const splitsExist = await tableExists(db, "payment_batch_splits");
   if (!splitsExist) {
-    throw new Error("payment_batch_splits no existe todavía — aplicá primero la migración 0021.");
+    throw new Error("payment_batch_splits no existe todavía — aplicá primero la migración 0022.");
   }
 
   const tableAlreadyExisted = await tableExists(db, "received_checks");
@@ -100,9 +100,9 @@ async function runMigration(db: Sql0022Client): Promise<Migration0022Summary> {
   return { tableAlreadyExisted, checksCountBefore, checksCountAfter };
 }
 
-export async function applyMigration0022ReceivedChecks(db: Sql0022Client): Promise<Migration0022Summary> {
+export async function applyMigration0023ReceivedChecks(db: Sql0023Client): Promise<Migration0023Summary> {
   await db.execute("BEGIN");
-  let summary: Migration0022Summary;
+  let summary: Migration0023Summary;
   try {
     summary = await runMigration(db);
   } catch (e) {

@@ -1,4 +1,4 @@
--- Migration 0020: cobros que imputan varias cuotas del mismo asegurado (Etapa 4A)
+-- Migration 0021: cobros que imputan varias cuotas del mismo asegurado (Etapa 4A)
 --
 -- payment_batches es el encabezado de un cobro múltiple: agrupa varios
 -- payments hijos (cada uno sigue representando una cuota individual — ver
@@ -13,7 +13,7 @@
 --                          del grupo "own"; ver src/lib/payments/batches.ts).
 -- total_received_cents   = base + surcharge = lo efectivamente recibido,
 --                          que debe coincidir exactamente con la suma de
---                          payment_batch_splits (migración 0021).
+--                          payment_batch_splits (migración 0022).
 --
 -- Un payment con batch_id NOT NULL es un hijo del batch: conserva
 -- installment_id/policy_id, su amount es el importe exacto de esa cuota,
@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_payment_batches_status ON payment_batches(status)
 -- nuevo, sin cambios de significado). Con valor: identifica de qué cobro
 -- múltiple es hijo esta cuota. Igual que en 0016 (due_date), este ALTER no es
 -- idempotente por sí solo — la idempotencia la garantiza el aplicador TS
--- (src/lib/migrations/apply-0020-payment-batches.ts), que verifica con
+-- (src/lib/migrations/apply-0021-payment-batches.ts), que verifica con
 -- PRAGMA table_info antes de ejecutarlo.
 ALTER TABLE payments ADD COLUMN batch_id INTEGER REFERENCES payment_batches(id);
 

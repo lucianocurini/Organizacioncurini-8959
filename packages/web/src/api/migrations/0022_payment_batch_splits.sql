@@ -1,4 +1,4 @@
--- Migration 0021: medios reales de un cobro múltiple (Etapa 4A)
+-- Migration 0022: medios reales de un cobro múltiple (Etapa 4A)
 --
 -- Los medios de pago de un payment_batch viven acá, una sola vez por medio
 -- (nunca repartidos por cuota) — mismo rol que payment_splits pero para el
@@ -6,7 +6,7 @@
 --
 -- SUM(amount_cents) de un batch debe ser exactamente
 -- payment_batches.total_received_cents (base + recargos Pronto Pago
--- incluidos, sin descomponer el instrumento — ver 0020 y
+-- incluidos, sin descomponer el instrumento — ver 0021 y
 -- src/lib/payments/batches.ts).
 --
 -- ON DELETE RESTRICT (no CASCADE): un split de batch es, desde la Etapa 4B,

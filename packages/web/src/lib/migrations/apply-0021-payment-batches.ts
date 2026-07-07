@@ -1,5 +1,5 @@
-// Lógica reutilizable de la migración 0020 (payment_batches + payments.batch_id).
-// Usada tanto por el script local (packages/web/scripts/apply_0020_local.ts)
+// Lógica reutilizable de la migración 0021 (payment_batches + payments.batch_id).
+// Usada tanto por el script local (packages/web/scripts/apply_0021_local.ts)
 // como por los tests, contra cualquier cliente compatible con esta interfaz
 // (bun:sqlite local hoy; Turso más adelante, cuando exista un script de
 // producción — no autorizado todavía en Etapa 4A).
@@ -12,11 +12,11 @@
 // Igual que en 0019, toda la función corre dentro de una única transacción
 // real (BEGIN/COMMIT/ROLLBACK acá adentro, no responsabilidad del caller).
 
-export interface Sql0020Client {
+export interface Sql0021Client {
   execute(sql: string, params?: any[]): Promise<{ rows: any[] }>;
 }
 
-export interface Migration0020Summary {
+export interface Migration0021Summary {
   tableAlreadyExisted: boolean; // payment_batches
   columnAlreadyExisted: boolean; // payments.batch_id
   paymentBatchesCountBefore: number;
@@ -53,22 +53,22 @@ const EXPECTED_COLUMNS = [
   "created_by", "created_at", "updated_at",
 ];
 
-async function tableExists(db: Sql0020Client, name: string): Promise<boolean> {
+async function tableExists(db: Sql0021Client, name: string): Promise<boolean> {
   const r = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", [name]);
   return r.rows.length > 0;
 }
 
-async function columnExists(db: Sql0020Client, table: string, column: string): Promise<boolean> {
+async function columnExists(db: Sql0021Client, table: string, column: string): Promise<boolean> {
   const cols = await db.execute(`PRAGMA table_info(${table})`);
   return cols.rows.some((r: any) => r.name === column);
 }
 
-async function countRows(db: Sql0020Client, table: string): Promise<number> {
+async function countRows(db: Sql0021Client, table: string): Promise<number> {
   const r = await db.execute(`SELECT COUNT(*) as c FROM ${table}`);
   return Number(r.rows[0].c);
 }
 
-async function runMigration(db: Sql0020Client): Promise<Migration0020Summary> {
+async function runMigration(db: Sql0021Client): Promise<Migration0021Summary> {
   const tableAlreadyExisted = await tableExists(db, "payment_batches");
   const columnAlreadyExisted = await columnExists(db, "payments", "batch_id");
   const paymentBatchesCountBefore = tableAlreadyExisted ? await countRows(db, "payment_batches") : 0;
@@ -114,9 +114,9 @@ async function runMigration(db: Sql0020Client): Promise<Migration0020Summary> {
   };
 }
 
-export async function applyMigration0020PaymentBatches(db: Sql0020Client): Promise<Migration0020Summary> {
+export async function applyMigration0021PaymentBatches(db: Sql0021Client): Promise<Migration0021Summary> {
   await db.execute("BEGIN");
-  let summary: Migration0020Summary;
+  let summary: Migration0021Summary;
   try {
     summary = await runMigration(db);
   } catch (e) {

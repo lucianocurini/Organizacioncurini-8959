@@ -160,7 +160,7 @@ export const paymentSplits = sqliteTable("payment_splits", {
 // totalReceivedCents   = baseAmountCents + surchargeAmountCents, y debe
 //                        coincidir exactamente con SUM(paymentBatchSplits).
 // CHECKs (base>0, surcharge>=0, total>0, status enum) e índices se declaran
-// en la migración 0020 (mismo estilo SQL crudo que el resto del proyecto).
+// en la migración 0021 (mismo estilo SQL crudo que el resto del proyecto).
 export const paymentBatches = sqliteTable("payment_batches", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   insuredId: integer("insured_id").notNull().references(() => insureds.id),
@@ -180,7 +180,7 @@ export const paymentBatches = sqliteTable("payment_batches", {
 // paymentSplits más arriba). method NUNCA es "lote" ni "combinado" (esos son
 // valores de resumen del payment padre/hijo, no medios reales) — mismo
 // vocabulario real que ya usa payment_splits.method. CHECK de método/importe
-// e índices se declaran en la migración 0021.
+// e índices se declaran en la migración 0022.
 export const paymentBatchSplits = sqliteTable("payment_batch_splits", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   batchId: integer("batch_id").notNull().references(() => paymentBatches.id),
@@ -196,14 +196,14 @@ export const paymentBatchSplits = sqliteTable("payment_batch_splits", {
 // un payment hijo ni a una cuota (esa relación es siempre indirecta, a
 // través del batch_split -> batch -> payments hijos). SUM(amountCents) de los
 // received_checks de un batchSplitId debe ser exactamente el amountCents de
-// ese payment_batch_splits (ver migración 0022 y
+// ese payment_batch_splits (ver migración 0023 y
 // src/lib/payments/received-checks.ts).
 //
 // status: en_cartera -> entregado_compania -> cobrado | rechazado
 // (terminales); anulado solo alcanzable desde en_cartera. Deliberadamente sin
 // estado "depositado" en esta etapa. Transiciones válidas se validan en
 // src/lib/payments/received-checks.ts (validateCheckStatusTransition), no acá
-// — el CHECK de la migración 0022 solo restringe el vocabulario posible.
+// — el CHECK de la migración 0023 solo restringe el vocabulario posible.
 export const receivedChecks = sqliteTable("received_checks", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   batchSplitId: integer("batch_split_id").notNull().references(() => paymentBatchSplits.id),

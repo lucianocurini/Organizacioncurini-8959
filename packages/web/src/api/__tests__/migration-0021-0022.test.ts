@@ -1,6 +1,6 @@
 /**
- * Prueba los aplicadores idempotentes de las migraciones 0020
- * (payment_batches + payments.batch_id) y 0021 (payment_batch_splits).
+ * Prueba los aplicadores idempotentes de las migraciones 0021
+ * (payment_batches + payments.batch_id) y 0022 (payment_batch_splits).
  * Sin backfill en ninguna de las dos — se arma una base temporal mínima a
  * mano (solo insureds/users/payments, tal como existían antes de esta
  * migración) en el scratchpad del sistema — se borra al finalizar. No toca
@@ -12,10 +12,10 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { applyMigration0020PaymentBatches, type Sql0020Client } from "../../lib/migrations/apply-0020-payment-batches";
-import { applyMigration0021PaymentBatchSplits, type Sql0021Client } from "../../lib/migrations/apply-0021-payment-batch-splits";
+import { applyMigration0021PaymentBatches, type Sql0021Client } from "../../lib/migrations/apply-0021-payment-batches";
+import { applyMigration0022PaymentBatchSplits, type Sql0022Client } from "../../lib/migrations/apply-0022-payment-batch-splits";
 
-function wrapBunSqlite(db: Database): Sql0020Client & Sql0021Client {
+function wrapBunSqlite(db: Database): Sql0021Client & Sql0022Client {
   return {
     async execute(sql: string, params: any[] = []) {
       const upper = sql.trim().toUpperCase();
@@ -38,9 +38,9 @@ afterEach(() => {
   tmpDir = null;
 });
 
-function makePreMigrationDb(): Sql0020Client & Sql0021Client {
-  tmpDir = mkdtempSync(join(tmpdir(), "migration-0020-0021-test-"));
-  const dbPath = join(tmpDir, "pre-0020.db");
+function makePreMigrationDb(): Sql0021Client & Sql0022Client {
+  tmpDir = mkdtempSync(join(tmpdir(), "migration-0021-0022-test-"));
+  const dbPath = join(tmpDir, "pre-0021.db");
   db = new Database(dbPath);
   db.run(`
     CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)
@@ -70,13 +70,13 @@ function insertPayment(amount: number, method: string) {
   );
 }
 
-describe("0020 — crea payment_batches y payments.batch_id", () => {
+describe("0021 — crea payment_batches y payments.batch_id", () => {
   test("sobre una base sin ninguna de las dos, sin backfill", async () => {
     const client = makePreMigrationDb();
     insertPayment(1000, "efectivo");
     insertPayment(2000, "transferencia");
 
-    const summary = await applyMigration0020PaymentBatches(client);
+    const summary = await applyMigration0021PaymentBatches(client);
 
     expect(summary.tableAlreadyExisted).toBe(false);
     expect(summary.columnAlreadyExisted).toBe(false);
@@ -95,11 +95,11 @@ describe("0020 — crea payment_batches y payments.batch_id", () => {
     const client = makePreMigrationDb();
     insertPayment(1000, "efectivo");
 
-    const first = await applyMigration0020PaymentBatches(client);
+    const first = await applyMigration0021PaymentBatches(client);
     expect(first.tableAlreadyExisted).toBe(false);
     expect(first.columnAlreadyExisted).toBe(false);
 
-    const second = await applyMigration0020PaymentBatches(client);
+    const second = await applyMigration0021PaymentBatches(client);
     expect(second.tableAlreadyExisted).toBe(true);
     expect(second.columnAlreadyExisted).toBe(true);
     expect(second.paymentsCountAfter).toBe(1);
@@ -107,7 +107,7 @@ describe("0020 — crea payment_batches y payments.batch_id", () => {
 
   test("los índices quedan creados", async () => {
     const client = makePreMigrationDb();
-    await applyMigration0020PaymentBatches(client);
+    await applyMigration0021PaymentBatches(client);
     const idx = await client.execute("SELECT name FROM sqlite_master WHERE type='index'");
     const names = (idx.rows as any[]).map((r) => r.name);
     expect(names).toContain("idx_payment_batches_insured_id");
@@ -117,17 +117,17 @@ describe("0020 — crea payment_batches y payments.batch_id", () => {
   });
 });
 
-describe("0021 — crea payment_batch_splits", () => {
+describe("0022 — crea payment_batch_splits", () => {
   test("requiere payment_batches ya aplicada", async () => {
     const client = makePreMigrationDb();
-    await expect(applyMigration0021PaymentBatchSplits(client)).rejects.toThrow(/payment_batches no existe/);
+    await expect(applyMigration0022PaymentBatchSplits(client)).rejects.toThrow(/payment_batches no existe/);
   });
 
-  test("sobre una base con 0020 ya aplicada, sin backfill", async () => {
+  test("sobre una base con 0021 ya aplicada, sin backfill", async () => {
     const client = makePreMigrationDb();
-    await applyMigration0020PaymentBatches(client);
+    await applyMigration0021PaymentBatches(client);
 
-    const summary = await applyMigration0021PaymentBatchSplits(client);
+    const summary = await applyMigration0022PaymentBatchSplits(client);
     expect(summary.tableAlreadyExisted).toBe(false);
     expect(summary.splitsCountBefore).toBe(0);
     expect(summary.splitsCountAfter).toBe(0);
@@ -138,20 +138,20 @@ describe("0021 — crea payment_batch_splits", () => {
 
   test("segunda corrida es idempotente", async () => {
     const client = makePreMigrationDb();
-    await applyMigration0020PaymentBatches(client);
+    await applyMigration0021PaymentBatches(client);
 
-    const first = await applyMigration0021PaymentBatchSplits(client);
+    const first = await applyMigration0022PaymentBatchSplits(client);
     expect(first.tableAlreadyExisted).toBe(false);
 
-    const second = await applyMigration0021PaymentBatchSplits(client);
+    const second = await applyMigration0022PaymentBatchSplits(client);
     expect(second.tableAlreadyExisted).toBe(true);
     expect(second.splitsCountAfter).toBe(0);
   });
 
   test("CHECK de método rechaza 'lote' y 'combinado' como método individual", async () => {
     const client = makePreMigrationDb();
-    await applyMigration0020PaymentBatches(client);
-    await applyMigration0021PaymentBatchSplits(client);
+    await applyMigration0021PaymentBatches(client);
+    await applyMigration0022PaymentBatchSplits(client);
 
     db!.run("INSERT INTO payment_batches (insured_id, base_amount_cents, surcharge_amount_cents, total_received_cents, payment_date, created_at, updated_at) VALUES (1, 100000, 0, 100000, '2027-01-01', 0, 0)");
     const batchId = (db!.query("SELECT last_insert_rowid() as id").get() as any).id;

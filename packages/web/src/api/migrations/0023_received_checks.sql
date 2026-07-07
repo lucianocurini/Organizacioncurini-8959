@@ -1,11 +1,11 @@
--- Migration 0022: cheques físicos recibidos dentro de un split cheque de un
+-- Migration 0023: cheques físicos recibidos dentro de un split cheque de un
 -- cobro múltiple (Etapa 4B).
 --
 -- Un received_checks SIEMPRE cuelga de un payment_batch_splits con
 -- method='cheque' (nunca de un payment individual, nunca de una cuota
 -- directamente): uno o varios cheques pueden componer un mismo split cheque,
 -- y SUM(received_checks.amount_cents) de un batch_split_id debe ser
--- exactamente ese payment_batch_splits.amount_cents (ver 0021 y
+-- exactamente ese payment_batch_splits.amount_cents (ver 0022 y
 -- src/lib/payments/received-checks.ts). No existe relación cheque ↔
 -- installment — la cuota que el cheque termina pagando es siempre indirecta,
 -- a través del batch.
@@ -17,7 +17,7 @@
 -- src/lib/payments/received-checks.ts (validateCheckStatusTransition), no
 -- este CHECK — acá solo se restringe el vocabulario de valores posibles.
 --
--- ON DELETE RESTRICT en batch_split_id: igual que 0021, este proyecto no
+-- ON DELETE RESTRICT en batch_split_id: igual que 0022, este proyecto no
 -- habilita PRAGMA foreign_keys, así que esta cláusula es hoy documentación de
 -- la intención (bloquear que se borre un split con cheques ya recibidos), no
 -- una restricción activa de SQLite. La aplicación debe bloquear
