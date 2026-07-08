@@ -466,6 +466,31 @@ export const remittanceItems = sqliteTable("remittance_items", {
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });
 
+// Etapa 4C: vínculo real entre una rendición y los instrumentos de pago
+// concretos que la componen (ver migración 0024 para el detalle completo de
+// cada caso). remittanceItemId es NULL para las allocations de un cobro
+// múltiple (payment_batches) — ese batch se rinde completo, no hay un ítem
+// individual al que atarla (ver src/lib/payments/remittance-allocations.ts).
+// paymentId/paymentBatchId son denormalizados a propósito (auditoría directa
+// sin join extra). Exactamente uno de paymentSplitId/paymentBatchSplitId/
+// cashEntryId identifica el instrumento real "hoja" (CHECK en la migración);
+// receivedCheckId es un disambiguador adicional dentro de un
+// paymentBatchSplitId con method='cheque' (nunca aparece sin él).
+export const remittanceAllocations = sqliteTable("remittance_allocations", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  remittanceId: integer("remittance_id").notNull().references(() => remittances.id),
+  remittanceItemId: integer("remittance_item_id").references(() => remittanceItems.id),
+  paymentId: integer("payment_id").references(() => payments.id),
+  paymentSplitId: integer("payment_split_id").references(() => paymentSplits.id),
+  paymentBatchId: integer("payment_batch_id").references(() => paymentBatches.id),
+  paymentBatchSplitId: integer("payment_batch_split_id").references(() => paymentBatchSplits.id),
+  receivedCheckId: integer("received_check_id").references(() => receivedChecks.id),
+  cashEntryId: integer("cash_entry_id").references(() => cashEntries.id),
+  method: text("method").notNull(), // mismo vocabulario que payment_splits.method
+  amountCents: integer("amount_cents").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+});
+
 // ─── GASTOS DE CAJA ──────────────────────────────────────────────────────────
 export const cashExpenses = sqliteTable("cash_expenses", {
   id: integer("id").primaryKey({ autoIncrement: true }),

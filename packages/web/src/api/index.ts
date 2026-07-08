@@ -26,6 +26,7 @@ import {
   cashExpenses,
   remittances,
   remittanceItems,
+  remittanceAllocations,
   commissionEntries,
   ivaEntries,
   ownMoneyMovements,
@@ -57,6 +58,12 @@ import {
   normalizeReceivedCheck, validateChecksMatchSplit, findPossibleCheckDuplicates,
   ReceivedCheckValidationError, type NormalizedReceivedCheck,
 } from "../lib/payments/received-checks";
+import {
+  resolveStandalonePaymentInstruments, resolveBatchInstruments, resolveCashEntryInstrument,
+  buildRemittanceAllocations, validateAllocationOwnership, validateAllocationTotals,
+  calculateExpectedCollectedCents, classifyRemittanceAllocationState, assertCompletePaymentBatches,
+  RemittanceAllocationValidationError, type ResolvedInstrument, type CollectedAmountSource,
+} from "../lib/payments/remittance-allocations";
 
 const app = new Hono().basePath("/api");
 
@@ -5880,7 +5887,100 @@ app.post("/remittances", requireAuth(async (c: any) => {
     }
 
     const remId = await db.transaction(async (tx) => {
-      // Crear rendición
+      // ── 1. Reconsultar orígenes reales dentro de la transacción — rechazar
+      // rendered=1, status distinto de confirmado, o cuota no_exigible ──
+      const paymentSourceItems = items.filter((i: any) => i.source === "payment");
+      const cashEntrySourceItems = items.filter((i: any) => i.source === "cash_entry");
+      const installmentSourceItems = items.filter((i: any) => i.source === "installment");
+
+      const paymentIds = paymentSourceItems.map((i: any) => i.sourceId);
+      const paymentRows = paymentIds.length
+        ? await tx.select().from(payments).where(inArray(payments.id, paymentIds)).all()
+        : [];
+      const paymentsById = new Map(paymentRows.map((p: any) => [p.id, p]));
+      for (const item of paymentSourceItems) {
+        const p = paymentsById.get(item.sourceId);
+        if (!p) throw new RemittanceAllocationValidationError(`El pago ${item.sourceId} no existe.`);
+        if (p.rendered) throw new RemittanceAllocationValidationError(`El pago ${item.sourceId} ya fue rendido.`);
+        if (p.status !== "confirmado") throw new RemittanceAllocationValidationError(`El pago ${item.sourceId} no está confirmado (status=${p.status}).`);
+      }
+
+      const cashEntryIds2 = cashEntrySourceItems.map((i: any) => i.sourceId);
+      const cashEntryRows = cashEntryIds2.length
+        ? await tx.select().from(cashEntries).where(inArray(cashEntries.id, cashEntryIds2)).all()
+        : [];
+      for (const item of cashEntrySourceItems) {
+        const e = cashEntryRows.find((r: any) => r.id === item.sourceId);
+        if (!e) throw new RemittanceAllocationValidationError(`El cobro manual ${item.sourceId} no existe.`);
+        if (e.rendered) throw new RemittanceAllocationValidationError(`El cobro manual ${item.sourceId} ya fue rendido.`);
+      }
+
+      const installmentIds2 = installmentSourceItems.map((i: any) => i.sourceId);
+      const installmentRows = installmentIds2.length
+        ? await tx.select().from(policyInstallments).where(inArray(policyInstallments.id, installmentIds2)).all()
+        : [];
+      for (const item of installmentSourceItems) {
+        const inst = installmentRows.find((r: any) => r.id === item.sourceId);
+        if (!inst) throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} no existe.`);
+        if (inst.rendered) throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} ya fue rendida.`);
+        if (inst.status === "no_exigible") throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} no es exigible y no puede rendirse.`);
+      }
+
+      // Recargos pronto_pago auto-incluidos: reconsultar dentro de la tx.
+      const surchargeIds = [...surchargeMap.values()].map((s: any) => s.id);
+      const surchargeRowsTx = surchargeIds.length
+        ? await tx.select().from(cashEntries).where(inArray(cashEntries.id, surchargeIds)).all()
+        : [];
+      for (const s of surchargeRowsTx as any[]) {
+        if (s.rendered) throw new RemittanceAllocationValidationError(`El recargo Pronto Pago ${s.id} ya fue rendido.`);
+      }
+      const allCashEntryRowsById = new Map<number, any>([...cashEntryRows, ...surchargeRowsTx].map((e: any) => [e.id, e]));
+
+      // ── 2. Batches completos — se rinden completos o no se rinden ──
+      const batchIdsInvolved = new Set<number>();
+      for (const p of paymentRows as any[]) if (p.batchId != null) batchIdsInvolved.add(p.batchId);
+
+      const includedPaymentIdsByBatch = new Map<number, Set<number>>();
+      for (const p of paymentRows as any[]) {
+        if (p.batchId == null) continue;
+        const set = includedPaymentIdsByBatch.get(p.batchId) ?? new Set<number>();
+        set.add(p.id);
+        includedPaymentIdsByBatch.set(p.batchId, set);
+      }
+
+      const batchInstrumentsByBatchId = new Map<number, ResolvedInstrument[]>();
+      const batchTotalReceivedCentsById = new Map<number, number>();
+      for (const batchId of batchIdsInvolved) {
+        const siblings = await tx.select({ id: payments.id, status: payments.status, rendered: payments.rendered })
+          .from(payments).where(eq(payments.batchId, batchId)).all();
+        assertCompletePaymentBatches({ batchId, siblings, includedPaymentIds: includedPaymentIdsByBatch.get(batchId)! });
+
+        const batchRow = await tx.select().from(paymentBatches).where(eq(paymentBatches.id, batchId)).get();
+        batchTotalReceivedCentsById.set(batchId, batchRow!.totalReceivedCents);
+
+        const splitsRows = await tx.select().from(paymentBatchSplits).where(eq(paymentBatchSplits.batchId, batchId)).all();
+        const splitIds = splitsRows.map((s: any) => s.id);
+        const checksRows = splitIds.length
+          ? await tx.select().from(receivedChecks).where(inArray(receivedChecks.batchSplitId, splitIds)).all()
+          : [];
+        const checksBySplitId = new Map<number, any[]>();
+        for (const chk of checksRows as any[]) {
+          const arr = checksBySplitId.get(chk.batchSplitId) ?? [];
+          arr.push(chk);
+          checksBySplitId.set(chk.batchSplitId, arr);
+        }
+        const instruments = resolveBatchInstruments({
+          paymentBatchId: batchId,
+          splits: (splitsRows as any[]).map((s) => ({
+            id: s.id, method: s.method, amountCents: s.amountCents,
+            checks: (checksBySplitId.get(s.id) ?? []).map((chk: any) => ({ id: chk.id, amountCents: chk.amountCents })),
+          })),
+        });
+        validateAllocationOwnership(instruments, { paymentBatchId: batchId });
+        batchInstrumentsByBatchId.set(batchId, instruments);
+      }
+
+      // ── 3. Crear remittance ──
       const [rem] = await tx.insert(remittances).values({
         date: body.date,
         canal: body.canal || "directo",
@@ -5894,10 +5994,19 @@ app.post("/remittances", requireAuth(async (c: any) => {
         createdAt: new Date(),
       }).returning();
 
-      // Insertar items y marcar fuentes como rendidas
-      for (const item of items) {
-        await tx.insert(remittanceItems).values({
-          remittanceId: rem.id,
+      // ── 4. Crear remittance_items (los del body + recargos pronto_pago auto-incluidos) ──
+      const effectiveItems = [
+        ...items,
+        ...(surchargeRowsTx as any[]).map((s) => ({
+          source: "cash_entry", sourceId: s.id, amount: s.amount, debtorStatus: "pagado",
+          clientName: s.clientName, policyNumber: s.policyNumber, companyName: s.companyName, paymentMethod: s.paymentMethod,
+        })),
+      ];
+
+      const insertedItems: { item: any; row: any }[] = [];
+      for (const item of effectiveItems) {
+        const [row] = await tx.insert(remittanceItems).values({
+          remittanceId: rem!.id,
           source: item.source,
           sourceId: item.sourceId,
           amount: item.amount,
@@ -5907,71 +6016,164 @@ app.post("/remittances", requireAuth(async (c: any) => {
           companyName: item.companyName || null,
           paymentMethod: item.paymentMethod || null,
           createdAt: new Date(),
-        });
+        }).returning();
+        insertedItems.push({ item, row: row! });
+      }
 
+      // ── 5. Construir allocations + expectedCollectedCents desde instrumentos reales ──
+      const allInstruments: ResolvedInstrument[] = [];
+      const collectedSources: CollectedAmountSource[] = [];
+      const batchIdsCounted = new Set<number>();
+
+      for (const { item, row } of insertedItems) {
         if (item.source === "payment") {
-          await tx.update(payments).set({ rendered: 1, renderedAt: new Date() })
-            .where(eq(payments.id, item.sourceId));
+          const p = paymentsById.get(item.sourceId);
+          if (p.batchId != null) {
+            // Las allocations del batch se construyen una sola vez, sin importar
+            // cuántos remittance_items (uno por cada hijo) referencien pagos de él.
+            if (!batchIdsCounted.has(p.batchId)) {
+              batchIdsCounted.add(p.batchId);
+              allInstruments.push(...batchInstrumentsByBatchId.get(p.batchId)!);
+              collectedSources.push({ kind: "batch", amountCents: batchTotalReceivedCentsById.get(p.batchId)! });
+            }
+          } else {
+            const splitsRows = await tx.select().from(paymentSplits).where(eq(paymentSplits.paymentId, item.sourceId)).all();
+            const instruments = resolveStandalonePaymentInstruments({
+              remittanceItemId: row.id,
+              paymentId: item.sourceId,
+              splits: (splitsRows as any[]).map((s) => ({ id: s.id, method: s.method, amountCents: s.amountCents })),
+            });
+            validateAllocationOwnership(instruments, { paymentId: item.sourceId });
+            allInstruments.push(...instruments);
+            collectedSources.push({ kind: "standalone_payment", amountCents: Math.round(p.amount * 100) });
+          }
         } else if (item.source === "cash_entry") {
-          await tx.update(cashEntries).set({ rendered: 1, renderedAt: new Date() })
-            .where(eq(cashEntries.id, item.sourceId));
+          const e = allCashEntryRowsById.get(item.sourceId);
+          const isSurcharge = e.entryType === "pronto_pago_surcharge";
+          let linkedPayment: any = isSurcharge && e.paymentId != null ? paymentsById.get(e.paymentId) : undefined;
+          if (isSurcharge && e.paymentId != null && !linkedPayment) {
+            linkedPayment = await tx.select().from(payments).where(eq(payments.id, e.paymentId)).get();
+          }
+          const isBatchSurcharge = isSurcharge && linkedPayment?.batchId != null;
+          // Recargo Pronto Pago de un hijo de batch: el remittance_item se crea
+          // igual (comportamiento sin cambios), pero NO genera allocation propia
+          // — ese dinero ya está una sola vez en la allocation del
+          // payment_batch_split del batch (ver totalReceivedCents = base +
+          // surcharge, validado en la creación del batch). Generar una allocation
+          // aparte acá duplicaría el conteo.
+          if (!isBatchSurcharge) {
+            const instrument = resolveCashEntryInstrument({
+              remittanceItemId: row.id, cashEntryId: item.sourceId, method: e.paymentMethod, amountCents: Math.round(e.amount * 100),
+            });
+            allInstruments.push(instrument);
+            collectedSources.push({ kind: "cash_entry", amountCents: Math.round(e.amount * 100) });
+          }
+        }
+        // installment / manual_debt: sin instrumento real, cero allocations.
+      }
+
+      const allocationDrafts = buildRemittanceAllocations(allInstruments);
+      const expectedCollectedCents = calculateExpectedCollectedCents(collectedSources);
+
+      // ── 6. Validar suma exacta contra instrumentos reales (nunca contra totalPaid) ──
+      const totalCheck = validateAllocationTotals(allocationDrafts, expectedCollectedCents);
+      if (!totalCheck.valid) {
+        throw new RemittanceAllocationValidationError(totalCheck.errorMessage!);
+      }
+      const state = classifyRemittanceAllocationState({
+        allocationCount: allocationDrafts.length,
+        allocationSumCents: allocationDrafts.reduce((s, a) => s + a.amountCents, 0),
+        expectedCollectedCents,
+        createdUnderAllocationsModel: true,
+      });
+      if (state === "inconsistent") {
+        throw new RemittanceAllocationValidationError(
+          "Las allocations construidas no son consistentes con el dinero real esperado de esta rendición — abortando antes de insertar nada."
+        );
+      }
+
+      // ── 7. Insertar allocations ──
+      if (allocationDrafts.length > 0) {
+        await tx.insert(remittanceAllocations).values(allocationDrafts.map((d) => ({
+          remittanceId: rem!.id,
+          remittanceItemId: d.remittanceItemId,
+          paymentId: d.paymentId,
+          paymentSplitId: d.paymentSplitId,
+          paymentBatchId: d.paymentBatchId,
+          paymentBatchSplitId: d.paymentBatchSplitId,
+          receivedCheckId: d.receivedCheckId,
+          cashEntryId: d.cashEntryId,
+          method: d.method,
+          amountCents: d.amountCents,
+          createdAt: new Date(),
+        })));
+      }
+
+      // ── 8. Marcar orígenes como rendered ──
+      for (const { item } of insertedItems) {
+        if (item.source === "payment") {
+          await tx.update(payments).set({ rendered: 1, renderedAt: new Date() }).where(eq(payments.id, item.sourceId));
+        } else if (item.source === "cash_entry") {
+          await tx.update(cashEntries).set({ rendered: 1, renderedAt: new Date() }).where(eq(cashEntries.id, item.sourceId));
         } else if (item.source === "installment") {
-          await tx.update(policyInstallments).set({ rendered: 1, renderedAt: new Date() })
-            .where(eq(policyInstallments.id, item.sourceId));
+          await tx.update(policyInstallments).set({ rendered: 1, renderedAt: new Date() }).where(eq(policyInstallments.id, item.sourceId));
         }
       }
 
-      // Auto-incluir recargos pronto_pago (canal=pronto_pago únicamente)
-      for (const [, surcharge] of surchargeMap) {
-        await tx.insert(remittanceItems).values({
-          remittanceId: rem.id,
-          source: "cash_entry",
-          sourceId: surcharge.id,
-          amount: surcharge.amount,
-          debtorStatus: "pagado",
-          clientName: surcharge.clientName,
-          policyNumber: surcharge.policyNumber,
-          companyName: surcharge.companyName,
-          paymentMethod: surcharge.paymentMethod,
-          createdAt: new Date(),
-        });
-        await tx.update(cashEntries).set({ rendered: 1, renderedAt: new Date() })
-          .where(eq(cashEntries.id, surcharge.id));
-      }
-
-      return rem.id;
+      return rem!.id;
     });
 
     return c.json({ ok: true, id: remId });
   } catch (e: any) {
+    if (e instanceof RemittanceAllocationValidationError) {
+      return c.json({ error: e.message }, 409);
+    }
     console.error("[POST /remittances]", e?.message, e);
     return c.json({ error: "No se pudo guardar la rendición" }, 500);
   }
 }));
 
-// DELETE /api/remittances/:id — eliminar rendición (des-rinde las cuotas)
+// DELETE /api/remittances/:id — eliminar rendición (des-rinde las cuotas,
+// revierte allocations) — transaccional completo (antes no lo era).
 app.delete("/remittances/:id", requireAdmin(async (c: any) => {
   const id = Number(c.req.param("id"));
-  const items = await db.select().from(remittanceItems)
-    .where(eq(remittanceItems.remittanceId, id)).all();
+  try {
+    await db.transaction(async (tx) => {
+      const rem = await tx.select().from(remittances).where(eq(remittances.id, id)).get();
+      if (!rem) throw new RemittanceAllocationValidationError(`La rendición ${id} no existe.`);
 
-  // Des-rendir fuentes
-  for (const item of items) {
-    if (item.source === "payment") {
-      await db.update(payments).set({ rendered: 0, renderedAt: null })
-        .where(eq(payments.id, item.sourceId));
-    } else if (item.source === "cash_entry") {
-      await db.update(cashEntries).set({ rendered: 0, renderedAt: null })
-        .where(eq(cashEntries.id, item.sourceId));
-    } else if (item.source === "installment") {
-      await db.update(policyInstallments).set({ rendered: 0, renderedAt: null })
-        .where(eq(policyInstallments.id, item.sourceId));
+      const items = await tx.select().from(remittanceItems).where(eq(remittanceItems.remittanceId, id)).all();
+      const allocations = await tx.select().from(remittanceAllocations).where(eq(remittanceAllocations.remittanceId, id)).all();
+
+      // Des-rendir fuentes. Para hijos de batch: cada remittance_item sigue
+      // representando un payment hijo puntual — se revierte ese payment como
+      // cualquier otro, sin tocar payment_batch_splits ni received_checks (el
+      // batch y sus instrumentos reales no se alteran, solo se borran las
+      // allocations que los vinculaban a esta rendición).
+      for (const item of items as any[]) {
+        if (item.source === "payment") {
+          await tx.update(payments).set({ rendered: 0, renderedAt: null }).where(eq(payments.id, item.sourceId));
+        } else if (item.source === "cash_entry") {
+          await tx.update(cashEntries).set({ rendered: 0, renderedAt: null }).where(eq(cashEntries.id, item.sourceId));
+        } else if (item.source === "installment") {
+          await tx.update(policyInstallments).set({ rendered: 0, renderedAt: null }).where(eq(policyInstallments.id, item.sourceId));
+        }
+      }
+
+      if (allocations.length > 0) {
+        await tx.delete(remittanceAllocations).where(eq(remittanceAllocations.remittanceId, id));
+      }
+      await tx.delete(remittanceItems).where(eq(remittanceItems.remittanceId, id));
+      await tx.delete(remittances).where(eq(remittances.id, id));
+    });
+    return c.json({ ok: true });
+  } catch (e: any) {
+    if (e instanceof RemittanceAllocationValidationError) {
+      return c.json({ error: e.message }, 404);
     }
+    console.error("[DELETE /remittances/:id]", e?.message, e);
+    return c.json({ error: "No se pudo eliminar la rendición" }, 500);
   }
-
-  await db.delete(remittanceItems).where(eq(remittanceItems.remittanceId, id));
-  await db.delete(remittances).where(eq(remittances.id, id));
-  return c.json({ ok: true });
 }));
 
 // PATCH /api/remittances/items/:id/paid — marcar adeudado como cobrado
