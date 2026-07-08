@@ -13,7 +13,7 @@ import {
   users, sessions, policies, companies, insureds, policyInstallments,
   payments, paymentSplits, remittances, remittanceItems, cashEntries,
 } from "../database/schema";
-import { eq, inArray, and } from "drizzle-orm";
+import { eq, inArray, and, sql } from "drizzle-orm";
 
 const SESSION_ID = "test-session-pay-splits-001";
 const USER_EMAIL = "test-pay-splits@test.local";
@@ -92,18 +92,56 @@ async function getSplits(paymentId: number) {
   return db.select().from(paymentSplits).where(eq(paymentSplits.paymentId, paymentId)).all();
 }
 
+// remittance_allocations (Etapa 4C) puede referenciar por FK tanto payments
+// como remittances — hay que borrarla antes que sus padres, o el DELETE de
+// esos padres falla en silencio (catch(() => {})) y deja huérfanos que
+// bloquean la corrida siguiente. Este archivo es previo a esa tabla, así que
+// chequea sqlite_master primero en vez de asumir que existe: mismo cleanup
+// determinista para beforeAll y afterAll, sin catch genérico.
+async function deleteRemittanceAllocationsFor(params: { paymentIds: number[]; remittanceIds: number[] }): Promise<void> {
+  const tableExists = await db.get<{ name: string }>(
+    sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'remittance_allocations'`
+  );
+  if (!tableExists) return;
+  if (params.paymentIds.length) {
+    await db.run(sql`DELETE FROM remittance_allocations WHERE payment_id IN ${params.paymentIds}`);
+  }
+  if (params.remittanceIds.length) {
+    await db.run(sql`DELETE FROM remittance_allocations WHERE remittance_id IN ${params.remittanceIds}`);
+  }
+}
+
 beforeAll(async () => {
   const prevUser = await db.select({ id: users.id }).from(users).where(eq(users.email, USER_EMAIL)).get();
   if (prevUser) {
     const prevPols = await db.select({ id: policies.id }).from(policies).where(eq(policies.createdBy, prevUser.id)).all();
     const polIds = prevPols.map(p => p.id);
+    const policyPayRows = polIds.length
+      ? await db.select({ id: payments.id }).from(payments).where(inArray(payments.policyId, polIds)).all()
+      : [];
+    // Pagos manuales/standalone (sin policyId, ej. manualPayer) creados
+    // directamente por este usuario — un cascade que solo siguiera
+    // policies->payments.policyId los dejaba huérfanos, bloqueando el DELETE
+    // de users por FK (payments.created_by), silenciado por el
+    // .catch(() => {}) de más abajo.
+    const standaloneRows = await db.select({ id: payments.id }).from(payments).where(eq(payments.createdBy, prevUser.id)).all();
+    const remRows = await db.select({ id: remittances.id }).from(remittances).where(eq(remittances.createdBy, prevUser.id)).all();
+
+    const allPayIds = [...new Set([...policyPayRows.map(r => r.id), ...standaloneRows.map(r => r.id)])];
+    const remIds = remRows.map(r => r.id);
+
+    await deleteRemittanceAllocationsFor({ paymentIds: allPayIds, remittanceIds: remIds });
+
+    if (allPayIds.length) await db.delete(paymentSplits).where(inArray(paymentSplits.paymentId, allPayIds)).catch(() => {});
+    if (polIds.length) await db.delete(payments).where(inArray(payments.policyId, polIds)).catch(() => {});
+    if (standaloneRows.length) await db.delete(payments).where(eq(payments.createdBy, prevUser.id)).catch(() => {});
     if (polIds.length) {
-      const payRows = await db.select({ id: payments.id }).from(payments).where(inArray(payments.policyId, polIds)).all();
-      const payIds = payRows.map(r => r.id);
-      if (payIds.length) await db.delete(paymentSplits).where(inArray(paymentSplits.paymentId, payIds)).catch(() => {});
-      await db.delete(payments).where(inArray(payments.policyId, polIds)).catch(() => {});
       await db.delete(policyInstallments).where(inArray(policyInstallments.policyId, polIds)).catch(() => {});
       await db.delete(policies).where(inArray(policies.id, polIds)).catch(() => {});
+    }
+    if (remIds.length) {
+      await db.delete(remittanceItems).where(inArray(remittanceItems.remittanceId, remIds)).catch(() => {});
+      await db.delete(remittances).where(inArray(remittances.id, remIds)).catch(() => {});
     }
     await db.delete(insureds).where(eq(insureds.createdBy, prevUser.id)).catch(() => {});
     await db.delete(sessions).where(eq(sessions.userId, prevUser.id)).catch(() => {});
@@ -127,6 +165,8 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  await deleteRemittanceAllocationsFor({ paymentIds: paymentIdsToClean, remittanceIds: remittanceIdsToClean });
+
   if (remittanceIdsToClean.length) {
     await db.delete(remittanceItems).where(inArray(remittanceItems.remittanceId, remittanceIdsToClean)).catch(() => {});
     await db.delete(remittances).where(inArray(remittances.id, remittanceIdsToClean)).catch(() => {});
