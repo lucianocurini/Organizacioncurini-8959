@@ -20,12 +20,25 @@ type Client = Sql0021Client & Sql0022Client & Sql0023Client;
 function wrapBunSqlite(db: Database): Client {
   return {
     async execute(sql: string, params: any[] = []) {
-      const upper = sql.trim().toUpperCase();
-      if (upper.startsWith("SELECT") || upper.startsWith("PRAGMA")) {
-        return { rows: db.query(sql).all(...params) as any[] };
+      // db.query() cachea el Statement compilado en el propio Database y
+      // nunca lo finaliza — con varias migraciones + validaciones corridas
+      // en la misma conexión, eso deja handles sqlite3_stmt vivos que
+      // impiden que sqlite3_close_v2 libere el archivo, y Windows no permite
+      // borrar un directorio con un archivo todavía bloqueado (EBUSY en el
+      // afterEach). db.prepare() no cachea, y finalize() explícito garantiza
+      // el cierre real sin depender del GC (mismo fix que
+      // migration-0024-remittance-allocations.test.ts).
+      const stmt = db.prepare(sql);
+      try {
+        const upper = sql.trim().toUpperCase();
+        if (upper.startsWith("SELECT") || upper.startsWith("PRAGMA")) {
+          return { rows: stmt.all(...params) as any[] };
+        }
+        stmt.run(...params);
+        return { rows: [] };
+      } finally {
+        stmt.finalize();
       }
-      db.query(sql).run(...params);
-      return { rows: [] };
     },
   };
 }
