@@ -64,6 +64,12 @@ import {
   calculateExpectedCollectedCents, classifyRemittanceAllocationState, assertCompletePaymentBatches,
   RemittanceAllocationValidationError, type ResolvedInstrument, type CollectedAmountSource,
 } from "../lib/payments/remittance-allocations";
+import {
+  applyStandalonePaymentToCartera, applyBatchToCartera, applyStandaloneSurchargeToCartera,
+  applyManualCashEntryToCartera, collectDistinctExpectedSources, classifyRemittanceForRendido,
+  accumulateRemittanceContribution, emptyMoneyBucket, emptyDirectCompanyBucket, emptyRendidoAccumulator,
+  centsToPesos, type CarteraInconsistency, type BatchForCartera,
+} from "../lib/payments/caja-summary";
 
 const app = new Hono().basePath("/api");
 
@@ -5428,78 +5434,204 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   const confirmedRemittances = await db.select().from(remittances)
     .where(eq(remittances.status, "confirmada")).all();
 
-  // Totales rendidos por método (sumados del paymentBreakdown de cada rendición)
-  const rendidoPorMetodo = { efectivo: 0, transferencia: 0, cheque: 0, pronto_pago: 0, total: 0 };
-  for (const r of confirmedRemittances) {
-    const bd = JSON.parse(r.paymentBreakdown || "{}");
-    rendidoPorMetodo.efectivo += bd.efectivo || 0;
-    rendidoPorMetodo.transferencia += bd.transferencia || 0;
-    rendidoPorMetodo.cheque += bd.cheque || 0;
-    rendidoPorMetodo.pronto_pago += bd.pronto_pago || 0;
-    rendidoPorMetodo.total += r.totalPaid || 0;
-  }
-
   // Adeudados clásicos (módulo antiguo — por compatibilidad)
   const debtsLegacy = await db.select().from(cashDebts)
     .where(eq(cashDebts.status, "pendiente")).all();
 
-  // Métodos que van directo a la compañía (NO a cuentas propias)
-  const DIRECTO_COMPANIA = ["transferencia_compania", "link_pago"];
+  // ── Cartera pendiente — instrumentos reales (src/lib/payments/caja-summary.ts) ──
+  // recargosProntoPago es una categoría separada — el recargo fijo de $800
+  // no es plata cobrada en efectivo/transferencia/cheque, es un cargo
+  // administrativo aparte. Nunca se le atribuye a un método.
+  const carteraBucket = emptyMoneyBucket();
+  const directoCompaniaBucket = emptyDirectCompanyBucket();
+  const carteraInconsistencias: CarteraInconsistency[] = [];
 
-  // Cobrado en cartera propia (sin rendir aún). recargosProntoPago es una
-  // categoría separada — el recargo fijo de $800 no es plata cobrada en
-  // efectivo/transferencia/cheque, es un cargo administrativo aparte. Nunca
-  // se le atribuye a un método (ni el primero, ni el de mayor importe, ni
-  // proporcional) — ver decisión de negocio explícita.
-  const cartera = { efectivo: 0, transferencia: 0, cheque: 0, recargosProntoPago: 0, total: 0 };
-  // Cobrado directo a la compañía (transf. compañía + links de pago)
-  const directoCompania = { transferencia_compania: 0, link_pago: 0, total: 0 };
-
+  // A. Pagos standalone confirmados y rendered=0 — sus payment_splits reales
+  // (nunca payments.paymentMethod, que puede valer "combinado").
   for (const p of paymentsInCartera) {
-    // El grupo se decide por los splits reales (garantizado no-mixed desde
-    // POST/PUT); el total de cada grupo suma payment.amount UNA sola vez por
-    // payment (no la suma de sus splits), para no depender de precisión
-    // acumulada de centavos ni duplicar nada.
-    const group = paymentGroupById.get(p.id);
+    if (p.batchId != null) continue; // hijos de batch: se procesan agrupados más abajo
     const splits = splitsByPaymentId.get(p.id) ?? [];
-    if (group === "direct_company") {
-      directoCompania.total += p.amount;
-      for (const s of splits) {
-        if (s.method === "transferencia_compania") directoCompania.transferencia_compania += s.amountCents / 100;
-        else if (s.method === "link_pago") directoCompania.link_pago += s.amountCents / 100;
-      }
-    } else {
-      cartera.total += p.amount;
-      for (const s of splits) {
-        if (s.method === "efectivo") cartera.efectivo += s.amountCents / 100;
-        else if (s.method === "transferencia") cartera.transferencia += s.amountCents / 100;
-        else if (s.method === "cheque") cartera.cheque += s.amountCents / 100;
-      }
+    applyStandalonePaymentToCartera(
+      { paymentId: p.id, amountCents: Math.round(p.amount * 100), splits },
+      carteraBucket, directoCompaniaBucket, carteraInconsistencias,
+    );
+  }
+
+  // B/C. Cobros múltiples (payment_batches) — agrupados una sola vez por
+  // batch, con sus splits y (si corresponde) received_checks reales.
+  const batchIdsInCartera = new Set<number>();
+  for (const p of allPayments) if (p.batchId != null) batchIdsInCartera.add(p.batchId);
+  if (batchIdsInCartera.size > 0) {
+    const batchIdsArr = [...batchIdsInCartera];
+    const batchRows = await db.select().from(paymentBatches).where(inArray(paymentBatches.id, batchIdsArr)).all();
+    const childRows = await db.select({ id: payments.id, batchId: payments.batchId, status: payments.status, rendered: payments.rendered })
+      .from(payments).where(inArray(payments.batchId, batchIdsArr)).all();
+    const batchSplitRows = await db.select().from(paymentBatchSplits).where(inArray(paymentBatchSplits.batchId, batchIdsArr)).all();
+    const batchSplitIdsArr = batchSplitRows.map((s: any) => s.id);
+    const batchCheckRows = batchSplitIdsArr.length
+      ? await db.select().from(receivedChecks).where(inArray(receivedChecks.batchSplitId, batchSplitIdsArr)).all()
+      : [];
+    const checksBySplitId = new Map<number, { id: number; amountCents: number }[]>();
+    for (const chk of batchCheckRows as any[]) {
+      const arr = checksBySplitId.get(chk.batchSplitId) ?? [];
+      arr.push({ id: chk.id, amountCents: chk.amountCents });
+      checksBySplitId.set(chk.batchSplitId, arr);
+    }
+    const splitsByBatchId = new Map<number, { method: string; amountCents: number; checks: { id: number; amountCents: number }[] }[]>();
+    for (const s of batchSplitRows as any[]) {
+      const arr = splitsByBatchId.get(s.batchId) ?? [];
+      arr.push({ method: s.method, amountCents: s.amountCents, checks: checksBySplitId.get(s.id) ?? [] });
+      splitsByBatchId.set(s.batchId, arr);
+    }
+    const childrenByBatchId = new Map<number, { paymentId: number; status: string; rendered: number }[]>();
+    for (const c of childRows as any[]) {
+      const arr = childrenByBatchId.get(c.batchId) ?? [];
+      arr.push({ paymentId: c.id, status: c.status, rendered: c.rendered });
+      childrenByBatchId.set(c.batchId, arr);
+    }
+    for (const b of batchRows as any[]) {
+      const batchForCartera: BatchForCartera = {
+        batchId: b.id, status: b.status,
+        splits: splitsByBatchId.get(b.id) ?? [],
+        children: childrenByBatchId.get(b.id) ?? [],
+      };
+      applyBatchToCartera(batchForCartera, carteraBucket, directoCompaniaBucket, carteraInconsistencias);
     }
   }
+
+  // D/E/G. cash_entries: recargo Pronto Pago standalone (nunca el de un hijo
+  // de batch, ya incluido en su payment_batch_splits) e ingresos manuales
+  // normales por su método real.
+  const surchargePaymentIds = manualInCartera
+    .filter((e: any) => e.entryType === "pronto_pago_surcharge" && e.paymentId != null)
+    .map((e: any) => e.paymentId as number);
+  const surchargeParentPayments = surchargePaymentIds.length
+    ? await db.select({ id: payments.id, batchId: payments.batchId }).from(payments).where(inArray(payments.id, surchargePaymentIds)).all()
+    : [];
+  const surchargeParentBatchIdByPaymentId = new Map<number, number | null>(surchargeParentPayments.map((p: any) => [p.id, p.batchId]));
+
   for (const e of manualInCartera) {
-    // El recargo Pronto Pago se identifica por entryType, NUNCA por
-    // paymentMethod (que puede valer "combinado" si el payment que lo generó
-    // tiene 2+ splits propios — cashEntries no tiene su propio desglose por
-    // splits). Va a su propia categoría dentro de cartera, no a
-    // efectivo/transferencia/cheque.
     if (e.entryType === "pronto_pago_surcharge") {
-      cartera.recargosProntoPago += e.amount;
-      cartera.total += e.amount;
+      const parentBatchId = e.paymentId != null ? surchargeParentBatchIdByPaymentId.get(e.paymentId) : null;
+      if (parentBatchId != null) continue; // ya incluido en el split del batch — no contar aparte
+      applyStandaloneSurchargeToCartera(Math.round(e.amount * 100), carteraBucket);
       continue;
     }
-    const m = e.paymentMethod as string;
-    if (DIRECTO_COMPANIA.includes(m)) {
-      if (m === "transferencia_compania") directoCompania.transferencia_compania += e.amount;
-      else if (m === "link_pago") directoCompania.link_pago += e.amount;
-      directoCompania.total += e.amount;
-    } else {
-      if (m === "efectivo") cartera.efectivo += e.amount;
-      else if (m === "transferencia") cartera.transferencia += e.amount;
-      else if (m === "cheque") cartera.cheque += e.amount;
-      cartera.total += e.amount;
-    }
+    applyManualCashEntryToCartera(e.paymentMethod as string, Math.round(e.amount * 100), carteraBucket, directoCompaniaBucket);
   }
+
+  const cartera = {
+    efectivo: centsToPesos(carteraBucket.efectivoCents),
+    transferencia: centsToPesos(carteraBucket.transferenciaCents),
+    cheque: centsToPesos(carteraBucket.chequeCents),
+    recargosProntoPago: centsToPesos(carteraBucket.recargosProntoPagoCents),
+    total: centsToPesos(carteraBucket.totalCents),
+  };
+  const directoCompania = {
+    transferencia_compania: centsToPesos(directoCompaniaBucket.transferenciaCompaniaCents),
+    link_pago: centsToPesos(directoCompaniaBucket.linkPagoCents),
+    total: centsToPesos(directoCompaniaBucket.totalCents),
+  };
+
+  // ── Rendido por método — remittance_allocations con fallback legacy ────────
+  // Cada rendición usa una única fuente (nunca paymentBreakdown + allocations
+  // + totalPaid al mismo tiempo): allocations si existen (exactas, contra
+  // instrumentos reales), paymentBreakdown legacy si no hay ninguna
+  // allocation pero la rendición sí tuvo dinero real, o cero si la rendición
+  // es nueva y solo tiene deuda/cuotas no cobradas.
+  const confirmedRemittanceIds = confirmedRemittances.map((r: any) => r.id as number);
+
+  const remittanceItemsForRendido = confirmedRemittanceIds.length
+    ? await db.select({ remittanceId: remittanceItems.remittanceId, source: remittanceItems.source })
+        .from(remittanceItems).where(inArray(remittanceItems.remittanceId, confirmedRemittanceIds)).all()
+    : [];
+  const hasRealMoneyItemsByRemittanceId = new Map<number, boolean>();
+  for (const it of remittanceItemsForRendido as any[]) {
+    if (it.source === "payment" || it.source === "cash_entry") hasRealMoneyItemsByRemittanceId.set(it.remittanceId, true);
+  }
+
+  const allocationsForRendido = confirmedRemittanceIds.length
+    ? await db.select().from(remittanceAllocations).where(inArray(remittanceAllocations.remittanceId, confirmedRemittanceIds)).all()
+    : [];
+  const allocationsByRemittanceId = new Map<number, typeof allocationsForRendido>();
+  for (const a of allocationsForRendido as any[]) {
+    const arr = allocationsByRemittanceId.get(a.remittanceId) ?? [];
+    arr.push(a);
+    allocationsByRemittanceId.set(a.remittanceId, arr);
+  }
+
+  // Instrumentos reales referenciados por TODAS las allocations, resueltos
+  // una sola vez (dedupeados) para todas las rendiciones — nunca resumando
+  // las mismas allocations (ver calculateExpectedCollectedCents).
+  const distinctAllForRendido = collectDistinctExpectedSources(allocationsForRendido as any[]);
+  const expectedPaymentRows = distinctAllForRendido.standalonePaymentIds.length
+    ? await db.select({ id: payments.id, amount: payments.amount }).from(payments).where(inArray(payments.id, distinctAllForRendido.standalonePaymentIds)).all()
+    : [];
+  const expectedPaymentAmountCentsById = new Map<number, number>(expectedPaymentRows.map((p: any) => [p.id, Math.round(p.amount * 100)]));
+
+  const expectedBatchRows = distinctAllForRendido.batchIds.length
+    ? await db.select({ id: paymentBatches.id, totalReceivedCents: paymentBatches.totalReceivedCents }).from(paymentBatches).where(inArray(paymentBatches.id, distinctAllForRendido.batchIds)).all()
+    : [];
+  const expectedBatchTotalCentsById = new Map<number, number>(expectedBatchRows.map((b: any) => [b.id, b.totalReceivedCents]));
+
+  const expectedCashEntryRows = distinctAllForRendido.cashEntryIds.length
+    ? await db.select({ id: cashEntries.id, amount: cashEntries.amount, entryType: cashEntries.entryType }).from(cashEntries).where(inArray(cashEntries.id, distinctAllForRendido.cashEntryIds)).all()
+    : [];
+  const expectedCashEntryAmountCentsById = new Map<number, number>(expectedCashEntryRows.map((e: any) => [e.id, Math.round(e.amount * 100)]));
+  const isProntoPagoSurchargeByCashEntryId = new Map<number, boolean>(expectedCashEntryRows.map((e: any) => [e.id, e.entryType === "pronto_pago_surcharge"]));
+
+  const rendidoAcc = emptyRendidoAccumulator();
+  const remittanceContributionById = new Map<number, { ownCents: number; directCents: number }>();
+
+  for (const r of confirmedRemittances) {
+    const allocationsRaw = (allocationsByRemittanceId.get(r.id) ?? []) as any[];
+    const allocationsForClassify = allocationsRaw.map((a) => ({
+      method: a.method, amountCents: a.amountCents,
+      isProntoPagoSurcharge: a.cashEntryId != null ? (isProntoPagoSurchargeByCashEntryId.get(a.cashEntryId) ?? false) : false,
+    }));
+
+    let expectedCollectedCents = 0;
+    if (allocationsRaw.length > 0) {
+      const distinct = collectDistinctExpectedSources(allocationsRaw);
+      const sources: CollectedAmountSource[] = [
+        ...distinct.standalonePaymentIds.map((id) => ({ kind: "standalone_payment" as const, amountCents: expectedPaymentAmountCentsById.get(id) ?? 0 })),
+        ...distinct.batchIds.map((id) => ({ kind: "batch" as const, amountCents: expectedBatchTotalCentsById.get(id) ?? 0 })),
+        ...distinct.cashEntryIds.map((id) => ({ kind: "cash_entry" as const, amountCents: expectedCashEntryAmountCentsById.get(id) ?? 0 })),
+      ];
+      expectedCollectedCents = calculateExpectedCollectedCents(sources);
+    }
+
+    const contribution = classifyRemittanceForRendido({
+      remittanceId: r.id, date: r.date, allocations: allocationsForClassify,
+      expectedCollectedCents, hasRealMoneyItems: hasRealMoneyItemsByRemittanceId.get(r.id) ?? false,
+      legacyPaymentBreakdownRaw: r.paymentBreakdown || "{}",
+    });
+    accumulateRemittanceContribution(contribution, rendidoAcc);
+    remittanceContributionById.set(r.id, {
+      ownCents: contribution.contributionOwnCents, directCents: contribution.contributionDirectCompaniaCents,
+    });
+  }
+
+  const rendidoPorMetodo = {
+    efectivo: centsToPesos(rendidoAcc.cartera.efectivoCents),
+    transferencia: centsToPesos(rendidoAcc.cartera.transferenciaCents),
+    cheque: centsToPesos(rendidoAcc.cartera.chequeCents),
+    pronto_pago: centsToPesos(rendidoAcc.cartera.recargosProntoPagoCents),
+    otros: centsToPesos(rendidoAcc.otrosLegacyCents),
+    total: centsToPesos(rendidoAcc.cartera.totalCents + rendidoAcc.otrosLegacyCents),
+  };
+  const rendidoDirectoCompania = {
+    transferencia_compania: centsToPesos(rendidoAcc.directoCompania.transferenciaCompaniaCents),
+    link_pago: centsToPesos(rendidoAcc.directoCompania.linkPagoCents),
+    total: centsToPesos(rendidoAcc.directoCompania.totalCents),
+  };
+  const allocationsModel = {
+    remittancesLegacyCount: rendidoAcc.remittancesLegacyCount,
+    remittancesCompleteCount: rendidoAcc.remittancesCompleteCount,
+    remittancesZeroCollectedCount: rendidoAcc.remittancesZeroCollectedCount,
+    inconsistencias: rendidoAcc.inconsistencias,
+    legacyUnknownMethods: rendidoAcc.legacyUnknownMethods,
+  };
 
   // Total cobrado histórico (en cartera + ya rendido + directo compañía)
   const totalCobrado = cartera.total + directoCompania.total +
@@ -5617,10 +5749,14 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
       periodPayments.reduce((s: number, p: any) => s + (p.amount || 0), 0) +
       periodEntries.reduce((s: number, e: any) => s + (e.amount || 0), 0);
 
-    // Rendiciones confirmadas cuya fecha cae en el período
+    // Rendiciones confirmadas cuya fecha cae en el período — misma fuente
+    // única por rendición que rendidoPorMetodo (nunca totalPaid).
     rendidoPeriodo = confirmedRemittances
       .filter((r: any) => r.date >= periodFrom! && r.date <= periodTo!)
-      .reduce((s: number, r: any) => s + (r.totalPaid || 0), 0);
+      .reduce((s: number, r: any) => {
+        const c = remittanceContributionById.get(r.id);
+        return s + (c ? centsToPesos(c.ownCents + c.directCents) : 0);
+      }, 0);
 
     // Gastos del período
     gastosPeriodo = allExpenses
@@ -5647,9 +5783,12 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
       total: cajaNeta,
     },
     rendidoPorMetodo,
+    rendidoDirectoCompania,
+    allocationsModel,
+    carteraInconsistencias,
     totalRendiciones: confirmedRemittances.length,
     totalCobrado,
-    totalRendido: rendidoPorMetodo.total,
+    totalRendido: rendidoPorMetodo.total + rendidoDirectoCompania.total,
     totalAdeudado,
     totalAdeudadoRendiciones,
     totalAdeudadoLegacy,

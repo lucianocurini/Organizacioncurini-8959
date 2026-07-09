@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { api } from "@/lib/api";
+import { type CashSummary, hasUnverifiedCashSummaryData } from "@/lib/caja-types";
 import {
   ComposedChart,
   Bar,
@@ -556,7 +557,7 @@ function Section({
 export default function CajaPage() {
   const { user } = useAuth();
 
-  const [summary, setSummary] = useState<any>(null);
+  const [summary, setSummary] = useState<CashSummary | null>(null);
   const [entries, setEntries] = useState<any[]>([]);
   const [payments, setPayments] = useState<any[]>([]);
   const [debts, setDebts] = useState<any[]>([]);
@@ -922,6 +923,31 @@ export default function CajaPage() {
           >
             {summary ? (
               <div className="p-5">
+                {hasUnverifiedCashSummaryData(summary) && (
+                  <div className="rounded-xl p-4 mb-5 flex items-start gap-3 bg-yellow-900/20 border border-yellow-500/30">
+                    <AlertTriangle size={20} className="text-yellow-400 shrink-0 mt-0.5" />
+                    <div>
+                      <p className="text-sm font-medium text-yellow-300">
+                        Hay movimientos que no pudieron verificarse y fueron excluidos de los totales para evitar duplicaciones.
+                      </p>
+                      <details className="mt-2 text-xs text-yellow-200/70">
+                        <summary className="cursor-pointer select-none">Ver detalle técnico</summary>
+                        <ul className="mt-2 space-y-1">
+                          {summary.allocationsModel.inconsistencias.map((i) => (
+                            <li key={`ra-${i.remittanceId}`}>
+                              Rendición #{i.remittanceId} ({i.date}): {i.reason}
+                            </li>
+                          ))}
+                          {summary.carteraInconsistencias.map((i, idx) => (
+                            <li key={`ci-${i.sourceType}-${i.sourceId}-${idx}`}>
+                              {i.sourceType} #{i.sourceId}: {i.reason}
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    </div>
+                  </div>
+                )}
                 {/* Diferencia de caja — temporalmente oculto.
                     Mezcla cartera + adeudados + gastos históricos en un solo número;
                     se reemplazará con un indicador de dinero propio en etapa posterior. */}
