@@ -19,8 +19,13 @@ import {
   accumulateRemittanceContribution,
   emptyRendidoAccumulator,
   centsToPesos,
+  buildAdeudadosDetalle,
+  assertAdeudadosDetalleMatchesTotal,
+  AdeudadosSumMismatchError,
   type CarteraInconsistency,
   type BatchForCartera,
+  type RemittanceDebtRowForDetalle,
+  type CashDebtLegacyRowForDetalle,
 } from "../../lib/payments/caja-summary";
 
 // ─── Métodos contables ──────────────────────────────────────────────────────
@@ -471,6 +476,107 @@ describe("accumulateRemittanceContribution", () => {
     expect(acc.cartera.efectivoCents).toBe(100000);
     expect(acc.cartera.transferenciaCents).toBe(20000);
     expect(acc.cartera.chequeCents).toBe(0); // el inconsistente no se suma
+  });
+});
+
+// ─── centsToPesos ───────────────────────────────────────────────────────────
+
+// ─── buildAdeudadosDetalle / assertAdeudadosDetalleMatchesTotal ────────────
+
+function reb(overrides: Partial<RemittanceDebtRowForDetalle> = {}): RemittanceDebtRowForDetalle {
+  return {
+    id: 1, source: "installment", policyNumber: "POL-1", debtorName: "Juan Pérez",
+    companyName: "Compañía A", amount: 1000, remittanceDate: "2027-05-01",
+    ...overrides,
+  };
+}
+function legacy(overrides: Partial<CashDebtLegacyRowForDetalle> = {}): CashDebtLegacyRowForDetalle {
+  return {
+    id: 1, clientName: "Ana López", policyNumber: "POL-2", companyName: "Compañía B",
+    amount: 500, createdAt: "2027-04-15",
+    ...overrides,
+  };
+}
+
+describe("buildAdeudadosDetalle", () => {
+  test("origen 'manual_debt' cuando source='manual_debt'", () => {
+    const [item] = buildAdeudadosDetalle([reb({ id: 10, source: "manual_debt" })], []);
+    expect(item!.origen).toBe("manual_debt");
+    expect(item!.id).toBe(10);
+    expect(item!.estado).toBe("pendiente");
+  });
+
+  test("origen 'installment' cuando source='installment'", () => {
+    const [item] = buildAdeudadosDetalle([reb({ id: 11, source: "installment" })], []);
+    expect(item!.origen).toBe("installment");
+  });
+
+  test("cash_debt legacy queda como origen 'cash_debt_legacy'", () => {
+    const [item] = buildAdeudadosDetalle([], [legacy({ id: 20 })]);
+    expect(item!.origen).toBe("cash_debt_legacy");
+    expect(item!.id).toBe(20);
+    expect(item!.deudor).toBe("Ana López");
+  });
+
+  test("combina ambas fuentes sin perder filas ni duplicar", () => {
+    const detalle = buildAdeudadosDetalle(
+      [reb({ id: 1, source: "installment" }), reb({ id: 2, source: "manual_debt" })],
+      [legacy({ id: 1 })] // mismo id numérico que un remittance item — no debe colisionar ni deduplicarse
+    );
+    expect(detalle.length).toBe(3);
+    expect(detalle.filter((d) => d.origen === "cash_debt_legacy").length).toBe(1);
+    expect(detalle.filter((d) => d.origen !== "cash_debt_legacy").length).toBe(2);
+  });
+
+  test("detalle vacío cuando no hay ninguna fuente", () => {
+    expect(buildAdeudadosDetalle([], [])).toEqual([]);
+  });
+
+  test("deudor cae a '—' si debtorName es null", () => {
+    const [item] = buildAdeudadosDetalle([reb({ debtorName: null })], []);
+    expect(item!.deudor).toBe("—");
+  });
+
+  test("fecha de cash_debt legacy se formatea a YYYY-MM-DD desde distintos tipos de createdAt", () => {
+    const [a] = buildAdeudadosDetalle([], [legacy({ createdAt: "2027-04-15T10:00:00.000Z" })]);
+    expect(a!.fecha).toBe("2027-04-15");
+    const [b] = buildAdeudadosDetalle([], [legacy({ createdAt: new Date("2027-06-01T00:00:00.000Z") })]);
+    expect(b!.fecha).toBe("2027-06-01");
+  });
+});
+
+describe("assertAdeudadosDetalleMatchesTotal", () => {
+  test("no lanza cuando la suma del detalle coincide con totalAdeudado", () => {
+    const detalle = buildAdeudadosDetalle([reb({ amount: 1000.5 })], [legacy({ amount: 500.25 })]);
+    expect(() => assertAdeudadosDetalleMatchesTotal(detalle, 1500.75)).not.toThrow();
+  });
+
+  test("lanza AdeudadosSumMismatchError controlado cuando NO coincide (nunca ajusta el número)", () => {
+    const detalle = buildAdeudadosDetalle([reb({ amount: 1000 })], []);
+    let caught: unknown;
+    try {
+      assertAdeudadosDetalleMatchesTotal(detalle, 999);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(AdeudadosSumMismatchError);
+    const err = caught as AdeudadosSumMismatchError;
+    expect(err.detalleSumCents).toBe(100000);
+    expect(err.totalAdeudadoCents).toBe(99900);
+  });
+
+  test("compara en centavos — evita falsos positivos de punto flotante", () => {
+    const detalle = buildAdeudadosDetalle(
+      [reb({ amount: 0.1 }), reb({ id: 2, amount: 0.2 })],
+      []
+    );
+    // 0.1 + 0.2 !== 0.3 en punto flotante — la comparación en centavos debe
+    // seguir considerándolos iguales.
+    expect(() => assertAdeudadosDetalleMatchesTotal(detalle, 0.3)).not.toThrow();
+  });
+
+  test("detalle vacío con total 0 no lanza", () => {
+    expect(() => assertAdeudadosDetalleMatchesTotal([], 0)).not.toThrow();
   });
 });
 

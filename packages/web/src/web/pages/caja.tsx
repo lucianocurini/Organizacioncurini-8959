@@ -4,7 +4,6 @@ import {
   Wallet,
   Plus,
   CheckCircle2,
-  Circle,
   Trash2,
   Pencil,
   X,
@@ -18,10 +17,12 @@ import {
   TrendingUp,
   Receipt,
   AlertTriangle,
+  AlertCircle,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { api } from "@/lib/api";
 import { type CashSummary, hasUnverifiedCashSummaryData } from "@/lib/caja-types";
+import { filterPendingCashItems, formatAdeudadoOrigin } from "@/lib/caja-cobrados";
 import {
   ComposedChart,
   Bar,
@@ -560,7 +561,6 @@ export default function CajaPage() {
   const [summary, setSummary] = useState<CashSummary | null>(null);
   const [entries, setEntries] = useState<any[]>([]);
   const [payments, setPayments] = useState<any[]>([]);
-  const [debts, setDebts] = useState<any[]>([]);
   const [stats, setStats] = useState<any[]>([]);
 
   const [sections, setSections] = useState({
@@ -591,7 +591,6 @@ export default function CajaPage() {
   });
 
   const [tab, setTab] = useState<"manual" | "cobranzas">("cobranzas");
-  const [filterRendered, setFilterRendered] = useState<"all" | "cartera" | "rendidos">("all");
 
   // ── Comisiones
   const [commissions, setCommissions] = useState<any[]>([]);
@@ -644,11 +643,10 @@ export default function CajaPage() {
   const [ownError, setOwnError] = useState<string | null>(null);
 
   const loadAll = useCallback(async () => {
-    const [s, e, p, d, st, comm, iva, comp, exp, own] = await Promise.all([
+    const [s, e, p, st, comm, iva, comp, exp, own] = await Promise.all([
       api.get(`/api/cash/summary?month=${periodoMes}`),
       api.get("/api/cash/entries"),
       api.get("/api/cash/payments"),
-      api.get("/api/cash/debts"),
       api.get("/api/cash/stats"),
       api.get("/api/cash/commissions"),
       api.get("/api/cash/iva"),
@@ -659,7 +657,6 @@ export default function CajaPage() {
     setSummary(s);
     setEntries(Array.isArray(e) ? e : []);
     setPayments(Array.isArray(p) ? p : []);
-    setDebts(Array.isArray(d) ? d : []);
     setStats(Array.isArray(st) ? st : []);
     setCommissions(Array.isArray(comm) ? comm : []);
     setIvaList(Array.isArray(iva) ? iva : []);
@@ -690,16 +687,6 @@ export default function CajaPage() {
   async function deleteEntry(id: number) {
     if (!confirm("¿Eliminar este cobro?")) return;
     await api.delete(`/api/cash/entries/${id}`);
-    loadAll();
-  }
-
-  async function toggleEntryRender(entry: any) {
-    await api.patch(`/api/cash/entries/${entry.id}/render`, { rendered: !entry.rendered });
-    loadAll();
-  }
-
-  async function togglePaymentRender(p: any) {
-    await api.patch(`/api/cash/payments/${p.id}/render`, { rendered: !p.rendered });
     loadAll();
   }
 
@@ -852,20 +839,12 @@ export default function CajaPage() {
 
   if (!user || user.role !== "admin") return <AppLayout><div /></AppLayout>;
 
-  // ─── filtered lists
-  const filteredEntries = entries.filter((e) => {
-    if (filterRendered === "cartera") return !e.rendered;
-    if (filterRendered === "rendidos") return e.rendered;
-    return true;
-  });
-
-  const filteredPayments = payments.filter((p) => {
-    if (filterRendered === "cartera") return !p.rendered;
-    if (filterRendered === "rendidos") return p.rendered;
-    return true;
-  });
-
-  const cobradosSource = tab === "manual" ? filteredEntries : filteredPayments;
+  // ─── Cobros pendientes de rendición — lista fija en rendered=0. El estado
+  // rendered se gestiona únicamente vía el flujo real de Rendiciones, nunca
+  // desde acá (ver filterPendingCashItems en src/web/lib/caja-cobrados.ts).
+  const pendingEntries = filterPendingCashItems(entries);
+  const pendingPayments = filterPendingCashItems(payments);
+  const cobradosSource = tab === "manual" ? pendingEntries : pendingPayments;
 
   return (
     <AppLayout>
@@ -1183,10 +1162,15 @@ export default function CajaPage() {
             )}
           </Section>
 
-          {/* ─── Cobrados ──────────────────────────────────────────────────── */}
+          {/* ─── Cobros pendientes de rendición ────────────────────────────── */}
+          {/* Lista fija en rendered=0 (ver filterPendingCashItems) — el estado
+              rendered se gestiona únicamente vía el flujo real de Rendiciones,
+              nunca desde un toggle manual acá. Los totales históricos
+              (totalRendido/rendidoPorMetodo/período rendido) siguen viniendo
+              de summary, sin cambios — esta lista es solo lo operativo. */}
           <Section
-            title="Cobrados"
-            badge={summary ? (tab === "manual" ? entries.length : payments.length) : undefined}
+            title="Cobros pendientes de rendición"
+            badge={summary ? cobradosSource.length : undefined}
             open={sections.cobrados}
             onToggle={() => toggleSection("cobrados")}
             action={
@@ -1201,7 +1185,9 @@ export default function CajaPage() {
             }
           >
             <div className="p-4">
-              {/* Tab + filtro */}
+              <p className="text-xs text-white/40 mb-3">Solo se muestran operaciones que todavía están en cartera.</p>
+
+              {/* Tab */}
               <div className="flex flex-wrap items-center gap-3 mb-4">
                 <div className="flex bg-white/5 rounded-lg p-0.5 text-xs">
                   <button
@@ -1217,43 +1203,19 @@ export default function CajaPage() {
                     Manual
                   </button>
                 </div>
-                <div className="flex bg-white/5 rounded-lg p-0.5 text-xs ml-auto">
-                  {(["all", "cartera", "rendidos"] as const).map((f) => (
-                    <button
-                      key={f}
-                      onClick={() => setFilterRendered(f)}
-                      className={`px-3 py-1.5 rounded-md transition-colors ${filterRendered === f ? "bg-white/10 text-white" : "text-white/40 hover:text-white"}`}
-                    >
-                      {f === "all" ? "Todos" : f === "cartera" ? "En cartera" : "Rendidos"}
-                    </button>
-                  ))}
-                </div>
               </div>
 
               {cobradosSource.length === 0 ? (
                 <div className="text-center py-8 text-white/30 text-sm">
-                  {tab === "manual" ? "No hay cobros manuales cargados." : "No hay cobros desde Cobranzas."}
+                  {tab === "manual" ? "No hay cobros manuales pendientes de rendición." : "No hay cobros desde Cobranzas pendientes de rendición."}
                 </div>
               ) : (
                 <div className="space-y-2">
                   {cobradosSource.map((item: any) => (
                     <div
                       key={item.id}
-                      className={`flex items-center gap-3 px-4 py-3 rounded-lg border transition-colors ${item.rendered ? "bg-white/3 border-white/5 opacity-60" : "bg-white/5 border-white/10"}`}
+                      className="flex items-center gap-3 px-4 py-3 rounded-lg border border-white/10 bg-white/5 transition-colors"
                     >
-                      {/* Render toggle */}
-                      <button
-                        title={item.rendered ? "Quitar rendición" : "Marcar rendido"}
-                        onClick={() => tab === "manual" ? toggleEntryRender(item) : togglePaymentRender(item)}
-                        className="shrink-0"
-                      >
-                        {item.rendered ? (
-                          <CheckCircle2 size={18} className="text-orange-400" />
-                        ) : (
-                          <Circle size={18} className="text-white/30 hover:text-orange-400" />
-                        )}
-                      </button>
-
                       {/* Info */}
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
@@ -1280,7 +1242,6 @@ export default function CajaPage() {
                             {methodIcon(item.paymentMethod)}
                             {methodLabel(item.paymentMethod)}
                           </span>
-                          {item.rendered && <span className="text-xs text-orange-400/70">Rendido</span>}
                         </div>
                       </div>
 
@@ -1829,9 +1790,16 @@ export default function CajaPage() {
           </Section>
 
           {/* ─── Adeudados ─────────────────────────────────────────────────── */}
+          {/* Detalle fila por fila de summary.adeudadosDetalle — misma fuente
+              que ya calcula totalAdeudado en el backend (ver src/lib/payments/
+              caja-summary.ts), sin una segunda consulta que reconstruya el
+              total. "Marcar cobrado"/editar/eliminar solo aplican a
+              origen='cash_debt_legacy' (las únicas filas que corresponden a
+              una fila real y editable de cash_debts) — instalments/manual_debt
+              de rendiciones se resuelven desde Cobranzas, no desde acá. */}
           <Section
-            title="Adeudados por asegurados"
-            badge={debts.filter((d) => d.status === "pendiente").length || undefined}
+            title="Adeudados"
+            badge={summary?.adeudadosDetalle.length || undefined}
             badgeColor="bg-red-600"
             open={sections.adeudados}
             onToggle={() => toggleSection("adeudados")}
@@ -1845,62 +1813,59 @@ export default function CajaPage() {
             }
           >
             <div className="p-4">
-              {debts.length === 0 ? (
-                <div className="text-center py-8 text-white/30 text-sm">No hay adeudados registrados.</div>
+              {!summary || summary.adeudadosDetalle.length === 0 ? (
+                <div className="text-center py-8 text-white/30 text-sm">No hay adeudados pendientes.</div>
               ) : (
                 <div className="space-y-2">
-                  {debts.map((debt: any) => (
+                  {summary.adeudadosDetalle.map((item) => (
                     <div
-                      key={debt.id}
-                      className={`flex items-center gap-3 px-4 py-3 rounded-lg border transition-colors ${debt.status === "cobrado" ? "bg-white/3 border-white/5 opacity-60" : "bg-red-900/10 border-red-500/20"}`}
+                      key={`${item.origen}-${item.id}`}
+                      className="flex items-center gap-3 px-4 py-3 rounded-lg border border-red-500/20 bg-red-900/10 transition-colors"
                     >
-                      <button
-                        title={debt.status === "cobrado" ? "Marcar pendiente" : "Marcar cobrado"}
-                        onClick={() => markDebtCobrado(debt)}
-                        className="shrink-0"
-                      >
-                        {debt.status === "cobrado" ? (
-                          <CheckCircle2 size={18} className="text-green-400" />
-                        ) : (
-                          <Circle size={18} className="text-red-400/60 hover:text-green-400" />
-                        )}
-                      </button>
+                      <AlertCircle size={16} className="text-red-400 shrink-0" />
 
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-sm font-medium text-white truncate">{debt.clientName}</span>
-                          {debt.policyNumber && (
-                            <span className="text-xs text-white/30">#{debt.policyNumber}</span>
+                          <span className="text-sm font-medium text-white truncate">{item.deudor}</span>
+                          {item.polizaODescripcion && (
+                            <span className="text-xs text-white/30">#{item.polizaODescripcion}</span>
                           )}
-                          {debt.companyName && (
-                            <span className="text-xs text-white/30">· {debt.companyName}</span>
+                          {item.compania && (
+                            <span className="text-xs text-white/30">· {item.compania}</span>
                           )}
                         </div>
                         <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                          {debt.dueDate && <span className="text-xs text-white/40">Venc: {debt.dueDate}</span>}
-                          {debt.notes && <span className="text-xs text-white/30">{debt.notes}</span>}
-                          {debt.status === "cobrado" && (
-                            <span className="text-xs text-green-400/70">Cobrado</span>
-                          )}
+                          <span className="text-xs text-white/40">{item.fecha}</span>
+                          <span className="text-xs text-white/30">{formatAdeudadoOrigin(item.origen)}</span>
+                          <span className="text-xs text-red-400/70">Pendiente</span>
                         </div>
                       </div>
 
-                      <span className="text-sm font-bold text-red-400 shrink-0">{fmt(debt.amount)}</span>
+                      <span className="text-sm font-bold text-red-400 shrink-0">{fmt(item.importe)}</span>
 
-                      <div className="flex items-center gap-1 shrink-0">
-                        <button
-                          onClick={() => setModals((m) => ({ ...m, editDebt: debt }))}
-                          className="p-1.5 text-white/30 hover:text-white rounded"
-                        >
-                          <Pencil size={14} />
-                        </button>
-                        <button
-                          onClick={() => deleteDebt(debt.id)}
-                          className="p-1.5 text-white/30 hover:text-red-400 rounded"
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
+                      {item.origen === "cash_debt_legacy" && (
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            title="Marcar cobrado"
+                            onClick={() => markDebtCobrado({ id: item.id, status: "pendiente" })}
+                            className="p-1.5 text-red-400/60 hover:text-green-400 rounded"
+                          >
+                            <CheckCircle2 size={16} />
+                          </button>
+                          <button
+                            onClick={() => setModals((m) => ({ ...m, editDebt: { id: item.id, clientName: item.deudor, policyNumber: item.polizaODescripcion, companyName: item.compania, amount: item.importe } }))}
+                            className="p-1.5 text-white/30 hover:text-white rounded"
+                          >
+                            <Pencil size={14} />
+                          </button>
+                          <button
+                            onClick={() => deleteDebt(item.id)}
+                            className="p-1.5 text-white/30 hover:text-red-400 rounded"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>

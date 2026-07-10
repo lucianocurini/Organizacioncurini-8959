@@ -85,6 +85,21 @@ export interface CajaPropiaPeriodo {
   flujoPropio: number;
 }
 
+// Espejo de AdeudadoOrigin/AdeudadoDetalleItem en
+// src/lib/payments/caja-summary.ts (backend) — misma forma, sin `any`.
+export type AdeudadoOrigin = "installment" | "manual_debt" | "cash_debt_legacy";
+
+export interface AdeudadoDetalleItem {
+  id: number;
+  origen: AdeudadoOrigin;
+  deudor: string;
+  polizaODescripcion: string | null;
+  compania: string | null;
+  importe: number;
+  fecha: string;
+  estado: "pendiente";
+}
+
 export interface CashSummary {
   cartera: CarteraPropia;
   directoCompania: DirectoCompania;
@@ -99,6 +114,7 @@ export interface CashSummary {
   totalAdeudado: number;
   totalAdeudadoRendiciones: number;
   totalAdeudadoLegacy: number;
+  adeudadosDetalle: AdeudadoDetalleItem[];
   totalGastos: number;
   gastosMes: number;
   diferencia: number;

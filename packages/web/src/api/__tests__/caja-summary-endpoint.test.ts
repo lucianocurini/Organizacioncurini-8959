@@ -20,7 +20,7 @@ import app from "../index";
 import { database as db } from "../database/index";
 import {
   users, sessions, insureds, payments, paymentSplits, paymentBatches, paymentBatchSplits, receivedChecks,
-  cashEntries, cashExpenses, commissionEntries, ownMoneyMovements,
+  cashEntries, cashExpenses, commissionEntries, ownMoneyMovements, cashDebts,
   remittances, remittanceItems, remittanceAllocations,
 } from "../database/schema";
 import { eq, inArray } from "drizzle-orm";
@@ -149,6 +149,10 @@ async function cleanupCashEntry(id: number) {
   await deleteWithRetry(() => db.delete(cashEntries).where(eq(cashEntries.id, id)));
 }
 
+async function cleanupCashDebt(id: number) {
+  await deleteWithRetry(() => db.delete(cashDebts).where(eq(cashDebts.id, id)));
+}
+
 async function cleanupBatch(batchId: number) {
   const splitRows = await db.select({ id: paymentBatchSplits.id }).from(paymentBatchSplits).where(eq(paymentBatchSplits.batchId, batchId)).all();
   const splitIds = splitRows.map((s) => s.id);
@@ -183,6 +187,9 @@ async function purgeStaleFixturesFor(prevUserId: number) {
 
   const staleCashEntries = await db.select({ id: cashEntries.id }).from(cashEntries).where(eq(cashEntries.createdBy, prevUserId)).all();
   for (const e of staleCashEntries) await cleanupCashEntry(e.id);
+
+  const staleCashDebts = await db.select({ id: cashDebts.id }).from(cashDebts).where(eq(cashDebts.createdBy, prevUserId)).all();
+  for (const d of staleCashDebts) await cleanupCashDebt(d.id);
 
   // insureds.created_by referencia users.id — debe borrarse antes que el
   // usuario, si no, el delete de users revienta con FOREIGN KEY constraint.
@@ -226,10 +233,12 @@ afterAll(async () => {
   const leftoverEntries = await db.select({ id: cashEntries.id }).from(cashEntries).where(eq(cashEntries.createdBy, userId)).all();
   const leftoverBatches = await db.select({ id: paymentBatches.id }).from(paymentBatches).where(eq(paymentBatches.createdBy, userId)).all();
   const leftoverRemittances = await db.select({ id: remittances.id }).from(remittances).where(eq(remittances.createdBy, userId)).all();
+  const leftoverDebts = await db.select({ id: cashDebts.id }).from(cashDebts).where(eq(cashDebts.createdBy, userId)).all();
   expect(leftoverPayments.length).toBe(0);
   expect(leftoverEntries.length).toBe(0);
   expect(leftoverBatches.length).toBe(0);
   expect(leftoverRemittances.length).toBe(0);
+  expect(leftoverDebts.length).toBe(0);
 });
 
 describe("GET /api/cash/summary — forma de la respuesta", () => {
@@ -529,6 +538,211 @@ describe("GET /api/cash/summary — sin regresión en gastos/comisiones/dinero p
       if (ownId !== undefined) await deleteWithRetry(() => db.delete(ownMoneyMovements).where(eq(ownMoneyMovements.id, ownId!)));
       if (commId !== undefined) await deleteWithRetry(() => db.delete(commissionEntries).where(eq(commissionEntries.id, commId!)));
       if (expId !== undefined) await deleteWithRetry(() => db.delete(cashExpenses).where(eq(cashExpenses.id, expId!)));
+    }
+  });
+});
+
+describe("GET /api/cash/summary — adeudadosDetalle", () => {
+  test("manual_debt pendiente (adeudado, sin paidAt) aparece con origen 'manual_debt'", async () => {
+    const before = (await getSummary()).body;
+    const [rem] = await db.insert(remittances).values({
+      date: FIXTURE_DATE, canal: "directo", paymentBreakdown: "{}",
+      totalAmount: 700, totalPaid: 0, status: "confirmada", createdBy: userId,
+    }).returning({ id: remittances.id });
+    const remId = rem!.id;
+    try {
+      await db.insert(remittanceItems).values({
+        remittanceId: remId, source: "manual_debt", sourceId: null, amount: 700, debtorStatus: "adeudado",
+        clientName: `${PREFIX} Deudor Manual`, policyNumber: `${PREFIX}-POL-1`, companyName: `${PREFIX} Cía`,
+      });
+      const after = (await getSummary()).body;
+
+      const newItems = after.adeudadosDetalle.filter((i: any) => !before.adeudadosDetalle.some((b: any) => b.id === i.id && b.origen === i.origen));
+      expect(newItems.length).toBe(1);
+      expect(newItems[0].origen).toBe("manual_debt");
+      expect(newItems[0].deudor).toBe(`${PREFIX} Deudor Manual`);
+      expect(newItems[0].polizaODescripcion).toBe(`${PREFIX}-POL-1`);
+      expect(newItems[0].compania).toBe(`${PREFIX} Cía`);
+      expect(newItems[0].importe).toBeCloseTo(700, 2);
+      expect(newItems[0].estado).toBe("pendiente");
+      expect(after.totalAdeudadoRendiciones - before.totalAdeudadoRendiciones).toBeCloseTo(700, 2);
+    } finally {
+      await cleanupRemittance(remId);
+    }
+  });
+
+  test("installment pendiente (adeudado, sin paidAt) aparece con origen 'installment'", async () => {
+    const before = (await getSummary()).body;
+    const { paymentId } = await mkStandalonePayment({ amount: 400, splits: [{ method: "efectivo", amountCents: 40000 }], rendered: 1 });
+    const [rem] = await db.insert(remittances).values({
+      date: FIXTURE_DATE, canal: "directo", paymentBreakdown: "{}",
+      totalAmount: 400, totalPaid: 400, status: "confirmada", createdBy: userId,
+    }).returning({ id: remittances.id });
+    const remId = rem!.id;
+    try {
+      // source='installment' representa una cuota rendida marcada como no
+      // pagada por el asegurado — no requiere sourceId real para este test
+      // (la clasificación de origen depende solo de la columna source).
+      await db.insert(remittanceItems).values({
+        remittanceId: remId, source: "installment", sourceId: null, amount: 400, debtorStatus: "adeudado",
+        clientName: `${PREFIX} Deudor Cuota`, policyNumber: `${PREFIX}-POL-2`, companyName: `${PREFIX} Cía`,
+      });
+      const after = (await getSummary()).body;
+
+      const newItems = after.adeudadosDetalle.filter((i: any) => !before.adeudadosDetalle.some((b: any) => b.id === i.id && b.origen === i.origen));
+      expect(newItems.length).toBe(1);
+      expect(newItems[0].origen).toBe("installment");
+      expect(newItems[0].deudor).toBe(`${PREFIX} Deudor Cuota`);
+    } finally {
+      await cleanupRemittance(remId);
+      await cleanupPayment(paymentId);
+    }
+  });
+
+  test("adeudado con paidAt seteado NO aparece en el detalle", async () => {
+    const before = (await getSummary()).body;
+    const [rem] = await db.insert(remittances).values({
+      date: FIXTURE_DATE, canal: "directo", paymentBreakdown: "{}",
+      totalAmount: 300, totalPaid: 0, status: "confirmada", createdBy: userId,
+    }).returning({ id: remittances.id });
+    const remId = rem!.id;
+    try {
+      await db.insert(remittanceItems).values({
+        remittanceId: remId, source: "manual_debt", sourceId: null, amount: 300, debtorStatus: "adeudado",
+        clientName: `${PREFIX} Ya Pagado`, paidAt: new Date(),
+      });
+      const after = (await getSummary()).body;
+
+      expect(after.adeudadosDetalle.some((i: any) => i.deudor === `${PREFIX} Ya Pagado`)).toBe(false);
+      expect(after.totalAdeudadoRendiciones - before.totalAdeudadoRendiciones).toBeCloseTo(0, 2);
+    } finally {
+      await cleanupRemittance(remId);
+    }
+  });
+
+  test("item con debtorStatus distinto de 'adeudado' (pagado) NO aparece en el detalle", async () => {
+    const before = (await getSummary()).body;
+    const { paymentId } = await mkStandalonePayment({ amount: 250, splits: [{ method: "efectivo", amountCents: 25000 }], rendered: 1 });
+    const [rem] = await db.insert(remittances).values({
+      date: FIXTURE_DATE, canal: "directo", paymentBreakdown: JSON.stringify({ efectivo: 250 }),
+      totalAmount: 250, totalPaid: 250, status: "confirmada", createdBy: userId,
+    }).returning({ id: remittances.id });
+    const remId = rem!.id;
+    try {
+      await db.insert(remittanceItems).values({
+        remittanceId: remId, source: "payment", sourceId: paymentId, amount: 250, debtorStatus: "pagado",
+        clientName: `${PREFIX} Pagado OK`,
+      });
+      const after = (await getSummary()).body;
+
+      expect(after.adeudadosDetalle.some((i: any) => i.deudor === `${PREFIX} Pagado OK`)).toBe(false);
+    } finally {
+      await cleanupRemittance(remId);
+      await cleanupPayment(paymentId);
+    }
+  });
+
+  test("cash_debt legacy pendiente aparece con origen 'cash_debt_legacy'", async () => {
+    const before = (await getSummary()).body;
+    const [debt] = await db.insert(cashDebts).values({
+      clientName: `${PREFIX} Deuda Legacy`, policyNumber: `${PREFIX}-POL-3`, companyName: `${PREFIX} Cía`,
+      amount: 850, status: "pendiente", createdBy: userId, createdAt: new Date(),
+    }).returning({ id: cashDebts.id });
+    const debtId = debt!.id;
+    try {
+      const after = (await getSummary()).body;
+
+      const newItems = after.adeudadosDetalle.filter((i: any) => !before.adeudadosDetalle.some((b: any) => b.id === i.id && b.origen === i.origen));
+      expect(newItems.length).toBe(1);
+      expect(newItems[0].origen).toBe("cash_debt_legacy");
+      expect(newItems[0].deudor).toBe(`${PREFIX} Deuda Legacy`);
+      expect(newItems[0].importe).toBeCloseTo(850, 2);
+      expect(after.totalAdeudadoLegacy - before.totalAdeudadoLegacy).toBeCloseTo(850, 2);
+    } finally {
+      await cleanupCashDebt(debtId);
+    }
+  });
+
+  test("cash_debt legacy con status='cobrado' NO aparece en el detalle", async () => {
+    const before = (await getSummary()).body;
+    const [debt] = await db.insert(cashDebts).values({
+      clientName: `${PREFIX} Deuda Ya Cobrada`, status: "cobrado", amount: 400, createdBy: userId, createdAt: new Date(),
+    }).returning({ id: cashDebts.id });
+    const debtId = debt!.id;
+    try {
+      const after = (await getSummary()).body;
+
+      expect(after.adeudadosDetalle.some((i: any) => i.deudor === `${PREFIX} Deuda Ya Cobrada`)).toBe(false);
+      expect(after.totalAdeudadoLegacy - before.totalAdeudadoLegacy).toBeCloseTo(0, 2);
+    } finally {
+      await cleanupCashDebt(debtId);
+    }
+  });
+
+  test("sin ningún adeudado activo, adeudadosDetalle sigue siendo un array (puede ser vacío)", async () => {
+    const { status, body } = await getSummary();
+    expect(status).toBe(200);
+    expect(Array.isArray(body.adeudadosDetalle)).toBe(true);
+  });
+
+  test("SUM(adeudadosDetalle.importe) === totalAdeudado (en centavos, con las 3 fuentes mezcladas)", async () => {
+    const { paymentId } = await mkStandalonePayment({ amount: 111.11, splits: [{ method: "efectivo", amountCents: 11111 }], rendered: 1 });
+    const [rem] = await db.insert(remittances).values({
+      date: FIXTURE_DATE, canal: "directo", paymentBreakdown: "{}",
+      totalAmount: 111.11, totalPaid: 0, status: "confirmada", createdBy: userId,
+    }).returning({ id: remittances.id });
+    const remId = rem!.id;
+    const [rem2] = await db.insert(remittances).values({
+      date: FIXTURE_DATE, canal: "directo", paymentBreakdown: "{}",
+      totalAmount: 222.22, totalPaid: 0, status: "confirmada", createdBy: userId,
+    }).returning({ id: remittances.id });
+    const remId2 = rem2!.id;
+    let debtId: number | undefined;
+    try {
+      await db.insert(remittanceItems).values({
+        remittanceId: remId, source: "installment", sourceId: null, amount: 111.11, debtorStatus: "adeudado",
+        clientName: `${PREFIX} Mix 1`,
+      });
+      await db.insert(remittanceItems).values({
+        remittanceId: remId2, source: "manual_debt", sourceId: null, amount: 222.22, debtorStatus: "adeudado",
+        clientName: `${PREFIX} Mix 2`,
+      });
+      const [debt] = await db.insert(cashDebts).values({
+        clientName: `${PREFIX} Mix 3`, amount: 333.33, status: "pendiente", createdBy: userId, createdAt: new Date(),
+      }).returning({ id: cashDebts.id });
+      debtId = debt!.id;
+
+      const { body } = await getSummary();
+      const detalleSumCents = body.adeudadosDetalle.reduce((s: number, i: any) => s + Math.round(i.importe * 100), 0);
+      const totalAdeudadoCents = Math.round(body.totalAdeudado * 100);
+      expect(detalleSumCents).toBe(totalAdeudadoCents);
+    } finally {
+      if (debtId !== undefined) await cleanupCashDebt(debtId);
+      await cleanupRemittance(remId2);
+      await cleanupRemittance(remId);
+      await cleanupPayment(paymentId);
+    }
+  });
+
+  test("no hay duplicados dentro de una misma fuente (2 adeudados manual_debt distintos generan 2 filas, no 1)", async () => {
+    const before = (await getSummary()).body;
+    const [rem] = await db.insert(remittances).values({
+      date: FIXTURE_DATE, canal: "directo", paymentBreakdown: "{}",
+      totalAmount: 600, totalPaid: 0, status: "confirmada", createdBy: userId,
+    }).returning({ id: remittances.id });
+    const remId = rem!.id;
+    try {
+      await db.insert(remittanceItems).values([
+        { remittanceId: remId, source: "manual_debt", sourceId: null, amount: 300, debtorStatus: "adeudado", clientName: `${PREFIX} Dup A` },
+        { remittanceId: remId, source: "manual_debt", sourceId: null, amount: 300, debtorStatus: "adeudado", clientName: `${PREFIX} Dup B` },
+      ]);
+      const after = (await getSummary()).body;
+
+      const newItems = after.adeudadosDetalle.filter((i: any) => !before.adeudadosDetalle.some((b: any) => b.id === i.id && b.origen === i.origen));
+      expect(newItems.length).toBe(2);
+      expect(new Set(newItems.map((i: any) => i.id)).size).toBe(2);
+    } finally {
+      await cleanupRemittance(remId);
     }
   });
 });

@@ -461,3 +461,115 @@ export function accumulateRemittanceContribution(contribution: RemittanceContrib
 export function centsToPesos(cents: number): number {
   return cents / 100;
 }
+
+// ─── Detalle de adeudados (Caja) ────────────────────────────────────────────
+//
+// Fuente única: las MISMAS filas que ya calculan totalAdeudadoRendiciones/
+// totalAdeudadoLegacy en el handler de /cash/summary (remittance_items con
+// debtorStatus='adeudado' AND paidAt IS NULL; cash_debts con status=
+// 'pendiente') — acá solo se normalizan a filas de detalle, sin volver a
+// consultar la DB ni recalcular el total. Cero deduplicación automática
+// entre ambas fuentes: no existe ninguna FK que relacione cash_debts con
+// remittance_items/policies, así que no hay manera confiable de detectar un
+// duplicado real (ver comentario en index.ts junto a debtsLegacy).
+
+export type AdeudadoOrigin = "installment" | "manual_debt" | "cash_debt_legacy";
+
+export interface AdeudadoDetalleItem {
+  id: number;
+  origen: AdeudadoOrigin;
+  deudor: string;
+  polizaODescripcion: string | null;
+  compania: string | null;
+  importe: number;
+  fecha: string;
+  estado: "pendiente";
+}
+
+export interface RemittanceDebtRowForDetalle {
+  id: number;
+  // remittance_items.source ya viene filtrado a solo debtorStatus='adeudado'
+  // — acá solo distingue 'manual_debt' de cualquier otro valor real
+  // (hoy siempre 'installment', el único otro source que puede quedar
+  // adeudado — 'payment'/'cash_entry' nunca tienen debtorStatus='adeudado').
+  source: string;
+  policyNumber: string | null;
+  debtorName: string | null;
+  companyName: string | null;
+  amount: number;
+  remittanceDate: string;
+}
+
+export interface CashDebtLegacyRowForDetalle {
+  id: number;
+  clientName: string;
+  policyNumber: string | null;
+  companyName: string | null;
+  amount: number;
+  // Único dato de fecha disponible en cash_debts para este propósito — no
+  // hay una "fecha de rendición" porque nunca pasó por una rendición.
+  createdAt: Date | number | string | null;
+}
+
+function formatDebtLegacyDate(createdAt: Date | number | string | null): string {
+  if (createdAt instanceof Date) return createdAt.toISOString().slice(0, 10);
+  if (typeof createdAt === "number") return new Date(createdAt * 1000).toISOString().slice(0, 10);
+  if (typeof createdAt === "string" && createdAt.length > 0) return createdAt.slice(0, 10);
+  return "";
+}
+
+export function buildAdeudadosDetalle(
+  remittanceDebtRows: ReadonlyArray<RemittanceDebtRowForDetalle>,
+  cashDebtRows: ReadonlyArray<CashDebtLegacyRowForDetalle>
+): AdeudadoDetalleItem[] {
+  const fromRemittances: AdeudadoDetalleItem[] = remittanceDebtRows.map((r) => ({
+    id: r.id,
+    origen: r.source === "manual_debt" ? "manual_debt" : "installment",
+    deudor: r.debtorName ?? "—",
+    polizaODescripcion: r.policyNumber,
+    compania: r.companyName,
+    importe: r.amount,
+    fecha: r.remittanceDate,
+    estado: "pendiente",
+  }));
+  const fromLegacy: AdeudadoDetalleItem[] = cashDebtRows.map((d) => ({
+    id: d.id,
+    origen: "cash_debt_legacy",
+    deudor: d.clientName,
+    polizaODescripcion: d.policyNumber,
+    compania: d.companyName,
+    importe: d.amount,
+    fecha: formatDebtLegacyDate(d.createdAt),
+    estado: "pendiente",
+  }));
+  return [...fromRemittances, ...fromLegacy];
+}
+
+// Lanzada cuando SUM(adeudadosDetalle.importe) no coincide con totalAdeudado
+// (comparación en centavos, para no arrastrar errores de punto flotante).
+// Nunca se "ajusta" el número para que cierre — ver regla explícita del
+// pedido que introdujo esto: si no coincide, es una señal real de que
+// alguna fila se está contando en el total pero no en el detalle (o
+// viceversa), y debe investigarse, no ocultarse.
+export class AdeudadosSumMismatchError extends Error {
+  constructor(
+    public readonly detalleSumCents: number,
+    public readonly totalAdeudadoCents: number
+  ) {
+    super(
+      `adeudadosDetalle no coincide con totalAdeudado: detalle=${detalleSumCents} centavos, ` +
+      `totalAdeudado=${totalAdeudadoCents} centavos, diferencia=${detalleSumCents - totalAdeudadoCents} centavos.`
+    );
+  }
+}
+
+export function assertAdeudadosDetalleMatchesTotal(
+  detalle: ReadonlyArray<AdeudadoDetalleItem>,
+  totalAdeudadoPesos: number
+): void {
+  const detalleSumCents = detalle.reduce((s, item) => s + Math.round(item.importe * 100), 0);
+  const totalAdeudadoCents = Math.round(totalAdeudadoPesos * 100);
+  if (detalleSumCents !== totalAdeudadoCents) {
+    throw new AdeudadosSumMismatchError(detalleSumCents, totalAdeudadoCents);
+  }
+}

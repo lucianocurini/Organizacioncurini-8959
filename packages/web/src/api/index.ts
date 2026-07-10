@@ -69,7 +69,8 @@ import {
   applyStandalonePaymentToCartera, applyBatchToCartera, applyStandaloneSurchargeToCartera,
   applyManualCashEntryToCartera, collectDistinctExpectedSources, classifyRemittanceForRendido,
   accumulateRemittanceContribution, emptyMoneyBucket, emptyDirectCompanyBucket, emptyRendidoAccumulator,
-  centsToPesos, type CarteraInconsistency, type BatchForCartera,
+  centsToPesos, buildAdeudadosDetalle, assertAdeudadosDetalleMatchesTotal, AdeudadosSumMismatchError,
+  type CarteraInconsistency, type BatchForCartera,
 } from "../lib/payments/caja-summary";
 
 const app = new Hono().basePath("/api");
@@ -5640,12 +5641,22 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     paymentGroupById.set(pid, classifySplitGroup(splits));
   }
 
-  // Adeudados de rendiciones (cuotas rendidas pero asegurado aún no pagó)
+  // Adeudados de rendiciones (cuotas rendidas pero asegurado aún no pagó).
+  // Mismas columnas que consume buildAdeudadosDetalle (src/lib/payments/
+  // caja-summary.ts) — una sola query, sin duplicar la lógica de totalAdeudado.
   const remittanceDebtItems = await db.select({
     id: remittanceItems.id,
     amount: remittanceItems.amount,
     paidAt: remittanceItems.paidAt,
+    source: remittanceItems.source,
+    sourceId: remittanceItems.sourceId,
+    policyNumber: remittanceItems.policyNumber,
+    debtorName: remittanceItems.clientName,
+    companyName: remittanceItems.companyName,
+    debtorStatus: remittanceItems.debtorStatus,
+    remittanceDate: remittances.date,
   }).from(remittanceItems)
+    .innerJoin(remittances, eq(remittanceItems.remittanceId, remittances.id))
     .where(eq(remittanceItems.debtorStatus, "adeudado"))
     .all();
   const unpaidDebtItems = remittanceDebtItems.filter((i: any) => !i.paidAt);
@@ -5863,6 +5874,18 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   const totalAdeudadoLegacy = debtsLegacy.reduce((s: number, d: any) => s + d.amount, 0);
   const totalAdeudado = totalAdeudadoRendiciones + totalAdeudadoLegacy;
 
+  // Detalle fila por fila de esos mismos adeudados (mismas filas de arriba,
+  // sin re-consultar ni recalcular el total — ver buildAdeudadosDetalle).
+  const adeudadosDetalle = buildAdeudadosDetalle(unpaidDebtItems, debtsLegacy);
+  try {
+    assertAdeudadosDetalleMatchesTotal(adeudadosDetalle, totalAdeudado);
+  } catch (e) {
+    if (e instanceof AdeudadosSumMismatchError) {
+      return c.json({ error: e.message }, 500);
+    }
+    throw e;
+  }
+
   // Gastos registrados (excluye anulados)
   const allExpenses = await db.select().from(cashExpenses).all();
   const totalGastos = allExpenses.filter((e: any) => e.status !== "anulado").reduce((s: number, e: any) => s + e.amount, 0);
@@ -6012,6 +6035,7 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     totalAdeudado,
     totalAdeudadoRendiciones,
     totalAdeudadoLegacy,
+    adeudadosDetalle,
     totalGastos,
     gastosMes,
     diferencia,
