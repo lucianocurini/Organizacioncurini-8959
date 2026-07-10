@@ -41,6 +41,7 @@ import {
 import { parseElNorteTxtV2 } from "../lib/parsers/el-norte-v2";
 import { isValidCalendarDate, buildInstallmentPlan, InstallmentPlanError } from "../lib/installments/plan";
 import { classifyInstallmentsForRebuild, runInstallmentRebuildTransaction, RebuildConflictError, PolicyNotFoundError } from "../lib/installments/rebuild";
+import { parseRebillingPayload, RebillingPayloadError, buildRebillingInstallmentPlan, hasRebillingGroupActivity } from "../lib/installments/rebilling-plan";
 import { validateAndNormalizeSplits, SplitValidationError, classifySplitGroup, isDirectCompanyPaymentMethod, type SplitGroup } from "../lib/payments/splits";
 import { recalculateInstallmentPaymentStatus } from "../lib/payments/installment-status";
 import {
@@ -286,6 +287,13 @@ app.get("/policies/:id", requireAuth(async (c: any) => {
 }));
 
 // ─── Rebillings ───────────────────────────────────────────────────────────────
+
+// Señales de control de flujo dentro de db.transaction — nunca se exponen
+// tal cual al cliente, el endpoint las mapea a la respuesta HTTP apropiada
+// (mismo patrón que RebuildConflictError en rebuild.ts).
+class RebillingDuplicateError extends Error {}
+class RebillingConflictError extends Error {}
+
 app.get("/policies/:id/rebillings", requireAuth(async (c: any) => {
   const rows = await db
     .select()
@@ -295,41 +303,261 @@ app.get("/policies/:id/rebillings", requireAuth(async (c: any) => {
   return c.json(rows, 200);
 }));
 
+// Cuotas vinculadas a una refacturación puntual, exclusivamente por
+// rebilling_id (nunca por policyId ni por rango de fechas). Refacturaciones
+// históricas sin cuotas vinculadas simplemente devuelven [] acá — ese es
+// justamente el caso que PUT (caso A) sabe completar.
+async function loadRebillingGroup(dbClient: any, rebillingId: number) {
+  return dbClient
+    .select({ id: policyInstallments.id, status: policyInstallments.status, rendered: policyInstallments.rendered })
+    .from(policyInstallments)
+    .where(eq(policyInstallments.rebillingId, rebillingId))
+    .all();
+}
+
+async function rebillingGroupActivitySets(dbClient: any, installmentIds: number[]) {
+  let paidInstallmentIds = new Set<number>();
+  let remittedInstallmentIds = new Set<number>();
+  if (installmentIds.length > 0) {
+    const payRows = await dbClient.select({ installmentId: payments.installmentId }).from(payments)
+      .where(inArray(payments.installmentId, installmentIds)).all();
+    paidInstallmentIds = new Set(payRows.map((r: any) => r.installmentId).filter((id: any) => id !== null));
+
+    const remRows = await dbClient.select({ sourceId: remittanceItems.sourceId }).from(remittanceItems)
+      .where(and(eq(remittanceItems.source, "installment"), inArray(remittanceItems.sourceId, installmentIds))).all();
+    remittedInstallmentIds = new Set(remRows.map((r: any) => r.sourceId).filter((id: any) => id !== null));
+  }
+  return { paidInstallmentIds, remittedInstallmentIds };
+}
+
+// Mensajes separados por endpoint — DELETE conserva el texto original tal
+// cual (ver rebilling-installments.test.ts, Caso E, que ya lo verifica
+// literal); PUT tiene el suyo porque la acción bloqueada es "editar", no
+// "eliminar".
+const REB_DELETE_BLOCK_MSG = "No se puede eliminar la refacturación porque tiene cuotas pagadas, rendidas o con movimientos asociados.";
+const REB_EDIT_BLOCK_MSG = "No se puede editar la refacturación porque tiene cuotas pagadas, rendidas o con movimientos asociados.";
+
 app.post("/policies/:id/rebillings", requireAuth(async (c: any) => {
   const user = c.get("user");
   const policyId = Number(c.req.param("id"));
   const body = await c.req.json();
-  const [row] = await db
-    .insert(rebillings)
-    .values({
-      policyId,
-      billingStart: body.billingStart,
-      billingEnd: body.billingEnd,
-      premium: body.premium ? Number(body.premium) : null,
-      monthlyFee: body.monthlyFee ? Number(body.monthlyFee) : null,
-      sumInsured: body.sumInsured ? Number(body.sumInsured) : null,
-      notes: body.notes || null,
-      createdBy: user.id,
-    })
-    .returning();
-  return c.json(row, 201);
+
+  // 1. validar póliza
+  const policy = await db.select({ id: policies.id }).from(policies).where(eq(policies.id, policyId)).get();
+  if (!policy) return c.json({ error: "La póliza no existe." }, 404);
+
+  // 2. validar payload
+  let payload;
+  try {
+    payload = parseRebillingPayload(body);
+  } catch (e: any) {
+    if (e instanceof RebillingPayloadError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
+  // 5. construir plan (antes de escribir nada — pura, sin DB)
+  let plan;
+  try {
+    plan = buildRebillingInstallmentPlan(payload);
+  } catch (e: any) {
+    if (e instanceof InstallmentPlanError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
+  try {
+    const result = await db.transaction(async (tx) => {
+      // 3. comprobar duplicado (dentro de la transacción — check-then-insert atómico)
+      const duplicate = await checkDuplicateRebilling(policyId, payload.billingStart, payload.billingEnd, payload.premium, tx);
+      if (duplicate) {
+        throw new RebillingDuplicateError(
+          `Ya existe una refacturación para esta póliza con el mismo período (${payload.billingStart} a ${payload.billingEnd}) y la misma prima.`
+        );
+      }
+
+      // 4. insertar rebilling
+      const [rebilling] = await tx.insert(rebillings).values({
+        policyId,
+        billingStart: payload.billingStart,
+        billingEnd: payload.billingEnd,
+        premium: payload.premium,
+        monthlyFee: payload.monthlyFee,
+        sumInsured: payload.sumInsured,
+        installmentCount: payload.installmentCount,
+        firstDueDate: payload.firstDueDate,
+        deductible: payload.deductible,
+        notes: payload.notes,
+        createdBy: user.id,
+      }).returning();
+
+      // 6. insertar N policy_installments
+      const insertedInstallments = await tx.insert(policyInstallments).values(
+        plan.installments.map((row) => ({
+          policyId,
+          number: row.number,
+          dueDate: row.dueDate,
+          amount: row.amount,
+          status: "pendiente",
+          rendered: 0,
+          rebillingId: rebilling!.id,
+        }))
+      ).returning();
+
+      // 7. incrementar policies.installments en N
+      await tx.update(policies)
+        .set({ installments: sql`COALESCE(${policies.installments}, 0) + ${plan.installments.length}` })
+        .where(eq(policies.id, policyId));
+
+      // 8. si deductible fue informado, actualizar la franquicia vigente
+      if (payload.deductible !== null) {
+        await tx.update(policies).set({ deductible: payload.deductible }).where(eq(policies.id, policyId));
+      }
+
+      return { rebilling, installments: insertedInstallments };
+    });
+
+    return c.json({ ...result.rebilling, installments: result.installments }, 201);
+  } catch (e: any) {
+    if (e instanceof RebillingDuplicateError) return c.json({ error: e.message }, 409);
+    throw e;
+  }
 }));
 
 app.put("/rebillings/:id", requireAuth(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isInteger(id) || id <= 0) {
+    return c.json({ error: "ID de refacturación inválido." }, 400);
+  }
   const body = await c.req.json();
-  const [row] = await db
-    .update(rebillings)
-    .set({
-      billingStart: body.billingStart,
-      billingEnd: body.billingEnd,
-      premium: body.premium ? Number(body.premium) : null,
-      monthlyFee: body.monthlyFee ? Number(body.monthlyFee) : null,
-      sumInsured: body.sumInsured ? Number(body.sumInsured) : null,
-      notes: body.notes || null,
-    })
-    .where(eq(rebillings.id, Number(c.req.param("id"))))
-    .returning();
-  return c.json(row, 200);
+
+  const existing = await db.select().from(rebillings).where(eq(rebillings.id, id)).get();
+  if (!existing) return c.json({ error: "La refacturación ya no existe" }, 404);
+
+  const currentGroup = await loadRebillingGroup(db, id);
+  const currentInstallmentIds = currentGroup.map((i: any) => i.id);
+  const { paidInstallmentIds, remittedInstallmentIds } = await rebillingGroupActivitySets(db, currentInstallmentIds);
+  const groupHasActivity = hasRebillingGroupActivity(currentGroup, paidInstallmentIds, remittedInstallmentIds);
+
+  // CASO C — hay actividad: bloquear cualquier cambio que afecte fechas,
+  // importe o cantidad de cuotas. Solo notes puede cambiar sin riesgo.
+  if (groupHasActivity) {
+    const touchesPlan =
+      body.billingStart !== undefined || body.billingEnd !== undefined ||
+      body.monthlyFee !== undefined || body.installmentCount !== undefined ||
+      body.firstDueDate !== undefined || body.premium !== undefined || body.deductible !== undefined;
+    if (touchesPlan) return c.json({ error: REB_EDIT_BLOCK_MSG }, 409);
+
+    const [row] = await db.update(rebillings)
+      .set({ notes: body.notes !== undefined ? (body.notes || null) : existing.notes })
+      .where(eq(rebillings.id, id))
+      .returning();
+    return c.json(row, 200);
+  }
+
+  // Sin actividad: si el body no trae installmentCount/firstDueDate, es una
+  // edición liviana (solo premium/sumInsured/notes/deductible sin tocar el
+  // plan de cuotas) — mismo comportamiento simple de siempre, sin regenerar
+  // nada. Si los trae, se regenera el grupo (caso A si no había cuotas, caso
+  // B si reemplaza un grupo previo sin actividad).
+  const wantsPlan = body.installmentCount !== undefined || body.firstDueDate !== undefined;
+  if (!wantsPlan) {
+    const [row] = await db.update(rebillings).set({
+      billingStart: body.billingStart ?? existing.billingStart,
+      billingEnd: body.billingEnd ?? existing.billingEnd,
+      premium: body.premium !== undefined ? (body.premium ? Number(body.premium) : null) : existing.premium,
+      monthlyFee: body.monthlyFee !== undefined ? (body.monthlyFee ? Number(body.monthlyFee) : null) : existing.monthlyFee,
+      sumInsured: body.sumInsured !== undefined ? (body.sumInsured ? Number(body.sumInsured) : null) : existing.sumInsured,
+      notes: body.notes !== undefined ? (body.notes || null) : existing.notes,
+    }).where(eq(rebillings.id, id)).returning();
+    return c.json(row, 200);
+  }
+
+  let payload;
+  try {
+    payload = parseRebillingPayload({
+      billingStart: body.billingStart ?? existing.billingStart,
+      billingEnd: body.billingEnd ?? existing.billingEnd,
+      premium: body.premium !== undefined ? body.premium : existing.premium,
+      monthlyFee: body.monthlyFee !== undefined ? body.monthlyFee : existing.monthlyFee,
+      installmentCount: body.installmentCount ?? existing.installmentCount,
+      firstDueDate: body.firstDueDate ?? existing.firstDueDate,
+      sumInsured: body.sumInsured !== undefined ? body.sumInsured : existing.sumInsured,
+      deductible: body.deductible !== undefined ? body.deductible : existing.deductible,
+      notes: body.notes !== undefined ? body.notes : existing.notes,
+    });
+  } catch (e: any) {
+    if (e instanceof RebillingPayloadError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
+  let plan;
+  try {
+    plan = buildRebillingInstallmentPlan(payload);
+  } catch (e: any) {
+    if (e instanceof InstallmentPlanError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
+  const result = await db.transaction(async (tx) => {
+    // Re-chequeo dentro de la transacción — mismo motivo que
+    // runInstallmentRebuildTransaction en rebuild.ts: el estado pudo cambiar
+    // entre el chequeo de arriba y este punto.
+    const recheckGroup = await loadRebillingGroup(tx, id);
+    const recheckIds = recheckGroup.map((i: any) => i.id);
+    const { paidInstallmentIds: rePaid, remittedInstallmentIds: reRem } = await rebillingGroupActivitySets(tx, recheckIds);
+    if (hasRebillingGroupActivity(recheckGroup, rePaid, reRem)) {
+      throw new RebillingConflictError();
+    }
+
+    const previousCount = recheckGroup.length;
+    if (previousCount > 0) {
+      await tx.delete(policyInstallments).where(eq(policyInstallments.rebillingId, id));
+    }
+
+    const [rebilling] = await tx.update(rebillings).set({
+      billingStart: payload.billingStart,
+      billingEnd: payload.billingEnd,
+      premium: payload.premium,
+      monthlyFee: payload.monthlyFee,
+      sumInsured: payload.sumInsured,
+      installmentCount: payload.installmentCount,
+      firstDueDate: payload.firstDueDate,
+      deductible: payload.deductible,
+      notes: payload.notes,
+    }).where(eq(rebillings.id, id)).returning();
+
+    const insertedInstallments = await tx.insert(policyInstallments).values(
+      plan.installments.map((row) => ({
+        policyId: existing.policyId,
+        number: row.number,
+        dueDate: row.dueDate,
+        amount: row.amount,
+        status: "pendiente",
+        rendered: 0,
+        rebillingId: id,
+      }))
+    ).returning();
+
+    // policies.installments ajustado por la DIFERENCIA (newCount - oldCount)
+    // — nunca "set" absoluto, para no pisar cuotas de otros grupos.
+    const diff = plan.installments.length - previousCount;
+    if (diff !== 0) {
+      await tx.update(policies)
+        .set({ installments: sql`COALESCE(${policies.installments}, 0) + ${diff}` })
+        .where(eq(policies.id, existing.policyId));
+    }
+
+    if (payload.deductible !== null) {
+      await tx.update(policies).set({ deductible: payload.deductible }).where(eq(policies.id, existing.policyId));
+    }
+
+    return { rebilling, installments: insertedInstallments, previousCount };
+  }).catch((e: any) => {
+    if (e instanceof RebillingConflictError) return null;
+    throw e;
+  });
+
+  if (result === null) return c.json({ error: REB_EDIT_BLOCK_MSG }, 409);
+  return c.json({ ...result.rebilling, installments: result.installments }, 200);
 }));
 
 app.delete("/rebillings/:id", requireAuth(async (c: any) => {
@@ -338,33 +566,14 @@ app.delete("/rebillings/:id", requireAuth(async (c: any) => {
     return c.json({ error: "ID de refacturación inválido." }, 400);
   }
 
-  const rebilling = await db.select({ id: rebillings.id }).from(rebillings).where(eq(rebillings.id, id)).get();
+  const rebilling = await db.select({ id: rebillings.id, policyId: rebillings.policyId }).from(rebillings).where(eq(rebillings.id, id)).get();
   if (!rebilling) return c.json({ error: "La refacturación ya no existe" }, 404);
 
-  const REB_BLOCK_MSG = "No se puede eliminar la refacturación porque tiene cuotas pagadas, rendidas o con movimientos asociados.";
-
-  // Cuotas vinculadas exclusivamente por rebilling_id (nunca por policyId ni rango de fechas).
-  // Refacturaciones históricas sin cuotas vinculadas simplemente devuelven [] acá.
-  const linkedInstallments = await db.select({ id: policyInstallments.id, status: policyInstallments.status, rendered: policyInstallments.rendered })
-    .from(policyInstallments)
-    .where(eq(policyInstallments.rebillingId, id))
-    .all();
-
-  const pagada = linkedInstallments.some((i) => i.status === "pagada");
-  if (pagada) return c.json({ error: REB_BLOCK_MSG }, 409);
-
-  const rendered = linkedInstallments.some((i) => i.rendered === 1);
-  if (rendered) return c.json({ error: REB_BLOCK_MSG }, 409);
-
-  const installmentIds = linkedInstallments.map((i) => i.id);
-  if (installmentIds.length > 0) {
-    const payByInst = await db.select({ id: payments.id }).from(payments)
-      .where(inArray(payments.installmentId, installmentIds)).get();
-    if (payByInst) return c.json({ error: REB_BLOCK_MSG }, 409);
-
-    const remByInst = await db.select({ id: remittanceItems.id }).from(remittanceItems)
-      .where(and(eq(remittanceItems.source, "installment"), inArray(remittanceItems.sourceId, installmentIds))).get();
-    if (remByInst) return c.json({ error: REB_BLOCK_MSG }, 409);
+  const linkedInstallments = await loadRebillingGroup(db, id);
+  const installmentIds = linkedInstallments.map((i: any) => i.id);
+  const { paidInstallmentIds, remittedInstallmentIds } = await rebillingGroupActivitySets(db, installmentIds);
+  if (hasRebillingGroupActivity(linkedInstallments, paidInstallmentIds, remittedInstallmentIds)) {
+    return c.json({ error: REB_DELETE_BLOCK_MSG }, 409);
   }
 
   const deletedInstallments = await db.transaction(async (tx) => {
@@ -372,6 +581,13 @@ app.delete("/rebillings/:id", requireAuth(async (c: any) => {
       await tx.delete(policyInstallments).where(eq(policyInstallments.rebillingId, id));
     }
     await tx.delete(rebillings).where(eq(rebillings.id, id));
+    // Nunca por debajo de 0 — refacturaciones históricas sin cuotas (o con
+    // policies.installments ya desincronizado) no deben producir un valor negativo.
+    if (installmentIds.length > 0) {
+      await tx.update(policies)
+        .set({ installments: sql`MAX(0, COALESCE(${policies.installments}, 0) - ${installmentIds.length})` })
+        .where(eq(policies.id, rebilling.policyId));
+    }
     return installmentIds.length;
   });
 
@@ -3573,10 +3789,14 @@ function normalizePremiumCents(premium: number | null | undefined): number {
   return Math.round((premium ?? 0) * 100);
 }
 
-async function enCheckDuplicateRebilling(
-  policyId: number, billingStart: string, billingEnd: string, premium: number | null | undefined
+// Genérico — no específico del importador de El Norte (a pesar del nombre
+// histórico de los call sites que la usaban primero): mismo criterio de
+// duplicado para el importador y para POST /policies/:id/rebillings (alta
+// manual) — policyId + billingStart + billingEnd + premium exactos.
+async function checkDuplicateRebilling(
+  policyId: number, billingStart: string, billingEnd: string, premium: number | null | undefined, dbClient: any = db
 ): Promise<boolean> {
-  const rows = await db.select({ premium: rebillings.premium })
+  const rows = await dbClient.select({ premium: rebillings.premium })
     .from(rebillings)
     .where(and(
       eq(rebillings.policyId, policyId),
@@ -3585,7 +3805,7 @@ async function enCheckDuplicateRebilling(
     ))
     .all();
   const targetCents = normalizePremiumCents(premium);
-  return rows.some(r => normalizePremiumCents(r.premium) === targetCents);
+  return rows.some((r: any) => normalizePremiumCents(r.premium) === targetCents);
 }
 
 function enDeduplicateBatch(policiesArr: any[]): { deduped: any[]; inBatchDuplicates: number } {
@@ -3684,7 +3904,7 @@ async function enImportOne(p: any, companyId: number, userId: number, counts: Im
   if (mov.includes("ENDOSO")) {
     const existing = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
     if (existing) {
-      if (await enCheckDuplicateRebilling(existing.id, p.startDate, p.endDate, p.premium)) {
+      if (await checkDuplicateRebilling(existing.id, p.startDate, p.endDate, p.premium)) {
         counts.duplicados++;
         return;
       }
@@ -3715,7 +3935,7 @@ async function enImportOne(p: any, companyId: number, userId: number, counts: Im
   if (mov.includes("PRORROGA")) {
     const existing = await db.select().from(policies).where(eq(policies.policyNumber, String(p.policyNumber))).get();
     if (existing) {
-      if (await enCheckDuplicateRebilling(existing.id, p.startDate, p.endDate, p.premium)) {
+      if (await checkDuplicateRebilling(existing.id, p.startDate, p.endDate, p.premium)) {
         counts.duplicados++;
         return;
       }

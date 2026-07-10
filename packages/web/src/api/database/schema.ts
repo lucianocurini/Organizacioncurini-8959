@@ -342,6 +342,13 @@ export const rebillings = sqliteTable("rebillings", {
   monthlyFee: real("monthly_fee"),
   sumInsured: real("sum_insured"),
   notes: text("notes"),
+  // Migración 0025 — datos del grupo de cuotas que esta refacturación genera
+  // en policy_installments (rebillingId = este id). NULL en refacturaciones
+  // históricas que nunca generaron cuotas (el bug original); se completan
+  // recién al editar esa refacturación (ver PUT /rebillings/:id, caso A).
+  installmentCount: integer("installment_count"), // cantidad de cuotas de ESTA refacturación puntual
+  firstDueDate: text("first_due_date"), // vencimiento de la primera cuota del grupo — valor propio, no derivado de billingStart
+  deductible: real("deductible"), // franquicia vigente al momento de esta refacturación (histórico por período)
   createdBy: integer("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });

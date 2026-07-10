@@ -30,6 +30,11 @@ const CYCLE_LABEL: Record<string, string> = {
 export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
   const months = CYCLE_MONTHS[policy.billingCycle] ?? 0;
 
+  // Refacturación histórica sin cuotas generadas (el bug que este flujo
+  // corrige): installmentCount nunca se completó. Se detecta explícitamente
+  // (no se infiere de otra cosa) para forzar a completar el plan al guardar.
+  const isHistoricalWithoutInstallments = !!initial && (initial.installmentCount == null || initial.installmentCount === 0);
+
   const defaultStart = initial?.billingStart ?? policy._nextStart ?? policy.startDate ?? "";
   const defaultEnd = initial?.billingEnd ?? (months ? addMonths(defaultStart, months) : "");
 
@@ -38,23 +43,53 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
     billingEnd: defaultEnd,
     premium: initial?.premium != null ? String(initial.premium) : (policy.premium != null ? String(policy.premium) : ""),
     monthlyFee: initial?.monthlyFee != null ? String(initial.monthlyFee) : (policy.monthlyFee != null ? String(policy.monthlyFee) : ""),
+    // Vacío si nunca se completó (histórica sin cuotas) — nunca se inventa un
+    // valor por defecto para esto, es siempre una entrada explícita.
+    installmentCount: initial?.installmentCount != null ? String(initial.installmentCount) : (!initial && months ? String(months) : ""),
+    // Puede precargarse con billingStart como sugerencia, pero el usuario
+    // puede cambiarlo — nunca se envía sin que el campo tenga un valor.
+    firstDueDate: initial?.firstDueDate ?? defaultStart,
     sumInsured: initial?.sumInsured != null ? String(initial.sumInsured) : (policy.sumInsured != null ? String(policy.sumInsured) : ""),
+    deductible: initial?.deductible != null ? String(initial.deductible) : (policy.deductible != null ? String(policy.deductible) : ""),
     notes: initial?.notes ?? "",
   });
   const [loading, setLoading] = useState(false);
 
   const set = (k: string, v: string) => setForm(f => {
     const next = { ...f, [k]: v };
-    if (k === "billingStart" && v && months) {
-      next.billingEnd = addMonths(v, months);
+    if (k === "billingStart") {
+      if (months) next.billingEnd = addMonths(v, months);
+      // Si firstDueDate todavía no fue editado a mano (coincide con el
+      // inicio anterior), lo sigue — pero no pisa un valor que el usuario ya
+      // cambió deliberadamente.
+      if (f.firstDueDate === f.billingStart) next.firstDueDate = v;
     }
     return next;
   });
 
+  function validate(): string | null {
+    if (!form.billingStart || !form.billingEnd) return "Completá las fechas de vigencia de la refacturación";
+    if (form.billingStart > form.billingEnd) return "El inicio de vigencia no puede ser posterior al fin de vigencia";
+    if (!form.firstDueDate) return "Completá la fecha de la primera cuota";
+    const count = Number(form.installmentCount);
+    if (!form.installmentCount || !Number.isInteger(count) || count <= 0) {
+      return "La cantidad de cuotas debe ser un entero mayor a cero";
+    }
+    const fee = Number(form.monthlyFee);
+    if (!form.monthlyFee || !Number.isFinite(fee) || fee <= 0) {
+      return "La cuota mensual debe ser mayor a cero";
+    }
+    if (form.deductible !== "" && (!Number.isFinite(Number(form.deductible)) || Number(form.deductible) < 0)) {
+      return "La franquicia debe ser un número mayor o igual a cero";
+    }
+    return null;
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!form.billingStart || !form.billingEnd) {
-      toast.error("Completá las fechas de vigencia de la refacturación");
+    const validationError = validate();
+    if (validationError) {
+      toast.error(validationError);
       return;
     }
     setLoading(true);
@@ -63,13 +98,16 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
         billingStart: form.billingStart,
         billingEnd: form.billingEnd,
         premium: form.premium !== "" ? Number(form.premium) : null,
-        monthlyFee: form.monthlyFee !== "" ? Number(form.monthlyFee) : null,
+        monthlyFee: Number(form.monthlyFee),
+        installmentCount: Number(form.installmentCount),
+        firstDueDate: form.firstDueDate,
         sumInsured: form.sumInsured !== "" ? Number(form.sumInsured) : null,
+        deductible: form.deductible !== "" ? Number(form.deductible) : null,
         notes: form.notes || null,
       };
       if (initial) {
         await api.put(`/api/rebillings/${initial.id}`, payload);
-        toast.success("Refacturación actualizada");
+        toast.success(isHistoricalWithoutInstallments ? "Cuotas generadas para la refacturación" : "Refacturación actualizada");
       } else {
         await api.post(`/api/policies/${policy.id}/rebillings`, payload);
         toast.success("Refacturación registrada");
@@ -114,6 +152,11 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
               </p>
             )}
           </div>
+          {isHistoricalWithoutInstallments && (
+            <div className="mt-2 bg-amber-500/10 border border-amber-500/20 rounded-xl px-4 py-3 text-xs text-amber-300">
+              Esta refacturación no tiene cuotas generadas. Completá cantidad de cuotas y primer vencimiento para crearlas — las cuotas de otras refacturaciones y de la emisión original no se modifican.
+            </div>
+          )}
         </div>
 
         <form onSubmit={handleSubmit} className="px-6 pb-6 pt-3 space-y-4">
@@ -132,23 +175,48 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
             </div>
           </div>
 
+          {/* Plan de cuotas */}
+          <div className="border border-[#1f2937] rounded-xl p-4 bg-[#0d1424] space-y-3">
+            <p className="text-xs text-gray-400 font-medium uppercase tracking-wider">Plan de cuotas</p>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className={lbl}>Cantidad de cuotas *</label>
+                <input type="number" min="1" step="1" className={inp} value={form.installmentCount}
+                  onChange={e => set("installmentCount", e.target.value)} placeholder="Ej: 3" required />
+              </div>
+              <div>
+                <label className={lbl}>Primer vencimiento *</label>
+                <input type="date" className={inp} value={form.firstDueDate}
+                  onChange={e => set("firstDueDate", e.target.value)} required />
+              </div>
+            </div>
+            <div>
+              <label className={lbl}>Cuota mensual (ARS) *</label>
+              <input type="number" className={inp} value={form.monthlyFee}
+                onChange={e => set("monthlyFee", e.target.value)} placeholder="0" required />
+              <p className="text-[11px] text-gray-600 mt-1">Importe total del grupo de cuotas = cuota mensual × cantidad de cuotas.</p>
+            </div>
+          </div>
+
           {/* Montos */}
           <div className="border border-[#1f2937] rounded-xl p-4 bg-[#0d1424] space-y-3">
             <p className="text-xs text-gray-400 font-medium uppercase tracking-wider">Valores actualizados</p>
             <div>
-              <label className={lbl}>Cuota mensual (ARS)</label>
-              <input type="number" className={inp} value={form.monthlyFee}
-                onChange={e => set("monthlyFee", e.target.value)} placeholder="0" />
-            </div>
-            <div>
               <label className={lbl}>Prima / Monto total (ARS)</label>
               <input type="number" className={inp} value={form.premium}
                 onChange={e => set("premium", e.target.value)} placeholder="0" />
+              <p className="text-[11px] text-gray-600 mt-1">Informativo — no se usa para calcular las cuotas.</p>
             </div>
             <div>
               <label className={lbl}>Suma asegurada (ARS)</label>
               <input type="number" className={inp} value={form.sumInsured}
                 onChange={e => set("sumInsured", e.target.value)} placeholder="0" />
+            </div>
+            <div>
+              <label className={lbl}>Franquicia (ARS)</label>
+              <input type="number" min="0" className={inp} value={form.deductible}
+                onChange={e => set("deductible", e.target.value)} placeholder="0" />
+              <p className="text-[11px] text-gray-600 mt-1">Si se informa, también actualiza la franquicia vigente de la póliza.</p>
             </div>
           </div>
 
