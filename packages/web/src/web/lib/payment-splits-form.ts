@@ -53,6 +53,22 @@ export function addSplitRow(splits: PaymentSplitFormRow[], method: string = "efe
   return [...splits, createSplitRow(method)];
 }
 
+/**
+ * Con exactamente un medio de pago, su importe SIEMPRE debe ser el mismo
+ * que el importe total del cobro — no tiene sentido pedirle al usuario que
+ * lo tipee dos veces. Se usa cada vez que cambia el total (cuota
+ * seleccionada, importe tipeado a mano, inicialización de edición) para que
+ * ese único split quede sincronizado sin intervención manual. Con 2+ splits
+ * (reparto combinado real) no hace nada — ahí el reparto es siempre manual.
+ */
+export function syncSingleSplitAmount(splits: PaymentSplitFormRow[], amount: string): PaymentSplitFormRow[] {
+  if (splits.length !== 1) return splits;
+  return [{ ...splits[0]!, amount }];
+}
+
+export const SINGLE_SPLIT_MISMATCH_MESSAGE =
+  "El importe del medio de pago debe coincidir con el total del cobro.";
+
 /** No permite eliminar la última fila — devuelve el array sin cambios si solo queda 1. */
 export function removeSplitRow(splits: PaymentSplitFormRow[], uid: string): PaymentSplitFormRow[] {
   if (splits.length <= 1) return splits;
@@ -149,6 +165,11 @@ export function validateSplitsForm(totalAmountRaw: string, splits: PaymentSplitF
     return { valid: false, group, errorMessage: msg };
   }
   return { valid: true, group, errorMessage: null };
+}
+
+/** Misma condición que usa el botón "Imputar pago"/"Guardar cambios" — evita doble submit mientras guarda. */
+export function isImputarButtonDisabled(saving: boolean, splitsValid: boolean): boolean {
+  return saving || !splitsValid;
 }
 
 /** Payload para POST/PUT — nunca incluye el uid local ni paymentMethod="combinado". */

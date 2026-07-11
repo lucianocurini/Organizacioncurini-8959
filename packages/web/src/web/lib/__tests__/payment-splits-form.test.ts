@@ -5,7 +5,8 @@ import { describe, test, expect } from "bun:test";
 import {
   createSplitRow, splitsFromPayment, addSplitRow, removeSplitRow, updateSplitRow,
   computeSplitTotals, validateSplitsForm, splitsToPayload, groupSplitsByMethod,
-  MIXED_GROUP_ERROR,
+  MIXED_GROUP_ERROR, syncSingleSplitAmount, SINGLE_SPLIT_MISMATCH_MESSAGE,
+  isImputarButtonDisabled,
 } from "../payment-splits-form";
 
 // ─── 1. Inicialización con un split ──────────────────────────────────────────
@@ -253,5 +254,138 @@ describe("Caso 20 — combinado agrupa métodos repetidos sin alterar el desglos
       { method: "cheque", amountCents: 25000 },
     ];
     expect(groupSplitsByMethod(splits)).toEqual(splits);
+  });
+});
+
+// ─── 21+. syncSingleSplitAmount — arreglo del bug de "Imputar pago" ──────────
+// Causa original: form.amount (importe total) y splits[0].amount (importe de
+// la única fila) eran dos estados de React sin relación — el usuario cargaba
+// el total (a mano o vía cuota) pero splits[0].amount seguía en "", la suma
+// nunca cerraba y el botón quedaba disabled sin ningún request de red.
+
+describe("Caso 21 — seleccionar cuota con un único split autocompleta el importe", () => {
+  test("splits[0].amount pasa a ser el importe de la cuota elegida", () => {
+    const splits = [createSplitRow("efectivo")]; // amount: "" (valor por defecto al abrir el modal)
+    const synced = syncSingleSplitAmount(splits, "5000"); // simula el onChange del selector de cuota
+    expect(synced[0]!.amount).toBe("5000");
+    expect(validateSplitsForm("5000", synced).valid).toBe(true);
+  });
+});
+
+describe("Caso 22 — escribir el importe total a mano con un único split lo sincroniza", () => {
+  test("splits[0].amount sigue al importe tipeado en el campo superior", () => {
+    const splits = [createSplitRow("transferencia")];
+    const synced = syncSingleSplitAmount(splits, "1234.56"); // simula el onChange de "Importe *"
+    expect(synced[0]!.amount).toBe("1234.56");
+    expect(validateSplitsForm("1234.56", synced).valid).toBe(true);
+  });
+});
+
+describe("Caso 23 — cambiar de cuota reemplaza el importe anterior, no lo acumula", () => {
+  test("dos syncs sucesivos con montos distintos dejan solo el último", () => {
+    let splits = [createSplitRow("efectivo")];
+    splits = syncSingleSplitAmount(splits, "3000"); // cuota A
+    splits = syncSingleSplitAmount(splits, "7000"); // usuario cambia a cuota B
+    expect(splits[0]!.amount).toBe("7000");
+    expect(splits.length).toBe(1);
+  });
+});
+
+describe("Caso 24 — un único split de efectivo queda válido tras sincronizar", () => {
+  test("efectivo + importe sincronizado → botón habilitable", () => {
+    const splits = syncSingleSplitAmount([createSplitRow("efectivo")], "2000");
+    const result = validateSplitsForm("2000", splits);
+    expect(result.valid).toBe(true);
+    expect(result.group).toBe("own");
+  });
+});
+
+describe("Caso 25 — un único split de transferencia queda válido tras sincronizar", () => {
+  test("transferencia + importe sincronizado → botón habilitable", () => {
+    const splits = syncSingleSplitAmount([createSplitRow("transferencia")], "2000");
+    const result = validateSplitsForm("2000", splits);
+    expect(result.valid).toBe(true);
+    expect(result.group).toBe("own");
+  });
+});
+
+describe("Caso 26 — un único split de cheque queda válido tras sincronizar", () => {
+  test("cheque + importe sincronizado → botón habilitable", () => {
+    const splits = syncSingleSplitAmount([createSplitRow("cheque")], "2000");
+    const result = validateSplitsForm("2000", splits);
+    expect(result.valid).toBe(true);
+    expect(result.group).toBe("own");
+  });
+});
+
+describe("Caso 27 — con 2+ splits, syncSingleSplitAmount no toca nada", () => {
+  test("devuelve el mismo array (misma referencia) sin modificar montos", () => {
+    const splits = [createSplitRow("efectivo", "600"), createSplitRow("transferencia", "400")];
+    const result = syncSingleSplitAmount(splits, "999999");
+    expect(result).toBe(splits); // no-op: ni siquiera arma un array nuevo
+    expect(result[0]!.amount).toBe("600");
+    expect(result[1]!.amount).toBe("400");
+  });
+
+  test("un reparto combinado ya válido sigue exigiendo la suma exacta (no se afloja)", () => {
+    const splits = [createSplitRow("efectivo", "600"), createSplitRow("transferencia", "300")];
+    // Con el fix, nadie llama a syncSingleSplitAmount acá (2 filas) — el reparto sigue siendo manual.
+    expect(validateSplitsForm("1000", splits).valid).toBe(false); // sigue faltando distribuir 100
+  });
+});
+
+describe("Caso 28 — edición de un pago existente con un único split", () => {
+  test("payment con 1 split ya correcto: sync es no-op, se conserva el importe real", () => {
+    const payment = { paymentMethod: "efectivo", amount: 8500, splits: [{ method: "efectivo", amountCents: 850000 }] };
+    const synced = syncSingleSplitAmount(splitsFromPayment(payment), String(payment.amount));
+    expect(synced.length).toBe(1);
+    expect(synced[0]!.amount).toBe("8500");
+    expect(validateSplitsForm(String(payment.amount), synced).valid).toBe(true);
+  });
+
+  test("payment legacy sin splits[]: se arma 1 fila y queda sincronizada con el total", () => {
+    const payment = { paymentMethod: "cheque", amount: 4200, splits: null };
+    const synced = syncSingleSplitAmount(splitsFromPayment(payment), String(payment.amount));
+    expect(synced[0]!.amount).toBe("4200");
+    expect(validateSplitsForm(String(payment.amount), synced).valid).toBe(true);
+  });
+});
+
+describe("Caso 29 — botón habilitado cuando todos los datos son válidos", () => {
+  test("saving=false y splits válidos → no disabled", () => {
+    const splits = syncSingleSplitAmount([createSplitRow("efectivo")], "1500");
+    const valid = validateSplitsForm("1500", splits).valid;
+    expect(isImputarButtonDisabled(false, valid)).toBe(false);
+  });
+
+  test("splits inválidos (sin sincronizar) → disabled aunque saving=false", () => {
+    const splits = [createSplitRow("efectivo")]; // amount: "" — nadie llamó al sync
+    const valid = validateSplitsForm("1500", splits).valid;
+    expect(isImputarButtonDisabled(false, valid)).toBe(true);
+  });
+});
+
+describe("Caso 30 — saving evita doble submit", () => {
+  test("saving=true deshabilita el botón aunque los splits sean válidos", () => {
+    const splits = syncSingleSplitAmount([createSplitRow("efectivo")], "1500");
+    const valid = validateSplitsForm("1500", splits).valid;
+    expect(valid).toBe(true);
+    expect(isImputarButtonDisabled(true, valid)).toBe(true);
+  });
+});
+
+describe("Caso 31 — mensaje claro cuando el único split no coincide con el total", () => {
+  test("SINGLE_SPLIT_MISMATCH_MESSAGE describe el caso de un solo medio de pago", () => {
+    expect(SINGLE_SPLIT_MISMATCH_MESSAGE).toBe("El importe del medio de pago debe coincidir con el total del cobro.");
+  });
+
+  test("un único split desincronizado a mano (fuera del flujo normal) sigue siendo inválido", () => {
+    // Simula al usuario tocando manualmente el importe de la fila después del sync automático
+    // (syncSingleSplitAmount no impide seguir editando esa fila a mano).
+    const synced = syncSingleSplitAmount([createSplitRow("efectivo")], "1500");
+    const manuallyEdited = updateSplitRow(synced, synced[0]!.uid, { amount: "1000" });
+    const result = validateSplitsForm("1500", manuallyEdited);
+    expect(result.valid).toBe(false);
+    expect(result.group).not.toBe("mixed");
   });
 });

@@ -13,6 +13,7 @@ import {
   type PaymentSplitFormRow, createSplitRow, splitsFromPayment,
   addSplitRow, removeSplitRow, updateSplitRow, computeSplitTotals,
   validateSplitsForm, splitsToPayload, groupSplitsByMethod,
+  syncSingleSplitAmount, SINGLE_SPLIT_MISMATCH_MESSAGE, isImputarButtonDisabled,
 } from "@/lib/payment-splits-form";
 import { getPendingItemPaymentGroup } from "@/lib/rendicion-pending";
 
@@ -138,7 +139,10 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
         // Etapa 3B-2: un combinado SIEMPRE se precarga desde payment.splits
         // (nunca desde paymentMethod, que puede valer "combinado" y no es un
         // método real seleccionable en ninguna fila).
-        splits: splitsFromPayment(editing.payment),
+        // syncSingleSplitAmount es no-op con 2+ splits — solo garantiza que,
+        // si el pago tiene un único medio, su importe quede igual al total
+        // (defensivo: cubre cualquier dato legacy con el split vacío).
+        splits: syncSingleSplitAmount(splitsFromPayment(editing.payment), String(editing.payment.amount)),
         paymentDate: editing.payment.paymentDate,
         dueDate: editing.payment.dueDate || "",
         periodMonth: editing.payment.periodMonth || "",
@@ -342,12 +346,18 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
                     onChange={e => {
                       const id = e.target.value;
                       const inst = installments.find((i: any) => String(i.id) === id);
-                      setForm(f => ({
-                        ...f,
-                        installmentId: id,
-                        amount: inst ? String(inst.amount) : f.amount,
-                        dueDate: id ? (inst?.dueDate ?? "") : "",
-                      }));
+                      setForm(f => {
+                        const amount = inst ? String(inst.amount) : f.amount;
+                        return {
+                          ...f,
+                          installmentId: id,
+                          amount,
+                          dueDate: id ? (inst?.dueDate ?? "") : "",
+                          // Con un único medio de pago, su importe sigue siempre
+                          // al de la cuota elegida — con 2+ splits no hace nada.
+                          splits: syncSingleSplitAmount(f.splits, amount),
+                        };
+                      });
                     }}
                     className="w-full px-3 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-blue-500"
                   >
@@ -399,7 +409,14 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
             <label className="block text-xs text-gray-400 mb-1">Importe *</label>
             <div className="relative">
               <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm">$</span>
-              <input type="number" value={form.amount} onChange={e => setForm(f => ({ ...f, amount: e.target.value }))}
+              <input type="number" value={form.amount}
+                onChange={e => setForm(f => ({
+                  ...f,
+                  amount: e.target.value,
+                  // Con un único medio de pago, su importe sigue siempre al
+                  // importe total — con 2+ splits no hace nada (reparto manual).
+                  splits: syncSingleSplitAmount(f.splits, e.target.value),
+                }))}
                 placeholder="0.00"
                 className="w-full pl-7 pr-3 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white placeholder-gray-500 outline-none focus:border-blue-500" />
             </div>
@@ -479,9 +496,11 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
               </span></span>
               {splitsValidation.group !== "mixed" && splitTotals.diferenciaCents != null && splitTotals.diferenciaCents !== 0 && (
                 <span className={splitTotals.diferenciaCents > 0 ? "text-yellow-400" : "text-red-400"}>
-                  {splitTotals.diferenciaCents > 0
-                    ? `Faltan distribuir ${formatCurrency(splitTotals.diferenciaCents / 100)}`
-                    : `Se excede por ${formatCurrency(Math.abs(splitTotals.diferenciaCents) / 100)}`}
+                  {form.splits.length === 1
+                    ? SINGLE_SPLIT_MISMATCH_MESSAGE
+                    : splitTotals.diferenciaCents > 0
+                      ? `Faltan distribuir ${formatCurrency(splitTotals.diferenciaCents / 100)}`
+                      : `Se excede por ${formatCurrency(Math.abs(splitTotals.diferenciaCents) / 100)}`}
                 </span>
               )}
             </div>
@@ -568,7 +587,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
             className="flex-1 py-2 px-4 rounded-lg border border-[#2d3748] text-gray-400 text-sm hover:text-white hover:bg-[#1a2540] transition-all">
             Cancelar
           </button>
-          <button onClick={handleSave} disabled={saving || !splitsValidation.valid}
+          <button onClick={handleSave} disabled={isImputarButtonDisabled(saving, splitsValidation.valid)}
             className="flex-1 py-2 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-all disabled:opacity-50">
             {saving ? "Guardando..." : editing ? "Guardar cambios" : "Imputar pago"}
           </button>
