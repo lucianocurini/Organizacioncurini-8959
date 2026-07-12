@@ -4,7 +4,7 @@
  */
 
 import { test, expect, describe } from "bun:test";
-import { groupInstallmentsByRebilling, summarizeInstallments } from "../rebilling-groups";
+import { groupInstallmentsByRebilling, summarizeInstallments, countLinkedInstallments } from "../rebilling-groups";
 
 const original = [
   { id: 1, number: 1, dueDate: "2027-01-01", amount: 1000, status: "pagada", notes: null, rebillingId: null },
@@ -65,6 +65,26 @@ describe("groupInstallmentsByRebilling", () => {
     const groups = groupInstallmentsByRebilling([...original, ...instA, ...instB], [rebA, rebB]);
     expect(groups.length).toBe(3);
     expect(groups.every((g) => g.installments.length > 0 || g.key !== "original")).toBe(true);
+  });
+});
+
+describe("countLinkedInstallments — cantidad real por rebilling_id (nunca installmentCount)", () => {
+  test("refacturación sin cuotas vinculadas → 0 (dispara el banner 'sin plan vinculado')", () => {
+    expect(countLinkedInstallments([...original, ...instA], 999)).toBe(0);
+  });
+
+  test("refacturación con cuotas vinculadas → cuenta exacta (no dispara el banner)", () => {
+    expect(countLinkedInstallments([...original, ...instA, ...instB], 10)).toBe(2);
+    expect(countLinkedInstallments([...original, ...instA, ...instB], 11)).toBe(1);
+  });
+
+  test("no cuenta cuotas de la emisión original (rebillingId null) ni de otra refacturación", () => {
+    const count = countLinkedInstallments([...original, ...instA, ...instB], 10);
+    expect(count).toBe(instA.length); // no suma original.length ni instB.length
+  });
+
+  test("lista vacía de cuotas → 0", () => {
+    expect(countLinkedInstallments([], 10)).toBe(0);
   });
 });
 

@@ -80,6 +80,22 @@ export function groupInstallmentsByRebilling(
   return groups;
 }
 
+/**
+ * Cantidad real de cuotas vinculadas a UNA refacturación puntual, exclusivamente
+ * por rebilling_id — nunca por installmentCount (metadata que puede ser null
+ * aun con cuotas ya vinculadas, o viceversa en datos históricos). Es el mismo
+ * criterio de "grupo real" que groupInstallmentsByRebilling, expuesto suelto
+ * para usarse en lugares que no necesitan armar todos los grupos (p.ej. la
+ * tarjeta de una sola refacturación en la lista de Refacturaciones, que debe
+ * verse igual aunque la póliza no tenga NINGUNA cuota en otros grupos).
+ */
+export function countLinkedInstallments(
+  installments: ReadonlyArray<{ rebillingId: number | null }>,
+  rebillingId: number,
+): number {
+  return installments.filter((i) => i.rebillingId === rebillingId).length;
+}
+
 export interface InstallmentTotals {
   total: number;
   pagadas: number;

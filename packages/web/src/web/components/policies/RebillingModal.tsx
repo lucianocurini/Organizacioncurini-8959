@@ -4,6 +4,10 @@ import { toast } from "sonner";
 import { X, RefreshCw } from "lucide-react";
 import { formatDate } from "@/lib/utils";
 import { addCalendarMonths, addCalendarDays, isValidCalendarDate } from "../../../lib/installments/plan";
+import {
+  validateRebillingForm, buildRebillingEditPayload, buildRebillingCreatePayload,
+  computePlanAmountMismatchWarning, type RebillingModalFormState,
+} from "../../lib/rebilling-modal";
 
 interface Props {
   policy: any;
@@ -27,28 +31,28 @@ const CYCLE_LABEL: Record<string, string> = {
   mensual: "Mensual", trimestral: "Trimestral", cuatrimestral: "Cuatrimestral", semestral: "Semestral", anual: "Anual",
 };
 
+// Modo determinado únicamente por la presencia de `initial` — nunca por
+// installmentCount ni por ningún otro campo del plan. Editar datos de una
+// refacturación existente NUNCA exige ni envía cantidad de cuotas o primer
+// vencimiento: eso pertenece exclusivamente a la acción separada "Corregir
+// plan de cuotas" (ver botón en la lista de refacturaciones de
+// poliza-detail.tsx, que usa POST /rebillings/:id/installments/rebuild).
 export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
+  const isEditMode = !!initial;
   const months = CYCLE_MONTHS[policy.billingCycle] ?? 0;
-
-  // Refacturación histórica sin cuotas generadas (el bug que este flujo
-  // corrige): installmentCount nunca se completó. Se detecta explícitamente
-  // (no se infiere de otra cosa) para forzar a completar el plan al guardar.
-  const isHistoricalWithoutInstallments = !!initial && (initial.installmentCount == null || initial.installmentCount === 0);
 
   const defaultStart = initial?.billingStart ?? policy._nextStart ?? policy.startDate ?? "";
   const defaultEnd = initial?.billingEnd ?? (months ? addMonths(defaultStart, months) : "");
 
-  const [form, setForm] = useState({
+  const [form, setForm] = useState<RebillingModalFormState>({
     billingStart: defaultStart,
     billingEnd: defaultEnd,
     premium: initial?.premium != null ? String(initial.premium) : (policy.premium != null ? String(policy.premium) : ""),
     monthlyFee: initial?.monthlyFee != null ? String(initial.monthlyFee) : (policy.monthlyFee != null ? String(policy.monthlyFee) : ""),
-    // Vacío si nunca se completó (histórica sin cuotas) — nunca se inventa un
-    // valor por defecto para esto, es siempre una entrada explícita.
-    installmentCount: initial?.installmentCount != null ? String(initial.installmentCount) : (!initial && months ? String(months) : ""),
-    // Puede precargarse con billingStart como sugerencia, pero el usuario
-    // puede cambiarlo — nunca se envía sin que el campo tenga un valor.
-    firstDueDate: initial?.firstDueDate ?? defaultStart,
+    // Solo relevantes en modo alta — en modo edición nunca se muestran, nunca
+    // se validan y nunca se envían al backend.
+    installmentCount: !isEditMode && months ? String(months) : "",
+    firstDueDate: defaultStart,
     sumInsured: initial?.sumInsured != null ? String(initial.sumInsured) : (policy.sumInsured != null ? String(policy.sumInsured) : ""),
     deductible: initial?.deductible != null ? String(initial.deductible) : (policy.deductible != null ? String(policy.deductible) : ""),
     notes: initial?.notes ?? "",
@@ -59,57 +63,30 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
     const next = { ...f, [k]: v };
     if (k === "billingStart") {
       if (months) next.billingEnd = addMonths(v, months);
-      // Si firstDueDate todavía no fue editado a mano (coincide con el
-      // inicio anterior), lo sigue — pero no pisa un valor que el usuario ya
-      // cambió deliberadamente.
-      if (f.firstDueDate === f.billingStart) next.firstDueDate = v;
+      if (!isEditMode && f.firstDueDate === f.billingStart) next.firstDueDate = v;
     }
     return next;
   });
 
-  function validate(): string | null {
-    if (!form.billingStart || !form.billingEnd) return "Completá las fechas de vigencia de la refacturación";
-    if (form.billingStart > form.billingEnd) return "El inicio de vigencia no puede ser posterior al fin de vigencia";
-    if (!form.firstDueDate) return "Completá la fecha de la primera cuota";
-    const count = Number(form.installmentCount);
-    if (!form.installmentCount || !Number.isInteger(count) || count <= 0) {
-      return "La cantidad de cuotas debe ser un entero mayor a cero";
-    }
-    const fee = Number(form.monthlyFee);
-    if (!form.monthlyFee || !Number.isFinite(fee) || fee <= 0) {
-      return "La cuota mensual debe ser mayor a cero";
-    }
-    if (form.deductible !== "" && (!Number.isFinite(Number(form.deductible)) || Number(form.deductible) < 0)) {
-      return "La franquicia debe ser un número mayor o igual a cero";
-    }
-    return null;
-  }
+  // Advertencia informativa (no bloqueante) — ver computePlanAmountMismatchWarning.
+  const planAmountMismatchWarning = isEditMode
+    ? computePlanAmountMismatchWarning(form.monthlyFee, form.premium, initial?.installmentCount)
+    : null;
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    const validationError = validate();
+    const validationError = validateRebillingForm(form, isEditMode);
     if (validationError) {
       toast.error(validationError);
       return;
     }
     setLoading(true);
     try {
-      const payload = {
-        billingStart: form.billingStart,
-        billingEnd: form.billingEnd,
-        premium: form.premium !== "" ? Number(form.premium) : null,
-        monthlyFee: Number(form.monthlyFee),
-        installmentCount: Number(form.installmentCount),
-        firstDueDate: form.firstDueDate,
-        sumInsured: form.sumInsured !== "" ? Number(form.sumInsured) : null,
-        deductible: form.deductible !== "" ? Number(form.deductible) : null,
-        notes: form.notes || null,
-      };
-      if (initial) {
-        await api.put(`/api/rebillings/${initial.id}`, payload);
-        toast.success(isHistoricalWithoutInstallments ? "Cuotas generadas para la refacturación" : "Refacturación actualizada");
+      if (isEditMode) {
+        await api.put(`/api/rebillings/${initial.id}`, buildRebillingEditPayload(form));
+        toast.success("Refacturación actualizada");
       } else {
-        await api.post(`/api/policies/${policy.id}/rebillings`, payload);
+        await api.post(`/api/policies/${policy.id}/rebillings`, buildRebillingCreatePayload(form));
         toast.success("Refacturación registrada");
       }
       onSaved();
@@ -132,7 +109,7 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
           <div className="flex items-center gap-2">
             <RefreshCw className="w-4 h-4 text-violet-400" />
             <h2 className="text-base font-semibold text-white" style={{ fontFamily: "Syne, sans-serif" }}>
-              {initial ? "Editar Refacturación" : "Nueva Refacturación"}
+              {isEditMode ? "Editar datos de la refacturación" : "Nueva Refacturación"}
             </h2>
           </div>
           <button onClick={onClose} className="text-gray-400 hover:text-white transition-colors">
@@ -152,9 +129,10 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
               </p>
             )}
           </div>
-          {isHistoricalWithoutInstallments && (
-            <div className="mt-2 bg-amber-500/10 border border-amber-500/20 rounded-xl px-4 py-3 text-xs text-amber-300">
-              Esta refacturación no tiene cuotas generadas. Completá cantidad de cuotas y primer vencimiento para crearlas — las cuotas de otras refacturaciones y de la emisión original no se modifican.
+          {isEditMode && (
+            <div className="mt-2 bg-blue-500/10 border border-blue-500/20 rounded-xl px-4 py-3 text-xs text-blue-300">
+              Esta pantalla solo edita datos administrativos (fechas, importes, franquicia, notas). No crea, borra ni
+              recalcula cuotas. Para corregir el plan de cuotas, usá la acción separada "Corregir plan de cuotas".
             </div>
           )}
         </div>
@@ -175,28 +153,32 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
             </div>
           </div>
 
-          {/* Plan de cuotas */}
-          <div className="border border-[#1f2937] rounded-xl p-4 bg-[#0d1424] space-y-3">
-            <p className="text-xs text-gray-400 font-medium uppercase tracking-wider">Plan de cuotas</p>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className={lbl}>Cantidad de cuotas *</label>
-                <input type="number" min="1" step="1" className={inp} value={form.installmentCount}
-                  onChange={e => set("installmentCount", e.target.value)} placeholder="Ej: 3" required />
+          {/* Plan de cuotas — SOLO en alta. En edición no se muestra: cantidad
+              de cuotas y primer vencimiento pertenecen a "Corregir plan de
+              cuotas", nunca a esta pantalla. */}
+          {!isEditMode && (
+            <div className="border border-[#1f2937] rounded-xl p-4 bg-[#0d1424] space-y-3">
+              <p className="text-xs text-gray-400 font-medium uppercase tracking-wider">Plan de cuotas</p>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className={lbl}>Cantidad de cuotas *</label>
+                  <input type="number" min="1" step="1" className={inp} value={form.installmentCount}
+                    onChange={e => set("installmentCount", e.target.value)} placeholder="Ej: 3" required />
+                </div>
+                <div>
+                  <label className={lbl}>Primer vencimiento *</label>
+                  <input type="date" className={inp} value={form.firstDueDate}
+                    onChange={e => set("firstDueDate", e.target.value)} required />
+                </div>
               </div>
               <div>
-                <label className={lbl}>Primer vencimiento *</label>
-                <input type="date" className={inp} value={form.firstDueDate}
-                  onChange={e => set("firstDueDate", e.target.value)} required />
+                <label className={lbl}>Cuota mensual (ARS) *</label>
+                <input type="number" className={inp} value={form.monthlyFee}
+                  onChange={e => set("monthlyFee", e.target.value)} placeholder="0" required />
+                <p className="text-[11px] text-gray-600 mt-1">Importe total del grupo de cuotas = cuota mensual × cantidad de cuotas.</p>
               </div>
             </div>
-            <div>
-              <label className={lbl}>Cuota mensual (ARS) *</label>
-              <input type="number" className={inp} value={form.monthlyFee}
-                onChange={e => set("monthlyFee", e.target.value)} placeholder="0" required />
-              <p className="text-[11px] text-gray-600 mt-1">Importe total del grupo de cuotas = cuota mensual × cantidad de cuotas.</p>
-            </div>
-          </div>
+          )}
 
           {/* Montos */}
           <div className="border border-[#1f2937] rounded-xl p-4 bg-[#0d1424] space-y-3">
@@ -207,6 +189,14 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
                 onChange={e => set("premium", e.target.value)} placeholder="0" />
               <p className="text-[11px] text-gray-600 mt-1">Informativo — no se usa para calcular las cuotas.</p>
             </div>
+            {isEditMode && (
+              <div>
+                <label className={lbl}>Cuota mensual (ARS)</label>
+                <input type="number" className={inp} value={form.monthlyFee}
+                  onChange={e => set("monthlyFee", e.target.value)} placeholder="0" />
+                <p className="text-[11px] text-gray-600 mt-1">Dato administrativo — cambiarlo acá no recalcula las cuotas ya generadas.</p>
+              </div>
+            )}
             <div>
               <label className={lbl}>Suma asegurada (ARS)</label>
               <input type="number" className={inp} value={form.sumInsured}
@@ -219,6 +209,12 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
               <p className="text-[11px] text-gray-600 mt-1">Si se informa, también actualiza la franquicia vigente de la póliza.</p>
             </div>
           </div>
+
+          {planAmountMismatchWarning && (
+            <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl px-4 py-3 text-xs text-amber-300">
+              {planAmountMismatchWarning}
+            </div>
+          )}
 
           {/* Notas */}
           <div>
@@ -236,7 +232,7 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
             <button type="submit" disabled={loading}
               className="px-5 py-2 bg-violet-600 hover:bg-violet-700 disabled:opacity-40 text-white text-sm font-medium rounded-lg transition-all flex items-center gap-2">
               {loading && <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />}
-              {initial ? "Guardar cambios" : "Registrar refacturación"}
+              {isEditMode ? "Guardar cambios" : "Registrar refacturación"}
             </button>
           </div>
         </form>

@@ -14,12 +14,13 @@ import {
   normalizeRebuildError, canConfirmRebuild,
   type RebuildBlockingInstallment,
 } from "@/lib/installments-rebuild";
+import { parseRebillingPayload, buildRebillingInstallmentPlan, RebillingPayloadError } from "../../lib/installments/rebilling-plan";
 import {
   shouldShowCancelButton, canConfirmCancellation,
   normalizeCancellationError, shouldRefreshAfterCancelResponse, NON_COLLECTIBLE_STATUS_LABEL,
   type CancellationFormInput, type CancellationPreviewSummary,
 } from "@/lib/policy-cancellation";
-import { groupInstallmentsByRebilling } from "@/lib/rebilling-groups";
+import { groupInstallmentsByRebilling, countLinkedInstallments } from "@/lib/rebilling-groups";
 
 const typeIcons: Record<string, any> = {
   automotor: Car, motovehiculo: Bike, ecomovilidad: Zap, hogar: Home, accidentes: ShieldCheck, art: HeartPulse, comercial: Briefcase, responsabilidad_civil: Scale, cascos: HardHat, incendio: Flame,
@@ -61,6 +62,28 @@ export default function PolizaDetail() {
   }>({ rebillingId: "", periodStart: "", periodEnd: "", periodAmount: "", installmentCount: "", firstDueDate: "", installmentIntervalMonths: "" });
   const [rebuildConfirmed, setRebuildConfirmed] = useState(false);
   const [rebuildSubmitting, setRebuildSubmitting] = useState(false);
+
+  // ─── Corregir plan de cuotas de UNA refacturación puntual — acción
+  // separada de "Editar datos de la refacturación" (RebillingModal). Usa
+  // GET/POST /rebillings/:id/installments/rebuild-check|rebuild, nunca PUT
+  // /rebillings/:id. Mismo patrón que el rebuild a nivel póliza de arriba,
+  // pero acotado a un solo rebillingId — nunca toca la emisión original ni
+  // otra refacturación.
+  const [rebillingRebuildTarget, setRebillingRebuildTarget] = useState<any>(null);
+  const [rebillingRebuildCheck, setRebillingRebuildCheck] = useState<{
+    classification: "NO_INSTALLMENTS" | "SAFE_TO_REBUILD" | "REQUIRES_MANUAL_REVIEW";
+    currentCount: number; currentTotal: number;
+    blockingInstallments: RebuildBlockingInstallment[];
+  } | null>(null);
+  const [rebillingRebuildCheckLoading, setRebillingRebuildCheckLoading] = useState(false);
+  const [showRebillingRebuildBlocked, setShowRebillingRebuildBlocked] = useState(false);
+  const [showRebillingRebuildForm, setShowRebillingRebuildForm] = useState(false);
+  const [rebillingRebuildForm, setRebillingRebuildForm] = useState<{
+    billingStart: string; billingEnd: string; monthlyFee: string; installmentCount: string;
+    firstDueDate: string; premium: string; sumInsured: string; deductible: string; notes: string;
+  }>({ billingStart: "", billingEnd: "", monthlyFee: "", installmentCount: "", firstDueDate: "", premium: "", sumInsured: "", deductible: "", notes: "" });
+  const [rebillingRebuildConfirmed, setRebillingRebuildConfirmed] = useState(false);
+  const [rebillingRebuildSubmitting, setRebillingRebuildSubmitting] = useState(false);
 
   // ─── Anulación manual de póliza ─────────────────────────────────────────────
   const [showCancelForm, setShowCancelForm] = useState(false);
@@ -157,6 +180,108 @@ export default function PolizaDetail() {
       else if (status === 404) toast.error("La refacturación ya no existe.");
       else if (status === 409) toast.error(e.message || "No se puede eliminar la refacturación.");
       else toast.error("No se pudo eliminar la refacturación.");
+    }
+  }
+
+  // Consulta (o reutiliza) rebuild-check de UNA refacturación al pulsar
+  // "Corregir plan de cuotas" — no se dispara automáticamente al cargar la
+  // página. reb puede venir de rebillingsList (fila de la lista) o de un
+  // group.rebillingId (banner "sin plan" en la sección de Cuotas).
+  async function openRebillingRebuildReview(reb: any) {
+    setRebillingRebuildTarget(reb);
+    setRebillingRebuildCheckLoading(true);
+    try {
+      const result = await api.get(`/api/rebillings/${reb.id}/installments/rebuild-check`);
+      setRebillingRebuildCheck(result);
+      if (decideRebuildUiAction(result.classification) === "show_blocked") {
+        setShowRebillingRebuildBlocked(true);
+        setShowRebillingRebuildForm(false);
+      } else {
+        setShowRebillingRebuildBlocked(false);
+        openRebillingRebuildForm(reb);
+      }
+    } catch {
+      toast.error("No se pudo consultar el estado del plan de esta refacturación.");
+    } finally {
+      setRebillingRebuildCheckLoading(false);
+    }
+  }
+
+  // Precarga con los datos actuales de la refacturación — nunca se infiere
+  // nada nuevo, es la misma metadata que ya tiene guardada.
+  function openRebillingRebuildForm(reb: any) {
+    setRebillingRebuildForm({
+      billingStart: reb.billingStart ?? "",
+      billingEnd: reb.billingEnd ?? "",
+      monthlyFee: reb.monthlyFee != null ? String(reb.monthlyFee) : "",
+      installmentCount: reb.installmentCount != null ? String(reb.installmentCount) : "",
+      firstDueDate: reb.firstDueDate ?? reb.billingStart ?? "",
+      premium: reb.premium != null ? String(reb.premium) : "",
+      sumInsured: reb.sumInsured != null ? String(reb.sumInsured) : "",
+      deductible: reb.deductible != null ? String(reb.deductible) : "",
+      notes: reb.notes ?? "",
+    });
+    setRebillingRebuildConfirmed(false);
+    setShowRebillingRebuildForm(true);
+  }
+
+  // Previsualización local — solo para mensajes y resumen inmediatos. La
+  // validación definitiva es siempre del backend (reclasifica de nuevo dentro
+  // de la transacción antes de borrar).
+  let rebillingRebuildPreviewPlan: ReturnType<typeof buildRebillingInstallmentPlan> | null = null;
+  let rebillingRebuildPreviewError: string | null = null;
+  if (showRebillingRebuildForm && rebillingRebuildForm.billingStart && rebillingRebuildForm.billingEnd
+      && rebillingRebuildForm.monthlyFee && rebillingRebuildForm.installmentCount && rebillingRebuildForm.firstDueDate) {
+    try {
+      const payload = parseRebillingPayload({
+        billingStart: rebillingRebuildForm.billingStart,
+        billingEnd: rebillingRebuildForm.billingEnd,
+        monthlyFee: rebillingRebuildForm.monthlyFee,
+        installmentCount: rebillingRebuildForm.installmentCount,
+        firstDueDate: rebillingRebuildForm.firstDueDate,
+        premium: rebillingRebuildForm.premium || null,
+        sumInsured: rebillingRebuildForm.sumInsured || null,
+        deductible: rebillingRebuildForm.deductible || null,
+        notes: rebillingRebuildForm.notes || null,
+      });
+      rebillingRebuildPreviewPlan = buildRebillingInstallmentPlan(payload);
+    } catch (e: any) {
+      rebillingRebuildPreviewError = e instanceof RebillingPayloadError || e instanceof InstallmentPlanError ? e.message : "Datos del plan inválidos.";
+    }
+  }
+  const canConfirmRebillingRebuild = canConfirmRebuild(!!rebillingRebuildPreviewPlan && !rebillingRebuildPreviewError, rebillingRebuildConfirmed);
+
+  async function doRebillingRebuild() {
+    if (!rebillingRebuildTarget || !rebillingRebuildPreviewPlan || rebillingRebuildPreviewError) return;
+    setRebillingRebuildSubmitting(true);
+    try {
+      const body = {
+        billingStart: rebillingRebuildForm.billingStart,
+        billingEnd: rebillingRebuildForm.billingEnd,
+        monthlyFee: Number(rebillingRebuildForm.monthlyFee),
+        installmentCount: Number(rebillingRebuildForm.installmentCount),
+        firstDueDate: rebillingRebuildForm.firstDueDate,
+        premium: rebillingRebuildForm.premium !== "" ? Number(rebillingRebuildForm.premium) : null,
+        sumInsured: rebillingRebuildForm.sumInsured !== "" ? Number(rebillingRebuildForm.sumInsured) : null,
+        deductible: rebillingRebuildForm.deductible !== "" ? Number(rebillingRebuildForm.deductible) : null,
+        notes: rebillingRebuildForm.notes || null,
+      };
+      const result = await api.post(`/api/rebillings/${rebillingRebuildTarget.id}/installments/rebuild`, body);
+      toast.success(`Plan de cuotas corregido (${result.previousCount} → ${result.insertedCount} cuotas).`);
+      setShowRebillingRebuildForm(false);
+      setRebillingRebuildCheck(null);
+      setRebillingRebuildTarget(null);
+      load();
+    } catch (e: any) {
+      const normalized = normalizeRebuildError(e);
+      if (normalized.kind === "blocked") {
+        setRebillingRebuildCheck(rc => rc ? { ...rc, classification: "REQUIRES_MANUAL_REVIEW", blockingInstallments: normalized.blockingInstallments } : rc);
+        setShowRebillingRebuildForm(false);
+        setShowRebillingRebuildBlocked(true);
+      }
+      toast.error(normalized.message);
+    } finally {
+      setRebillingRebuildSubmitting(false);
     }
   }
 
@@ -380,7 +505,19 @@ export default function PolizaDetail() {
           // regla que classifyInstallmentsForRebuild en el backend).
           const expectedCount: number | null = p.installments ?? null;
           const comparison = compareExpectedVsActual(expectedCount, installmentsList.length);
-          const showRebuildButton = shouldShowRebuildButton(installmentsList.length, comparison);
+
+          // Esta reconstrucción (Subetapa 2B, /policies/:id/installments/rebuild)
+          // es EXCLUSIVA de la emisión original: classifyInstallmentsForRebuild
+          // (rebuild.ts) bloquea la póliza entera apenas UNA cuota tenga
+          // rebillingId no nulo, sin importar si esa cuota está sana o no — no
+          // hay forma de que tenga éxito si existe alguna refacturación con
+          // cuotas vinculadas. Mostrar el botón en ese caso solo invita a
+          // confundirlo con "Corregir plan de cuotas" de la refacturación
+          // puntual (lista de Refacturaciones, más abajo) — que sí es la acción
+          // correcta ahí. Se oculta acá, nunca se toca la clasificación del
+          // backend.
+          const hasAnyRebillingLinkedInstallment = installmentsList.some((i: any) => i.rebillingId !== null);
+          const showRebuildButton = shouldShowRebuildButton(installmentsList.length, comparison) && !hasAnyRebillingLinkedInstallment;
 
           // Consulta (o reutiliza) rebuild-check al pulsar "Corregir plan de
           // cuotas" — no se dispara automáticamente al cargar la página, para
@@ -559,7 +696,7 @@ export default function PolizaDetail() {
                         className="text-xs px-3 py-1 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded-lg hover:bg-blue-500/20 disabled:opacity-50 transition-all flex items-center gap-1.5"
                       >
                         {rebuildCheckLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
-                        Corregir plan de cuotas
+                        Corregir plan de cuotas (emisión original)
                       </button>
                     )}
                   </div>
@@ -724,8 +861,19 @@ export default function PolizaDetail() {
                         )}
                       </div>
                       {group.installments.length === 0 ? (
-                        <div className="bg-[#111827] border border-amber-500/20 rounded-xl px-4 py-3 text-xs text-amber-300">
-                          Esta refacturación no tiene cuotas generadas. Editala y completá cantidad de cuotas + primer vencimiento para crearlas.
+                        <div className="bg-[#111827] border border-amber-500/20 rounded-xl px-4 py-3 text-xs text-amber-300 flex items-center justify-between gap-3 flex-wrap">
+                          <span>Esta refacturación no tiene un plan de cuotas vinculado.</span>
+                          {group.rebillingId != null && (
+                            <button
+                              onClick={() => {
+                                const reb = rebillingsList.find((r: any) => r.id === group.rebillingId);
+                                if (reb) openRebillingRebuildReview(reb);
+                              }}
+                              className="text-xs px-2.5 py-1 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 rounded-lg border border-amber-500/30 transition-all whitespace-nowrap"
+                            >
+                              Crear / corregir plan
+                            </button>
+                          )}
                         </div>
                       ) : (
                       <div className="bg-[#111827] border border-[#1f2937] rounded-xl overflow-x-auto">
@@ -842,7 +990,7 @@ export default function PolizaDetail() {
                   <div className="bg-[#111827] border border-blue-500/30 rounded-2xl w-full max-w-lg my-4">
                     <div className="flex items-center justify-between px-6 py-4 border-b border-[#1f2937]">
                       <h2 className="text-lg font-semibold text-white" style={{ fontFamily: "Syne, sans-serif" }}>
-                        Corregir plan de cuotas
+                        Corregir plan de cuotas (emisión original)
                       </h2>
                       <button onClick={() => setShowRebuildForm(false)} className="text-gray-400 hover:text-white transition-colors">
                         <X className="w-5 h-5" />
@@ -1011,11 +1159,19 @@ export default function PolizaDetail() {
                 {rebillingsList.map((r, idx) => {
                   const isActive = r.billingStart <= today && r.billingEnd >= today;
                   const isPast = r.billingEnd < today;
+                  // Grupo REAL por rebilling_id — nunca installmentCount (metadata,
+                  // puede ser null aun con cuotas vinculadas, o viceversa en datos
+                  // históricos). Se calcula acá porque installmentsList (la
+                  // variable equivalente de la sección "Cuotas") vive en un scope
+                  // aparte que no se renderiza cuando la póliza tiene 0 cuotas en
+                  // total — este banner debe verse igual en ese caso.
+                  const linkedInstallmentsCount = countLinkedInstallments((row.installments ?? []) as any[], r.id);
                   return (
                     <div key={r.id} className={cn(
-                      "bg-[#111827] border rounded-xl px-5 py-4 flex items-start justify-between gap-4",
+                      "bg-[#111827] border rounded-xl px-5 py-4 flex flex-col gap-3",
                       isActive ? "border-violet-500/30 bg-violet-500/5" : "border-[#1f2937]"
                     )}>
+                    <div className="flex items-start justify-between gap-4">
                       <div className="flex items-start gap-3 flex-1 min-w-0">
                         <div className={cn(
                           "w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 mt-0.5",
@@ -1052,9 +1208,19 @@ export default function PolizaDetail() {
                         <button
                           onClick={() => { setEditingRebilling(r); setShowRebilling(true); }}
                           className="p-1.5 text-gray-500 hover:text-blue-400 hover:bg-blue-500/10 rounded-lg transition-all"
-                          title="Editar"
+                          title="Editar datos"
                         >
                           <Pencil className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => openRebillingRebuildReview(r)}
+                          disabled={rebillingRebuildCheckLoading && rebillingRebuildTarget?.id === r.id}
+                          className="p-1.5 text-gray-500 hover:text-amber-400 hover:bg-amber-500/10 rounded-lg transition-all disabled:opacity-40"
+                          title="Corregir plan de cuotas"
+                        >
+                          {rebillingRebuildCheckLoading && rebillingRebuildTarget?.id === r.id
+                            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            : <ListOrdered className="w-3.5 h-3.5" />}
                         </button>
                         <button
                           onClick={() => deleteRebilling(r.id)}
@@ -1064,6 +1230,21 @@ export default function PolizaDetail() {
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
                       </div>
+                    </div>
+
+                    {linkedInstallmentsCount === 0 && (
+                      <div className="bg-amber-500/5 border border-amber-500/20 rounded-lg px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
+                        <span className="text-xs text-amber-300">Esta refacturación no tiene un plan de cuotas vinculado.</span>
+                        <button
+                          onClick={() => openRebillingRebuildReview(r)}
+                          disabled={rebillingRebuildCheckLoading && rebillingRebuildTarget?.id === r.id}
+                          className="text-xs px-2.5 py-1 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 rounded-lg border border-amber-500/30 transition-all disabled:opacity-50 whitespace-nowrap flex items-center gap-1.5"
+                        >
+                          {rebillingRebuildCheckLoading && rebillingRebuildTarget?.id === r.id && <Loader2 className="w-3 h-3 animate-spin" />}
+                          Crear / corregir plan
+                        </button>
+                      </div>
+                    )}
                     </div>
                   );
                 })}
@@ -1124,6 +1305,166 @@ export default function PolizaDetail() {
           onClose={() => { setShowRebilling(false); setEditingRebilling(null); }}
           onSaved={() => { setShowRebilling(false); setEditingRebilling(null); load(); }}
         />
+      )}
+
+      {/* Corregir plan de cuotas — bloqueado: la refacturación tiene cuotas
+          con actividad real. No se modificó nada; se muestra el motivo
+          exacto por cuota. Acción completamente separada de "Editar datos". */}
+      {showRebillingRebuildBlocked && rebillingRebuildCheck?.classification === "REQUIRES_MANUAL_REVIEW" && (
+        <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 p-4 overflow-y-auto">
+          <div className="bg-[#111827] border border-red-500/30 rounded-2xl w-full max-w-lg my-4">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-[#1f2937]">
+              <h2 className="text-lg font-semibold text-white" style={{ fontFamily: "Syne, sans-serif" }}>
+                No se puede corregir el plan
+              </h2>
+              <button
+                onClick={() => { setShowRebillingRebuildBlocked(false); setRebillingRebuildTarget(null); }}
+                className="text-gray-400 hover:text-white transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-6">
+              <div className="flex items-center gap-2 mb-2">
+                <AlertCircle className="w-4 h-4 text-red-400" />
+                <p className="text-sm text-red-400 font-medium">Esta refacturación tiene actividad real registrada</p>
+              </div>
+              <p className="text-xs text-gray-400 mb-3">
+                No se modificó ninguna cuota. Estas cuotas requieren revisión manual antes de poder corregir el plan:
+              </p>
+              <div className="space-y-2">
+                {rebillingRebuildCheck.blockingInstallments.map(b => (
+                  <div key={b.id} className="bg-[#0d1424] border border-red-500/10 rounded-lg px-3 py-2">
+                    <p className="text-xs text-white font-medium">Cuota #{b.number} — vence {formatDate(b.dueDate)}</p>
+                    <ul className="mt-1 space-y-0.5">
+                      {b.reasons.map((r, i) => (
+                        <li key={i} className="text-xs text-gray-400">· {r}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+              <button
+                onClick={() => { setShowRebillingRebuildBlocked(false); setRebillingRebuildTarget(null); }}
+                className="mt-4 text-xs text-gray-500 hover:text-white transition-colors"
+              >
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Corregir plan de cuotas — formulario: plan actual vs. propuesto,
+          confirmación explícita obligatoria. Usa exclusivamente
+          POST /rebillings/:id/installments/rebuild — nunca PUT. */}
+      {showRebillingRebuildForm && rebillingRebuildTarget && (
+        <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 p-4 overflow-y-auto">
+          <div className="bg-[#111827] border border-amber-500/30 rounded-2xl w-full max-w-lg my-4">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-[#1f2937]">
+              <h2 className="text-lg font-semibold text-white" style={{ fontFamily: "Syne, sans-serif" }}>
+                Corregir plan de cuotas
+              </h2>
+              <button onClick={() => setShowRebillingRebuildForm(false)} className="text-gray-400 hover:text-white transition-colors">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-6 space-y-4">
+              <p className="text-xs text-gray-500">
+                Esta acción reemplaza ÚNICAMENTE el grupo de cuotas de esta refacturación puntual
+                ({formatDate(rebillingRebuildTarget.billingStart)} → {formatDate(rebillingRebuildTarget.billingEnd)}).
+                No toca la emisión original ni ninguna otra refacturación.
+              </p>
+
+              {rebillingRebuildCheck && (
+                <div className="bg-[#0d1424] border border-[#1f2937] rounded-xl p-4 text-xs space-y-1">
+                  <p className="text-gray-400 font-medium mb-1">Plan actual</p>
+                  <p className="text-gray-400">Cuotas: <span className="text-white">{rebillingRebuildCheck.currentCount}</span></p>
+                  <p className="text-gray-400">Importe total: <span className="text-white">{formatCurrency(rebillingRebuildCheck.currentTotal)}</span></p>
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Inicio período *</label>
+                  <input type="date" value={rebillingRebuildForm.billingStart}
+                    onChange={e => setRebillingRebuildForm(f => ({ ...f, billingStart: e.target.value }))}
+                    className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500" />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Fin período *</label>
+                  <input type="date" value={rebillingRebuildForm.billingEnd}
+                    onChange={e => setRebillingRebuildForm(f => ({ ...f, billingEnd: e.target.value }))}
+                    className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500" />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Cantidad de cuotas *</label>
+                  <input type="number" min="1" value={rebillingRebuildForm.installmentCount}
+                    onChange={e => setRebillingRebuildForm(f => ({ ...f, installmentCount: e.target.value }))}
+                    placeholder="Ej: 3"
+                    className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500" />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Primer vencimiento *</label>
+                  <input type="date" value={rebillingRebuildForm.firstDueDate}
+                    onChange={e => setRebillingRebuildForm(f => ({ ...f, firstDueDate: e.target.value }))}
+                    className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500" />
+                </div>
+                <div className="col-span-2">
+                  <label className="text-xs text-gray-500 block mb-1">Cuota mensual (ARS) *</label>
+                  <input type="number" value={rebillingRebuildForm.monthlyFee}
+                    onChange={e => setRebillingRebuildForm(f => ({ ...f, monthlyFee: e.target.value }))}
+                    placeholder="0"
+                    className="w-full px-2 py-1.5 bg-[#1f2937] border border-[#374151] rounded text-white text-xs outline-none focus:border-amber-500" />
+                </div>
+              </div>
+
+              {rebillingRebuildPreviewError && (
+                <p className="text-xs text-red-400">{rebillingRebuildPreviewError}</p>
+              )}
+
+              {rebillingRebuildPreviewPlan && !rebillingRebuildPreviewError && (
+                <div className="bg-[#0d1424] border border-amber-500/20 rounded-xl p-4 space-y-1.5 text-xs">
+                  <p className="text-amber-400 font-medium mb-1">Plan propuesto</p>
+                  <p className="text-gray-400">Cantidad de cuotas: <span className="text-white">{rebillingRebuildPreviewPlan.installments.length}</span></p>
+                  <p className="text-gray-400">Importe total: <span className="text-white">{formatCurrency(rebillingRebuildPreviewPlan.totalAmount)}</span></p>
+                  <p className="text-gray-400">
+                    Primera cuota: <span className="text-white">{formatDate(rebillingRebuildPreviewPlan.installments[0]?.dueDate ?? "")}</span> ·
+                    {" "}Última cuota: <span className="text-white">{formatDate(rebillingRebuildPreviewPlan.installments[rebillingRebuildPreviewPlan.installments.length - 1]?.dueDate ?? "")}</span>
+                  </p>
+                </div>
+              )}
+
+              <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3">
+                <p className="text-xs text-amber-400/90">
+                  Se reemplazará únicamente el grupo de cuotas de ESTA refacturación. No se puede deshacer automáticamente.
+                </p>
+              </div>
+
+              <label className="flex items-start gap-2 cursor-pointer select-none">
+                <input type="checkbox" checked={rebillingRebuildConfirmed}
+                  onChange={e => setRebillingRebuildConfirmed(e.target.checked)}
+                  className="mt-0.5" />
+                <span className="text-xs text-gray-300">Confirmo que revisé el nuevo plan de cuotas de esta refacturación</span>
+              </label>
+
+              <div className="flex justify-end gap-3 pt-2">
+                <button type="button" onClick={() => setShowRebillingRebuildForm(false)} className="px-4 py-2 bg-[#1f2937] text-gray-300 text-sm rounded-lg hover:bg-[#374151] transition-all">
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  disabled={!canConfirmRebillingRebuild || rebillingRebuildSubmitting}
+                  onClick={doRebillingRebuild}
+                  className="px-5 py-2 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white text-sm font-medium rounded-lg transition-all flex items-center gap-2"
+                >
+                  {rebillingRebuildSubmitting && <Loader2 className="w-4 h-4 animate-spin" />}
+                  Confirmar corrección
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Anular póliza — mismo patrón visual que "Corregir plan de cuotas":

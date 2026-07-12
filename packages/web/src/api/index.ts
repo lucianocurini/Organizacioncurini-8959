@@ -42,6 +42,7 @@ import { parseElNorteTxtV2 } from "../lib/parsers/el-norte-v2";
 import { isValidCalendarDate, buildInstallmentPlan, InstallmentPlanError } from "../lib/installments/plan";
 import { classifyInstallmentsForRebuild, runInstallmentRebuildTransaction, RebuildConflictError, PolicyNotFoundError } from "../lib/installments/rebuild";
 import { parseRebillingPayload, RebillingPayloadError, buildRebillingInstallmentPlan, hasRebillingGroupActivity } from "../lib/installments/rebilling-plan";
+import { classifyRebillingGroupForRebuild, runRebillingRebuildTransaction, RebillingRebuildConflictError, RebillingNotFoundError } from "../lib/installments/rebilling-rebuild";
 import { validateAndNormalizeSplits, SplitValidationError, classifySplitGroup, isDirectCompanyPaymentMethod, type SplitGroup } from "../lib/payments/splits";
 import { recalculateInstallmentPaymentStatus } from "../lib/payments/installment-status";
 import {
@@ -293,7 +294,6 @@ app.get("/policies/:id", requireAuth(async (c: any) => {
 // tal cual al cliente, el endpoint las mapea a la respuesta HTTP apropiada
 // (mismo patrón que RebuildConflictError en rebuild.ts).
 class RebillingDuplicateError extends Error {}
-class RebillingConflictError extends Error {}
 
 app.get("/policies/:id/rebillings", requireAuth(async (c: any) => {
   const rows = await db
@@ -455,10 +455,12 @@ app.put("/rebillings/:id", requireAuth(async (c: any) => {
   }
 
   // Sin actividad: si el body no trae installmentCount/firstDueDate, es una
-  // edición liviana (solo premium/sumInsured/notes/deductible sin tocar el
-  // plan de cuotas) — mismo comportamiento simple de siempre, sin regenerar
-  // nada. Si los trae, se regenera el grupo (caso A si no había cuotas, caso
-  // B si reemplaza un grupo previo sin actividad).
+  // edición de METADATA (fecha, período, importe, franquicia, observaciones,
+  // etc.) — nunca toca policy_installments. Esta es la única rama que la UI
+  // nueva de "Editar datos de la refacturación" usa. Si el body trae esos
+  // campos, se toma como el camino LEGACY de regeneración de plan (ver nota
+  // más abajo) — la UI nueva nunca los envía desde acá; para corregir el plan
+  // existe la acción separada POST /rebillings/:id/installments/rebuild.
   const wantsPlan = body.installmentCount !== undefined || body.firstDueDate !== undefined;
   if (!wantsPlan) {
     const [row] = await db.update(rebillings).set({
@@ -467,11 +469,27 @@ app.put("/rebillings/:id", requireAuth(async (c: any) => {
       premium: body.premium !== undefined ? (body.premium ? Number(body.premium) : null) : existing.premium,
       monthlyFee: body.monthlyFee !== undefined ? (body.monthlyFee ? Number(body.monthlyFee) : null) : existing.monthlyFee,
       sumInsured: body.sumInsured !== undefined ? (body.sumInsured ? Number(body.sumInsured) : null) : existing.sumInsured,
+      deductible: body.deductible !== undefined ? (body.deductible ? Number(body.deductible) : null) : existing.deductible,
       notes: body.notes !== undefined ? (body.notes || null) : existing.notes,
     }).where(eq(rebillings.id, id)).returning();
+
+    // Igual que en el alta y en la corrección de plan: si se informó
+    // franquicia, también actualiza la vigente de la póliza. Nunca toca
+    // cuotas — esta rama es puramente metadata.
+    if (body.deductible !== undefined && body.deductible) {
+      await db.update(policies).set({ deductible: Number(body.deductible) }).where(eq(policies.id, existing.policyId));
+    }
     return c.json(row, 200);
   }
 
+  // ── CAMINO LEGACY (regenera el plan a través de PUT) ──────────────────────
+  // Se conserva por compatibilidad hacia atrás — algún caller antiguo podría
+  // seguir enviando installmentCount/firstDueDate acá — pero la UI nueva
+  // (RebillingModal en modo "Editar datos") NUNCA envía estos campos, así que
+  // nunca cae en esta rama. Para corregir el plan de forma explícita y
+  // confirmada, usar POST /rebillings/:id/installments/rebuild (misma lógica
+  // de fondo, vía runRebillingRebuildTransaction — no hay dos implementaciones
+  // distintas de "borrar y regenerar", solo dos puertas de entrada).
   let payload;
   try {
     payload = parseRebillingPayload({
@@ -498,67 +516,111 @@ app.put("/rebillings/:id", requireAuth(async (c: any) => {
     throw e;
   }
 
-  const result = await db.transaction(async (tx) => {
-    // Re-chequeo dentro de la transacción — mismo motivo que
-    // runInstallmentRebuildTransaction en rebuild.ts: el estado pudo cambiar
-    // entre el chequeo de arriba y este punto.
-    const recheckGroup = await loadRebillingGroup(tx, id);
-    const recheckIds = recheckGroup.map((i: any) => i.id);
-    const { paidInstallmentIds: rePaid, remittedInstallmentIds: reRem } = await rebillingGroupActivitySets(tx, recheckIds);
-    if (hasRebillingGroupActivity(recheckGroup, rePaid, reRem)) {
-      throw new RebillingConflictError();
-    }
-
-    const previousCount = recheckGroup.length;
-    if (previousCount > 0) {
-      await tx.delete(policyInstallments).where(eq(policyInstallments.rebillingId, id));
-    }
-
-    const [rebilling] = await tx.update(rebillings).set({
-      billingStart: payload.billingStart,
-      billingEnd: payload.billingEnd,
-      premium: payload.premium,
-      monthlyFee: payload.monthlyFee,
-      sumInsured: payload.sumInsured,
-      installmentCount: payload.installmentCount,
-      firstDueDate: payload.firstDueDate,
-      deductible: payload.deductible,
-      notes: payload.notes,
-    }).where(eq(rebillings.id, id)).returning();
-
-    const insertedInstallments = await tx.insert(policyInstallments).values(
-      plan.installments.map((row) => ({
-        policyId: existing.policyId,
-        number: row.number,
-        dueDate: row.dueDate,
-        amount: row.amount,
-        status: "pendiente",
-        rendered: 0,
-        rebillingId: id,
-      }))
-    ).returning();
-
-    // policies.installments ajustado por la DIFERENCIA (newCount - oldCount)
-    // — nunca "set" absoluto, para no pisar cuotas de otros grupos.
-    const diff = plan.installments.length - previousCount;
-    if (diff !== 0) {
-      await tx.update(policies)
-        .set({ installments: sql`COALESCE(${policies.installments}, 0) + ${diff}` })
-        .where(eq(policies.id, existing.policyId));
-    }
-
-    if (payload.deductible !== null) {
-      await tx.update(policies).set({ deductible: payload.deductible }).where(eq(policies.id, existing.policyId));
-    }
-
-    return { rebilling, installments: insertedInstallments, previousCount };
-  }).catch((e: any) => {
-    if (e instanceof RebillingConflictError) return null;
-    throw e;
-  });
+  const result = await db.transaction(async (tx) => runRebillingRebuildTransaction(tx, id, plan, payload))
+    .catch((e: any) => {
+      if (e instanceof RebillingRebuildConflictError) return null;
+      throw e;
+    });
 
   if (result === null) return c.json({ error: REB_EDIT_BLOCK_MSG }, 409);
-  return c.json({ ...result.rebilling, installments: result.installments }, 200);
+  return c.json({ ...result.rebilling, installments: result.insertedRows }, 200);
+}));
+
+// Consulta de solo lectura: ¿se puede corregir el plan de cuotas de ESTA
+// refacturación puntual? No modifica nada — ver classifyRebillingGroupForRebuild
+// (lib/installments/rebilling-rebuild.ts). Acción separada de PUT /rebillings/:id:
+// esta es la única vía pensada para reemplazar el grupo de cuotas.
+app.get("/rebillings/:id/installments/rebuild-check", requireAuth(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isInteger(id) || id <= 0) {
+    return c.json({ error: "ID de refacturación inválido." }, 400);
+  }
+  try {
+    const result = await classifyRebillingGroupForRebuild(db, id);
+    return c.json(result, 200);
+  } catch (e: any) {
+    if (e instanceof RebillingNotFoundError) return c.json({ error: "La refacturación ya no existe" }, 404);
+    throw e;
+  }
+}));
+
+// Reconstruye el plan de cuotas de UNA refacturación puntual: borra solo las
+// cuotas de ese rebillingId (nunca la emisión original ni otra refacturación)
+// y las reemplaza por un plan nuevo. Bloquea completamente si hay actividad
+// real (pagada, rendida, payment o remittance_item vinculados).
+app.post("/rebillings/:id/installments/rebuild", requireAuth(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isInteger(id) || id <= 0) {
+    return c.json({ error: "ID de refacturación inválido." }, 400);
+  }
+  const existing = await db.select().from(rebillings).where(eq(rebillings.id, id)).get();
+  if (!existing) return c.json({ error: "La refacturación ya no existe" }, 404);
+
+  const body = await c.req.json();
+
+  let payload;
+  try {
+    payload = parseRebillingPayload({
+      billingStart: body.billingStart ?? existing.billingStart,
+      billingEnd: body.billingEnd ?? existing.billingEnd,
+      premium: body.premium !== undefined ? body.premium : existing.premium,
+      monthlyFee: body.monthlyFee !== undefined ? body.monthlyFee : existing.monthlyFee,
+      installmentCount: body.installmentCount,
+      firstDueDate: body.firstDueDate,
+      sumInsured: body.sumInsured !== undefined ? body.sumInsured : existing.sumInsured,
+      deductible: body.deductible !== undefined ? body.deductible : existing.deductible,
+      notes: body.notes !== undefined ? body.notes : existing.notes,
+    });
+  } catch (e: any) {
+    if (e instanceof RebillingPayloadError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
+  let plan;
+  try {
+    plan = buildRebillingInstallmentPlan(payload);
+  } catch (e: any) {
+    if (e instanceof InstallmentPlanError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
+  // Chequeo previo (fuera de la transacción): informativo, para devolver 409
+  // rápido sin abrir una transacción de escritura innecesaria. La única
+  // autorización real para borrar es la reclasificación que
+  // runRebillingRebuildTransaction hace con `tx`, inmediatamente antes.
+  let precheck;
+  try {
+    precheck = await classifyRebillingGroupForRebuild(db, id);
+  } catch (e: any) {
+    if (e instanceof RebillingNotFoundError) return c.json({ error: "La refacturación ya no existe" }, 404);
+    throw e;
+  }
+  if (precheck.classification === "REQUIRES_MANUAL_REVIEW") {
+    return c.json({
+      error: "La refacturación tiene cuotas con actividad — no se puede corregir el plan.",
+      blockingInstallments: precheck.blockingInstallments,
+    }, 409);
+  }
+
+  try {
+    const result = await db.transaction(async (tx) => runRebillingRebuildTransaction(tx, id, plan, payload));
+    return c.json({
+      rebuilt: true,
+      rebillingId: id,
+      policyId: result.policyId,
+      previousCount: result.previousCount,
+      insertedCount: result.insertedRows.length,
+      rebilling: result.rebilling,
+      installments: result.insertedRows,
+    }, 200);
+  } catch (e: any) {
+    if (e instanceof RebillingRebuildConflictError) {
+      return c.json({ error: e.message, blockingInstallments: e.blockingInstallments }, 409);
+    }
+    if (e instanceof RebillingNotFoundError) return c.json({ error: "La refacturación ya no existe" }, 404);
+    console.error("[POST /rebillings/:id/installments/rebuild]", e?.message, e);
+    return c.json({ error: "No se pudo corregir el plan de cuotas." }, 500);
+  }
 }));
 
 app.delete("/rebillings/:id", requireAuth(async (c: any) => {
