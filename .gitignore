@@ -39,6 +39,7 @@ local-audits/
 # dotenv environment variable files
 .env
 .env.test
+.env.staging
 .env.development.local
 .env.test.local
 .env.production.local
