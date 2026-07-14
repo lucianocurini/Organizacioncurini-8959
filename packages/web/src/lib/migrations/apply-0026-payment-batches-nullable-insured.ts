@@ -36,13 +36,13 @@ export interface Migration0026Summary {
   paymentBatchesCountAfter: number;
 }
 
-const EXPECTED_COLUMNS = [
+export const EXPECTED_COLUMNS = [
   "id", "insured_id", "base_amount_cents", "surcharge_amount_cents",
   "total_received_cents", "payment_date", "status", "notes",
   "created_by", "created_at", "updated_at",
 ];
 
-const CREATE_NEW_TABLE_SQL = `
+export const CREATE_NEW_TABLE_SQL = `
 CREATE TABLE payment_batches_new (
   id                     INTEGER PRIMARY KEY AUTOINCREMENT,
   insured_id             INTEGER REFERENCES insureds(id),
@@ -57,10 +57,36 @@ CREATE TABLE payment_batches_new (
   updated_at             INTEGER NOT NULL
 )`.trim();
 
-const CREATE_INDEXES_SQL = [
+export const INSERT_INTO_NEW_TABLE_SQL = `
+INSERT INTO payment_batches_new (
+  id, insured_id, base_amount_cents, surcharge_amount_cents, total_received_cents,
+  payment_date, status, notes, created_by, created_at, updated_at
+)
+SELECT
+  id, insured_id, base_amount_cents, surcharge_amount_cents, total_received_cents,
+  payment_date, status, notes, created_by, created_at, updated_at
+FROM payment_batches
+`.trim();
+
+export const DROP_OLD_TABLE_SQL = "DROP TABLE payment_batches";
+export const RENAME_TABLE_SQL = "ALTER TABLE payment_batches_new RENAME TO payment_batches";
+
+export const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_payment_batches_insured_id ON payment_batches(insured_id)",
   "CREATE INDEX IF NOT EXISTS idx_payment_batches_payment_date ON payment_batches(payment_date)",
   "CREATE INDEX IF NOT EXISTS idx_payment_batches_status ON payment_batches(status)",
+];
+
+// Misma secuencia de trabajo (sin BEGIN/COMMIT/PRAGMA, que en el runner de
+// Turso los agrega client.migrate() automáticamente alrededor de este mismo
+// arreglo — ver apply-0026-prod.ts). Se exporta para que ese runner nunca
+// tenga que reescribir o duplicar este SQL a mano.
+export const MIGRATION_0026_WORK_STATEMENTS: string[] = [
+  CREATE_NEW_TABLE_SQL,
+  INSERT_INTO_NEW_TABLE_SQL,
+  DROP_OLD_TABLE_SQL,
+  RENAME_TABLE_SQL,
+  ...CREATE_INDEXES_SQL,
 ];
 
 async function tableExists(db: Sql0026Client, name: string): Promise<boolean> {
@@ -68,7 +94,7 @@ async function tableExists(db: Sql0026Client, name: string): Promise<boolean> {
   return r.rows.length > 0;
 }
 
-async function isInsuredIdNullable(db: Sql0026Client): Promise<boolean> {
+export async function isInsuredIdNullable(db: Sql0026Client): Promise<boolean> {
   const cols = await db.execute("PRAGMA table_info(payment_batches)");
   const insuredCol = cols.rows.find((r: any) => r.name === "insured_id");
   if (!insuredCol) {
@@ -110,19 +136,10 @@ export async function applyMigration0026PaymentBatchesNullableInsured(db: Sql002
         throw new Error(`payment_batches_new quedó sin columnas esperadas: ${missing.join(", ")}. Abortando.`);
       }
 
-      await db.execute(`
-        INSERT INTO payment_batches_new (
-          id, insured_id, base_amount_cents, surcharge_amount_cents, total_received_cents,
-          payment_date, status, notes, created_by, created_at, updated_at
-        )
-        SELECT
-          id, insured_id, base_amount_cents, surcharge_amount_cents, total_received_cents,
-          payment_date, status, notes, created_by, created_at, updated_at
-        FROM payment_batches
-      `);
+      await db.execute(INSERT_INTO_NEW_TABLE_SQL);
 
-      await db.execute("DROP TABLE payment_batches");
-      await db.execute("ALTER TABLE payment_batches_new RENAME TO payment_batches");
+      await db.execute(DROP_OLD_TABLE_SQL);
+      await db.execute(RENAME_TABLE_SQL);
 
       for (const sql of CREATE_INDEXES_SQL) {
         await db.execute(sql);
