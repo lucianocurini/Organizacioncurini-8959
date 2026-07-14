@@ -446,6 +446,255 @@ describe("POST /api/remittances — cobro múltiple (payment_batches)", () => {
   });
 });
 
+describe("POST /api/remittances — cobro múltiple mixto (cuota existente + cobro manual)", () => {
+  test("batch mixto completo crea las allocations una sola vez; ambos hijos quedan rendered; ningún remittance_item queda adeudado", async () => {
+    const p1 = await mkPolicy(companyId);
+    const i1 = await mkInstallment(p1, 1, 1000);
+    const p2 = await mkPolicy(companyId);
+
+    const created = await callPostBatch({
+      paymentDate: "2027-06-01", insuredId,
+      items: [
+        { source: "installment", installmentId: i1 },
+        { source: "policy_manual_payment", policyId: p2, amount: 500 },
+      ],
+      splits: [{ method: "transferencia", amount: 1500 }],
+      applyProntoPagoSurcharge: false,
+    });
+    expect(created.status).toBe(201);
+    const batchId = created.body.id as number;
+    const childRows = await db.select().from(payments).where(eq(payments.batchId, batchId)).all();
+    expect(childRows.length).toBe(2);
+
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { transferencia: 1500 },
+      items: childRows.map((c) => ({ source: "payment", sourceId: c.id, amount: c.amount, paymentMethod: "lote" })),
+    });
+    expect(res.status).toBe(200);
+    const allocs = await getAllocations(res.body.id);
+    expect(allocs.length).toBe(1); // un solo split, compartido por ambos hijos (cuota + manual)
+    expect(allocs[0]!.paymentBatchId).toBe(batchId);
+    expect(allocs[0]!.amountCents).toBe(150000);
+    for (const c of childRows) expect((await getPayment(c.id))!.rendered).toBe(1);
+
+    const items = await db.select().from(remittanceItems).where(eq(remittanceItems.remittanceId, res.body.id)).all();
+    expect(items.length).toBe(2);
+    expect(items.every((it: any) => it.debtorStatus === "pagado")).toBe(true);
+  });
+
+  test("batch mixto parcial — falta el hijo manual → 409, nada se modifica", async () => {
+    const p1 = await mkPolicy(companyId);
+    const i1 = await mkInstallment(p1, 1, 1000);
+    const p2 = await mkPolicy(companyId);
+
+    const created = await callPostBatch({
+      paymentDate: "2027-06-01", insuredId,
+      items: [
+        { source: "installment", installmentId: i1 },
+        { source: "policy_manual_payment", policyId: p2, amount: 500 },
+      ],
+      splits: [{ method: "efectivo", amount: 1500 }],
+      applyProntoPagoSurcharge: false,
+    });
+    const batchId = created.body.id as number;
+    const childRows = await db.select().from(payments).where(eq(payments.batchId, batchId)).all();
+    const instChild = childRows.find((c) => c.installmentId === i1)!;
+
+    const beforeCount = (await db.select().from(remittances).all()).length;
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { efectivo: 1000 },
+      items: [{ source: "payment", sourceId: instChild.id, amount: 1000, paymentMethod: "lote" }],
+    });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/rendirse completo/);
+    const afterCount = (await db.select().from(remittances).all()).length;
+    expect(afterCount).toBe(beforeCount);
+    for (const c of childRows) expect((await getPayment(c.id))!.rendered).toBe(0);
+  });
+
+  test("batch mixto parcial — falta el hijo con cuota → 409, nada se modifica", async () => {
+    const p1 = await mkPolicy(companyId);
+    const i1 = await mkInstallment(p1, 1, 1000);
+    const p2 = await mkPolicy(companyId);
+
+    const created = await callPostBatch({
+      paymentDate: "2027-06-01", insuredId,
+      items: [
+        { source: "installment", installmentId: i1 },
+        { source: "policy_manual_payment", policyId: p2, amount: 500 },
+      ],
+      splits: [{ method: "efectivo", amount: 1500 }],
+      applyProntoPagoSurcharge: false,
+    });
+    const batchId = created.body.id as number;
+    const childRows = await db.select().from(payments).where(eq(payments.batchId, batchId)).all();
+    const manualChild = childRows.find((c) => c.installmentId == null)!;
+
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { efectivo: 500 },
+      items: [{ source: "payment", sourceId: manualChild.id, amount: 500, paymentMethod: "lote" }],
+    });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/rendirse completo/);
+    for (const c of childRows) expect((await getPayment(c.id))!.rendered).toBe(0);
+  });
+});
+
+describe("POST /api/remittances — imputación completamente manual (source=\"manual_payment\" libre)", () => {
+  test("un batch 100% manual libre se rinde como dinero real, siempre pagado", async () => {
+    const created = await callPostBatch({
+      paymentDate: "2027-06-01", insuredId,
+      items: [{ source: "manual_payment", manualPayer: `${PREFIX} Cliente libre`, amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+      applyProntoPagoSurcharge: false,
+    });
+    expect(created.status).toBe(201);
+    const batchId = created.body.id as number;
+    const children = await mkChildIds(batchId);
+    expect(children.length).toBe(1);
+
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { efectivo: 500 },
+      items: [{ source: "payment", sourceId: children[0], amount: 500, paymentMethod: "lote" }],
+    });
+    expect(res.status).toBe(200);
+    const allocs = await getAllocations(res.body.id);
+    expect(allocs.length).toBe(1);
+    expect(allocs[0]!.paymentBatchId).toBe(batchId);
+    expect(allocs[0]!.amountCents).toBe(50000);
+    expect((await getPayment(children[0]!))!.rendered).toBe(1);
+
+    const items = await db.select().from(remittanceItems).where(eq(remittanceItems.remittanceId, res.body.id)).all();
+    expect(items[0]!.debtorStatus).toBe("pagado");
+  });
+
+  test("batch mixto (cuota + manual libre) se rinde completo, ambos pagados", async () => {
+    const p1 = await mkPolicy(companyId);
+    const i1 = await mkInstallment(p1, 1, 700);
+
+    const created = await callPostBatch({
+      paymentDate: "2027-06-01", insuredId,
+      items: [
+        { source: "installment", installmentId: i1 },
+        { source: "manual_payment", manualPayer: `${PREFIX} Cliente libre 2`, amount: 300 },
+      ],
+      splits: [{ method: "transferencia", amount: 1000 }],
+      applyProntoPagoSurcharge: false,
+    });
+    const batchId = created.body.id as number;
+    const childRows = await db.select().from(payments).where(eq(payments.batchId, batchId)).all();
+
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { transferencia: 1000 },
+      items: childRows.map((c) => ({ source: "payment", sourceId: c.id, amount: c.amount, paymentMethod: "lote" })),
+    });
+    expect(res.status).toBe(200);
+    for (const c of childRows) expect((await getPayment(c.id))!.rendered).toBe(1);
+    const items = await db.select().from(remittanceItems).where(eq(remittanceItems.remittanceId, res.body.id)).all();
+    expect(items.every((it: any) => it.debtorStatus === "pagado")).toBe(true);
+  });
+
+  test("marcar el hijo manual libre como adeudado sigue rechazado (mismo guard que cualquier payment)", async () => {
+    const created = await callPostBatch({
+      paymentDate: "2027-06-01", insuredId,
+      items: [{ source: "manual_payment", manualPayer: `${PREFIX} Cliente libre 3`, amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+      applyProntoPagoSurcharge: false,
+    });
+    const batchId = created.body.id as number;
+    const children = await mkChildIds(batchId);
+
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { efectivo: 500 },
+      items: [{ source: "payment", sourceId: children[0], amount: 500, debtorStatus: "adeudado", paymentMethod: "lote" }],
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Un cobro confirmado no puede registrarse como adeudado.");
+  });
+});
+
+describe("POST /api/remittances — un cobro confirmado nunca puede rendirse como adeudado", () => {
+  test("source='payment' standalone con debtorStatus='adeudado' → 400, nada se crea ni se marca rendido", async () => {
+    const { paymentId } = await mkStandalonePayment({ amount: 400, splits: [{ method: "efectivo", amountCents: 40000 }] });
+    const beforeCount = (await db.select().from(remittances).all()).length;
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { efectivo: 400 },
+      items: [{ source: "payment", sourceId: paymentId, amount: 400, debtorStatus: "adeudado", paymentMethod: "efectivo" }],
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Un cobro confirmado no puede registrarse como adeudado.");
+    const afterCount = (await db.select().from(remittances).all()).length;
+    expect(afterCount).toBe(beforeCount);
+    expect((await getPayment(paymentId))!.rendered).toBe(0);
+  });
+
+  test("source='payment' hijo de batch (con cuota) con debtorStatus='adeudado' → 400", async () => {
+    const p1 = await mkPolicy(companyId);
+    const i1 = await mkInstallment(p1, 1, 1000);
+    const created = await callPostBatch({
+      paymentDate: "2027-06-01", insuredId,
+      items: [{ installmentId: i1 }],
+      splits: [{ method: "efectivo", amount: 1000 }],
+      applyProntoPagoSurcharge: false,
+    });
+    const batchId = created.body.id as number;
+    const children = await mkChildIds(batchId);
+
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { efectivo: 1000 },
+      items: [{ source: "payment", sourceId: children[0], amount: 1000, debtorStatus: "adeudado", paymentMethod: "lote" }],
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Un cobro confirmado no puede registrarse como adeudado.");
+  });
+
+  test("source='payment' hijo manual de batch (installmentId NULL) con debtorStatus='adeudado' → 400", async () => {
+    const p1 = await mkPolicy(companyId);
+    const created = await callPostBatch({
+      paymentDate: "2027-06-01", insuredId,
+      items: [{ source: "policy_manual_payment", policyId: p1, amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+      applyProntoPagoSurcharge: false,
+    });
+    const batchId = created.body.id as number;
+    const children = await mkChildIds(batchId);
+
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { efectivo: 500 },
+      items: [{ source: "payment", sourceId: children[0], amount: 500, debtorStatus: "adeudado", paymentMethod: "lote" }],
+    });
+    expect(res.status).toBe(400);
+  });
+
+  test("source='payment' sin debtorStatus (default 'pagado') sigue funcionando normalmente", async () => {
+    const { paymentId } = await mkStandalonePayment({ amount: 250, splits: [{ method: "efectivo", amountCents: 25000 }] });
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { efectivo: 250 },
+      items: [{ source: "payment", sourceId: paymentId, amount: 250, paymentMethod: "efectivo" }],
+    });
+    expect(res.status).toBe(200);
+  });
+
+  test("source='installment' con debtorStatus='adeudado' sigue permitido — es la vía real de deuda", async () => {
+    const policyId = await mkPolicy(companyId);
+    const instId = await mkInstallment(policyId, 1, 700);
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { efectivo: 700 },
+      items: [{ source: "installment", sourceId: instId, amount: 700, debtorStatus: "adeudado" }],
+    });
+    expect(res.status).toBe(200);
+    expect((await getInstallment(instId))!.rendered).toBe(1);
+  });
+
+  test("source='manual_debt' sigue permitido (deuda manual, sin instrumento real)", async () => {
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { efectivo: 900 },
+      items: [{ source: "manual_debt", amount: 900, debtorStatus: "adeudado" }],
+    });
+    expect(res.status).toBe(200);
+  });
+});
+
 describe("DELETE /api/remittances/:id", () => {
   test("revierte rendered, borra allocations/items/remittance para un pago standalone", async () => {
     const { paymentId } = await mkStandalonePayment({ amount: 400, splits: [{ method: "efectivo", amountCents: 40000 }] });

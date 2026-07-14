@@ -6,8 +6,9 @@ import { toast } from "sonner";
 import {
   DollarSign, Plus, Search, TrendingUp, CreditCard,
   Banknote, ArrowRightLeft, Trash2, Edit2, X, ChevronDown, Link, CheckSquare,
-  ClipboardList, AlertCircle, ChevronRight, ReceiptText, Building2, Check, ShoppingCart, Save
+  ClipboardList, AlertCircle, ChevronRight, ReceiptText, Building2, Check, ShoppingCart, Save, Layers
 } from "lucide-react";
+import { PendingInstallmentsBatchTab } from "@/components/payments/PendingInstallmentsBatchTab";
 import { cn, formatCurrency as _fc } from "@/lib/utils";
 import {
   type PaymentSplitFormRow, createSplitRow, splitsFromPayment,
@@ -1217,7 +1218,13 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
           source: i.source,
           sourceId: i.sourceId,
           amount: i.amount,
-          debtorStatus: (i.source === "manual_debt" || debtorItems.has(key(i))) ? "adeudado" : "pagado",
+          // Un payment confirmado (source='payment') NUNCA puede mandarse como
+          // adeudado, sin importar el estado de debtorItems — la UI ya no
+          // ofrece el toggle para ese source, pero esto es defensivo (no
+          // depender solo de que el checkbox esté oculto).
+          debtorStatus: i.source === "payment"
+            ? "pagado"
+            : (i.source === "manual_debt" || debtorItems.has(key(i))) ? "adeudado" : "pagado",
           clientName: i.clientName,
           policyNumber: i.policyNumber,
           companyName: i.companyName,
@@ -1299,7 +1306,11 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                                     <span className="block text-xs text-purple-400 mt-0.5">+$800 PP</span>
                                   )}
                                 </div>
-                                {sel && (
+                                {/* Un cobro confirmado (source='payment') nunca puede rendirse como
+                                    adeudado — representa dinero ya recibido. El toggle solo tiene
+                                    sentido para cash_entry (cobro manual de Caja, mismo criterio que
+                                    ya tenía antes de esta regla). */}
+                                {sel && item.source !== "payment" && (
                                   <button type="button" onClick={e => { e.stopPropagation(); toggleDebtor(item); }}
                                     className={cn("text-xs px-2 py-1 rounded border shrink-0 transition-all",
                                       isDebtor ? "bg-red-900/30 border-red-500/40 text-red-400" : "border-white/15 text-white/40 hover:border-yellow-500/40 hover:text-yellow-400")}>
@@ -2205,7 +2216,7 @@ function GastosTab() {
 // ─── Contenedor principal con tabs ───────────────────────────────────────────
 export default function Cobranzas() {
   const { user } = useAuth();
-  const [tab, setTab] = useState<"cobranzas" | "rendiciones" | "adeudados" | "transferencias" | "gastos">("cobranzas");
+  const [tab, setTab] = useState<"cobranzas" | "lote" | "rendiciones" | "adeudados" | "transferencias" | "gastos">("cobranzas");
 
   return (
     <AppLayout>
@@ -2222,6 +2233,7 @@ export default function Cobranzas() {
         <div className="flex flex-wrap gap-1 bg-white/5 border border-white/10 rounded-lg p-1 w-fit">
           {[
             { key: "cobranzas", label: "Cobranzas", icon: DollarSign },
+            { key: "lote", label: "Cuotas pendientes", icon: Layers },
             { key: "transferencias", label: "Transf. Compañía", icon: Building2 },
             { key: "rendiciones", label: "Rendiciones", icon: ReceiptText },
             { key: "adeudados", label: "Adeudados", icon: AlertCircle },
@@ -2239,6 +2251,7 @@ export default function Cobranzas() {
 
         {/* Contenido del tab */}
         {tab === "cobranzas" && <CobranzasTab />}
+        {tab === "lote" && <PendingInstallmentsBatchTab />}
         {tab === "transferencias" && <TransferenciasTab />}
         {tab === "rendiciones" && <RendicionesTab />}
         {tab === "adeudados" && <AdeudadosTab />}

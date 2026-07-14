@@ -163,7 +163,15 @@ export const paymentSplits = sqliteTable("payment_splits", {
 // en la migración 0021 (mismo estilo SQL crudo que el resto del proyecto).
 export const paymentBatches = sqliteTable("payment_batches", {
   id: integer("id").primaryKey({ autoIncrement: true }),
-  insuredId: integer("insured_id").notNull().references(() => insureds.id),
+  // Nullable desde la migración 0026 (Etapa "lote multi-asegurado") — un
+  // batch ya no representa necesariamente a un único asegurado (puede
+  // mezclar pólizas de distintos integrantes de una familia, o ser 100%
+  // manual_payment sin ninguna fila real detrás). Es un dato DERIVADO server
+  // side (ver resolveBatchInsuredId en src/lib/payments/batches.ts), nunca
+  // una restricción de creación: se guarda el insuredId real solo si TODOS
+  // los ítems del batch coinciden en el mismo asegurado real; NULL si hay
+  // más de uno, o si ninguno tiene un insuredId real.
+  insuredId: integer("insured_id").references(() => insureds.id),
   baseAmountCents: integer("base_amount_cents").notNull(),
   surchargeAmountCents: integer("surcharge_amount_cents").notNull().default(0),
   totalReceivedCents: integer("total_received_cents").notNull(),
@@ -173,6 +181,13 @@ export const paymentBatches = sqliteTable("payment_batches", {
   createdBy: integer("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
   updatedAt: integer("updated_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  // Migración 0027 — trazabilidad de la anulación (POST
+  // /payment-batches/:id/cancel). Los 3 quedan NULL mientras status sigue
+  // "confirmado"; se completan juntos, una sola vez, en la misma transacción
+  // que pone status="anulado" — nunca se editan por separado.
+  cancelledAt: integer("cancelled_at", { mode: "timestamp" }),
+  cancelledBy: integer("cancelled_by").references(() => users.id),
+  cancellationReason: text("cancellation_reason"),
 });
 
 // Etapa 4A: medios reales de un payment_batches — una sola vez por medio,
@@ -427,6 +442,14 @@ export const cashEntries = sqliteTable("cash_entries", {
   paymentId: integer("payment_id").references(() => payments.id), // único por payment cuando entry_type = 'pronto_pago_surcharge' (ver ux_cash_entries_pronto_pago_payment)
   createdBy: integer("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  // Migración 0027 — mismo criterio sin CHECK a nivel DB que cashExpenses.status
+  // (texto libre). 'activo' es el único valor real hasta esta etapa;
+  // 'anulado' se usa exclusivamente para el recargo Pronto Pago de un
+  // payment_batches cancelado (POST /payment-batches/:id/cancel) — nunca se
+  // borra la fila, solo se marca. No confundir con `rendered`: un recargo
+  // puede estar anulado y rendered=0 a la vez (nunca llegó a rendirse).
+  status: text("status").notNull().default("activo"), // activo | anulado
+  voidedAt: integer("voided_at", { mode: "timestamp" }),
 });
 
 // Adeudados por asegurados

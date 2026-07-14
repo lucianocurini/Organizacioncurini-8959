@@ -10,7 +10,7 @@ import app from "../index";
 import { database as db } from "../database/index";
 import {
   users, sessions, policies, companies, insureds, policyInstallments,
-  payments, paymentSplits, paymentBatches, paymentBatchSplits, cashEntries, receivedChecks,
+  payments, paymentSplits, paymentBatches, paymentBatchSplits, cashEntries, receivedChecks, cashDebts,
 } from "../database/schema";
 import { eq, inArray, and } from "drizzle-orm";
 
@@ -226,23 +226,44 @@ describe("3. Cuotas de pólizas distintas del mismo asegurado", () => {
   });
 });
 
-describe("4. Cuotas de asegurados distintos → rechazo", () => {
-  test("una cuota de otro insuredId → 400, nada se crea", async () => {
+describe("4. Cuotas de asegurados distintos → PERMITIDO (lote multi-asegurado)", () => {
+  test("una cuota de otro insuredId → 201, batch.insuredId queda NULL (mezcla real)", async () => {
     const policyA = await mkPolicy(insuredId, companyId);
     const policyB = await mkPolicy(otherInsuredId, companyId);
     const instA = await mkInstallment(policyA, 1, "2027-01-01", 500);
     const instB = await mkInstallment(policyB, 1, "2027-01-01", 500);
 
-    const before = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
     const { status, body } = await callPost({
-      insuredId, paymentDate: "2027-01-01", notes: null,
+      paymentDate: "2027-01-01", notes: null,
       items: [{ installmentId: instA }, { installmentId: instB }],
       splits: [{ method: "efectivo", amount: 1000 }],
     });
-    expect(status).toBe(400);
-    expect(body.error).toContain("mismo asegurado");
-    const after = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
-    expect(after.length).toBe(before.length);
+    expect(status).toBe(201);
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.insuredId).toBeNull();
+    const children = await getChildren(body.id);
+    expect(children.map(c => c.installmentId).sort()).toEqual([instA, instB].sort());
+  });
+
+  test("caso familiar real: 3 pólizas de 3 asegurados distintos en un solo batch → 201", async () => {
+    const thirdInsured = (await db.insert(insureds).values({ name: `${PREFIX} Asegurado C`, createdBy: userId }).returning({ id: insureds.id }))[0]!.id;
+    const policyA = await mkPolicy(insuredId, companyId);
+    const policyB = await mkPolicy(otherInsuredId, companyId);
+    const policyC = await mkPolicy(thirdInsured, companyId);
+    const instA = await mkInstallment(policyA, 1, "2027-01-01", 500);
+    const instB = await mkInstallment(policyB, 1, "2027-01-01", 300);
+    const instC = await mkInstallment(policyC, 1, "2027-01-01", 200);
+
+    const { status, body } = await callPost({
+      paymentDate: "2027-01-01", notes: "resumen familiar",
+      items: [{ installmentId: instA }, { installmentId: instB }, { installmentId: instC }],
+      splits: [{ method: "efectivo", amount: 1000 }],
+    });
+    expect(status).toBe(201);
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.insuredId).toBeNull();
+    expect(batch!.baseAmountCents).toBe(100000);
+    await db.delete(insureds).where(eq(insureds.id, thirdInsured)).catch(() => {});
   });
 });
 
@@ -1235,7 +1256,8 @@ describe("42-47. Lectura de cartera GET /api/received-checks", () => {
     expect(row.installments.length).toBe(1);
     expect(row.installments[0].installmentId).toBe(instId);
     expect(Array.isArray(row.companies)).toBe(true);
-    expect(row.insured.id).toBe(insuredId);
+    expect(row.insuredSummary.insuredId).toBe(insuredId);
+    expect(row.insuredSummary.insuredDisplay).toBeDefined();
   });
 
   test("47. un batch histórico sin cheques (splits solo efectivo) sigue legible — no rompe la lectura de cartera", async () => {
@@ -1252,5 +1274,656 @@ describe("42-47. Lectura de cartera GET /api/received-checks", () => {
     // sola presencia de un batch sin cheques no puede romper la consulta.
     const { status: listStatus } = await callGetReceivedChecks({});
     expect(listStatus).toBe(200);
+  });
+});
+
+// ─── 48+: Cobro manual real (source="policy_manual_payment") ─────────────────────────
+// UN COBRO MANUAL NUNCA ES UNA DEUDA — ver comentario de cabecera de
+// src/lib/payments/batches.ts. Estos tests verifican que un ítem manual
+// dentro de un payment_batch se comporta como dinero real: payment hijo
+// confirmado con installmentId NULL, sin policy_installments/cash_debts
+// nuevos, mismo tratamiento de Pronto Pago y de bloqueo PUT/DELETE que un
+// hijo de cuota.
+
+describe("48. Batch 100% manual", () => {
+  test("un cobro manual solo → 201, hijo con installmentId NULL", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId, amount: 500, description: "cuota faltante" }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    expect(status).toBe(201);
+    const children = await getChildren(body.id);
+    expect(children.length).toBe(1);
+    expect(children[0]!.installmentId).toBeNull();
+    expect(children[0]!.policyId).toBe(policyId);
+    expect(children[0]!.amount).toBe(500);
+    expect(children[0]!.status).toBe("confirmado");
+    expect(children[0]!.notes).toBe("cuota faltante");
+  });
+});
+
+describe("49. Batch mixto — cuota existente + cobro manual", () => {
+  test("1 cuota + 1 manual del mismo asegurado → 201, ambos hijos correctos", async () => {
+    const policyA = await mkPolicy(insuredId, companyId);
+    const policyB = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyA, 1, "2027-01-01", 700);
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [
+        { source: "installment", installmentId: instId },
+        { source: "policy_manual_payment", policyId: policyB, amount: 300 },
+      ],
+      splits: [{ method: "efectivo", amount: 1000 }],
+    });
+    expect(status).toBe(201);
+    const children = await getChildren(body.id);
+    expect(children.length).toBe(2);
+    const instChild = children.find(c => c.installmentId === instId)!;
+    const manualChild = children.find(c => c.installmentId == null)!;
+    expect(instChild.amount).toBe(700);
+    expect(manualChild.amount).toBe(300);
+    expect(manualChild.policyId).toBe(policyB);
+
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.baseAmountCents).toBe(100000); // 700 + 300
+  });
+});
+
+describe("50. Legacy sin source explícito sigue funcionando (compatibilidad)", () => {
+  test("items sin `source` se tratan como installment", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const { status } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }], // sin source, forma legacy
+      splits: [{ method: "efectivo", amount: 1000 }],
+    });
+    expect(status).toBe(201);
+  });
+});
+
+describe("51. Cobro manual con póliza inexistente → 404, nada se crea", () => {
+  test("policyId inexistente", async () => {
+    const before = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId: 999999999, amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    expect(status).toBe(404);
+    expect(body.error).toContain("no existen");
+    const after = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    expect(after.length).toBe(before.length);
+  });
+});
+
+describe("52. Cobro manual con póliza cancelada → 409", () => {
+  test("policy.status='cancelada' bloquea el manual_payment", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    await db.update(policies).set({ status: "cancelada" }).where(eq(policies.id, policyId));
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId, amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    expect(status).toBe(409);
+    expect(body.error).toContain("cancelada");
+  });
+});
+
+describe("53. Cobro manual con póliza (policy_manual_payment) de otro asegurado → PERMITIDO (lote multi-asegurado)", () => {
+  test("policyId de otro insuredId, único ítem → 201, batch.insuredId = ese asegurado real (uno solo, aunque distinto de cualquier 'principal')", async () => {
+    const otherPolicy = await mkPolicy(otherInsuredId, companyId);
+    const { status, body } = await callPost({
+      paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId: otherPolicy, amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    expect(status).toBe(201);
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.insuredId).toBe(otherInsuredId);
+  });
+
+  test("mezclado con una cuota real de otro asegurado → 201, batch.insuredId queda NULL (dos asegurados reales distintos)", async () => {
+    const policyA = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyA, 1, "2027-01-01", 500);
+    const otherPolicy = await mkPolicy(otherInsuredId, companyId);
+    const { status, body } = await callPost({
+      paymentDate: "2027-01-01", notes: null,
+      items: [
+        { source: "installment", installmentId: instId },
+        { source: "policy_manual_payment", policyId: otherPolicy, amount: 500 },
+      ],
+      splits: [{ method: "efectivo", amount: 1000 }],
+    });
+    expect(status).toBe(201);
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.insuredId).toBeNull();
+    const children = await getChildren(body.id);
+    expect(children.length).toBe(2);
+  });
+});
+
+describe("54. Cobro manual con amount inválido → 400, nada se crea", () => {
+  test("amount = 0", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const { status } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId, amount: 0 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    expect(status).toBe(400);
+  });
+  test("amount negativo", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const { status } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId, amount: -100 }],
+      splits: [{ method: "efectivo", amount: 100 }],
+    });
+    expect(status).toBe(400);
+  });
+  test("amount con más de dos decimales reales", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const { status } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId, amount: 100.567 }],
+      splits: [{ method: "efectivo", amount: 100.57 }],
+    });
+    expect(status).toBe(400);
+  });
+});
+
+describe("55. Source inválido → 400, nada se crea", () => {
+  test("source desconocido en un ítem", async () => {
+    const before = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "cash_entry", policyId: 1, amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain("source inválido");
+    const after = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    expect(after.length).toBe(before.length);
+  });
+});
+
+describe("56. notes/description del cobro manual se preserva en el payment hijo", () => {
+  test("description con espacios se recorta y se guarda en payments.notes", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const { body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId, amount: 500, description: "  cuota faltante importada  " }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    const children = await getChildren(body.id);
+    expect(children[0]!.notes).toBe("cuota faltante importada");
+  });
+  test("sin description → notes queda null", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const { body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId, amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    const children = await getChildren(body.id);
+    expect(children[0]!.notes).toBeNull();
+  });
+});
+
+describe("57. Recargo Pronto Pago Rivadavia sobre un cobro manual", () => {
+  test("cobro manual contra una póliza Rivadavia, medios propios → 1 recargo", async () => {
+    const rivPolicy = await mkPolicy(insuredId, rivadaviaCompanyId);
+    const { body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId: rivPolicy, amount: 1000 }],
+      splits: [{ method: "efectivo", amount: 1000 + 800 }],
+    });
+    const children = await getChildren(body.id);
+    expect(children.length).toBe(1);
+    const surcharges = await db.select().from(cashEntries)
+      .where(and(eq(cashEntries.paymentId, children[0]!.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surcharges.length).toBe(1);
+    expect(surcharges[0]!.amount).toBe(800);
+  });
+
+  test("batch mixto: cuota Rivadavia + manual Rivadavia → dos recargos, uno por hijo", async () => {
+    const rivPolicyA = await mkPolicy(insuredId, rivadaviaCompanyId);
+    const rivPolicyB = await mkPolicy(insuredId, rivadaviaCompanyId);
+    const instId = await mkInstallment(rivPolicyA, 1, "2027-01-01", 600);
+    const { body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [
+        { source: "installment", installmentId: instId },
+        { source: "policy_manual_payment", policyId: rivPolicyB, amount: 400 },
+      ],
+      splits: [{ method: "efectivo", amount: 1000 + 1600 }],
+    });
+    const children = await getChildren(body.id);
+    const childIds = children.map(c => c.id);
+    const surcharges = await db.select().from(cashEntries)
+      .where(and(inArray(cashEntries.paymentId, childIds), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surcharges.length).toBe(2);
+    expect(new Set(surcharges.map(s => s.paymentId)).size).toBe(2);
+  });
+
+  test("manual Rivadavia con medios direct_company → cero recargos", async () => {
+    const rivPolicy = await mkPolicy(insuredId, rivadaviaCompanyId);
+    const { body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId: rivPolicy, amount: 1000 }],
+      splits: [{ method: "transferencia_compania", amount: 1000 }],
+    });
+    const children = await getChildren(body.id);
+    const surcharges = await db.select().from(cashEntries)
+      .where(and(eq(cashEntries.paymentId, children[0]!.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surcharges.length).toBe(0);
+  });
+});
+
+describe("58. Rollback total si el hijo manual falla a mitad de la transacción", () => {
+  test("hijo installment insertado OK, hijo manual con amount NULL revienta → todo se revierte (batch, splits, primer hijo)", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2099-01-01", 600);
+    const manualPolicyId = await mkPolicy(insuredId, companyId);
+
+    const beforeBatches = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    const beforePayments = await db.select({ id: payments.id }).from(payments).all();
+    const beforeBatchIds = new Set(beforeBatches.map(b => b.id));
+    const beforePaymentIds = new Set(beforePayments.map(p => p.id));
+
+    let threw = false;
+    try {
+      await db.transaction(async (tx) => {
+        const [batch] = await tx.insert(paymentBatches).values({
+          insuredId, baseAmountCents: 100000, surchargeAmountCents: 0, totalReceivedCents: 100000,
+          paymentDate: "2027-01-01", status: "confirmado", createdBy: userId,
+        }).returning();
+        await tx.insert(paymentBatchSplits).values({ batchId: batch!.id, method: "efectivo", amountCents: 100000 });
+        await tx.insert(payments).values({
+          policyId, installmentId: instId, amount: 600, paymentMethod: "lote",
+          paymentDate: "2027-01-01", status: "confirmado", batchId: batch!.id, createdBy: userId,
+        });
+        // Hijo manual: amount NULL viola NOT NULL — fallo real de SQLite.
+        await tx.insert(payments).values({
+          policyId: manualPolicyId, installmentId: null, amount: null as any, paymentMethod: "lote",
+          paymentDate: "2027-01-01", status: "confirmado", batchId: batch!.id, createdBy: userId,
+        });
+      });
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+
+    const afterBatches = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    const afterPayments = await db.select({ id: payments.id }).from(payments).all();
+    expect(afterBatches.filter(b => !beforeBatchIds.has(b.id)).length).toBe(0);
+    expect(afterPayments.filter(p => !beforePaymentIds.has(p.id)).length).toBe(0);
+  });
+});
+
+describe("59. GET /api/payment-batches/:id con hijo manual", () => {
+  test("item manual viene con installment=null y el resto de los campos resueltos", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId, amount: 500, description: "cuota faltante" }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+
+    const { status, body } = await callGetBatch(created.id);
+    expect(status).toBe(200);
+    expect(body.items.length).toBe(1);
+    const item = body.items[0];
+    expect(item.installment).toBeNull();
+    expect(item.payment.installmentId).toBeNull();
+    expect(item.payment.notes).toBe("cuota faltante");
+    expect(item.policy.id).toBe(policyId);
+    expect(item.company).toBeDefined();
+    expect(body.integrity.baseMatchesChildren).toBe(true);
+  });
+
+  test("batch mixto (cuota + manual) → integrity sigue cerrando", async () => {
+    const policyA = await mkPolicy(insuredId, companyId);
+    const policyB = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyA, 1, "2027-01-01", 700);
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [
+        { source: "installment", installmentId: instId },
+        { source: "policy_manual_payment", policyId: policyB, amount: 300 },
+      ],
+      splits: [{ method: "efectivo", amount: 1000 }],
+    });
+
+    const { body } = await callGetBatch(created.id);
+    expect(body.items.length).toBe(2);
+    const manualItem = body.items.find((i: any) => i.installment == null);
+    const instItem = body.items.find((i: any) => i.installment != null);
+    expect(manualItem).toBeDefined();
+    expect(instItem).toBeDefined();
+    expect(body.integrity.baseMatchesChildren).toBe(true);
+    expect(body.integrity.totalMatchesBasePlusSurcharge).toBe(true);
+    expect(body.integrity.splitsMatchTotal).toBe(true);
+  });
+});
+
+describe("60. PUT/DELETE individual de un hijo manual del batch sigue bloqueado", () => {
+  test("PUT monetario sobre un hijo manual → 409, mismo mensaje que un hijo de cuota", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId, amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    const children = await getChildren(created.id);
+
+    const { status, body } = await callPutPayment(children[0]!.id, { amount: 999 });
+    expect(status).toBe(409);
+    expect(body.error).toContain("cobro múltiple");
+
+    const unchanged = await db.select({ amount: payments.amount }).from(payments).where(eq(payments.id, children[0]!.id)).get();
+    expect(unchanged?.amount).toBe(500);
+  });
+
+  test("editar solo notas de un hijo manual sigue permitido", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId, amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    const children = await getChildren(created.id);
+
+    const { status } = await callPutPayment(children[0]!.id, { notes: "nota nueva" });
+    expect(status).toBe(200);
+  });
+
+  test("DELETE de un hijo manual → 409", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId, amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    const children = await getChildren(created.id);
+
+    const res = await app.fetch(new Request(`http://localhost/api/payments/${children[0]!.id}`, {
+      method: "DELETE", headers: authHeaders(),
+    }));
+    expect(res.status).toBe(409);
+  });
+});
+
+describe("61. Un cobro manual nunca crea policy_installments ni cash_debts", () => {
+  test("después de crear un batch manual, no aparece ninguna cuota nueva ni deuda nueva", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const beforeInstallments = await db.select({ id: policyInstallments.id }).from(policyInstallments).where(eq(policyInstallments.policyId, policyId)).all();
+    expect(beforeInstallments.length).toBe(0);
+
+    const { status } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId, amount: 500, description: "cuota faltante" }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    expect(status).toBe(201);
+
+    const afterInstallments = await db.select({ id: policyInstallments.id }).from(policyInstallments).where(eq(policyInstallments.policyId, policyId)).all();
+    expect(afterInstallments.length).toBe(0); // ningún policy_installments nuevo
+  });
+});
+
+// ─── 62+: Imputación completamente manual (source="manual_payment") ───────────
+// Mismo modelo que la variante "Imputación manual" ya existente en
+// POST /payments standalone: pagador/N° de póliza/compañía en texto libre,
+// SIN ninguna póliza real detrás. policyId e installmentId quedan NULL en el
+// payment hijo. UN COBRO MANUAL NUNCA ES UNA DEUDA — mismo tratamiento que
+// cualquier otro ítem del batch (dinero real, cuenta en Caja, se rinde).
+
+describe("62. Batch con un único manual_payment completamente libre", () => {
+  test("solo pagador → 201, hijo con policyId/installmentId NULL", async () => {
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "manual_payment", manualPayer: "Cliente sin póliza cargada", amount: 500, description: "pago suelto" }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    expect(status).toBe(201);
+    const children = await getChildren(body.id);
+    expect(children.length).toBe(1);
+    expect(children[0]!.policyId).toBeNull();
+    expect(children[0]!.installmentId).toBeNull();
+    expect(children[0]!.amount).toBe(500);
+    expect(children[0]!.status).toBe("confirmado");
+    expect(children[0]!.manualPayer).toBe("Cliente sin póliza cargada");
+    expect(children[0]!.notes).toBe("pago suelto");
+  });
+
+  test("solo N° de póliza manual (sin pagador) → 201", async () => {
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "manual_payment", manualPolicyNumber: "MAN-12345", amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    expect(status).toBe(201);
+    const children = await getChildren(body.id);
+    expect(children[0]!.manualPayer).toBeNull();
+    expect(children[0]!.manualPolicyNumber).toBe("MAN-12345");
+  });
+
+  test("sin pagador ni N° de póliza manual → 400, nada se crea", async () => {
+    const before = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "manual_payment", amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain("pagador");
+    const after = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    expect(after.length).toBe(before.length);
+  });
+});
+
+describe("63. Batch mixto — cuota existente + manual_payment libre", () => {
+  test("1 cuota + 1 imputación libre del mismo asegurado → 201, ambos hijos correctos", async () => {
+    const policyA = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyA, 1, "2027-01-01", 700);
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [
+        { source: "installment", installmentId: instId },
+        { source: "manual_payment", manualPayer: "Cliente extra", amount: 300 },
+      ],
+      splits: [{ method: "efectivo", amount: 1000 }],
+    });
+    expect(status).toBe(201);
+    const children = await getChildren(body.id);
+    expect(children.length).toBe(2);
+    const instChild = children.find(c => c.installmentId === instId)!;
+    const manualChild = children.find(c => c.installmentId == null)!;
+    expect(instChild.amount).toBe(700);
+    expect(manualChild.amount).toBe(300);
+    expect(manualChild.policyId).toBeNull();
+    expect(manualChild.manualPayer).toBe("Cliente extra");
+  });
+});
+
+describe("64. Varios manual_payment libres en el mismo batch", () => {
+  test("dos imputaciones libres distintas → 201, ambas preservan sus propios datos manuales", async () => {
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [
+        { source: "manual_payment", manualPayer: "Cliente A", manualCompany: "MAPFRE", amount: 200 },
+        { source: "manual_payment", manualPayer: "Cliente A (otro pago)", manualPolicyNumber: "MAN-999", amount: 300 },
+      ],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    expect(status).toBe(201);
+    const children = await getChildren(body.id);
+    expect(children.length).toBe(2);
+    expect(children.every(c => c.policyId == null && c.installmentId == null)).toBe(true);
+    const withCompany = children.find(c => c.manualCompany === "MAPFRE")!;
+    const withPolicyNumber = children.find(c => c.manualPolicyNumber === "MAN-999")!;
+    expect(withCompany.amount).toBe(200);
+    expect(withPolicyNumber.amount).toBe(300);
+  });
+});
+
+describe("65. El primer ítem manual_payment libre NUNCA exige insuredId — body.insuredId ya ni se lee", () => {
+  test("sin body.insuredId, batch 100% manual → 201, batch.insuredId queda NULL", async () => {
+    const before = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    const { status, body } = await callPost({
+      paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "manual_payment", manualPayer: "Cliente inventado", amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    expect(status).toBe(201);
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.insuredId).toBeNull();
+    const after = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    expect(after.length).toBe(before.length + 1);
+  });
+
+  test("un body.insuredId inexistente/inventado no rompe nada — ya no se lee ni se valida", async () => {
+    const { status } = await callPost({
+      insuredId: 999999999, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "manual_payment", manualPayer: "Cliente real", amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    expect(status).toBe(201);
+  });
+});
+
+describe("66. Cuota + manual_payment libre pueden convivir sin exigir ningún insuredId común", () => {
+  test("cuota de un asegurado real + manual_payment libre (sin ninguno) → 201, batch.insuredId = el de la cuota (el manual no cuenta como 'otro')", async () => {
+    const policyA = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyA, 1, "2027-01-01", 500);
+    const { status, body } = await callPost({
+      paymentDate: "2027-01-01", notes: null,
+      items: [
+        { source: "installment", installmentId: instId },
+        { source: "manual_payment", manualPayer: "Cliente extra", amount: 300 },
+      ],
+      splits: [{ method: "efectivo", amount: 800 }],
+    });
+    expect(status).toBe(201);
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.insuredId).toBe(insuredId);
+  });
+
+  test("caso familiar completo: cuota (asegurado A) + policy_manual_payment (asegurado B) + manual_payment libre → 201, batch.insuredId NULL (mezcla real de A y B)", async () => {
+    const policyA = await mkPolicy(insuredId, companyId);
+    const instA = await mkInstallment(policyA, 1, "2027-01-01", 500);
+    const policyB = await mkPolicy(otherInsuredId, companyId);
+    const { status, body } = await callPost({
+      paymentDate: "2027-01-01", notes: "resumen familiar con faltante manual",
+      items: [
+        { source: "installment", installmentId: instA },
+        { source: "policy_manual_payment", policyId: policyB, amount: 300 },
+        { source: "manual_payment", manualPayer: "Cuota faltante", amount: 200 },
+      ],
+      splits: [{ method: "efectivo", amount: 1000 }],
+    });
+    expect(status).toBe(201);
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.insuredId).toBeNull();
+    expect(batch!.baseAmountCents).toBe(100000);
+    const children = await getChildren(body.id);
+    expect(children.length).toBe(3);
+  });
+});
+
+describe("67. manualPayer/manualPolicyNumber/manualCompany se preservan tal cual en el payment hijo", () => {
+  test("los 3 campos junto con notes/description quedan guardados exactamente", async () => {
+    const { body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{
+        source: "manual_payment", manualPayer: "Juan Pérez", manualPolicyNumber: "MAN-777", manualCompany: "MAPFRE",
+        amount: 500, description: "pago telefónico",
+      }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    const children = await getChildren(body.id);
+    expect(children[0]!.manualPayer).toBe("Juan Pérez");
+    expect(children[0]!.manualPolicyNumber).toBe("MAN-777");
+    expect(children[0]!.manualCompany).toBe("MAPFRE");
+    expect(children[0]!.notes).toBe("pago telefónico");
+  });
+});
+
+describe("68. Un manual_payment libre nunca crea policy_installments ni cash_debts", () => {
+  test("después de crear un batch 100% manual libre, no aparece ninguna cuota nueva ni deuda nueva", async () => {
+    const beforeDebts = await db.select({ id: cashDebts.id }).from(cashDebts).all();
+
+    const { status } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "manual_payment", manualPayer: "Cliente sin póliza", amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    expect(status).toBe(201);
+
+    const afterDebts = await db.select({ id: cashDebts.id }).from(cashDebts).all();
+    expect(afterDebts.length).toBe(beforeDebts.length); // ningún cash_debts nuevo
+  });
+});
+
+describe("69. Pronto Pago NUNCA se aplica solo por texto libre de compañía", () => {
+  test("manualCompany='Rivadavia' con medios propios → cero recargos (a diferencia de una póliza real)", async () => {
+    const { body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "manual_payment", manualPayer: "Cliente Rivadavia (texto)", manualCompany: "Rivadavia", amount: 1000 }],
+      splits: [{ method: "efectivo", amount: 1000 }], // sin +800 — si aplicara recargo, esto fallaría por suma incorrecta
+    });
+    expect(body.id).toBeDefined();
+    const children = await getChildren(body.id);
+    expect(children.length).toBe(1);
+    const surcharges = await db.select().from(cashEntries)
+      .where(and(eq(cashEntries.paymentId, children[0]!.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surcharges.length).toBe(0);
+
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.surchargeAmountCents).toBe(0);
+    expect(batch!.totalReceivedCents).toBe(100000); // exactamente la base, sin recargo
+  });
+
+  test("comparación directa: la MISMA compañía real (Rivadavia) vía policy_manual_payment SÍ genera recargo", async () => {
+    const rivPolicy = await mkPolicy(insuredId, rivadaviaCompanyId);
+    const { body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "policy_manual_payment", policyId: rivPolicy, amount: 1000 }],
+      splits: [{ method: "efectivo", amount: 1000 + 800 }],
+    });
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.surchargeAmountCents).toBe(80000);
+  });
+});
+
+describe("70. PUT/DELETE individual de un hijo manual_payment libre sigue bloqueado", () => {
+  test("PUT monetario sobre un hijo manual libre → 409", async () => {
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "manual_payment", manualPayer: "Cliente sin póliza", amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    const children = await getChildren(created.id);
+    const { status, body } = await callPutPayment(children[0]!.id, { amount: 999 });
+    expect(status).toBe(409);
+    expect(body.error).toContain("cobro múltiple");
+  });
+
+  test("DELETE de un hijo manual libre → 409", async () => {
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "manual_payment", manualPayer: "Cliente sin póliza", amount: 500 }],
+      splits: [{ method: "efectivo", amount: 500 }],
+    });
+    const children = await getChildren(created.id);
+    const res = await app.fetch(new Request(`http://localhost/api/payments/${children[0]!.id}`, {
+      method: "DELETE", headers: authHeaders(),
+    }));
+    expect(res.status).toBe(409);
   });
 });

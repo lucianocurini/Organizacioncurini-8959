@@ -19,7 +19,8 @@ import { test, expect, beforeAll, afterAll, describe } from "bun:test";
 import app from "../index";
 import { database as db } from "../database/index";
 import {
-  users, sessions, insureds, payments, paymentSplits, paymentBatches, paymentBatchSplits, receivedChecks,
+  users, sessions, insureds, companies, policies, policyInstallments,
+  payments, paymentSplits, paymentBatches, paymentBatchSplits, receivedChecks,
   cashEntries, cashExpenses, commissionEntries, ownMoneyMovements, cashDebts,
   remittances, remittanceItems, remittanceAllocations,
 } from "../database/schema";
@@ -32,6 +33,7 @@ const FIXTURE_DATE = "2027-06-01"; // lejos del mes/año actual — no afecta co
 
 let userId: number;
 let insuredId: number;
+let companyId: number;
 
 function authHeaders() {
   return { "x-session-id": SESSION_ID, "Content-Type": "application/json" };
@@ -44,6 +46,13 @@ async function getSummary(query = ""): Promise<{ status: number; body: any }> {
 
 async function callPostRemittance(body: Record<string, any>) {
   const res = await app.fetch(new Request("http://localhost/api/remittances", {
+    method: "POST", headers: authHeaders(), body: JSON.stringify(body),
+  }));
+  return { status: res.status, body: await res.json() };
+}
+
+async function callPostBatch(body: Record<string, any>) {
+  const res = await app.fetch(new Request("http://localhost/api/payment-batches", {
     method: "POST", headers: authHeaders(), body: JSON.stringify(body),
   }));
   return { status: res.status, body: await res.json() };
@@ -217,6 +226,9 @@ beforeAll(async () => {
 
   const [ins] = await db.insert(insureds).values({ name: `${PREFIX} Asegurado`, createdBy: userId }).returning({ id: insureds.id });
   insuredId = ins!.id;
+
+  const existingCo = await db.select({ id: companies.id }).from(companies).where(eq(companies.name, `${PREFIX} Co`)).get();
+  companyId = existingCo?.id ?? (await db.insert(companies).values({ name: `${PREFIX} Co` }).returning({ id: companies.id }))[0]!.id;
 });
 
 afterAll(async () => {
@@ -329,6 +341,69 @@ describe("GET /api/cash/summary — cartera pendiente", () => {
     }
   });
 
+  test("batch mixto real (cuota existente + cobro manual) — cuenta una sola vez, nunca por hijo", async () => {
+    const before = (await getSummary()).body;
+
+    const [policyReal] = await db.insert(policies).values({
+      policyNumber: `${PREFIX}-REAL-${Date.now()}`, type: "automotor", status: "activa",
+      companyId, insuredId, startDate: "2027-01-01", endDate: "2027-12-31", createdBy: userId,
+    }).returning({ id: policies.id });
+    const realPolicyId = policyReal!.id;
+    const [instRow] = await db.insert(policyInstallments).values({
+      policyId: realPolicyId, number: 1, dueDate: FIXTURE_DATE, amount: 700, status: "pendiente", rendered: 0,
+    }).returning({ id: policyInstallments.id });
+    const instId = instRow!.id;
+
+    const [policyManual] = await db.insert(policies).values({
+      policyNumber: `${PREFIX}-MANUAL-${Date.now()}`, type: "automotor", status: "activa",
+      companyId, insuredId, startDate: "2027-01-01", endDate: "2027-12-31", createdBy: userId,
+    }).returning({ id: policies.id });
+    const manualPolicyId = policyManual!.id;
+
+    const created = await callPostBatch({
+      paymentDate: FIXTURE_DATE, insuredId,
+      items: [
+        { source: "installment", installmentId: instId },
+        { source: "policy_manual_payment", policyId: manualPolicyId, amount: 300 },
+      ],
+      splits: [{ method: "efectivo", amount: 1000 }],
+      applyProntoPagoSurcharge: false,
+    });
+    expect(created.status).toBe(201);
+    const batchId = created.body.id as number;
+    const childRows = await db.select().from(payments).where(eq(payments.batchId, batchId)).all();
+    expect(childRows.length).toBe(2);
+
+    try {
+      // Cartera pendiente sube exactamente $1000 (700 cuota + 300 manual) una
+      // sola vez — nunca se duplica por tener 2 payments hijos.
+      const afterCreate = (await getSummary()).body;
+      expect(afterCreate.cartera.efectivo - before.cartera.efectivo).toBeCloseTo(1000, 2);
+    } finally {
+      await cleanupBatch(batchId);
+      await deleteWithRetry(() => db.delete(policyInstallments).where(eq(policyInstallments.id, instId)));
+      await deleteWithRetry(() => db.delete(policies).where(inArray(policies.id, [realPolicyId, manualPolicyId])));
+    }
+  });
+
+  test("batch 100% imputación manual libre (sin ninguna póliza real) — cuenta como dinero real, una sola vez", async () => {
+    const before = (await getSummary()).body;
+    const created = await callPostBatch({
+      paymentDate: FIXTURE_DATE, insuredId,
+      items: [{ source: "manual_payment", manualPayer: `${PREFIX} Cliente libre`, amount: 650 }],
+      splits: [{ method: "efectivo", amount: 650 }],
+      applyProntoPagoSurcharge: false,
+    });
+    expect(created.status).toBe(201);
+    const batchId = created.body.id as number;
+    try {
+      const after = (await getSummary()).body;
+      expect(after.cartera.efectivo - before.cartera.efectivo).toBeCloseTo(650, 2);
+    } finally {
+      await cleanupBatch(batchId);
+    }
+  });
+
   test("recargo Pronto Pago standalone — categoría separada", async () => {
     const before = (await getSummary()).body;
     const { paymentId } = await mkStandalonePayment({ amount: 1000, splits: [{ method: "efectivo", amountCents: 100000 }] });
@@ -423,6 +498,61 @@ describe("GET /api/cash/summary — rendido por método", () => {
     } finally {
       if (remId !== undefined) await cleanupRemittance(remId);
       await cleanupPayment(paymentId);
+    }
+  });
+
+  test("batch mixto real (cuota + cobro manual) rendido — sale de cartera pendiente, entra a rendido una sola vez", async () => {
+    const before = (await getSummary()).body;
+
+    const [policyReal] = await db.insert(policies).values({
+      policyNumber: `${PREFIX}-REND-REAL-${Date.now()}`, type: "automotor", status: "activa",
+      companyId, insuredId, startDate: "2027-01-01", endDate: "2027-12-31", createdBy: userId,
+    }).returning({ id: policies.id });
+    const realPolicyId = policyReal!.id;
+    const [instRow] = await db.insert(policyInstallments).values({
+      policyId: realPolicyId, number: 1, dueDate: FIXTURE_DATE, amount: 700, status: "pendiente", rendered: 0,
+    }).returning({ id: policyInstallments.id });
+    const instId = instRow!.id;
+
+    const [policyManual] = await db.insert(policies).values({
+      policyNumber: `${PREFIX}-REND-MANUAL-${Date.now()}`, type: "automotor", status: "activa",
+      companyId, insuredId, startDate: "2027-01-01", endDate: "2027-12-31", createdBy: userId,
+    }).returning({ id: policies.id });
+    const manualPolicyId = policyManual!.id;
+
+    const created = await callPostBatch({
+      paymentDate: FIXTURE_DATE, insuredId,
+      items: [
+        { source: "installment", installmentId: instId },
+        { source: "policy_manual_payment", policyId: manualPolicyId, amount: 300 },
+      ],
+      splits: [{ method: "efectivo", amount: 1000 }],
+      applyProntoPagoSurcharge: false,
+    });
+    expect(created.status).toBe(201);
+    const batchId = created.body.id as number;
+    const childRows = await db.select().from(payments).where(eq(payments.batchId, batchId)).all();
+
+    let remId: number | undefined;
+    try {
+      const res = await callPostRemittance({
+        date: FIXTURE_DATE, canal: "directo", paymentBreakdown: { efectivo: 1000 },
+        items: childRows.map((c) => ({ source: "payment", sourceId: c.id, amount: c.amount, paymentMethod: "lote" })),
+      });
+      expect(res.status).toBe(200);
+      remId = res.body.id;
+
+      const after = (await getSummary()).body;
+      // Salió de cartera pendiente (diferencia neta 0 contra el snapshot inicial)...
+      expect(after.cartera.efectivo - before.cartera.efectivo).toBeCloseTo(0, 2);
+      // ...y entró en rendido por método, una sola vez (no 700 + 300 duplicado por hijo).
+      expect(after.rendidoPorMetodo.efectivo - before.rendidoPorMetodo.efectivo).toBeCloseTo(1000, 2);
+      expect(after.allocationsModel.remittancesCompleteCount - before.allocationsModel.remittancesCompleteCount).toBe(1);
+    } finally {
+      if (remId !== undefined) await cleanupRemittance(remId);
+      await cleanupBatch(batchId);
+      await deleteWithRetry(() => db.delete(policyInstallments).where(eq(policyInstallments.id, instId)));
+      await deleteWithRetry(() => db.delete(policies).where(inArray(policies.id, [realPolicyId, manualPolicyId])));
     }
   });
 
