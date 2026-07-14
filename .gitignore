@@ -21,6 +21,21 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # local databases
 *.db
 
+# local database backups y snapshots de producción (nunca commitear —
+# pueden contener datos reales de asegurados/pagos; ver incidente de
+# database-safety). Reglas explícitas y redundantes a propósito: estos
+# archivos no terminan en ".db", así que *.db no los cubre.
+dev.db.backup*
+*.db.backup*
+*.db.backup-*
+packages/web/dev.db.backup*
+packages/web/backup-prod-*.json
+packages/web/backup-test-*.json
+packages/web/backup-*-prod-*.json
+
+# local read-only audits (nunca commitear — puede contener datos de producción)
+local-audits/
+
 # dotenv environment variable files
 .env
 .env.test
@@ -29,6 +44,12 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .env.production.local
 .env.local
 .env*.local
+
+# excepción: .env.test de la RAÍZ (sin secretos — solo fuerza file: local
+# para que `bun test` corrido desde la raíz nunca resuelva a Turso, ver
+# assert-safe-environment.ts). Los .env.test anidados (ej. packages/web/.env.test)
+# siguen ignorados por la regla de arriba.
+!/.env.test
 
 # caches
 .eslintcache
