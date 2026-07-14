@@ -105,3 +105,21 @@ h1, h2, h3, h4, h5 {
 
 /* Table hover */
 .table-row-hover:hover { background: rgba(37, 99, 235, 0.06); }
+
+/* Select de medios de pago (Imputar pago individual, Cobrar en lote) — bug
+   real detectado en QA visual: en Chrome, el popup nativo de <option> se
+   rendería con fondo blanco y texto también claro (heredado del <select>),
+   ilegible salvo al pasar el cursor. El <select> en sí ya tiene el tema
+   oscuro correcto vía Tailwind; lo que faltaba era decirle al navegador que
+   el propio CONTROL vive en un contexto oscuro (color-scheme), porque el
+   popup de <option> lo pinta el motor nativo del SO/browser, no el CSS de
+   fondo del elemento. Mismas variables que ya usa el resto del tema
+   (--popover/--popover-foreground) — sin colores nuevos. */
+.payment-method-select {
+  color-scheme: dark;
+}
+.payment-method-select option,
+.payment-method-select optgroup {
+  background: var(--popover);
+  color: var(--popover-foreground);
+}

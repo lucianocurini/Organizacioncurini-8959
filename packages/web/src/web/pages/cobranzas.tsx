@@ -446,7 +446,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
                     value={split.method}
                     disabled={isRendered}
                     onChange={e => setForm(f => ({ ...f, splits: updateSplitRow(f.splits, split.uid, { method: e.target.value }) }))}
-                    className="flex-1 min-w-0 px-2 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-blue-500 disabled:opacity-50"
+                    className="payment-method-select flex-1 min-w-0 px-2 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-blue-500 disabled:opacity-50"
                   >
                     <optgroup label="Cuentas propias">
                       {["efectivo", "transferencia", "cheque"].map((key) => (
@@ -838,7 +838,7 @@ function CobranzasTab() {
               className="w-full pl-9 pr-3 py-2 bg-[#0d1424] border border-[#1f2937] rounded-lg text-sm text-white placeholder-gray-500 outline-none focus:border-blue-500" />
           </div>
           <select value={filterMethod} onChange={e => setFilterMethod(e.target.value)}
-            className="px-3 py-2 bg-[#0d1424] border border-[#1f2937] rounded-lg text-sm text-gray-300 outline-none">
+            className="payment-method-select px-3 py-2 bg-[#0d1424] border border-[#1f2937] rounded-lg text-sm text-gray-300 outline-none">
             <option value="">Todos los métodos</option>
             {Object.entries(METHOD_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
           </select>
