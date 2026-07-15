@@ -13,6 +13,7 @@ import {
   describeBatchCancelImpact, canShowCancelButton, canShowEditButton, isCancelConfirmationValid, buildBatchCancelPayload,
   emptyBatchEditForm, validateBatchEditForm, buildBatchPatchPayload, BATCH_CORRECTION_HINT,
   MIXED_GROUP_ERROR, SURCHARGE_AMOUNT_CENTS,
+  updateSplitMethodPreservingChecks, splitsToPaymentSplitsPayload,
 } from "../payment-batch-form";
 
 function pendingItem(overrides: Partial<PendingInstallmentForPayment> = {}): PendingInstallmentForPayment {
@@ -817,5 +818,79 @@ describe("BATCH_CORRECTION_HINT", () => {
   test("texto operativo fijo de corrección por anular + recrear", () => {
     expect(BATCH_CORRECTION_HINT).toContain("anulá este cobro");
     expect(BATCH_CORRECTION_HINT).toContain("creá uno nuevo");
+  });
+});
+
+// ─── Migración 0028 — cheques en cobranzas individuales ─────────────────────
+// updateSplitMethodPreservingChecks/splitsToPaymentSplitsPayload son
+// reutilizados por el modal de "Imputar pago individual" (cobranzas.tsx) —
+// se testean acá, junto al resto de los helpers de splits/cheques que ya
+// reutiliza, en vez de en un archivo de tests de componentes React (este
+// proyecto no usa ese tipo de test — ver el resto de web/lib/__tests__).
+
+describe("updateSplitMethodPreservingChecks", () => {
+  test("cambiar A cheque agrega una fila de cheque vacía", () => {
+    const splits = [createBatchSplitRow("efectivo", "1000")];
+    const updated = updateSplitMethodPreservingChecks(splits, splits[0]!.uid, "cheque");
+    expect(updated[0]!.method).toBe("cheque");
+    expect(updated[0]!.checks.length).toBe(1);
+    expect(updated[0]!.checks[0]!.checkNumber).toBe("");
+  });
+
+  test("cambiar cheque->cheque (no-op de método) no descarta cheques ya cargados", () => {
+    let splits = [createBatchSplitRow("cheque", "1000")];
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    splits = updateCheckInSplit(splits, splits[0]!.uid, splits[0]!.checks[0]!.uid, { checkNumber: "0001" });
+    const updated = updateSplitMethodPreservingChecks(splits, splits[0]!.uid, "cheque");
+    expect(updated[0]!.checks.length).toBe(1);
+    expect(updated[0]!.checks[0]!.checkNumber).toBe("0001");
+  });
+
+  test("cambiar DE cheque a otro método descarta los cheques cargados", () => {
+    let splits = [createBatchSplitRow("cheque", "1000")];
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    splits = updateCheckInSplit(splits, splits[0]!.uid, splits[0]!.checks[0]!.uid, { checkNumber: "0001" });
+    const updated = updateSplitMethodPreservingChecks(splits, splits[0]!.uid, "efectivo");
+    expect(updated[0]!.method).toBe("efectivo");
+    expect(updated[0]!.checks).toEqual([]);
+  });
+
+  test("no toca otros splits", () => {
+    const a = createBatchSplitRow("efectivo", "500");
+    const b = createBatchSplitRow("transferencia", "500");
+    const updated = updateSplitMethodPreservingChecks([a, b], a.uid, "cheque");
+    expect(updated[1]).toEqual(b);
+  });
+});
+
+describe("splitsToPaymentSplitsPayload", () => {
+  test("split no-cheque nunca incluye la clave `checks`", () => {
+    const splits = [createBatchSplitRow("efectivo", "1000")];
+    const payload = splitsToPaymentSplitsPayload(splits);
+    expect(payload).toEqual([{ method: "efectivo", amount: 1000 }]);
+    expect("checks" in payload[0]!).toBe(false);
+  });
+
+  test("split cheque incluye checks[] recortados y normalizados", () => {
+    let splits = [createBatchSplitRow("cheque", "1000")];
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    splits = updateCheckInSplit(splits, splits[0]!.uid, splits[0]!.checks[0]!.uid, {
+      checkNumber: "  0001  ", bankName: "  Banco Nación  ", dueDate: "2027-08-01", amount: "1000",
+    });
+    const payload = splitsToPaymentSplitsPayload(splits);
+    expect(payload[0]!.checks).toEqual([{
+      checkNumber: "0001", bankName: "Banco Nación", bankCode: null, drawerName: null,
+      drawerDocument: null, issueDate: null, dueDate: "2027-08-01", amount: 1000, notes: null,
+    }]);
+  });
+
+  test("dos splits — cada uno mapeado independientemente", () => {
+    const a = createBatchSplitRow("efectivo", "600");
+    const b = createBatchSplitRow("transferencia", "400");
+    const payload = splitsToPaymentSplitsPayload([a, b]);
+    expect(payload).toEqual([
+      { method: "efectivo", amount: 600 },
+      { method: "transferencia", amount: 400 },
+    ]);
   });
 });

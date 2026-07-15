@@ -219,9 +219,18 @@ export const paymentBatchSplits = sqliteTable("payment_batch_splits", {
 // estado "depositado" en esta etapa. Transiciones válidas se validan en
 // src/lib/payments/received-checks.ts (validateCheckStatusTransition), no acá
 // — el CHECK de la migración 0023 solo restringe el vocabulario posible.
+//
+// Migración 0028: batchSplitId pasa a nullable y se agrega paymentSplitId —
+// un cheque de un pago INDIVIDUAL (payment_splits con method='cheque') cuelga
+// de paymentSplitId en vez de batchSplitId. Exactamente uno de los dos debe
+// estar presente (CHECK XOR a nivel DB, ver migración 0028) — nunca ambos,
+// nunca ninguno. Este archivo no encodea ese CHECK (ver comentario de
+// paymentSplits más arriba sobre por qué este proyecto no usa el helper
+// check() de Drizzle) — la única fuente de verdad es el SQL de la migración.
 export const receivedChecks = sqliteTable("received_checks", {
   id: integer("id").primaryKey({ autoIncrement: true }),
-  batchSplitId: integer("batch_split_id").notNull().references(() => paymentBatchSplits.id),
+  batchSplitId: integer("batch_split_id").references(() => paymentBatchSplits.id),
+  paymentSplitId: integer("payment_split_id").references(() => paymentSplits.id),
   checkNumber: text("check_number").notNull(),
   bankName: text("bank_name").notNull(),
   bankCode: text("bank_code"),

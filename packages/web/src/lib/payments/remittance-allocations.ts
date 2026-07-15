@@ -38,6 +38,19 @@ export interface ResolvedPaymentSplitInstrument {
   amountCents: number;
 }
 
+// Migración 0028: un payment_split method='cheque' de un pago STANDALONE
+// (no batch) produce un instrumento POR CHEQUE — mismo criterio que
+// ResolvedBatchCheckInstrument, pero con paymentId/paymentSplitId en vez de
+// paymentBatchId/paymentBatchSplitId.
+export interface ResolvedPaymentSplitCheckInstrument {
+  kind: "payment_split_check";
+  remittanceItemId: number;
+  paymentId: number;
+  paymentSplitId: number;
+  receivedCheckId: number;
+  amountCents: number;
+}
+
 export interface ResolvedBatchSplitInstrument {
   kind: "batch_split";
   paymentBatchId: number;
@@ -64,6 +77,7 @@ export interface ResolvedCashEntryInstrument {
 
 export type ResolvedInstrument =
   | ResolvedPaymentSplitInstrument
+  | ResolvedPaymentSplitCheckInstrument
   | ResolvedBatchSplitInstrument
   | ResolvedBatchCheckInstrument
   | ResolvedCashEntryInstrument;
@@ -75,27 +89,65 @@ export type ResolvedInstrument =
  * rindiendo). Si el payment no tiene ningún split real, es una
  * inconsistencia de datos que no se puede rendir — se rechaza en vez de
  * inventar un instrumento sin respaldo.
+ *
+ * Migración 0028: un split method='cheque' produce un instrumento POR
+ * CHEQUE (ResolvedPaymentSplitCheckInstrument), igual que
+ * resolveBatchInstruments hace para un split cheque de batch — nunca se
+ * genera además un instrumento por el split completo (se duplicaría el
+ * importe). El resto de los métodos sigue produciendo un instrumento por
+ * split completo, sin cambios. La suma de los cheques de un split cheque
+ * debe coincidir exactamente con el importe de ese split — si no, es una
+ * inconsistencia de datos (no se prorratea ni se ajusta).
  */
-export interface StandalonePaymentSplitRow { id: number; method: string; amountCents: number }
+export interface StandalonePaymentSplitRow { id: number; method: string; amountCents: number; checks?: ReadonlyArray<{ id: number; amountCents: number }> }
 
 export function resolveStandalonePaymentInstruments(params: {
   remittanceItemId: number;
   paymentId: number;
   splits: ReadonlyArray<StandalonePaymentSplitRow>;
-}): ResolvedPaymentSplitInstrument[] {
+}): Array<ResolvedPaymentSplitInstrument | ResolvedPaymentSplitCheckInstrument> {
   if (params.splits.length === 0) {
     throw new RemittanceAllocationValidationError(
       `El pago ${params.paymentId} no tiene ningún payment_splits real — no se puede rendir.`
     );
   }
-  return params.splits.map((s) => ({
-    kind: "payment_split" as const,
-    remittanceItemId: params.remittanceItemId,
-    paymentId: params.paymentId,
-    paymentSplitId: s.id,
-    method: s.method,
-    amountCents: s.amountCents,
-  }));
+  const resolved: Array<ResolvedPaymentSplitInstrument | ResolvedPaymentSplitCheckInstrument> = [];
+  for (const s of params.splits) {
+    if (s.method === "cheque") {
+      const checks = s.checks ?? [];
+      if (checks.length === 0) {
+        throw new RemittanceAllocationValidationError(
+          `El split cheque ${s.id} del pago ${params.paymentId} no tiene ningún received_checks real — no se puede rendir.`
+        );
+      }
+      const checksTotalCents = checks.reduce((sum, ch) => sum + ch.amountCents, 0);
+      if (checksTotalCents !== s.amountCents) {
+        throw new RemittanceAllocationValidationError(
+          `La suma de los cheques del split ${s.id} ($${(checksTotalCents / 100).toFixed(2)}) no coincide con su importe ($${(s.amountCents / 100).toFixed(2)}).`
+        );
+      }
+      for (const chk of checks) {
+        resolved.push({
+          kind: "payment_split_check" as const,
+          remittanceItemId: params.remittanceItemId,
+          paymentId: params.paymentId,
+          paymentSplitId: s.id,
+          receivedCheckId: chk.id,
+          amountCents: chk.amountCents,
+        });
+      }
+    } else {
+      resolved.push({
+        kind: "payment_split" as const,
+        remittanceItemId: params.remittanceItemId,
+        paymentId: params.paymentId,
+        paymentSplitId: s.id,
+        method: s.method,
+        amountCents: s.amountCents,
+      });
+    }
+  }
+  return resolved;
 }
 
 /**
@@ -206,6 +258,18 @@ export function buildRemittanceAllocations(instruments: ReadonlyArray<ResolvedIn
           method: instrument.method,
           amountCents: instrument.amountCents,
         };
+      case "payment_split_check":
+        return {
+          remittanceItemId: instrument.remittanceItemId,
+          paymentId: instrument.paymentId,
+          paymentSplitId: instrument.paymentSplitId,
+          paymentBatchId: null,
+          paymentBatchSplitId: null,
+          receivedCheckId: instrument.receivedCheckId,
+          cashEntryId: null,
+          method: "cheque",
+          amountCents: instrument.amountCents,
+        };
       case "batch_split":
         return {
           remittanceItemId: null,
@@ -260,7 +324,10 @@ export function validateAllocationOwnership(
   expected: { paymentId?: number; paymentBatchId?: number }
 ): void {
   for (const instrument of instruments) {
-    if (instrument.kind === "payment_split" && expected.paymentId != null && instrument.paymentId !== expected.paymentId) {
+    if (
+      (instrument.kind === "payment_split" || instrument.kind === "payment_split_check") &&
+      expected.paymentId != null && instrument.paymentId !== expected.paymentId
+    ) {
       throw new RemittanceAllocationValidationError(
         `El payment_split ${instrument.paymentSplitId} pertenece al pago ${instrument.paymentId}, no al pago ${expected.paymentId}.`
       );

@@ -439,6 +439,55 @@ export function sumCheckRowsCents(checks: ReadonlyArray<CheckFormRow>): number {
   return checks.reduce((sum, c) => sum + (amountStringToCentsStrict(c.amount) ?? 0), 0);
 }
 
+// Migración 0028 — cheques en cobranzas INDIVIDUALES: cambiar el método de
+// un split debe conservar sus cheques solo si sigue siendo "cheque". Al
+// entrar a "cheque" arranca con una fila vacía (nunca 0, para no mostrar el
+// subformulario sin nada que completar); al salir de "cheque" se descartan
+// (un split no-cheque no puede tener checks — ver
+// validateChecksMatchSplit/normalizeReceivedCheck del backend). Reutilizado
+// por el modal de "Imputar pago individual" (cobranzas.tsx); "Cobrar en
+// lote" no lo necesita porque ahí cada split nuevo ya nace con el método
+// elegido en el selector de "+ Agregar medio", nunca cambia de método
+// después de creado con cheques cargados.
+export function updateSplitMethodPreservingChecks(splits: BatchSplitFormRow[], uid: string, method: string): BatchSplitFormRow[] {
+  const updated = updateBatchSplitRow(splits, uid, { method });
+  return updated.map((s) => {
+    if (s.uid !== uid) return s;
+    if (method === "cheque") return { ...s, checks: s.checks.length > 0 ? s.checks : [createCheckRow()] };
+    return { ...s, checks: [] };
+  });
+}
+
+// Payload de splits para POST/PUT /api/payments (pago individual) — mismo
+// mapeo de checks que ya usa buildPaymentBatchPayload para POST
+// /api/payment-batches, pero sin el resto del sobre (items/paymentDate/etc.,
+// que no aplican a un pago individual).
+export interface PaymentSplitPayloadItem {
+  method: string;
+  amount: number;
+  checks?: ReceivedCheckInput[];
+}
+
+export function splitsToPaymentSplitsPayload(splits: ReadonlyArray<BatchSplitFormRow>): PaymentSplitPayloadItem[] {
+  return splits.map((s) => ({
+    method: s.method,
+    amount: Number(s.amount),
+    ...(s.method === "cheque" ? {
+      checks: s.checks.map((c) => ({
+        checkNumber: c.checkNumber.trim(),
+        bankName: c.bankName.trim(),
+        bankCode: c.bankCode.trim() || null,
+        drawerName: c.drawerName.trim() || null,
+        drawerDocument: c.drawerDocument.trim() || null,
+        issueDate: c.issueDate || null,
+        dueDate: c.dueDate,
+        amount: Number(c.amount),
+        notes: c.notes.trim() || null,
+      })),
+    } : {}),
+  }));
+}
+
 // ─── 6. Recargo Pronto Pago estimado + importe objetivo del reparto ────────
 // El backend es la única autoridad real (recalcula todo con datos de DB) —
 // esto es una ESTIMACIÓN de UI para que el importe que el usuario tipea en

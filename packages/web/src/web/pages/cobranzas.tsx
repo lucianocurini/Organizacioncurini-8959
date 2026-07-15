@@ -6,16 +6,21 @@ import { toast } from "sonner";
 import {
   DollarSign, Plus, Search, TrendingUp, CreditCard,
   Banknote, ArrowRightLeft, Trash2, Edit2, X, ChevronDown, Link, CheckSquare,
-  ClipboardList, AlertCircle, ChevronRight, ReceiptText, Building2, Check, ShoppingCart, Save, Layers
+  ClipboardList, AlertCircle, ChevronRight, ReceiptText, Building2, Check, ShoppingCart, Save, Layers, Ban
 } from "lucide-react";
 import { PendingInstallmentsBatchTab } from "@/components/payments/PendingInstallmentsBatchTab";
 import { cn, formatCurrency as _fc } from "@/lib/utils";
 import {
-  type PaymentSplitFormRow, createSplitRow, splitsFromPayment,
-  addSplitRow, removeSplitRow, updateSplitRow, computeSplitTotals,
-  validateSplitsForm, splitsToPayload, groupSplitsByMethod,
-  syncSingleSplitAmount, SINGLE_SPLIT_MISMATCH_MESSAGE, isImputarButtonDisabled,
+  splitsFromPayment, computeSplitTotals, groupSplitsByMethod,
+  SINGLE_SPLIT_MISMATCH_MESSAGE, isImputarButtonDisabled,
 } from "@/lib/payment-splits-form";
+import {
+  type BatchSplitFormRow, type CheckFormRow,
+  createBatchSplitRow, addBatchSplitRow, removeBatchSplitRow, updateBatchSplitRow,
+  syncSingleBatchSplitAmount, addCheckToSplit, removeCheckFromSplit, updateCheckInSplit,
+  validateBatchSplitsForm, updateSplitMethodPreservingChecks, splitsToPaymentSplitsPayload,
+} from "@/lib/payment-batch-form";
+import { CheckSubForm } from "@/components/payments/CheckSubForm";
 import { getPendingItemPaymentGroup } from "@/lib/rendicion-pending";
 
 function formatCurrency(v: number, short = false) {
@@ -77,6 +82,7 @@ interface PaymentRow {
     status: string;
     rendered: number;
     hasSurcharge: boolean;
+    hasChecks: boolean;
     dueDate: string | null;
     splits: { method: string; amountCents: number; notes: string | null }[];
   };
@@ -115,7 +121,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
     manualPolicyNumber: "",
     manualCompany: "",
     amount: "",
-    splits: [createSplitRow("efectivo")] as PaymentSplitFormRow[],
+    splits: [createBatchSplitRow("efectivo")] as BatchSplitFormRow[],
     paymentDate: new Date().toISOString().split("T")[0],
     dueDate: "",
     periodMonth: "",
@@ -140,10 +146,18 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
         // Etapa 3B-2: un combinado SIEMPRE se precarga desde payment.splits
         // (nunca desde paymentMethod, que puede valer "combinado" y no es un
         // método real seleccionable en ninguna fila).
-        // syncSingleSplitAmount es no-op con 2+ splits — solo garantiza que,
-        // si el pago tiene un único medio, su importe quede igual al total
-        // (defensivo: cubre cualquier dato legacy con el split vacío).
-        splits: syncSingleSplitAmount(splitsFromPayment(editing.payment), String(editing.payment.amount)),
+        // syncSingleBatchSplitAmount es no-op con 2+ splits — solo garantiza
+        // que, si el pago tiene un único medio, su importe quede igual al
+        // total (defensivo: cubre cualquier dato legacy con el split vacío).
+        // Migración 0028: los cheques existentes de un split ya cargado NO se
+        // reconstruyen acá (checks: []) — el backend bloquea con 409 editar
+        // los splits de un pago que ya tiene cheques reales (ver PUT
+        // /payments/:id), así que este formulario solo necesita `checks`
+        // poblado para un split cheque NUEVO que el usuario está cargando.
+        splits: syncSingleBatchSplitAmount(
+          splitsFromPayment(editing.payment).map((s) => ({ ...s, checks: [] as CheckFormRow[] })),
+          String(editing.payment.amount)
+        ),
         paymentDate: editing.payment.paymentDate,
         dueDate: editing.payment.dueDate || "",
         periodMonth: editing.payment.periodMonth || "",
@@ -158,7 +172,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
       setApplyProntoPagoSurcharge(true);
       setForm({
         policyId: "", installmentId: "", manualPayer: "", manualPolicyNumber: "", manualCompany: "",
-        amount: "", splits: [createSplitRow("efectivo")],
+        amount: "", splits: [createBatchSplitRow("efectivo")],
         paymentDate: new Date().toISOString().split("T")[0],
         dueDate: "", periodMonth: "", notes: "", status: "confirmado",
       });
@@ -185,7 +199,13 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
   // Etapa 3B-2: validación completa de la sección de splits — se usa tanto
   // para el disabled del botón Guardar como (repetida) adentro de handleSave,
   // para no depender exclusivamente del disabled ante un estado stale.
-  const splitsValidation = validateSplitsForm(form.amount, form.splits);
+  // Migración 0028: validateBatchSplitsForm agrega la validación de los
+  // cheques de cada split method="cheque" (número/banco/vencimiento
+  // obligatorios, suma de cheques = importe del split) sobre la misma
+  // validación de siempre (método/suma total/grupo propio-vs-directo) — es
+  // la misma función que ya usa "Cobrar en lote", ninguna lógica nueva.
+  const targetAmountCents = Math.round(Number(form.amount) * 100);
+  const splitsValidation = validateBatchSplitsForm(targetAmountCents, form.splits);
   const splitTotals = computeSplitTotals(form.amount, form.splits);
 
   // Si el grupo deja de ser "own" (ej. el usuario cambia todas las filas a
@@ -211,7 +231,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
       return;
     }
     // Re-validar acá, no confiar solo en el disabled del botón.
-    const validation = validateSplitsForm(form.amount, form.splits);
+    const validation = validateBatchSplitsForm(Math.round(Number(form.amount) * 100), form.splits);
     if (!validation.valid) {
       toast.error(validation.errorMessage || "Revisá el desglose de medios de pago.");
       return;
@@ -221,7 +241,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
       amount: Number(form.amount),
       // El backend decide resolvedPaymentMethod a partir de splits — nunca
       // se envía paymentMethod="combinado" ni un método suelto acá.
-      splits: splitsToPayload(form.splits),
+      splits: splitsToPaymentSplitsPayload(form.splits),
       paymentDate: form.paymentDate,
       dueDate: form.dueDate || null,
       periodMonth: form.periodMonth || null,
@@ -356,7 +376,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
                           dueDate: id ? (inst?.dueDate ?? "") : "",
                           // Con un único medio de pago, su importe sigue siempre
                           // al de la cuota elegida — con 2+ splits no hace nada.
-                          splits: syncSingleSplitAmount(f.splits, amount),
+                          splits: syncSingleBatchSplitAmount(f.splits, amount),
                         };
                       });
                     }}
@@ -416,7 +436,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
                   amount: e.target.value,
                   // Con un único medio de pago, su importe sigue siempre al
                   // importe total — con 2+ splits no hace nada (reparto manual).
-                  splits: syncSingleSplitAmount(f.splits, e.target.value),
+                  splits: syncSingleBatchSplitAmount(f.splits, e.target.value),
                 }))}
                 placeholder="0.00"
                 className="w-full pl-7 pr-3 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white placeholder-gray-500 outline-none focus:border-blue-500" />
@@ -428,7 +448,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
             <div className="flex items-center justify-between mb-1.5">
               <label className="block text-xs text-gray-400">Medios de pago *</label>
               <button type="button"
-                onClick={() => setForm(f => ({ ...f, splits: addSplitRow(f.splits) }))}
+                onClick={() => setForm(f => ({ ...f, splits: addBatchSplitRow(f.splits) }))}
                 disabled={isRendered}
                 className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
                 + Agregar medio
@@ -437,52 +457,64 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
 
             <div className="space-y-2">
               {form.splits.map((split, idx) => (
-                <div key={split.uid} className="flex items-center gap-2">
-                  <label htmlFor={`split-method-${split.uid}`} className="sr-only">
-                    Método del medio de pago {idx + 1}
-                  </label>
-                  <select
-                    id={`split-method-${split.uid}`}
-                    value={split.method}
-                    disabled={isRendered}
-                    onChange={e => setForm(f => ({ ...f, splits: updateSplitRow(f.splits, split.uid, { method: e.target.value }) }))}
-                    className="payment-method-select flex-1 min-w-0 px-2 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-blue-500 disabled:opacity-50"
-                  >
-                    <optgroup label="Cuentas propias">
-                      {["efectivo", "transferencia", "cheque"].map((key) => (
-                        <option key={key} value={key}>{METHOD_LABELS[key]}</option>
-                      ))}
-                    </optgroup>
-                    <optgroup label="Directo a Compañía">
-                      {["transferencia_compania", "link_pago"].map((key) => (
-                        <option key={key} value={key}>{METHOD_LABELS[key]}</option>
-                      ))}
-                    </optgroup>
-                  </select>
-
-                  <label htmlFor={`split-amount-${split.uid}`} className="sr-only">
-                    Importe del medio de pago {idx + 1}
-                  </label>
-                  <div className="relative w-28 shrink-0">
-                    <span className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400 text-xs">$</span>
-                    <input
-                      id={`split-amount-${split.uid}`}
-                      type="number" step="0.01" min="0"
-                      value={split.amount}
+                <div key={split.uid} className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <label htmlFor={`split-method-${split.uid}`} className="sr-only">
+                      Método del medio de pago {idx + 1}
+                    </label>
+                    <select
+                      id={`split-method-${split.uid}`}
+                      value={split.method}
                       disabled={isRendered}
-                      onChange={e => setForm(f => ({ ...f, splits: updateSplitRow(f.splits, split.uid, { amount: e.target.value }) }))}
-                      placeholder="0.00"
-                      className="w-full pl-5 pr-2 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white placeholder-gray-500 outline-none focus:border-blue-500 disabled:opacity-50"
-                    />
+                      onChange={e => setForm(f => ({ ...f, splits: updateSplitMethodPreservingChecks(f.splits, split.uid, e.target.value) }))}
+                      className="payment-method-select flex-1 min-w-0 px-2 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-blue-500 disabled:opacity-50"
+                    >
+                      <optgroup label="Cuentas propias">
+                        {["efectivo", "transferencia", "cheque"].map((key) => (
+                          <option key={key} value={key}>{METHOD_LABELS[key]}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Directo a Compañía">
+                        {["transferencia_compania", "link_pago"].map((key) => (
+                          <option key={key} value={key}>{METHOD_LABELS[key]}</option>
+                        ))}
+                      </optgroup>
+                    </select>
+
+                    <label htmlFor={`split-amount-${split.uid}`} className="sr-only">
+                      Importe del medio de pago {idx + 1}
+                    </label>
+                    <div className="relative w-28 shrink-0">
+                      <span className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400 text-xs">$</span>
+                      <input
+                        id={`split-amount-${split.uid}`}
+                        type="number" step="0.01" min="0"
+                        value={split.amount}
+                        disabled={isRendered}
+                        onChange={e => setForm(f => ({ ...f, splits: updateBatchSplitRow(f.splits, split.uid, { amount: e.target.value }) }))}
+                        placeholder="0.00"
+                        className="w-full pl-5 pr-2 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white placeholder-gray-500 outline-none focus:border-blue-500 disabled:opacity-50"
+                      />
+                    </div>
+
+                    <button type="button"
+                      onClick={() => setForm(f => ({ ...f, splits: removeBatchSplitRow(f.splits, split.uid) }))}
+                      disabled={isRendered || form.splits.length <= 1}
+                      aria-label={`Eliminar medio de pago ${idx + 1} (${METHOD_LABELS[split.method] || split.method})`}
+                      className="p-2 text-gray-400 hover:text-red-400 disabled:opacity-30 disabled:cursor-not-allowed transition-colors shrink-0">
+                      <Trash2 className="w-4 h-4" />
+                    </button>
                   </div>
 
-                  <button type="button"
-                    onClick={() => setForm(f => ({ ...f, splits: removeSplitRow(f.splits, split.uid) }))}
-                    disabled={isRendered || form.splits.length <= 1}
-                    aria-label={`Eliminar medio de pago ${idx + 1} (${METHOD_LABELS[split.method] || split.method})`}
-                    className="p-2 text-gray-400 hover:text-red-400 disabled:opacity-30 disabled:cursor-not-allowed transition-colors shrink-0">
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                  {/* Migración 0028: subformulario de cheque(s) — mismo componente que "Cobrar en lote" */}
+                  {split.method === "cheque" && !isRendered && (
+                    <CheckSubForm
+                      split={split}
+                      onAdd={() => setForm(f => ({ ...f, splits: addCheckToSplit(f.splits, split.uid) }))}
+                      onRemove={(checkUid) => setForm(f => ({ ...f, splits: removeCheckFromSplit(f.splits, split.uid, checkUid) }))}
+                      onUpdate={(checkUid, patch) => setForm(f => ({ ...f, splits: updateCheckInSplit(f.splits, split.uid, checkUid, patch) }))}
+                    />
+                  )}
                 </div>
               ))}
             </div>
@@ -506,7 +538,11 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
               )}
             </div>
 
-            {splitsValidation.group === "mixed" && (
+            {/* Migración 0028: además de "mixed", cubre los errores propios de
+                cheque (número/banco/vencimiento faltante, suma de cheques
+                distinta al importe del split) que validateBatchSplitsForm ya
+                valida y que el bloque de diferencia de arriba no muestra. */}
+            {splitsValidation.errorMessage && (
               <p className="mt-2 text-xs text-red-400" role="alert">{splitsValidation.errorMessage}</p>
             )}
           </div>
@@ -703,7 +739,34 @@ function CobranzasTab() {
       load();
     } catch (err: any) {
       const msg = err?.message || "";
-      toast.error(msg.includes("rendido") ? msg : "Error al eliminar el pago");
+      const status = err?.status;
+      // El backend ya trae un mensaje específico y accionable para 400/409
+      // (rendido, cheques asociados, hijo de un cobro múltiple) — se muestra
+      // tal cual, igual que en handleSave. El genérico queda solo para
+      // fallos inesperados (5xx, red, sin mensaje).
+      if (msg && status && status < 500) toast.error(msg);
+      else toast.error("Error al eliminar el pago");
+    }
+  }
+
+  // Migración 0028: un pago con cheques reales asociados nunca se borra
+  // físicamente (DELETE ya lo rechaza con 409) — la única corrección
+  // disponible es anularlo (soft, conserva payment_splits/received_checks
+  // para trazabilidad) y volver a cargarlo si hace falta. Mismo criterio que
+  // POST /payment-batches/:id/cancel para cobros múltiples.
+  async function handleAnular(id: number) {
+    if (!confirm(
+      "Este pago tiene cheques asociados. No se eliminará físicamente. Se anulará el pago y el cheque quedará anulado."
+    )) return;
+    try {
+      await api.put(`/api/payments/${id}`, { status: "anulado" });
+      toast.success("Pago anulado");
+      load();
+    } catch (err: any) {
+      const msg = err?.message || "";
+      const status = err?.status;
+      if (msg && status && status < 500) toast.error(msg);
+      else toast.error("Error al anular el pago");
     }
   }
 
@@ -926,10 +989,17 @@ function CobranzasTab() {
                         className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-blue-400 transition-colors">
                         <Edit2 className="w-3 h-3" /> Editar
                       </button>
-                      <button onClick={() => handleDelete(r.payment.id)}
-                        className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-red-400 transition-colors">
-                        <Trash2 className="w-3 h-3" /> Eliminar
-                      </button>
+                      {r.payment.hasChecks ? (
+                        <button onClick={() => handleAnular(r.payment.id)}
+                          className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-red-500/30 text-red-400 hover:bg-red-500/10 transition-colors">
+                          <Ban className="w-3 h-3" /> Anular pago
+                        </button>
+                      ) : (
+                        <button onClick={() => handleDelete(r.payment.id)}
+                          className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-red-400 transition-colors">
+                          <Trash2 className="w-3 h-3" /> Eliminar
+                        </button>
+                      )}
                     </div>
                   </div>
                 );
@@ -1008,10 +1078,17 @@ function CobranzasTab() {
                               className="text-gray-400 hover:text-blue-400 transition-colors" title="Editar">
                               <Edit2 className="w-4 h-4" />
                             </button>
-                            <button onClick={() => handleDelete(r.payment.id)}
-                              className="text-gray-400 hover:text-red-400 transition-colors" title="Eliminar">
-                              <Trash2 className="w-4 h-4" />
-                            </button>
+                            {r.payment.hasChecks ? (
+                              <button onClick={() => handleAnular(r.payment.id)}
+                                className="text-red-400 hover:text-red-300 transition-colors" title="Anular pago (tiene cheques asociados)">
+                                <Ban className="w-4 h-4" />
+                              </button>
+                            ) : (
+                              <button onClick={() => handleDelete(r.payment.id)}
+                                className="text-gray-400 hover:text-red-400 transition-colors" title="Eliminar">
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            )}
                           </div>
                         </td>
                       </tr>
