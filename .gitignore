@@ -32,6 +32,11 @@ packages/web/dev.db.backup*
 packages/web/backup-prod-*.json
 packages/web/backup-test-*.json
 packages/web/backup-*-prod-*.json
+backups/
+*.backup
+*.backup.*
+backup-*.json
+*-backup-*.json
 
 # local read-only audits (nunca commitear — puede contener datos de producción)
 local-audits/
