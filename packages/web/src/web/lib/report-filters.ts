@@ -8,6 +8,7 @@ export const REPORT_MOVEMENT_TYPES = [
   "renovation_confirmed",
   "renovation_imported",
   "new_policy",
+  "pending_installment",
 ] as const;
 
 export const REPORT_REBILLING_TYPES = [

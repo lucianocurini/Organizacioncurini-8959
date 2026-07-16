@@ -7,7 +7,7 @@ import { test, expect, beforeAll, afterAll, describe } from "bun:test";
 import app from "../index";
 import { database as db } from "../database/index";
 import {
-  users, sessions, policies, rebillings, companies, insureds, policyFleetVehicles,
+  users, sessions, policies, rebillings, companies, insureds, policyFleetVehicles, policyInstallments,
 } from "../database/schema";
 import { eq, inArray } from "drizzle-orm";
 
@@ -111,6 +111,25 @@ async function mkReb(opts: {
   return r!.id;
 }
 
+async function mkInstallment(opts: {
+  policyId: number;
+  number: number;
+  dueDate: string;
+  amount?: number;
+  status?: string;
+  rendered?: number;
+}): Promise<number> {
+  const [i] = await db.insert(policyInstallments).values({
+    policyId: opts.policyId,
+    number: opts.number,
+    dueDate: opts.dueDate,
+    amount: opts.amount ?? 15000,
+    status: opts.status ?? "pendiente",
+    rendered: opts.rendered ?? 0,
+  }).returning({ id: policyInstallments.id });
+  return i!.id;
+}
+
 async function callReport(month: string, params: Record<string, string> = {}, sid = SESSION_ID) {
   const qs = new URLSearchParams({ month, ...params });
   return app.fetch(new Request(`http://localhost/api/reports/renewals-rebillings?${qs}`, {
@@ -165,6 +184,7 @@ afterAll(async () => {
   }
   if (policyIdsToClean.length) {
     await db.delete(policyFleetVehicles).where(inArray(policyFleetVehicles.policyId, policyIdsToClean)).catch(() => {});
+    await db.delete(policyInstallments).where(inArray(policyInstallments.policyId, policyIdsToClean)).catch(() => {});
     await db.delete(policies).where(inArray(policies.id, policyIdsToClean)).catch(() => {});
   }
   const me = await db.select({ id: users.id }).from(users).where(eq(users.email, USER_EMAIL)).get();
@@ -747,5 +767,190 @@ describe("Caso M — seguridad y autenticación", () => {
   test("type fuera de whitelist → ignorado, no filtra", async () => {
     const res = await callReport(M, { type: "malicious<script>" });
     expect(res.status).toBe(200);
+  });
+});
+
+// ── Caso O — Cuotas pendientes del mes (proyección de cartera) ───────────────
+// Reproduce el reclamo original: "el reporte mensual no muestra cuotas de
+// meses futuros". A diferencia de rebillings/policies (eventos ya
+// registrados), esta sección proyecta por policyInstallments.dueDate — debe
+// mostrar meses futuros aunque no haya ninguna rebilling ni alta cargada.
+
+describe("Caso O — Cuotas pendientes del mes (installments por dueDate)", () => {
+  test("cuota pendiente con dueDate en un mes futuro aparece en pendingInstallments de ese mes", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-O-FUTURA",
+      companyId: coMercantilId,
+      startDate: "2026-01-01",
+    });
+    await mkInstallment({ policyId: polId, number: 8, dueDate: `${M}-05`, amount: 22500 });
+
+    const body = await (await callReport(M)).json();
+    const row = body.pendingInstallments.find((r: any) => r.policyId === polId);
+    expect(row).toBeDefined();
+    expect(row.amount).toBe(22500);
+    expect(row.status).toBe("pendiente");
+    expect(body.totals.pendingInstallmentsCount).toBe(body.pendingInstallments.length);
+  });
+
+  test("cuota 'vencida' también aparece, y se cuenta en pendingInstallmentsOverdueCount", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-O-VENCIDA",
+      companyId: coMercantilId,
+      startDate: "2026-01-01",
+    });
+    await mkInstallment({ policyId: polId, number: 1, dueDate: `${M}-10`, status: "vencida" });
+
+    const body = await (await callReport(M)).json();
+    const row = body.pendingInstallments.find((r: any) => r.policyId === polId);
+    expect(row).toBeDefined();
+    expect(row.status).toBe("vencida");
+    expect(body.totals.pendingInstallmentsOverdueCount).toBeGreaterThanOrEqual(1);
+  });
+
+  test("no depende de pagos/cash_entries: la cuota aparece sin que exista ningún payment asociado", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-O-SINPAGO",
+      companyId: coMercantilId,
+      startDate: "2026-01-01",
+    });
+    await mkInstallment({ policyId: polId, number: 1, dueDate: `${M}-01` });
+
+    // No se crea ningún payment/cash_entry para esta póliza — solo la cuota.
+    const body = await (await callReport(M)).json();
+    expect(body.pendingInstallments.some((r: any) => r.policyId === polId)).toBe(true);
+  });
+
+  test("cuota 'pagada' NO aparece en pendingInstallments", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-O-PAGADA",
+      companyId: coMercantilId,
+      startDate: "2026-01-01",
+    });
+    await mkInstallment({ policyId: polId, number: 1, dueDate: `${M}-01`, status: "pagada" });
+
+    const body = await (await callReport(M)).json();
+    expect(body.pendingInstallments.some((r: any) => r.policyId === polId)).toBe(false);
+  });
+
+  test("cuota 'no_exigible' (póliza anulada) NO aparece en pendingInstallments", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-O-NOEXIGIBLE",
+      companyId: coMercantilId,
+      startDate: "2026-01-01",
+    });
+    await mkInstallment({ policyId: polId, number: 1, dueDate: `${M}-01`, status: "no_exigible" });
+
+    const body = await (await callReport(M)).json();
+    expect(body.pendingInstallments.some((r: any) => r.policyId === polId)).toBe(false);
+  });
+
+  test("cuota ya rendida (rendered=1) NO aparece, aunque siga 'pendiente'", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-O-RENDIDA",
+      companyId: coMercantilId,
+      startDate: "2026-01-01",
+    });
+    await mkInstallment({ policyId: polId, number: 1, dueDate: `${M}-01`, rendered: 1 });
+
+    const body = await (await callReport(M)).json();
+    expect(body.pendingInstallments.some((r: any) => r.policyId === polId)).toBe(false);
+  });
+
+  test("cuota con dueDate fuera del mes pedido no aparece (respeta límites de mes)", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-O-OTROMES",
+      companyId: coMercantilId,
+      startDate: "2026-01-01",
+    });
+    await mkInstallment({ policyId: polId, number: 1, dueDate: `${M_ADJ}-01` });
+
+    const body = await (await callReport(M)).json();
+    expect(body.pendingInstallments.some((r: any) => r.policyId === polId)).toBe(false);
+  });
+
+  test("respeta filtro companyId", async () => {
+    const polMercantil = await mkPolicy({
+      num: "TEST-RM-O-FILT-MERC",
+      companyId: coMercantilId,
+      startDate: "2026-01-01",
+    });
+    const polRiv = await mkPolicy({
+      num: "TEST-RM-O-FILT-RIV",
+      companyId: coRivadaviaId,
+      startDate: "2026-01-01",
+    });
+    await mkInstallment({ policyId: polMercantil, number: 1, dueDate: `${M}-01` });
+    await mkInstallment({ policyId: polRiv, number: 1, dueDate: `${M}-01` });
+
+    const body = await (await callReport(M, { companyId: String(coMercantilId) })).json();
+    expect(body.pendingInstallments.some((r: any) => r.policyId === polMercantil)).toBe(true);
+    expect(body.pendingInstallments.some((r: any) => r.policyId === polRiv)).toBe(false);
+  });
+
+  test("respeta filtro q (por número de póliza)", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-O-QFILTER",
+      companyId: coMercantilId,
+      startDate: "2026-01-01",
+    });
+    await mkInstallment({ policyId: polId, number: 1, dueDate: `${M}-01` });
+
+    const body = await (await callReport(M, { q: "test-rm-o-qfilter" })).json();
+    expect(body.pendingInstallments.some((r: any) => r.policyId === polId)).toBe(true);
+    const bodyOther = await (await callReport(M, { q: "no-existe-esta-poliza" })).json();
+    expect(bodyOther.pendingInstallments.some((r: any) => r.policyId === polId)).toBe(false);
+  });
+
+  test("movementType=pending_installment → solo esta sección, el resto vacío", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-O-MOVTYPE",
+      companyId: coMercantilId,
+      startDate: `${M}-01`,
+      notes: null,
+    });
+    await mkInstallment({ policyId: polId, number: 1, dueDate: `${M}-01` });
+
+    const body = await (await callReport(M, { movementType: "pending_installment" })).json();
+    expect(body.pendingInstallments.some((r: any) => r.policyId === polId)).toBe(true);
+    expect(body.newPolicies).toHaveLength(0);
+    expect(body.rebillings).toHaveLength(0);
+    expect(body.renovationsConfirmed).toHaveLength(0);
+    expect(body.renovationsImported).toHaveLength(0);
+  });
+
+  test("no cuenta en totals.totalMovements (concepto distinto de los movimientos de póliza)", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-O-NOTMOVS",
+      companyId: coMercantilId,
+      startDate: "2026-01-01",
+    });
+    await mkInstallment({ policyId: polId, number: 1, dueDate: `${M}-01` });
+
+    const body = await (await callReport(M)).json();
+    const expectedTotalMovements =
+      body.rebillings.length + body.renovationsConfirmed.length +
+      body.renovationsImported.length + body.newPolicies.length;
+    expect(body.totals.totalMovements).toBe(expectedTotalMovements);
+  });
+
+  test("no rompe el resto del reporte para el mismo mes (rebillings/altas siguen funcionando)", async () => {
+    const polReb = await mkPolicy({
+      num: "TEST-RM-O-COEXIST-REB",
+      companyId: coElNorteId,
+      startDate: "2026-01-01",
+      notes: "Importado de El Norte v2 | Prórroga",
+    });
+    await mkReb({ policyId: polReb, billingStart: `${M}-01`, notes: "Importado de El Norte v2 | Prórroga" });
+    const polInst = await mkPolicy({
+      num: "TEST-RM-O-COEXIST-INST",
+      companyId: coElNorteId,
+      startDate: "2026-01-01",
+    });
+    await mkInstallment({ policyId: polInst, number: 1, dueDate: `${M}-01` });
+
+    const body = await (await callReport(M)).json();
+    expect(body.rebillings.some((r: any) => r.policyId === polReb)).toBe(true);
+    expect(body.pendingInstallments.some((r: any) => r.policyId === polInst)).toBe(true);
   });
 });

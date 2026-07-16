@@ -77,6 +77,20 @@ interface NewPolicyRow {
   insuredAsset: string | null;
 }
 
+interface PendingInstallmentRow {
+  installmentId: number;
+  installmentNumber: number;
+  policyId: number;
+  policyNumber: string;
+  insuredName: string;
+  companyName: string;
+  type: string;
+  dueDate: string;
+  amount: number;
+  status: string;
+  insuredAsset: string | null;
+}
+
 interface ReportTotals {
   rebillingsCount: number;
   rebillingsDuplicateGroups: number;
@@ -87,6 +101,9 @@ interface ReportTotals {
   totalPremiumRenovations: number;
   newPoliciesCount: number;
   totalMovements: number;
+  pendingInstallmentsCount: number;
+  pendingInstallmentsOverdueCount: number;
+  totalPendingInstallmentsAmount: number;
 }
 
 interface ReportData {
@@ -95,6 +112,7 @@ interface ReportData {
   renovationsConfirmed: RenovationConfirmedRow[];
   renovationsImported: RenovationImportedRow[];
   newPolicies: NewPolicyRow[];
+  pendingInstallments: PendingInstallmentRow[];
   totals: ReportTotals;
 }
 
@@ -182,6 +200,25 @@ function AltaBadge({ reason }: { reason: string }) {
     );
   }
   return null;
+}
+
+const INSTALLMENT_STATUS_LABELS: Record<string, string> = {
+  pendiente: "Pendiente",
+  vencida: "Vencida",
+};
+
+const INSTALLMENT_STATUS_COLORS: Record<string, string> = {
+  pendiente: "bg-blue-500/15 text-blue-400 border-blue-500/20",
+  vencida: "bg-red-500/15 text-red-400 border-red-500/20",
+};
+
+function InstallmentStatusBadge({ status }: { status: string }) {
+  return (
+    <span className={cn("inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium border",
+      INSTALLMENT_STATUS_COLORS[status] ?? INSTALLMENT_STATUS_COLORS.pendiente)}>
+      {INSTALLMENT_STATUS_LABELS[status] ?? status}
+    </span>
+  );
 }
 
 function TypeBadge({ type }: { type: string }) {
@@ -305,6 +342,9 @@ function exportExcel(data: ReportData, activeFilters: string) {
     { Sección: "Premio total renovaciones", Valor: data.totals.totalPremiumRenovations },
     { Sección: "Altas del mes", Valor: data.totals.newPoliciesCount },
     { Sección: "Total movimientos", Valor: data.totals.totalMovements },
+    { Sección: "Cuotas pendientes (proyección)", Valor: data.totals.pendingInstallmentsCount },
+    { Sección: "  · Vencidas", Valor: data.totals.pendingInstallmentsOverdueCount },
+    { Sección: "  · Importe total", Valor: data.totals.totalPendingInstallmentsAmount },
   ];
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), "Resumen");
 
@@ -377,6 +417,20 @@ function exportExcel(data: ReportData, activeFilters: string) {
         : "Alta directa",
   }));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(altasRows), "Altas");
+
+  // Cuotas pendientes sheet (proyección — no depende de pagos)
+  const pendingRows = data.pendingInstallments.map((r) => ({
+    "N° Póliza": r.policyNumber,
+    "Asegurado": r.insuredName,
+    "Bien asegurado": r.insuredAsset ?? "",
+    "Compañía": r.companyName,
+    "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
+    "Vencimiento": r.dueDate,
+    "Cuota N°": r.installmentNumber,
+    "Importe": r.amount,
+    "Estado": INSTALLMENT_STATUS_LABELS[r.status] ?? r.status,
+  }));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(pendingRows), "Cuotas pendientes");
 
   XLSX.writeFile(wb, `renovaciones_refacturaciones_${data.month}.xlsx`);
 }
@@ -460,6 +514,24 @@ function exportCSV(data: ReportData) {
         : r.classificationReason === "refacturacion_sin_base"
           ? "Refact. sin base"
           : "Alta directa",
+    })),
+    ...data.pendingInstallments.map((r) => ({
+      "Tipo de movimiento": "Cuota pendiente",
+      "Subtipo": INSTALLMENT_STATUS_LABELS[r.status] ?? r.status,
+      "N° Póliza": r.policyNumber,
+      "Asegurado": r.insuredName,
+      "Bien asegurado": r.insuredAsset ?? "",
+      "Compañía": r.companyName,
+      "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
+      "Fecha inicio": r.dueDate,
+      "Fecha fin": "",
+      "Premio": r.amount ?? "",
+      "Cuota mensual": "",
+      "Inicio póliza original": "",
+      "Duplicados detectados": "",
+      "Póliza anterior": "",
+      "Importador": "",
+      "Clasificación alta": "",
     })),
   ];
 
@@ -685,6 +757,7 @@ export default function ReporteMes() {
             <option value="renovation_confirmed">Renovaciones confirmadas</option>
             <option value="renovation_imported">Renovaciones importadas</option>
             <option value="new_policy">Altas</option>
+            <option value="pending_installment">Cuotas pendientes</option>
           </select>
           <select
             value={rebillingTypeFilter}
@@ -711,7 +784,7 @@ export default function ReporteMes() {
 
         {/* Summary cards */}
         {t && (
-          <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-6">
+          <div className="grid grid-cols-2 lg:grid-cols-6 gap-3 mb-6">
             <SummaryCard
               icon={BarChart3}
               label="Refacturaciones"
@@ -745,6 +818,13 @@ export default function ReporteMes() {
               value={t.totalPremiumRebillings > 0 ? formatCurrency(t.totalPremiumRebillings) : "—"}
               sub={t.totalPremiumRenovations > 0 ? `Renov.: ${formatCurrency(t.totalPremiumRenovations)}` : undefined}
               color="bg-teal-600/20 text-teal-400"
+            />
+            <SummaryCard
+              icon={FileText}
+              label="Cuotas pendientes"
+              value={t.pendingInstallmentsCount}
+              sub={t.pendingInstallmentsOverdueCount > 0 ? `${t.pendingInstallmentsOverdueCount} vencidas` : undefined}
+              color="bg-red-600/20 text-red-400"
             />
           </div>
         )}
@@ -991,6 +1071,60 @@ export default function ReporteMes() {
                           <AltaBadge reason={r.classificationReason} />
                         </div>
                       </Td>
+                      <Td className="col-actions sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
+                        <PolicyActions policyId={r.policyId} onChanged={load} returnTo={currentReportPath} />
+                      </Td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </Section>
+
+            {/* 5. Cuotas pendientes del mes (proyección, no depende de pagos) */}
+            <Section
+              title="Cuotas pendientes del mes"
+              count={data.pendingInstallments.length}
+              empty="Sin cuotas pendientes con vencimiento en este período."
+            >
+              <table className="w-full table-fixed" style={{ minWidth: 1150 }}>
+                <colgroup>
+                  <col style={{ width: 90 }} />
+                  <col style={{ width: 110 }} />
+                  <col style={{ width: 130 }} />
+                  <col style={{ width: 140 }} />
+                  <col style={{ width: 220 }} />
+                  <col style={{ width: 90 }} />
+                  <col style={{ width: 70 }} />
+                  <col style={{ width: 100 }} />
+                  <col style={{ width: 100 }} />
+                  <col style={{ width: 110 }} />
+                </colgroup>
+                <thead className="border-b border-[#1f2937] bg-[#0d1424]">
+                  <tr>
+                    <Th>Vencimiento</Th>
+                    <Th>Compañía</Th>
+                    <Th>N° Póliza</Th>
+                    <Th>Asegurado</Th>
+                    <Th>Bien asegurado</Th>
+                    <Th>Tipo</Th>
+                    <Th>Cuota N°</Th>
+                    <Th>Importe</Th>
+                    <Th>Estado</Th>
+                    <Th className="col-actions text-right sticky right-0 bg-[#0d1424]">Acciones</Th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#1f2937]">
+                  {data.pendingInstallments.map((r) => (
+                    <tr key={r.installmentId} className="hover:bg-[#0d1424]/50 transition-colors">
+                      <Td className="font-mono text-xs">{formatDate(r.dueDate)}</Td>
+                      <Td className="text-gray-400">{r.companyName}</Td>
+                      <Td><span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span></Td>
+                      <Td>{r.insuredName}</Td>
+                      <Td className="whitespace-normal break-words"><AssetCell value={r.insuredAsset} /></Td>
+                      <Td><TypeBadge type={r.type} /></Td>
+                      <Td className="text-gray-400 text-xs">{r.installmentNumber}</Td>
+                      <Td className="font-medium text-white">{formatCurrency(r.amount)}</Td>
+                      <Td><InstallmentStatusBadge status={r.status} /></Td>
                       <Td className="col-actions sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
                         <PolicyActions policyId={r.policyId} onChanged={load} returnTo={currentReportPath} />
                       </Td>

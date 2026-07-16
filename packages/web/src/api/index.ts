@@ -5856,7 +5856,7 @@ const REPORT_VALID_TYPES = new Set([
   "responsabilidad_civil","cascos","incendio",
 ]);
 const REPORT_VALID_MOVEMENT_TYPES = new Set([
-  "rebilling","renovation_confirmed","renovation_imported","new_policy",
+  "rebilling","renovation_confirmed","renovation_imported","new_policy","pending_installment",
 ]);
 const REPORT_VALID_REBILLING_TYPES = new Set([
   "prorroga","endoso","extension_vigencia","renovacion","rehabilitacion","otro",
@@ -6069,10 +6069,62 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     .orderBy(asc(policies.startDate))
     .all();
 
+  // ── 3. Cuotas pendientes con vencimiento en el mes (proyección de cartera) ──
+  // A diferencia de 1 y 2 (que muestran eventos YA registrados: refacturaciones
+  // creadas, pólizas dadas de alta), esta sección proyecta hacia adelante por
+  // policyInstallments.dueDate — por eso puede mostrar meses futuros aunque no
+  // exista todavía ninguna rebilling ni póliza nueva cargada para ese mes.
+  // No depende de payments/cash_entries (Caja es un concepto aparte, ver
+  // GET /cash/summary): una cuota "pendiente"/"vencida" se muestra exista o no
+  // un pago asociado.
+  const instConditions: any[] = [
+    gte(policyInstallments.dueDate, startDate),
+    lt(policyInstallments.dueDate, endDateExclusive),
+    inArray(policyInstallments.status, ["pendiente", "vencida"]),
+    eq(policyInstallments.rendered, 0),
+  ];
+  if (companyId) instConditions.push(eq(policies.companyId, companyId));
+  if (validType) instConditions.push(eq(policies.type, validType));
+
+  const instRaw = await db
+    .select({
+      installmentId: policyInstallments.id,
+      installmentNumber: policyInstallments.number,
+      policyId: policies.id,
+      policyNumber: policies.policyNumber,
+      dueDate: policyInstallments.dueDate,
+      amount: policyInstallments.amount,
+      status: policyInstallments.status,
+      type: policies.type,
+      companyId: policies.companyId,
+      insuredName: insureds.name,
+      companyName: companies.name,
+      isFleet: policies.isFleet,
+      vehicleBrand: policies.vehicleBrand,
+      vehicleModel: policies.vehicleModel,
+      vehicleYear: policies.vehicleYear,
+      vehiclePlate: policies.vehiclePlate,
+      motoBrand: policies.motoBrand,
+      motoModel: policies.motoModel,
+      motoYear: policies.motoYear,
+      motoPlate: policies.motoPlate,
+      propertyAddress: policies.propertyAddress,
+      businessName: policies.businessName,
+      businessActivity: policies.businessActivity,
+    })
+    .from(policyInstallments)
+    .innerJoin(policies, eq(policyInstallments.policyId, policies.id))
+    .innerJoin(insureds, eq(policies.insuredId, insureds.id))
+    .innerJoin(companies, eq(policies.companyId, companies.id))
+    .where(and(...instConditions))
+    .orderBy(asc(policyInstallments.dueDate))
+    .all();
+
   // ── Bien asegurado: conteo de flota en un solo query batched (sin N+1) ──
   const fleetPolicyIds = [
     ...rebRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
     ...polRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
+    ...instRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
   ];
   const fleetCounts = new Map<number, number>();
   if (fleetPolicyIds.length > 0) {
@@ -6103,6 +6155,24 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     extraDuplicateRows: Number(r.duplicateCount) - 1,
     insuredAsset: reportInsuredAsset(
       { ...r, type: String(r.policyType) } as ReportAssetFields,
+      Number(r.policyId),
+      fleetCounts,
+    ),
+  }));
+
+  let pendingInstallmentRows = instRaw.map((r) => ({
+    installmentId: Number(r.installmentId),
+    installmentNumber: Number(r.installmentNumber),
+    policyId: Number(r.policyId),
+    policyNumber: String(r.policyNumber),
+    insuredName: String(r.insuredName),
+    companyName: String(r.companyName),
+    type: String(r.type),
+    dueDate: String(r.dueDate),
+    amount: Number(r.amount),
+    status: String(r.status),
+    insuredAsset: reportInsuredAsset(
+      { ...r, type: String(r.type) } as ReportAssetFields,
       Number(r.policyId),
       fleetCounts,
     ),
@@ -6196,10 +6266,12 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
   let filteredConfirmed     = validMovementType && validMovementType !== "renovation_confirmed"  ? [] : renovationsConfirmed.filter(matchesQ);
   let filteredImported      = validMovementType && validMovementType !== "renovation_imported"   ? [] : renovationsImported.filter(matchesQ);
   let filteredNew           = validMovementType && validMovementType !== "new_policy"            ? [] : newPolicies.filter(matchesQ);
+  let filteredPending       = validMovementType && validMovementType !== "pending_installment"    ? [] : pendingInstallmentRows.filter(matchesQ);
 
   // ── 4. Sort ──
-  const VALID_SORT_KEYS_REBILLING = new Set(["billingStart","billingEnd","policyNumber","insuredName","companyName","premium","type","rebillingType"]);
-  const VALID_SORT_KEYS_POLICY    = new Set(["startDate","endDate","policyNumber","insuredName","companyName","premium","type"]);
+  const VALID_SORT_KEYS_REBILLING   = new Set(["billingStart","billingEnd","policyNumber","insuredName","companyName","premium","type","rebillingType"]);
+  const VALID_SORT_KEYS_POLICY      = new Set(["startDate","endDate","policyNumber","insuredName","companyName","premium","type"]);
+  const VALID_SORT_KEYS_INSTALLMENT = new Set(["dueDate","policyNumber","insuredName","companyName","amount","status"]);
 
   function applySortRebilling(arr: typeof filteredRebillings): typeof filteredRebillings {
     if (!sortBy || !VALID_SORT_KEYS_REBILLING.has(sortBy)) return arr;
@@ -6219,11 +6291,21 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
       return validSortOrder === "desc" ? -cmp : cmp;
     });
   }
+  function applySortInstallment(arr: typeof filteredPending): typeof filteredPending {
+    if (!sortBy || !VALID_SORT_KEYS_INSTALLMENT.has(sortBy)) return arr;
+    return [...arr].sort((a, b) => {
+      const va = (a as any)[sortBy] ?? "";
+      const vb = (b as any)[sortBy] ?? "";
+      const cmp = typeof va === "number" ? va - vb : String(va).localeCompare(String(vb));
+      return validSortOrder === "desc" ? -cmp : cmp;
+    });
+  }
 
   filteredRebillings = applySortRebilling(filteredRebillings);
   filteredConfirmed  = applySortPolicy(filteredConfirmed);
   filteredImported   = applySortPolicy(filteredImported);
   filteredNew        = applySortPolicy(filteredNew);
+  filteredPending    = applySortInstallment(filteredPending);
 
   // ── 5. Totals ──
   const rebillingsDuplicateGroups = filteredRebillings.filter((r) => r.duplicateCount > 1).length;
@@ -6231,6 +6313,8 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
   const totalPremiumRebillings    = filteredRebillings.reduce((s, r) => s + (r.premium ?? 0), 0);
   const totalPremiumRenovations   =
     [...filteredConfirmed, ...filteredImported].reduce((s, r) => s + (r.premium ?? 0), 0);
+  const pendingInstallmentsOverdueCount = filteredPending.filter((r) => r.status === "vencida").length;
+  const totalPendingInstallmentsAmount  = filteredPending.reduce((s, r) => s + (r.amount ?? 0), 0);
 
   return c.json({
     month,
@@ -6238,6 +6322,9 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     renovationsConfirmed:  filteredConfirmed,
     renovationsImported:   filteredImported,
     newPolicies:           filteredNew,
+    // Proyección de cartera — no se suma a totalMovements (concepto distinto:
+    // cuotas por vencer, no eventos de póliza ya registrados).
+    pendingInstallments:   filteredPending,
     totals: {
       rebillingsCount:           filteredRebillings.length,
       rebillingsDuplicateGroups,
@@ -6250,6 +6337,9 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
       totalMovements:
         filteredRebillings.length + filteredConfirmed.length +
         filteredImported.length + filteredNew.length,
+      pendingInstallmentsCount:        filteredPending.length,
+      pendingInstallmentsOverdueCount,
+      totalPendingInstallmentsAmount:  Math.round(totalPendingInstallmentsAmount * 100) / 100,
     },
   }, 200);
 }));
