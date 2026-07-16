@@ -32,10 +32,19 @@ function authHeaders() {
   return { "x-session-id": SESSION_ID, "Content-Type": "application/json" };
 }
 
-async function mkPolicy(insured: number, company: number): Promise<number> {
+async function getCashSummary(): Promise<any> {
+  const res = await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }));
+  return res.json();
+}
+
+async function mkPolicy(
+  insured: number, company: number,
+  opts: { type?: string; parentPolicyId?: number | null } = {}
+): Promise<number> {
   const [p] = await db.insert(policies).values({
     policyNumber: `${PREFIX}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-    type: "automotor", status: "activa", companyId: company, insuredId: insured,
+    type: opts.type ?? "automotor", status: "activa", companyId: company, insuredId: insured,
+    parentPolicyId: opts.parentPolicyId ?? null,
     startDate: "2027-01-01", endDate: "2027-12-31", isRebilling: 0, createdBy: userId,
   }).returning({ id: policies.id });
   policyIdsToClean.push(p!.id);
@@ -489,6 +498,142 @@ describe("19-22. Pronto Pago por cuota Rivadavia", () => {
     const surcharges = await db.select().from(cashEntries)
       .where(and(eq(cashEntries.paymentId, children[0]!.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
     expect(surcharges.length).toBe(0);
+  });
+});
+
+// ─── Grupo económico Rivadavia + Accidentes de Pasajeros asociada ───────────
+// Reproduce el caso real reportado (asegurado BISI NESTOR GUSTAVO FERNA):
+// una póliza principal Rivadavia + su accesoria de Accidentes de Pasajeros
+// (policies.parentPolicyId → principal) se cobran juntas en el mismo lote.
+// Antes del fix: 2 recargos ($1600). Ahora: 1 solo recargo para todo el
+// grupo económico — ver src/lib/payments/policy-economic-group.ts.
+describe("Grupo económico Rivadavia — principal + Accidentes de Pasajeros asociada", () => {
+  test("principal + accesoria vinculada (parentPolicyId presente en el batch) → 1 solo cash_entry de recargo, 2 payments hijos", async () => {
+    const principalId = await mkPolicy(insuredId, rivadaviaCompanyId, { type: "automotor" });
+    const accesoriaId = await mkPolicy(insuredId, rivadaviaCompanyId, { type: "accidentes_pasajeros", parentPolicyId: principalId });
+    const instPrincipal = await mkInstallment(principalId, 1, "2027-01-01", 78171);
+    const instAccesoria = await mkInstallment(accesoriaId, 1, "2027-01-01", 1300);
+
+    // Ejemplo obligatorio del pedido: 78.171 + 1.300 = 79.471 base + 800 recargo = 80.271 total.
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instPrincipal }, { installmentId: instAccesoria }],
+      splits: [{ method: "efectivo", amount: 79471 + 800 }],
+    });
+    expect(status).toBe(201);
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.baseAmountCents).toBe(7947100);
+    expect(batch!.surchargeAmountCents).toBe(80000);
+    expect(batch!.totalReceivedCents).toBe(8027100);
+
+    // 2 payments hijos — ambas cuotas siguen existiendo por separado, con su importe real propio.
+    const children = await getChildren(body.id);
+    expect(children.length).toBe(2);
+    const childByInstallment = new Map(children.map((c) => [c.installmentId, c]));
+    expect(childByInstallment.get(instPrincipal)!.amount).toBe(78171);
+    expect(childByInstallment.get(instAccesoria)!.amount).toBe(1300);
+
+    // 1 solo cash_entry de recargo para todo el grupo — atado a un solo payment hijo.
+    const childIds = children.map((c) => c.id);
+    const surcharges = await db.select().from(cashEntries)
+      .where(and(inArray(cashEntries.paymentId, childIds), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surcharges.length).toBe(1);
+    expect(surcharges[0]!.amount).toBe(800);
+  });
+
+  test("accesoria SIN principal en el mismo batch (parentPolicyId no incluido) → no agrupa, cada una su propio recargo", async () => {
+    const principalId = await mkPolicy(insuredId, rivadaviaCompanyId, { type: "automotor" });
+    const accesoriaId = await mkPolicy(insuredId, rivadaviaCompanyId, { type: "accidentes_pasajeros", parentPolicyId: principalId });
+    const instAccesoria = await mkInstallment(accesoriaId, 1, "2027-01-01", 1300);
+    // Nota: la principal existe en DB pero NO se incluye en este batch —
+    // conservador, no se agrupa (mismo criterio que sin parentPolicyId).
+
+    const { body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instAccesoria }],
+      splits: [{ method: "efectivo", amount: 1300 + 800 }],
+    });
+    const children = await getChildren(body.id);
+    const surcharges = await db.select().from(cashEntries)
+      .where(and(eq(cashEntries.paymentId, children[0]!.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surcharges.length).toBe(1);
+    expect(surcharges[0]!.amount).toBe(800);
+  });
+
+  test("accesoria sin parentPolicyId (nunca vinculada) → genera su propio recargo, sin agrupar", async () => {
+    const accesoriaSuelta = await mkPolicy(insuredId, rivadaviaCompanyId, { type: "accidentes_pasajeros", parentPolicyId: null });
+    const inst = await mkInstallment(accesoriaSuelta, 1, "2027-01-01", 1300);
+
+    const { body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: inst }],
+      splits: [{ method: "efectivo", amount: 1300 + 800 }],
+    });
+    const children = await getChildren(body.id);
+    const surcharges = await db.select().from(cashEntries)
+      .where(and(eq(cashEntries.paymentId, children[0]!.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surcharges.length).toBe(1);
+  });
+
+  test("dos pólizas Rivadavia realmente independientes (sin relación) → 2 recargos", async () => {
+    const p1 = await mkPolicy(insuredId, rivadaviaCompanyId, { type: "automotor" });
+    const p2 = await mkPolicy(insuredId, rivadaviaCompanyId, { type: "automotor" });
+    const inst1 = await mkInstallment(p1, 1, "2027-01-01", 600);
+    const inst2 = await mkInstallment(p2, 1, "2027-01-01", 400);
+
+    const { body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: inst1 }, { installmentId: inst2 }],
+      splits: [{ method: "efectivo", amount: 1000 + 1600 }],
+    });
+    const children = await getChildren(body.id);
+    const childIds = children.map((c) => c.id);
+    const surcharges = await db.select().from(cashEntries)
+      .where(and(inArray(cashEntries.paymentId, childIds), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surcharges.length).toBe(2);
+  });
+
+  test("otra compañía no-Rivadavia con la misma forma principal+accesoria no genera ningún recargo", async () => {
+    const principalId = await mkPolicy(insuredId, companyId, { type: "automotor" }); // companyId = compañía no-Rivadavia del harness
+    const accesoriaId = await mkPolicy(insuredId, companyId, { type: "accidentes_pasajeros", parentPolicyId: principalId });
+    const instPrincipal = await mkInstallment(principalId, 1, "2027-01-01", 1000);
+    const instAccesoria = await mkInstallment(accesoriaId, 1, "2027-01-01", 500);
+
+    const { body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instPrincipal }, { installmentId: instAccesoria }],
+      splits: [{ method: "efectivo", amount: 1500 }],
+    });
+    const children = await getChildren(body.id);
+    const childIds = children.map((c) => c.id);
+    const surcharges = await db.select().from(cashEntries)
+      .where(and(inArray(cashEntries.paymentId, childIds), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surcharges.length).toBe(0);
+  });
+
+  test("Caja refleja un solo recargo ($800, no $1600) para principal + accesoria", async () => {
+    // El recargo de un batch NO aparece como bucket "recargosProntoPago"
+    // separado (eso es solo para cash_entries standalone) — va fundido en
+    // el importe del split (payment_batch_splits), que representa el total
+    // realmente recibido (base + recargo). Por eso la forma correcta de
+    // verificar "un solo recargo, no dos" en Caja es que el total pendiente
+    // suba EXACTAMENTE base + 1×$800 (80.271), nunca base + 2×$800 (81.071).
+    const before = await getCashSummary();
+
+    const principalId = await mkPolicy(insuredId, rivadaviaCompanyId, { type: "automotor" });
+    const accesoriaId = await mkPolicy(insuredId, rivadaviaCompanyId, { type: "accidentes_pasajeros", parentPolicyId: principalId });
+    const instPrincipal = await mkInstallment(principalId, 1, "2027-01-01", 78171);
+    const instAccesoria = await mkInstallment(accesoriaId, 1, "2027-01-01", 1300);
+
+    await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instPrincipal }, { installmentId: instAccesoria }],
+      splits: [{ method: "efectivo", amount: 79471 + 800 }],
+    });
+
+    const after = await getCashSummary();
+    expect(after.cartera.efectivo - before.cartera.efectivo).toBeCloseTo(80271, 2);
+    expect(after.cartera.total - before.cartera.total).toBeCloseTo(80271, 2);
   });
 });
 

@@ -41,6 +41,7 @@ import {
 import { isValidCalendarDate } from "../../lib/installments/plan";
 import { classifySplitGroup } from "../../lib/payments/splits";
 import { SURCHARGE_AMOUNT_CENTS } from "../../lib/payments/batches";
+import { isSurchargeAbsorbedByGroup } from "../../lib/payments/policy-economic-group";
 
 export type { SplitGroup };
 export { computeSplitTotals, groupSplitsByMethod, amountStringToCentsStrict, MIXED_GROUP_ERROR, SURCHARGE_AMOUNT_CENTS };
@@ -51,6 +52,14 @@ export interface PendingInstallmentForPayment {
   installmentId: number;
   policyId: number;
   policyNumber: string;
+  // Grupo económico Rivadavia (ver lib/payments/policy-economic-group.ts):
+  // policyType/parentPolicyId de la póliza real de esta cuota;
+  // parentPolicyNumber solo para mostrar la pista visual "Accesoria de
+  // póliza X" — nunca se usa para decidir agrupación (eso lo hace el
+  // backend con parentPolicyId, no con el número).
+  policyType: string;
+  parentPolicyId: number | null;
+  parentPolicyNumber: string | null;
   insuredId: number;
   insuredName: string;
   companyId: number;
@@ -71,6 +80,9 @@ export interface InstallmentCartItem {
   installmentId: number;
   policyId: number;
   policyNumber: string;
+  policyType: string;
+  parentPolicyId: number | null;
+  parentPolicyNumber: string | null;
   insuredId: number;
   insuredName: string;
   companyId: number;
@@ -88,6 +100,9 @@ export interface PolicyManualPaymentCartItem {
   localId: string;
   policyId: number;
   policyNumber: string;
+  policyType: string;
+  parentPolicyId: number | null;
+  parentPolicyNumber: string | null;
   insuredId: number;
   insuredName: string;
   companyId: number;
@@ -184,6 +199,9 @@ export function addInstallmentToCart(cart: BatchCartItem[], item: PendingInstall
     installmentId: item.installmentId,
     policyId: item.policyId,
     policyNumber: item.policyNumber,
+    policyType: item.policyType,
+    parentPolicyId: item.parentPolicyId,
+    parentPolicyNumber: item.parentPolicyNumber,
     insuredId: item.insuredId,
     insuredName: item.insuredName,
     companyId: item.companyId,
@@ -280,6 +298,15 @@ export function buildManualCartItemFromForm(form: ManualPaymentFormState): Polic
       localId,
       policyId: Number(form.policyId),
       policyNumber: form.policyNumber,
+      // El buscador de "vincular a póliza" de un cobro manual no resuelve
+      // hoy el type/parentPolicyId real de la póliza elegida — se deja
+      // conservador (nunca "accidentes_pasajeros" agrupable), mismo
+      // criterio que el caso D de policy-economic-group.ts: nunca inventar
+      // un vínculo que no se puede confirmar. El backend es quien decide de
+      // verdad (relee la póliza real en POST /payment-batches).
+      policyType: "",
+      parentPolicyId: null,
+      parentPolicyNumber: null,
       insuredId: Number(form.policyInsuredId),
       insuredName: form.policyInsuredName,
       companyId: Number(form.policyCompanyId),
@@ -493,18 +520,32 @@ export function splitsToPaymentSplitsPayload(splits: ReadonlyArray<BatchSplitFor
 // esto es una ESTIMACIÓN de UI para que el importe que el usuario tipea en
 // los medios ya incluya el recargo esperado, en vez de descubrir recién al
 // confirmar que "la suma no coincide". Mismo criterio exacto que
-// calculateApplicableRivadaviaSurcharges del backend: $800 por cuota o
-// policy_manual_payment cuya companyName (REAL) contenga "rivadavia", solo
-// si el grupo de medios es "own". Un manual_payment (imputación libre) NUNCA
-// entra acá — no tiene companyName real, solo texto suelto sin garantía
-// (manualCompany no se usa para esta estimación a propósito, mismo criterio
-// que el backend: ver batches.ts).
+// calculateApplicableRivadaviaSurcharges del backend: $800 por GRUPO
+// ECONÓMICO Rivadavia (cuota o policy_manual_payment cuya companyName REAL
+// contenga "rivadavia"), solo si el grupo de medios es "own". Una póliza
+// accesoria de Accidentes de Pasajeros cuyo parentPolicyId apunta a otra
+// póliza YA presente en este mismo carrito no suma su propio recargo — ver
+// lib/payments/policy-economic-group.ts (mismo criterio, mismo archivo,
+// para que frontend y backend nunca se desalineen). Un manual_payment
+// (imputación libre) NUNCA entra acá — no tiene companyName real, solo
+// texto suelto sin garantía (manualCompany no se usa para esta estimación a
+// propósito, mismo criterio que el backend: ver batches.ts).
 
 export function estimateProntoPagoSurchargeCents(cart: ReadonlyArray<BatchCartItem>): number {
-  const rivadaviaCount = cart.filter((i) =>
+  const rivadaviaItems = cart.filter((i) =>
     i.kind !== "manual_payment" && (i.companyName ?? "").toLowerCase().includes("rivadavia")
-  ).length;
-  return rivadaviaCount * SURCHARGE_AMOUNT_CENTS;
+  );
+  const policyIdsInScope = new Set(
+    cart.filter((i): i is InstallmentCartItem | PolicyManualPaymentCartItem => i.kind !== "manual_payment").map((i) => i.policyId)
+  );
+  const applicableCount = rivadaviaItems.filter((i) => {
+    if (i.kind === "manual_payment") return false; // ya excluido arriba, defensivo para el type narrowing
+    return !isSurchargeAbsorbedByGroup(
+      { id: i.policyId, type: i.policyType, parentPolicyId: i.parentPolicyId },
+      policyIdsInScope
+    );
+  }).length;
+  return applicableCount * SURCHARGE_AMOUNT_CENTS;
 }
 
 /**

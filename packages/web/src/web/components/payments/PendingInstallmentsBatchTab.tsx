@@ -58,9 +58,20 @@ function cartItemLabel(item: BatchCartItem): string {
   return `Cobro manual — ${parts.length > 0 ? parts.join(" / ") : "imputación libre"}`;
 }
 
+/** Pista visual discreta cuando el ítem es una accesoria de Accidentes de
+ * Pasajeros vinculada por parentPolicyId (ver lib/payments/policy-economic-group.ts)
+ * — nunca fusiona la fila con la de su principal, solo la identifica. */
+function cartItemAccessoryHint(item: BatchCartItem): string | null {
+  if (item.kind === "installment" || item.kind === "policy_manual_payment") {
+    return item.parentPolicyNumber ? ` · Accesoria de póliza ${item.parentPolicyNumber}` : null;
+  }
+  return null;
+}
+
 function cartItemSubtitle(item: BatchCartItem): string {
-  if (item.kind === "installment") return `${item.companyName} · vence ${fmtDate(item.dueDate)}`;
-  if (item.kind === "policy_manual_payment") return `${item.companyName}${item.description ? ` · ${item.description}` : ""}`;
+  const hint = cartItemAccessoryHint(item) ?? "";
+  if (item.kind === "installment") return `${item.companyName} · vence ${fmtDate(item.dueDate)}${hint}`;
+  if (item.kind === "policy_manual_payment") return `${item.companyName}${item.description ? ` · ${item.description}` : ""}${hint}`;
   const company = item.manualCompany ? `Compañía: ${item.manualCompany}` : "Sin compañía";
   return `${company}${item.description ? ` · ${item.description}` : ""}`;
 }
@@ -280,7 +291,14 @@ export function PendingInstallmentsBatchTab() {
                         className={cn("border-b border-white/5 last:border-0", !state.addable && "opacity-40")}
                       >
                         <td className="px-3 py-2.5 text-white">{item.insuredName}</td>
-                        <td className="px-3 py-2.5 text-white/70 font-mono text-xs">{item.policyNumber}</td>
+                        <td className="px-3 py-2.5 text-white/70 font-mono text-xs">
+                          {item.policyNumber}
+                          {item.parentPolicyNumber && (
+                            <span className="block text-[10px] text-white/40 font-sans normal-case">
+                              Accesoria de póliza {item.parentPolicyNumber}
+                            </span>
+                          )}
+                        </td>
                         <td className="px-3 py-2.5 text-white/70">{item.companyName}</td>
                         <td className="px-3 py-2.5 text-white/50 font-mono text-xs">#{item.installmentNumber}</td>
                         <td className="px-3 py-2.5 text-white/70">{fmtDate(item.dueDate)}</td>

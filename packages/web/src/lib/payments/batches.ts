@@ -47,6 +47,7 @@
 // recalculateInstallmentPaymentStatus (no hay cuota que recalcular).
 
 import { isMultipleOfCent, isAllowedPaymentMethod, classifySplitGroup, type SplitGroup } from "./splits";
+import { isSurchargeAbsorbedByGroup } from "./policy-economic-group";
 
 export class PaymentBatchValidationError extends Error {}
 
@@ -209,6 +210,13 @@ export interface BatchItemContext {
   rendered: number | null; // 0 | 1
   policyStatus: string | null; // activa | vencida | cancelada | por_vencer — null si no hay póliza real
   isRivadavia: boolean;
+  // Grupo económico Rivadavia (ver policy-economic-group.ts) — policyType/
+  // parentPolicyId de la póliza REAL del ítem, null para manual_payment (sin
+  // póliza real detrás). Solo se usan para decidir si una accesoria de
+  // Accidentes de Pasajeros absorbe su recargo en el de la principal —
+  // nunca cambian amount/installmentId/payment hijo.
+  policyType: string | null;
+  parentPolicyId: number | null;
   description: string | null; // policy_manual_payment / manual_payment
   manualPayer: string | null; // solo manual_payment
   manualPolicyNumber: string | null; // solo manual_payment
@@ -348,22 +356,45 @@ export function resolveBatchSplitGroup(splits: NormalizedPaymentBatchSplit[]): S
 // ─── Pronto Pago ──────────────────────────────────────────────────────────────
 
 /**
- * $800 por cada ítem Rivadavia elegible — nunca por recibo ni por póliza.
- * Solo aplica si TODOS los medios del batch son del grupo "own" (mixed ya se
- * rechazó antes de llegar acá). `isRivadavia` es siempre false para
- * manual_payment (imputación libre, ver comentario de cabecera) — así que
- * esta función nunca les genera recargo, sin necesidad de un caso especial
- * acá: ya viene resuelto en el contexto. Devuelve los CONTEXTOS concretos
- * que generan recargo (no solo un id — un cobro manual no tiene
- * installmentId al que atarlo), para que el endpoint sepa a qué payment
- * hijo asociar cada cash_entry por identidad de objeto.
+ * $800 por cada GRUPO ECONÓMICO Rivadavia elegible — nunca por recibo ni por
+ * póliza suelta. Solo aplica si TODOS los medios del batch son del grupo
+ * "own" (mixed ya se rechazó antes de llegar acá). `isRivadavia` es siempre
+ * false para manual_payment (imputación libre, ver comentario de cabecera)
+ * — así que esta función nunca les genera recargo, sin necesidad de un caso
+ * especial acá: ya viene resuelto en el contexto.
+ *
+ * Grupo económico (ver policy-economic-group.ts): una póliza accesoria de
+ * Accidentes de Pasajeros cuyo parentPolicyId apunta a otra póliza presente
+ * en ESTE MISMO batch no genera su propio recargo — el de su principal ya
+ * cubre el grupo entero. Esto es estrictamente sobre el RECARGO: el
+ * importe base de la accesoria se sigue sumando igual, y sigue generando su
+ * propio payment hijo (ver POST /payment-batches) — acá solo se decide qué
+ * contextos entran en la lista que dispara un cash_entry de recargo.
+ *
+ * Dos o más cuotas de la MISMA póliza (sin relación de accesoria) siguen
+ * generando un recargo cada una — esa regla preexistente no cambia; el
+ * agrupamiento nuevo es exclusivamente para el vínculo principal/accesoria.
+ *
+ * Devuelve los CONTEXTOS concretos que generan recargo (no solo un id — un
+ * cobro manual no tiene installmentId al que atarlo), para que el endpoint
+ * sepa a qué payment hijo asociar cada cash_entry por identidad de objeto.
  */
 export function calculateApplicableRivadaviaSurcharges(
   items: BatchItemContext[],
   splitGroup: SplitGroup
 ): BatchItemContext[] {
   if (splitGroup !== "own") return [];
-  return items.filter((i) => i.isRivadavia);
+  const policyIdsInScope = new Set(
+    items.filter((i): i is BatchItemContext & { policyId: number } => i.policyId != null).map((i) => i.policyId)
+  );
+  return items.filter((i) => {
+    if (!i.isRivadavia) return false;
+    if (i.policyId == null) return true; // manual_payment: sin póliza real, sin cambios de comportamiento
+    return !isSurchargeAbsorbedByGroup(
+      { id: i.policyId, type: i.policyType ?? "", parentPolicyId: i.parentPolicyId },
+      policyIdsInScope
+    );
+  });
 }
 
 export const SURCHARGE_AMOUNT_CENTS = 80000; // $800, mismo monto fijo que Etapa 3B

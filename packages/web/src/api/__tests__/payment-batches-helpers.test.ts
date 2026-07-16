@@ -19,6 +19,7 @@ function ctx(overrides: Partial<BatchItemContext>): BatchItemContext {
   return {
     kind: "installment", installmentId: 1, policyId: 1, insuredId: 1, amount: 1000,
     installmentStatus: "pendiente", rendered: 0, policyStatus: "activa", isRivadavia: false,
+    policyType: null, parentPolicyId: null,
     description: null, manualPayer: null, manualPolicyNumber: null, manualCompany: null,
     ...overrides,
   } as BatchItemContext;
@@ -303,6 +304,66 @@ describe("calculateApplicableRivadaviaSurcharges", () => {
   });
   test("SURCHARGE_AMOUNT_CENTS es $800", () => {
     expect(SURCHARGE_AMOUNT_CENTS).toBe(80000);
+  });
+
+  // ─── Grupo económico Rivadavia + Accidentes de Pasajeros ──────────────────
+
+  test("A. Rivadavia principal sola → 1 recargo", () => {
+    const principal = ctx({ isRivadavia: true, installmentId: 1, policyId: 100, policyType: "automotor" });
+    const result = calculateApplicableRivadaviaSurcharges([principal], "own");
+    expect(result).toEqual([principal]);
+  });
+
+  test("B. principal + accesoria accidentes_pasajeros (parentPolicyId presente en el batch) → 1 solo recargo total", () => {
+    const principal = ctx({ isRivadavia: true, installmentId: 1, policyId: 100, policyType: "automotor" });
+    const accesoria = ctx({
+      isRivadavia: true, installmentId: 2, policyId: 200,
+      policyType: "accidentes_pasajeros", parentPolicyId: 100,
+    });
+    const result = calculateApplicableRivadaviaSurcharges([principal, accesoria], "own");
+    expect(result).toEqual([principal]);
+    expect(result.length).toBe(1);
+  });
+
+  test("C. dos pólizas Rivadavia independientes → 2 recargos", () => {
+    const p1 = ctx({ isRivadavia: true, installmentId: 1, policyId: 100, policyType: "automotor" });
+    const p2 = ctx({ isRivadavia: true, installmentId: 2, policyId: 300, policyType: "automotor" });
+    const result = calculateApplicableRivadaviaSurcharges([p1, p2], "own");
+    expect(result).toEqual([p1, p2]);
+  });
+
+  test("D. accesoria SIN parentPolicyId → no agrupa, genera su propio recargo", () => {
+    const accesoria = ctx({
+      isRivadavia: true, installmentId: 1, policyId: 200,
+      policyType: "accidentes_pasajeros", parentPolicyId: null,
+    });
+    const result = calculateApplicableRivadaviaSurcharges([accesoria], "own");
+    expect(result).toEqual([accesoria]);
+  });
+
+  test("D. accesoria cuyo parentPolicyId NO está en el batch → no agrupa, genera su propio recargo", () => {
+    const accesoria = ctx({
+      isRivadavia: true, installmentId: 1, policyId: 200,
+      policyType: "accidentes_pasajeros", parentPolicyId: 999, // 999 no está entre los items de este batch
+    });
+    const result = calculateApplicableRivadaviaSurcharges([accesoria], "own");
+    expect(result).toEqual([accesoria]);
+  });
+
+  test("dos cuotas de la MISMA póliza principal (sin accesoria) siguen generando 2 recargos — no se agrupa por póliza sola", () => {
+    const cuota1 = ctx({ isRivadavia: true, installmentId: 1, policyId: 100, policyType: "automotor" });
+    const cuota2 = ctx({ isRivadavia: true, installmentId: 2, policyId: 100, policyType: "automotor" });
+    const result = calculateApplicableRivadaviaSurcharges([cuota1, cuota2], "own");
+    expect(result).toEqual([cuota1, cuota2]);
+  });
+
+  test("otras compañías (isRivadavia=false) no generan recargo aunque tengan type/parentPolicyId de accesoria", () => {
+    const noRivadavia = ctx({
+      isRivadavia: false, installmentId: 1, policyId: 200,
+      policyType: "accidentes_pasajeros", parentPolicyId: 100,
+    });
+    const result = calculateApplicableRivadaviaSurcharges([noRivadavia], "own");
+    expect(result).toEqual([]);
   });
 });
 

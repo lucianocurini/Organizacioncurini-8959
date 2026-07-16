@@ -18,8 +18,9 @@ import {
 
 function pendingItem(overrides: Partial<PendingInstallmentForPayment> = {}): PendingInstallmentForPayment {
   return {
-    installmentId: 1, policyId: 10, policyNumber: "POL-1", insuredId: 100,
-    insuredName: "Juan Pérez", companyId: 200, companyName: "Compañía A",
+    installmentId: 1, policyId: 10, policyNumber: "POL-1",
+    policyType: "automotor", parentPolicyId: null, parentPolicyNumber: null,
+    insuredId: 100, insuredName: "Juan Pérez", companyId: 200, companyName: "Compañía A",
     installmentNumber: 1, dueDate: "2027-06-01", amount: 1000, status: "pendiente",
     rebillingId: null, ...overrides,
   };
@@ -27,8 +28,9 @@ function pendingItem(overrides: Partial<PendingInstallmentForPayment> = {}): Pen
 
 function installmentCartItem(overrides: Partial<Extract<BatchCartItem, { kind: "installment" }>> = {}): BatchCartItem {
   return {
-    kind: "installment", installmentId: 1, policyId: 10, policyNumber: "POL-1", insuredId: 100,
-    insuredName: "Juan Pérez", companyId: 200, companyName: "Compañía A",
+    kind: "installment", installmentId: 1, policyId: 10, policyNumber: "POL-1",
+    policyType: "automotor", parentPolicyId: null, parentPolicyNumber: null,
+    insuredId: 100, insuredName: "Juan Pérez", companyId: 200, companyName: "Compañía A",
     installmentNumber: 1, dueDate: "2027-06-01", amount: 1000, status: "pendiente",
     ...overrides,
   };
@@ -37,8 +39,9 @@ function installmentCartItem(overrides: Partial<Extract<BatchCartItem, { kind: "
 /** Cobro manual vinculado a una póliza real (source="policy_manual_payment"). */
 function policyManualCartItem(overrides: Partial<Extract<BatchCartItem, { kind: "policy_manual_payment" }>> = {}): BatchCartItem {
   return {
-    kind: "policy_manual_payment", localId: "manual-test-1", policyId: 20, policyNumber: "POL-2", insuredId: 100,
-    insuredName: "Juan Pérez", companyId: 200, companyName: "Compañía A",
+    kind: "policy_manual_payment", localId: "manual-test-1", policyId: 20, policyNumber: "POL-2",
+    policyType: "automotor", parentPolicyId: null, parentPolicyNumber: null,
+    insuredId: 100, insuredName: "Juan Pérez", companyId: 200, companyName: "Compañía A",
     amount: 500, description: "cuota faltante",
     ...overrides,
   };
@@ -373,6 +376,62 @@ describe("recargo Pronto Pago estimado", () => {
   test("calculateBatchTargetAmountCents sin splits cargados devuelve solo la base", () => {
     const cart = [installmentCartItem({ amount: 1000, companyName: "Rivadavia" })];
     expect(calculateBatchTargetAmountCents(cart, [])).toBe(100000);
+  });
+
+  // ─── Grupo económico Rivadavia + Accidentes de Pasajeros asociada ─────────
+  // Mismo criterio que calculateApplicableRivadaviaSurcharges del backend
+  // (src/lib/payments/batches.ts) — frontend y backend deben coincidir
+  // siempre en el conteo, ver policy-economic-group.ts (fuente única).
+
+  test("A. Rivadavia principal sola → $800", () => {
+    const cart = [installmentCartItem({ companyName: "Rivadavia", policyId: 100, policyType: "automotor" })];
+    expect(estimateProntoPagoSurchargeCents(cart)).toBe(SURCHARGE_AMOUNT_CENTS);
+  });
+
+  test("B. principal + accesoria accidentes_pasajeros vinculada (parentPolicyId en el cart) → $800, no $1600", () => {
+    // Mismo ejemplo del pedido: principal $78.171 + accesoria $1.300 → recargo único $800.
+    const cart = [
+      installmentCartItem({ amount: 78171, companyName: "Rivadavia", policyId: 100, policyType: "automotor" }),
+      installmentCartItem({
+        amount: 1300, companyName: "Rivadavia", policyId: 200,
+        policyType: "accidentes_pasajeros", parentPolicyId: 100, installmentId: 2,
+      }),
+    ];
+    expect(estimateProntoPagoSurchargeCents(cart)).toBe(SURCHARGE_AMOUNT_CENTS);
+    expect(calculateCartTotal(cart)).toBe(79471);
+  });
+
+  test("C. dos pólizas Rivadavia independientes → $1600", () => {
+    const cart = [
+      installmentCartItem({ companyName: "Rivadavia", policyId: 100, policyType: "automotor" }),
+      installmentCartItem({ companyName: "Rivadavia", policyId: 300, policyType: "automotor", installmentId: 2 }),
+    ];
+    expect(estimateProntoPagoSurchargeCents(cart)).toBe(SURCHARGE_AMOUNT_CENTS * 2);
+  });
+
+  test("D. accesoria sin parentPolicyId → no agrupa, cuenta su propio recargo", () => {
+    const cart = [installmentCartItem({
+      companyName: "Rivadavia", policyId: 200, policyType: "accidentes_pasajeros", parentPolicyId: null,
+    })];
+    expect(estimateProntoPagoSurchargeCents(cart)).toBe(SURCHARGE_AMOUNT_CENTS);
+  });
+
+  test("D. accesoria cuyo parentPolicyId no está en el cart → no agrupa, cuenta su propio recargo", () => {
+    const cart = [installmentCartItem({
+      companyName: "Rivadavia", policyId: 200, policyType: "accidentes_pasajeros", parentPolicyId: 999,
+    })];
+    expect(estimateProntoPagoSurchargeCents(cart)).toBe(SURCHARGE_AMOUNT_CENTS);
+  });
+
+  test("otras compañías (misma forma principal+accesoria) → $0", () => {
+    const cart = [
+      installmentCartItem({ companyName: "El Norte", policyId: 100, policyType: "automotor" }),
+      installmentCartItem({
+        companyName: "El Norte", policyId: 200, policyType: "accidentes_pasajeros",
+        parentPolicyId: 100, installmentId: 2,
+      }),
+    ];
+    expect(estimateProntoPagoSurchargeCents(cart)).toBe(0);
   });
 });
 

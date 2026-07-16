@@ -2106,6 +2106,8 @@ app.get("/installments/pending-for-payment", requireAuth(async (c: any) => {
     rebillingId: policyInstallments.rebillingId,
     policyId: policies.id,
     policyNumber: policies.policyNumber,
+    policyType: policies.type,
+    parentPolicyId: policies.parentPolicyId,
     insuredId: policies.insuredId,
     insuredName: insureds.name,
     companyId: companies.id,
@@ -2145,7 +2147,25 @@ app.get("/installments/pending-for-payment", requireAuth(async (c: any) => {
     a.installmentNumber - b.installmentNumber
   );
 
-  return c.json(rows, 200);
+  // parentPolicyNumber: solo para la pista visual "Accesoria de póliza X" en
+  // el carrito de Cobrar en lote (ver policy-economic-group.ts) — nunca se
+  // usa para decidir agrupación real (eso lo hace el backend con
+  // parentPolicyId/type, no con el número mostrado). Una sola consulta
+  // extra, no N+1, y se degrada a null sin romper nada si la principal no
+  // está en este listado (ej. ya no tiene cuotas pendientes).
+  const parentPolicyIds = [...new Set(rows.map((r) => r.parentPolicyId).filter((id): id is number => id != null))];
+  const parentNumberById = new Map<number, string>();
+  if (parentPolicyIds.length > 0) {
+    const parentRows = await db.select({ id: policies.id, policyNumber: policies.policyNumber })
+      .from(policies).where(inArray(policies.id, parentPolicyIds)).all();
+    for (const p of parentRows) parentNumberById.set(p.id, p.policyNumber);
+  }
+  const result = rows.map((r) => ({
+    ...r,
+    parentPolicyNumber: r.parentPolicyId != null ? (parentNumberById.get(r.parentPolicyId) ?? null) : null,
+  }));
+
+  return c.json(result, 200);
 }));
 
 // ─── PAYMENT BATCHES (Etapa 4A/4B + cobro manual real) ─────────────────────────
@@ -2291,6 +2311,8 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
     rendered: policyInstallments.rendered,
     policyId: policies.id,
     policyNumber: policies.policyNumber,
+    policyType: policies.type,
+    parentPolicyId: policies.parentPolicyId,
     policyStatus: policies.status,
     insuredId: policies.insuredId,
     insuredName: insureds.name,
@@ -2318,6 +2340,8 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
   const policyManualRows = policyManualIds.length > 0 ? await db.select({
     policyId: policies.id,
     policyNumber: policies.policyNumber,
+    policyType: policies.type,
+    parentPolicyId: policies.parentPolicyId,
     policyStatus: policies.status,
     insuredId: policies.insuredId,
     insuredName: insureds.name,
@@ -2351,6 +2375,8 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
       rendered: r.rendered,
       policyStatus: r.policyStatus,
       isRivadavia: (r.companyName ?? "").toLowerCase().includes("rivadavia"),
+      policyType: r.policyType,
+      parentPolicyId: r.parentPolicyId,
       description: null,
       manualPayer: null, manualPolicyNumber: null, manualCompany: null,
     };
@@ -2368,6 +2394,8 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
       rendered: null,
       policyStatus: r.policyStatus,
       isRivadavia: (r.companyName ?? "").toLowerCase().includes("rivadavia"),
+      policyType: r.policyType,
+      parentPolicyId: r.parentPolicyId,
       description: item.description,
       manualPayer: null, manualPolicyNumber: null, manualCompany: null,
     };
@@ -2391,6 +2419,8 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
       rendered: null,
       policyStatus: null,
       isRivadavia: false,
+      policyType: null,
+      parentPolicyId: null,
       description: item.description,
       manualPayer: item.manualPayer, manualPolicyNumber: item.manualPolicyNumber, manualCompany: item.manualCompany,
     };
