@@ -419,7 +419,13 @@ export default function PolizaDetail() {
             <div className="border-t border-[#1f2937] my-2" />
             <InfoRow label="Período" value={
               p.vigencyPeriod === "semestral" ? "Semestral (6 meses)" :
-              p.vigencyPeriod === "cuatrimestral" ? "Cuatrimestral (4 meses)" : "Anual"
+              p.vigencyPeriod === "cuatrimestral" ? "Cuatrimestral (4 meses)" :
+              // "mensual" nunca es un período de vigencia contractual real —
+              // dato legacy de importación (casi siempre una refacturación
+              // mensual mal clasificada, ver resolveVigencyPeriod en
+              // index.ts) que se muestra tal cual para poder detectarlo,
+              // nunca reetiquetado silenciosamente como "Anual".
+              p.vigencyPeriod === "mensual" ? "Mensual — revisar" : "Anual"
             } />
             <InfoRow label="Vigencia desde" value={formatDate(p.startDate)} />
             <InfoRow label="Vigencia hasta" value={formatDate(p.endDate)} />

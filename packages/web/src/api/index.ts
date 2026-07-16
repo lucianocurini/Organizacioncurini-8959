@@ -837,8 +837,18 @@ app.post("/policies", requireAuth(async (c: any) => {
   else if (!["mensual", "trimestral", "cuatrimestral", "semestral"].includes(body.billingCycle))
     return c.json({ error: `Frecuencia de refacturación inválida: "${body.billingCycle}"` }, 400);
   // Normalize and validate vigencyPeriod
+  // "mensual" NUNCA es una vigencia contractual normal (no hay pólizas de
+  // vigencia real de 1 mes) — es tolerancia LEGACY únicamente: 15 pólizas
+  // de dev.db ya quedaron así por un bug del importador de Mercantil Andina
+  // (resolveVigencyPeriod más abajo confundía "período importado de 1 mes" =
+  // refacturación mensual con "vigencia de 1 mes"). Se acepta acá solo para
+  // que esas pólizas ya existentes se puedan seguir editando/guardando (el
+  // <select> de PolicyModal.tsx deliberadamente NO ofrece "mensual" como
+  // opción — ver aviso "Vigencia mensual detectada" en el modal). El caso
+  // correcto de "la compañía refactura mes a mes" es vigencyPeriod="anual" +
+  // billingCycle="mensual", nunca vigencyPeriod="mensual".
   if (!body.vigencyPeriod) body.vigencyPeriod = null;
-  else if (!["anual", "semestral", "cuatrimestral"].includes(body.vigencyPeriod))
+  else if (!["anual", "semestral", "cuatrimestral", "mensual"].includes(body.vigencyPeriod))
     return c.json({ error: `Período de vigencia inválido: "${body.vigencyPeriod}"` }, 400);
   // Normalize and validate nextRebillingDate: nullable, fecha real, nunca texto arbitrario.
   if (!body.nextRebillingDate) body.nextRebillingDate = null;
@@ -883,10 +893,11 @@ app.put("/policies/:id", requireAuth(async (c: any) => {
     else if (!["mensual", "trimestral", "cuatrimestral", "semestral"].includes(body.billingCycle))
       return c.json({ error: `Frecuencia de refacturación inválida: "${body.billingCycle}"` }, 400);
   }
-  // Normalize and validate vigencyPeriod
+  // Normalize and validate vigencyPeriod (ver comentario en POST /policies —
+  // "mensual" es un valor real que produce el importador de Mercantil Andina).
   if ("vigencyPeriod" in body) {
     if (!body.vigencyPeriod) body.vigencyPeriod = null;
-    else if (!["anual", "semestral", "cuatrimestral"].includes(body.vigencyPeriod))
+    else if (!["anual", "semestral", "cuatrimestral", "mensual"].includes(body.vigencyPeriod))
       return c.json({ error: `Período de vigencia inválido: "${body.vigencyPeriod}"` }, 400);
   }
   // Normalize and validate nextRebillingDate — solo si se envía (edición parcial no la toca).

@@ -44,7 +44,7 @@ export const policies = sqliteTable("policies", {
   deductible: real("deductible"), // franquicia
   billingCycle: text("billing_cycle"), // refacturación: mensual | trimestral | cuatrimestral | semestral
   installments: integer("installments"), // cantidad de cuotas
-  vigencyPeriod: text("vigency_period"), // anual | semestral | cuatrimestral
+  vigencyPeriod: text("vigency_period"), // anual | semestral | cuatrimestral | mensual
   paymentMethod: text("payment_method"), // manual | cbu | tarjeta_credito
   startDate: text("start_date").notNull(),
   endDate: text("end_date").notNull(),

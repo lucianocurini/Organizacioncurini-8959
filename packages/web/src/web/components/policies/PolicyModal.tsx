@@ -45,6 +45,10 @@ const EMPTY_VEHICLE: FleetVehicle = {
 // Default installment count by vigency period — solo una sugerencia inicial,
 // editable (ver "Cantidad de cuotas" en el form); nunca se usa como entrada
 // silenciosa del cálculo real, que corre siempre por buildInstallmentPlan.
+// "mensual" deliberadamente NO tiene entrada acá — no es un período de
+// vigencia normal seleccionable (ver <select> de Período más abajo); solo
+// puede aparecer en pólizas legacy ya importadas (ver aviso "Vigencia
+// mensual detectada").
 const VIGENCY_DEFAULT_COUNT: Record<string, number> = { anual: 12, semestral: 6, cuatrimestral: 4 };
 
 // Plan de cuotas mensuales para el alta de una póliza nueva. El período
@@ -188,10 +192,17 @@ interface Props {
   onSaved: () => void;
 }
 
-// Auto-calculate end date from start + vigency period
+// Auto-calculate end date from start + vigency period.
+// "mensual" no es una opción normal del <select> de Período (ver más abajo)
+// — esta rama existe solo para que una póliza LEGACY que ya tiene
+// vigencyPeriod="mensual" (dato de importación, ver resolveVigencyPeriod en
+// index.ts) siga recalculando bien su endDate si el usuario edita startDate
+// sin haber cambiado el período — nunca se llega acá eligiendo "Mensual"
+// desde el selector, porque esa opción no existe.
 function calcEndDate(start: string, period: string): string {
   if (!start || !period || period === "anual") return "";
   const d = new Date(start);
+  if (period === "mensual") d.setMonth(d.getMonth() + 1);
   if (period === "cuatrimestral") d.setMonth(d.getMonth() + 4);
   if (period === "semestral") d.setMonth(d.getMonth() + 6);
   d.setDate(d.getDate() - 1);
@@ -849,9 +860,15 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
                 <input className={inputClass} type="date" value={form.endDate} onChange={e => set("endDate", e.target.value)} required />
               </div>
             </div>
-            {form.vigencyPeriod !== "anual" && (
+            {(form.vigencyPeriod === "semestral" || form.vigencyPeriod === "cuatrimestral") && (
               <p className="text-xs text-blue-400">
                 La fecha de fin se calculó automáticamente según el período seleccionado.
+              </p>
+            )}
+            {form.vigencyPeriod === "mensual" && (
+              <p className="text-xs text-amber-400">
+                Vigencia mensual detectada. Revisar si corresponde refacturación mensual
+                (billingCycle="mensual" con vigencia anual), no una vigencia contractual de 1 mes.
               </p>
             )}
             <div className="grid grid-cols-3 gap-3">
