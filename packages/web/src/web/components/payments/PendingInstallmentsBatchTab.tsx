@@ -5,7 +5,7 @@ import {
   Search, Loader2, X, Plus, Trash2, ReceiptText, Layers, RefreshCw, Info, ChevronDown, ShoppingCart, FileEdit, Users,
   Pencil, Ban, AlertTriangle,
 } from "lucide-react";
-import { cn, formatCurrency } from "@/lib/utils";
+import { cn, formatCurrency, formatCurrencyCents } from "@/lib/utils";
 import {
   type PendingInstallmentForPayment, type BatchSplitFormRow, type PaymentBatchSummary,
   type PaymentBatchDetail, type BatchCartItem, type ManualPaymentFormState,
@@ -750,7 +750,7 @@ function BatchPaymentModal({
                 )}
                 <tr>
                   <td colSpan={3} className="px-3 py-2 text-white font-semibold">Total a cobrar</td>
-                  <td className="px-3 py-2 text-right text-white font-mono font-semibold">{formatCurrency(targetCents / 100)}</td>
+                  <td className="px-3 py-2 text-right text-white font-mono font-semibold">{formatCurrencyCents(targetCents)}</td>
                 </tr>
               </tfoot>
             </table>
@@ -810,9 +810,9 @@ function BatchPaymentModal({
 
             {/* Totales */}
             <div className="mt-3 flex items-center justify-between text-xs">
-              <span className="text-white/40">Distribuido: {formatCurrency(totals.distributedCents / 100)}</span>
+              <span className="text-white/40">Distribuido: {formatCurrencyCents(totals.distributedCents)}</span>
               {totals.diferenciaCents !== 0 && totals.diferenciaCents != null && (
-                <span className="text-amber-400">Diferencia: {formatCurrency(totals.diferenciaCents / 100)}</span>
+                <span className="text-amber-400">Diferencia: {formatCurrencyCents(totals.diferenciaCents)}</span>
               )}
             </div>
             {validation.errorMessage && (

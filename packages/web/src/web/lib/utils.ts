@@ -10,6 +10,20 @@ export function formatCurrency(value: number | null | undefined): string {
   return new Intl.NumberFormat("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 }).format(value);
 }
 
+/**
+ * Variante de formatCurrency que SIEMPRE muestra los dos decimales reales, a
+ * partir de un importe en CENTAVOS enteros (no pesos) — evita el redondeo a
+ * peso entero de formatCurrency, que en el editor de medios de pago (splits)
+ * ocultaba diferencias reales de centavos (ej. "-$0" en vez de "-$0,06").
+ * Usar solo donde el usuario necesita ver/comparar el importe exacto
+ * (Cobrar en lote, Imputar pago individual) — en el resto de la app
+ * (dashboards, reportes) formatCurrency sigue siendo el helper correcto.
+ */
+export function formatCurrencyCents(cents: number | null | undefined): string {
+  if (cents == null) return "—";
+  return new Intl.NumberFormat("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(cents / 100);
+}
+
 export function formatDate(dateStr: string | null | undefined): string {
   if (!dateStr) return "—";
   const [y, m, d] = dateStr.split("-");

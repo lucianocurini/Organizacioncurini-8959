@@ -9,7 +9,7 @@ import {
   ClipboardList, AlertCircle, ChevronRight, ReceiptText, Building2, Check, ShoppingCart, Save, Layers, Ban
 } from "lucide-react";
 import { PendingInstallmentsBatchTab } from "@/components/payments/PendingInstallmentsBatchTab";
-import { cn, formatCurrency as _fc } from "@/lib/utils";
+import { cn, formatCurrency as _fc, formatCurrencyCents } from "@/lib/utils";
 import {
   splitsFromPayment, computeSplitTotals, groupSplitsByMethod,
   SINGLE_SPLIT_MISMATCH_MESSAGE, isImputarButtonDisabled,
@@ -522,18 +522,18 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
             {/* Totales / diferencia — todo en centavos, nunca suma directa de floats */}
             <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-400">
               <span>Total del cobro: <span className="text-white font-medium">
-                {splitTotals.totalCents != null ? formatCurrency(splitTotals.totalCents / 100) : "—"}
+                {splitTotals.totalCents != null ? formatCurrencyCents(splitTotals.totalCents) : "—"}
               </span></span>
               <span>Distribuido: <span className="text-white font-medium">
-                {formatCurrency(splitTotals.distributedCents / 100)}
+                {formatCurrencyCents(splitTotals.distributedCents)}
               </span></span>
               {splitsValidation.group !== "mixed" && splitTotals.diferenciaCents != null && splitTotals.diferenciaCents !== 0 && (
                 <span className={splitTotals.diferenciaCents > 0 ? "text-yellow-400" : "text-red-400"}>
                   {form.splits.length === 1
                     ? SINGLE_SPLIT_MISMATCH_MESSAGE
                     : splitTotals.diferenciaCents > 0
-                      ? `Faltan distribuir ${formatCurrency(splitTotals.diferenciaCents / 100)}`
-                      : `Se excede por ${formatCurrency(Math.abs(splitTotals.diferenciaCents) / 100)}`}
+                      ? `Faltan distribuir ${formatCurrencyCents(splitTotals.diferenciaCents)}`
+                      : `Se excede por ${formatCurrencyCents(Math.abs(splitTotals.diferenciaCents))}`}
                 </span>
               )}
             </div>

@@ -1,5 +1,6 @@
 import { Trash2, Plus } from "lucide-react";
-import type { BatchSplitFormRow, CheckFormRow } from "@/lib/payment-batch-form";
+import { type BatchSplitFormRow, type CheckFormRow, amountStringToCentsStrict } from "@/lib/payment-batch-form";
+import { formatCurrencyCents } from "@/lib/utils";
 
 // Subformulario de cheques (uno o varios) para un split method="cheque" —
 // extraído de PendingInstallmentsBatchTab.tsx (Cobrar en lote) para
@@ -15,8 +16,20 @@ export function CheckSubForm({
   onRemove: (checkUid: string) => void;
   onUpdate: (checkUid: string, patch: Partial<Omit<CheckFormRow, "uid">>) => void;
 }) {
+  // split.amount es el importe objetivo de ESTE split (con un único medio en
+  // el lote/pago, ya viene sincronizado al total real, centavos incluidos —
+  // ver syncSingleBatchSplitAmount). El campo de importe de arriba puede
+  // mostrarlo redondeado a peso en otros lugares de la pantalla; acá se
+  // repite con los centavos reales para que el usuario no tenga que
+  // adivinar/copiar un valor redondeado al cargar cada cheque.
+  const targetCents = amountStringToCentsStrict(split.amount);
   return (
     <div className="pl-3 border-l-2 border-yellow-500/30 space-y-2">
+      {targetCents != null && (
+        <p className="text-[11px] text-yellow-300/80">
+          El importe total de cheques debe ser exactamente {formatCurrencyCents(targetCents)}.
+        </p>
+      )}
       {split.checks.map((chk, idx) => (
         <div key={chk.uid} className="bg-black/20 rounded-lg p-2 space-y-1.5">
           <div className="flex items-center justify-between">

@@ -7,7 +7,7 @@ import {
   estimateProntoPagoSurchargeCents, calculateBatchTargetAmountCents,
   createBatchSplitRow, addBatchSplitRow, removeBatchSplitRow, updateBatchSplitRow,
   syncSingleBatchSplitAmount, addCheckToSplit, removeCheckFromSplit, updateCheckInSplit,
-  validateBatchSplitsForm, validateCheckRow, sumCheckRowsCents,
+  validateBatchSplitsForm, validateCheckRow, sumCheckRowsCents, amountStringToCentsStrict,
   isBatchSubmitDisabled, buildPaymentBatchPayload, normalizeBatchSubmitError,
   isManualBatchDetailItem, isFreeformManualBatchDetailItem, describeBatchDetailItem, batchDetailItemInsuredLabel,
   describeBatchCancelImpact, canShowCancelButton, canShowEditButton, isCancelConfirmationValid, buildBatchCancelPayload,
@@ -919,6 +919,64 @@ describe("updateSplitMethodPreservingChecks", () => {
     const b = createBatchSplitRow("transferencia", "500");
     const updated = updateSplitMethodPreservingChecks([a, b], a.uid, "cheque");
     expect(updated[1]).toEqual(b);
+  });
+});
+
+// ─── Caso reportado — cheque + efectivo con centavos reales ─────────────────
+// Total real $249.911,94 (24991194 centavos): cheque $249.900 + efectivo $12
+// suman $249.912 en pesos enteros, pero faltan/sobran 6 centavos reales. La
+// validación siempre operó en centavos (no cambia acá) — estos tests
+// reproducen el escenario exacto reportado para dejar constancia de que la
+// suma en centavos ya bloqueaba correctamente; el bug real era de display
+// (ver utils.test.ts, formatCurrencyCents).
+
+describe("validateBatchSplitsForm — caso reportado: cheque + efectivo con centavos reales", () => {
+  function chequeMasEfectivo(efectivoAmount: string): BatchSplitFormRow[] {
+    let splits: BatchSplitFormRow[] = [
+      createBatchSplitRow("cheque", "249900"),
+      createBatchSplitRow("efectivo", efectivoAmount),
+    ];
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    splits = updateCheckInSplit(splits, splits[0]!.uid, splits[0]!.checks[0]!.uid, {
+      checkNumber: "1", bankName: "Nación", dueDate: "2027-06-01", amount: "249900",
+    });
+    return splits;
+  }
+
+  test("cheque $249.900 + efectivo $12 contra objetivo $249.911,94 → inválido, sobran $0,06 (no debe poder confirmarse)", () => {
+    const result = validateBatchSplitsForm(24991194, chequeMasEfectivo("12"));
+    expect(result.valid).toBe(false);
+    expect(result.errorMessage).toContain("Se excede");
+  });
+
+  test("ajustando el efectivo a $11,94 el total cierra exacto en centavos → válido (sí puede confirmarse)", () => {
+    const result = validateBatchSplitsForm(24991194, chequeMasEfectivo("11.94"));
+    expect(result.valid).toBe(true);
+  });
+
+  test("efectivo insuficiente ($11,93) sigue bloqueado por 1 centavo real de diferencia", () => {
+    const result = validateBatchSplitsForm(24991194, chequeMasEfectivo("11.93"));
+    expect(result.valid).toBe(false);
+    expect(result.errorMessage).toContain("Faltan distribuir");
+  });
+});
+
+describe("hint de CheckSubForm — importe objetivo del split con centavos reales", () => {
+  test("cheque como único medio: split.amount sincronizado al total conserva los centavos exactos", () => {
+    const cart = [installmentCartItem({ amount: 249911.94 })];
+    const target = calculateBatchTargetAmountCents(cart, [createBatchSplitRow("cheque")]);
+    const synced = syncSingleBatchSplitAmount([createBatchSplitRow("cheque")], String(target / 100));
+    // Mismo cálculo que usa CheckSubForm para el hint "El importe total de
+    // cheques debe ser exactamente $X" — nunca redondeado a peso entero.
+    expect(amountStringToCentsStrict(synced[0]!.amount)).toBe(24991194);
+  });
+
+  test("split cheque combinado con otro medio: el hint usa el importe de ESE split, no el total del lote", () => {
+    let splits: BatchSplitFormRow[] = [
+      createBatchSplitRow("cheque", "249900"),
+      createBatchSplitRow("efectivo", "12.06"),
+    ];
+    expect(amountStringToCentsStrict(splits[0]!.amount)).toBe(24990000);
   });
 });
 
