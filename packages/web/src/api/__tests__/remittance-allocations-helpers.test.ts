@@ -6,8 +6,8 @@
 import { test, expect, describe } from "bun:test";
 import {
   resolveStandalonePaymentInstruments, resolveBatchInstruments, resolveCashEntryInstrument,
-  buildRemittanceAllocations, validateAllocationOwnership, validateAllocationTotals,
-  calculateExpectedCollectedCents, classifyRemittanceAllocationState, assertCompletePaymentBatches,
+  resolveBatchChildPaymentInstrument, buildRemittanceAllocations, validateAllocationOwnership, validateAllocationTotals,
+  calculateExpectedCollectedCents, classifyRemittanceAllocationState,
   RemittanceAllocationValidationError,
 } from "../../lib/payments/remittance-allocations";
 
@@ -109,6 +109,32 @@ describe("resolveCashEntryInstrument", () => {
   });
 });
 
+// ─── Migración 0029 — rendición por cuota de un hijo de batch ──────────────
+// A diferencia de resolveBatchInstruments (arrastra TODO el instrumento de
+// cobranza del batch), este instrumento representa la SALIDA de un único
+// payment hijo, independiente de sus hermanos — nunca referencia
+// payment_batch_split_id/received_check_id.
+
+describe("resolveBatchChildPaymentInstrument", () => {
+  test("produce un único instrumento atado al payment puntual, con paymentBatchId solo informativo", () => {
+    const instrument = resolveBatchChildPaymentInstrument({
+      remittanceItemId: 30, paymentId: 55, paymentBatchId: 7, method: "transferencia", amountCents: 60000,
+    });
+    expect(instrument).toEqual({
+      kind: "batch_child_payment", remittanceItemId: 30, paymentId: 55, paymentBatchId: 7,
+      method: "transferencia", amountCents: 60000,
+    });
+  });
+
+  test("dos hijos del mismo batch producen instrumentos independientes (métodos e importes propios)", () => {
+    const a = resolveBatchChildPaymentInstrument({ remittanceItemId: 1, paymentId: 10, paymentBatchId: 7, method: "efectivo", amountCents: 30000 });
+    const b = resolveBatchChildPaymentInstrument({ remittanceItemId: 2, paymentId: 11, paymentBatchId: 7, method: "cheque", amountCents: 40000 });
+    expect(a.paymentBatchId).toBe(b.paymentBatchId); // mismo lote de origen
+    expect(a.paymentId).not.toBe(b.paymentId);
+    expect(a.method).not.toBe(b.method);
+  });
+});
+
 describe("buildRemittanceAllocations", () => {
   test("traduce cada tipo de instrumento a su AllocationDraft correspondiente", () => {
     const drafts = buildRemittanceAllocations([
@@ -116,13 +142,26 @@ describe("buildRemittanceAllocations", () => {
       { kind: "batch_split", paymentBatchId: 4, paymentBatchSplitId: 5, method: "transferencia", amountCents: 2000 },
       { kind: "batch_split_check", paymentBatchId: 4, paymentBatchSplitId: 6, receivedCheckId: 7, amountCents: 3000 },
       { kind: "cash_entry", remittanceItemId: 8, cashEntryId: 9, method: "efectivo", amountCents: 4000 },
+      { kind: "batch_child_payment", remittanceItemId: 10, paymentId: 11, paymentBatchId: 12, method: "cheque", amountCents: 5000 },
     ]);
     expect(drafts).toEqual([
       { remittanceItemId: 1, paymentId: 2, paymentSplitId: 3, paymentBatchId: null, paymentBatchSplitId: null, receivedCheckId: null, cashEntryId: null, method: "efectivo", amountCents: 1000 },
       { remittanceItemId: null, paymentId: null, paymentSplitId: null, paymentBatchId: 4, paymentBatchSplitId: 5, receivedCheckId: null, cashEntryId: null, method: "transferencia", amountCents: 2000 },
       { remittanceItemId: null, paymentId: null, paymentSplitId: null, paymentBatchId: 4, paymentBatchSplitId: 6, receivedCheckId: 7, cashEntryId: null, method: "cheque", amountCents: 3000 },
       { remittanceItemId: 8, paymentId: null, paymentSplitId: null, paymentBatchId: null, paymentBatchSplitId: null, receivedCheckId: null, cashEntryId: 9, method: "efectivo", amountCents: 4000 },
+      { remittanceItemId: 10, paymentId: 11, paymentSplitId: null, paymentBatchId: 12, paymentBatchSplitId: null, receivedCheckId: null, cashEntryId: null, method: "cheque", amountCents: 5000 },
     ]);
+  });
+
+  test("batch_child_payment nunca incluye paymentSplitId/paymentBatchSplitId/receivedCheckId — no consume el instrumento de cobranza", () => {
+    const [draft] = buildRemittanceAllocations([
+      { kind: "batch_child_payment", remittanceItemId: 1, paymentId: 2, paymentBatchId: 3, method: "efectivo", amountCents: 1000 },
+    ]);
+    expect(draft!.paymentSplitId).toBeNull();
+    expect(draft!.paymentBatchSplitId).toBeNull();
+    expect(draft!.receivedCheckId).toBeNull();
+    expect(draft!.paymentId).toBe(2);
+    expect(draft!.paymentBatchId).toBe(3); // denormalizado, solo trazabilidad
   });
 });
 
@@ -189,57 +228,34 @@ describe("validateAllocationTotals / calculateExpectedCollectedCents", () => {
     const result = validateAllocationTotals([{ amountCents: allocationsSum }], expected);
     expect(result.valid).toBe(true);
   });
-});
 
-describe("assertCompletePaymentBatches", () => {
-  test("no lanza cuando todos los hijos pendientes cobrables están incluidos", () => {
-    expect(() => assertCompletePaymentBatches({
-      batchId: 1,
-      siblings: [
-        { id: 10, status: "confirmado", rendered: 0 },
-        { id: 11, status: "confirmado", rendered: 0 },
-      ],
-      includedPaymentIds: new Set([10, 11]),
-    })).not.toThrow();
+  // ─── Migración 0029 — rendición por cuota ──────────────────────────────
+  // A diferencia de "batch" (se cuenta el batch entero una sola vez, arriba),
+  // cada hijo rendido por separado aporta SOLO su propio importe — nunca el
+  // total del batch — y ninguna referencia al instrumento de cobranza
+  // original entra en la cuenta esperada.
+
+  test("hijo de batch rendido por separado: aporta solo su propio importe, no el total del batch", () => {
+    const expected = calculateExpectedCollectedCents([{ kind: "batch_child_payment", amountCents: 60000 }]);
+    expect(expected).toBe(60000);
+    const result = validateAllocationTotals([{ amountCents: 60000 }], expected);
+    expect(result.valid).toBe(true);
   });
 
-  test("rechaza si falta un hijo pendiente cobrable", () => {
-    expect(() => assertCompletePaymentBatches({
-      batchId: 1,
-      siblings: [
-        { id: 10, status: "confirmado", rendered: 0 },
-        { id: 11, status: "confirmado", rendered: 0 },
-      ],
-      includedPaymentIds: new Set([10]),
-    })).toThrow(/debe rendirse completo/);
+  test("dos hijos del mismo batch rendidos juntos: se suman sus propios importes, no se duplica el batch", () => {
+    const expected = calculateExpectedCollectedCents([
+      { kind: "batch_child_payment", amountCents: 60000 },
+      { kind: "batch_child_payment", amountCents: 40000 },
+    ]);
+    expect(expected).toBe(100000);
   });
 
-  test("ignora hijos anulados o ya rendidos al exigir completitud", () => {
-    expect(() => assertCompletePaymentBatches({
-      batchId: 1,
-      siblings: [
-        { id: 10, status: "confirmado", rendered: 0 },
-        { id: 11, status: "anulado", rendered: 0 },
-        { id: 12, status: "confirmado", rendered: 1 },
-      ],
-      includedPaymentIds: new Set([10]),
-    })).not.toThrow();
-  });
-
-  test("rechaza si se incluye un hijo anulado", () => {
-    expect(() => assertCompletePaymentBatches({
-      batchId: 1,
-      siblings: [{ id: 10, status: "anulado", rendered: 0 }],
-      includedPaymentIds: new Set([10]),
-    })).toThrow(/anulado/);
-  });
-
-  test("rechaza si se incluye un hijo ya rendido", () => {
-    expect(() => assertCompletePaymentBatches({
-      batchId: 1,
-      siblings: [{ id: 10, status: "confirmado", rendered: 1 }],
-      includedPaymentIds: new Set([10]),
-    })).toThrow(/ya rendido/);
+  test("hijo de batch + pago standalone en la misma rendición: se suman ambos", () => {
+    const expected = calculateExpectedCollectedCents([
+      { kind: "batch_child_payment", amountCents: 60000 },
+      { kind: "standalone_payment", amountCents: 25000 },
+    ]);
+    expect(expected).toBe(85000);
   });
 });
 

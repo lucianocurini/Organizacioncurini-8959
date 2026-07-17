@@ -3,7 +3,11 @@
 // rendicion-pending.ts.
 // Ejecutar con: bun test packages/web/src/web/lib/__tests__/rendicion-pending.test.ts
 import { describe, test, expect } from "bun:test";
-import { getPendingItemPaymentGroup } from "../rendicion-pending";
+import {
+  getPendingItemPaymentGroup, isBatchChildPendingPayment,
+  computeDefaultRendicionMethod, attachRendicionMethod,
+  getRendicionItemMethodLabel, RENDICION_METHOD_LABELS,
+} from "../rendicion-pending";
 
 // ─── 1/2. paymentGroup del backend tiene prioridad ───────────────────────────
 
@@ -132,5 +136,108 @@ describe("Caso 10 — un combinado directo sigue siendo un único remittanceItem
     expect(payloadItems.length).toBe(1);
     expect(payloadItems[0]!.amount).toBe(1000);
     expect(getPendingItemPaymentGroup(selectedItems[0]!)).toBe("direct_company");
+  });
+});
+
+// ─── 11. isBatchChildPendingPayment ────────────────────────────────────────────
+
+describe("Caso 11 — isBatchChildPendingPayment distingue hijo de lote de standalone", () => {
+  test("source='payment' con batchId → true", () => {
+    expect(isBatchChildPendingPayment({ source: "payment", batchId: 7 })).toBe(true);
+  });
+  test("source='payment' sin batchId (standalone) → false", () => {
+    expect(isBatchChildPendingPayment({ source: "payment", batchId: null })).toBe(false);
+    expect(isBatchChildPendingPayment({ source: "payment" })).toBe(false);
+  });
+  test("source='cash_entry' nunca es hijo de lote, aunque traiga batchId por error", () => {
+    expect(isBatchChildPendingPayment({ source: "cash_entry", batchId: 7 })).toBe(false);
+  });
+});
+
+// ─── 12. computeDefaultRendicionMethod ─────────────────────────────────────────
+
+describe("Caso 12 — default del selector 'Medio de rendición'", () => {
+  test("un único medio de cobro real compartido por todos los ítems → se usa ese", () => {
+    expect(computeDefaultRendicionMethod([{ paymentMethod: "efectivo" }, { paymentMethod: "efectivo" }])).toBe("efectivo");
+    expect(computeDefaultRendicionMethod([{ paymentMethod: "cheque" }])).toBe("cheque");
+  });
+  test("medios de cobro mezclados → default neutro 'efectivo', no adivina cuál usar", () => {
+    expect(computeDefaultRendicionMethod([{ paymentMethod: "efectivo" }, { paymentMethod: "transferencia" }])).toBe("efectivo");
+  });
+  test("solo 'lote' (hijos de batch, paymentMethod no es un medio real) → default neutro", () => {
+    expect(computeDefaultRendicionMethod([{ paymentMethod: "lote" }, { paymentMethod: "lote" }])).toBe("efectivo");
+  });
+  test("solo 'combinado' o sin paymentMethod (manual_debt) → default neutro", () => {
+    expect(computeDefaultRendicionMethod([{ paymentMethod: "combinado" }])).toBe("efectivo");
+    expect(computeDefaultRendicionMethod([{ paymentMethod: null }, {}])).toBe("efectivo");
+  });
+  test("sin ítems seleccionados → default neutro", () => {
+    expect(computeDefaultRendicionMethod([])).toBe("efectivo");
+  });
+});
+
+// ─── 13. attachRendicionMethod ─────────────────────────────────────────────────
+
+describe("Caso 13 — attachRendicionMethod nunca deja colar el medio de cobro original", () => {
+  test("todos los ítems salen con el medio de rendición elegido, sin importar su paymentMethod original", () => {
+    const items = [
+      { source: "payment", sourceId: 1, paymentMethod: "efectivo" }, // standalone cobrado en efectivo
+      { source: "payment", sourceId: 2, paymentMethod: "lote" },      // hijo de batch cobrado con cheque (paymentMethod="lote")
+      { source: "manual_debt", sourceId: null, paymentMethod: null },
+    ];
+    const result = attachRendicionMethod(items, "transferencia");
+    expect(result.every((i) => i.paymentMethod === "transferencia")).toBe(true);
+    expect(result.length).toBe(3);
+  });
+
+  test("no muta el array original", () => {
+    const items = [{ source: "payment", sourceId: 1, paymentMethod: "efectivo" }];
+    const result = attachRendicionMethod(items, "cheque");
+    expect(items[0]!.paymentMethod).toBe("efectivo");
+    expect(result[0]!.paymentMethod).toBe("cheque");
+  });
+});
+
+// ─── 14. getRendicionItemMethodLabel — bug de QA visual (2026-07) ─────────────
+//
+// El listado/detalle de Rendiciones mostraba "Transf. cuenta propia" para un
+// ítem rendido por transferencia — reusaba por error el mapa de labels del
+// contexto de COBRO (METHOD_LABELS en cobranzas.tsx), donde esa distinción
+// tiene sentido (separar de transferencia_compania/link_pago). En contexto
+// de RENDICIÓN, "transferencia" nunca debe sugerir "cuenta propia". El dato
+// (remittance_items.paymentMethod / remittance_allocations.method) siempre
+// fue correcto — era pura etiqueta.
+
+describe("Caso 14 — getRendicionItemMethodLabel nunca dice 'cuenta propia'", () => {
+  test("transferencia → 'Transferencia', no 'Transf. cuenta propia'", () => {
+    expect(getRendicionItemMethodLabel("transferencia")).toBe("Transferencia");
+    expect(getRendicionItemMethodLabel("transferencia")).not.toMatch(/cuenta propia/i);
+  });
+  test("efectivo → 'Efectivo'", () => {
+    expect(getRendicionItemMethodLabel("efectivo")).toBe("Efectivo");
+  });
+  test("cheque → 'Cheque'", () => {
+    expect(getRendicionItemMethodLabel("cheque")).toBe("Cheque");
+  });
+  test("transferencia_compania → menciona 'Compañía', no 'cuenta propia'", () => {
+    const label = getRendicionItemMethodLabel("transferencia_compania");
+    expect(label).toMatch(/Compañía/);
+    expect(label).not.toMatch(/cuenta propia/i);
+  });
+  test("link_pago → 'Link de Pago'", () => {
+    expect(getRendicionItemMethodLabel("link_pago")).toBe("Link de Pago");
+  });
+  test("valor no reconocido (legacy) cae al valor crudo, no revienta", () => {
+    expect(getRendicionItemMethodLabel("lote")).toBe("lote");
+    expect(getRendicionItemMethodLabel("combinado")).toBe("combinado");
+  });
+  test("null/undefined → '—'", () => {
+    expect(getRendicionItemMethodLabel(null)).toBe("—");
+    expect(getRendicionItemMethodLabel(undefined)).toBe("—");
+  });
+  test("ninguna etiqueta de RENDICION_METHOD_LABELS contiene 'cuenta propia'", () => {
+    for (const label of Object.values(RENDICION_METHOD_LABELS)) {
+      expect(label).not.toMatch(/cuenta propia/i);
+    }
   });
 });

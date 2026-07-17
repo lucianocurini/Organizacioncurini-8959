@@ -326,6 +326,32 @@ describe("GET /api/cash/summary — cartera pendiente", () => {
     }
   });
 
+  // Etapa "rendición por cuota" (Migración 0029) — mandatorio: un batch con
+  // un hijo ya rendido (a su compañía) y otro todavía no, YA NO es una
+  // inconsistencia: la porción pendiente sigue en cartera, la rendida sale.
+  test("batch parcialmente rendido — el hijo rendido sale de cartera, el pendiente queda, sin inconsistencia (cierra exacto)", async () => {
+    const before = (await getSummary()).body;
+    const { batchId, childIds } = await mkBatch({
+      baseAmountCents: 200000, splits: [{ method: "efectivo", amountCents: 200000 }], childrenCount: 2,
+    });
+    try {
+      // Un hijo ya fue rendido a su compañía (simulado directo, aislado del
+      // flujo de POST /remittances que ya se cubre en
+      // remittance-allocations-endpoints.test.ts) — el otro sigue pendiente.
+      await db.update(payments).set({ rendered: 1, renderedAt: new Date() }).where(eq(payments.id, childIds[0]!));
+
+      const after = (await getSummary()).body;
+      // Antes de esta etapa esto se excluía por completo (delta 0, reportado
+      // como inconsistencia). Ahora: la mitad todavía pendiente (1000 de los
+      // 2000 originales) sigue en cartera, sin inconsistencia.
+      expect(after.cartera.efectivo - before.cartera.efectivo).toBeCloseTo(1000, 2);
+      const newInconsistencies = (after.carteraInconsistencias as any[]).filter((i) => i.sourceId === batchId);
+      expect(newInconsistencies.length).toBe(0);
+    } finally {
+      await cleanupBatch(batchId);
+    }
+  });
+
   test("batch con cheque — usa received_checks, se suma una sola vez", async () => {
     const before = (await getSummary()).body;
     const { batchId } = await mkBatch({
@@ -537,7 +563,7 @@ describe("GET /api/cash/summary — rendido por método", () => {
     try {
       const res = await callPostRemittance({
         date: FIXTURE_DATE, canal: "directo", paymentBreakdown: { efectivo: 1000 },
-        items: childRows.map((c) => ({ source: "payment", sourceId: c.id, amount: c.amount, paymentMethod: "lote" })),
+        items: childRows.map((c) => ({ source: "payment", sourceId: c.id, amount: c.amount, paymentMethod: "efectivo" })),
       });
       expect(res.status).toBe(200);
       remId = res.body.id;

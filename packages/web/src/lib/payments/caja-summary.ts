@@ -132,12 +132,45 @@ export interface BatchChildForCartera {
   paymentId: number;
   status: string; // confirmado | pendiente | anulado
   rendered: number; // 0 | 1
+  // Etapa "rendición por cuota" (Migración 0029): payments.amount de ESTE
+  // hijo, en centavos — base del prorrateo cuando el batch queda con
+  // hijos rendered mixto (algunos ya rendidos, otros no). Antes de esta
+  // etapa un batch mixto era imposible (assertCompletePaymentBatches lo
+  // impedía) y este campo no hacía falta.
+  amountCents: number;
 }
 export interface BatchForCartera {
   batchId: number;
   status: string; // payment_batches.status: confirmado | anulado
   splits: ReadonlyArray<BatchSplitForCartera>;
   children: ReadonlyArray<BatchChildForCartera>;
+}
+
+/**
+ * Reparte totalCents en centavos ENTEROS entre weights, sin drift (método
+ * del resto mayor / Hamilton — floor de cada porción proporcional, y el
+ * remanente entero se asigna a quienes tienen el resto fraccionario más
+ * grande). Garantiza sum(resultado) === totalCents exacto. Usado solo para
+ * ESTIMAR/MOSTRAR cuánta plata de un batch parcialmente rendido sigue en la
+ * oficina, por método — nunca para decidir qué instrumento físico (cheque/
+ * transferencia) se le entrega a qué compañía, eso lo define cada rendición
+ * real con su propio instrumento de salida (ver Migración 0029).
+ */
+function apportionCents(totalCents: number, weights: ReadonlyArray<number>): number[] {
+  const sumWeights = weights.reduce((s, w) => s + w, 0);
+  if (sumWeights <= 0 || totalCents <= 0) return weights.map(() => 0);
+  const raw = weights.map((w) => (totalCents * w) / sumWeights);
+  const floors = raw.map((r) => Math.floor(r));
+  let remainder = totalCents - floors.reduce((s, f) => s + f, 0);
+  const order = raw
+    .map((r, i) => ({ i, frac: r - floors[i]! }))
+    .sort((a, b) => b.frac - a.frac);
+  const result = [...floors];
+  for (let k = 0; k < order.length && remainder > 0; k++) {
+    result[order[k]!.i]! += 1;
+    remainder--;
+  }
+  return result;
 }
 
 export function applyBatchToCartera(
@@ -151,18 +184,38 @@ export function applyBatchToCartera(
   const confirmedChildren = batch.children.filter((c) => c.status === "confirmado");
   if (confirmedChildren.length === 0) return; // sin hijos confirmados, nada que contar
 
-  const renderedStates = new Set(confirmedChildren.map((c) => c.rendered));
-  if (renderedStates.size > 1) {
-    inconsistencias.push({
-      sourceType: "batch",
-      sourceId: batch.batchId,
-      reason: `El cobro múltiple ${batch.batchId} tiene hijos confirmados con estado de rendición mixto — se excluye de los totales.`,
-    });
-    return;
-  }
-  if (renderedStates.has(1)) return; // ya rendido completo, no aporta a cartera pendiente
+  // Etapa "rendición por cuota": cobrar por lote no obliga a rendir el lote
+  // completo — un batch puede quedar con algunos hijos ya rendidos y otros
+  // no, sin que eso sea una inconsistencia. Los hijos ya rendidos salen de
+  // cartera pendiente; los que faltan rendir, siguen.
+  const pendingChildren = confirmedChildren.filter((c) => c.rendered === 0);
+  if (pendingChildren.length === 0) return; // todos los hijos confirmados ya fueron rendidos
 
-  for (const split of batch.splits) {
+  const totalChildrenAmountCents = confirmedChildren.reduce((s, c) => s + c.amountCents, 0);
+  const pendingChildrenAmountCents = pendingChildren.reduce((s, c) => s + c.amountCents, 0);
+  const allPending = totalChildrenAmountCents > 0 && pendingChildrenAmountCents === totalChildrenAmountCents;
+
+  // splitCentsToApply[i] = cuánto de CADA split del batch corresponde a la
+  // porción todavía pendiente de rendir. Caso común (nadie se rindió
+  // todavía): el split completo, mismo comportamiento exacto que antes de
+  // esta etapa. Caso mixto: se prorratea en proporción a cuánto de la base
+  // del batch (suma de payments.amount de sus hijos) sigue sin rendir —
+  // una sola operación de redondeo por batch (el total prorrateado), y
+  // apportionCents reparte ese total exacto entre los splits sin drift.
+  let splitCentsToApply: number[];
+  if (allPending) {
+    splitCentsToApply = batch.splits.map((s) => s.amountCents);
+  } else {
+    const totalReceivedCents = batch.splits.reduce((s, sp) => s + sp.amountCents, 0);
+    const pendingTargetCents = totalChildrenAmountCents > 0
+      ? Math.round((totalReceivedCents * pendingChildrenAmountCents) / totalChildrenAmountCents)
+      : 0;
+    splitCentsToApply = apportionCents(pendingTargetCents, batch.splits.map((s) => s.amountCents));
+  }
+
+  batch.splits.forEach((split, i) => {
+    const cents = splitCentsToApply[i]!;
+    if (cents <= 0) return;
     if (split.method === "cheque") {
       const checksSum = split.checks.reduce((s, c) => s + c.amountCents, 0);
       if (checksSum !== split.amountCents) {
@@ -173,15 +226,15 @@ export function applyBatchToCartera(
             `La suma de los cheques del cobro ${batch.batchId} ($${(checksSum / 100).toFixed(2)}) no coincide con el split ` +
             `cheque ($${(split.amountCents / 100).toFixed(2)}).`,
         });
-        continue; // no sumar este split parcialmente
+        return; // no sumar este split parcialmente
       }
-      addOwnMethodCents(cartera, "cheque", split.amountCents); // una sola vez, nunca además el split padre
+      addOwnMethodCents(cartera, "cheque", cents); // una sola vez, nunca además el split padre
     } else if (OWN_METHODS.has(split.method)) {
-      addOwnMethodCents(cartera, split.method, split.amountCents);
+      addOwnMethodCents(cartera, split.method, cents);
     } else if (DIRECT_COMPANY_METHODS.has(split.method)) {
-      addDirectCompanyCents(directoCompania, split.method, split.amountCents);
+      addDirectCompanyCents(directoCompania, split.method, cents);
     }
-  }
+  });
 }
 
 // D. Pronto Pago standalone — cash_entry pronto_pago_surcharge rendered=0

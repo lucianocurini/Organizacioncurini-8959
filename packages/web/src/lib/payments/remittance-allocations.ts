@@ -75,12 +75,32 @@ export interface ResolvedCashEntryInstrument {
   amountCents: number;
 }
 
+// Migración 0029 — rendición por cuota: un payment HIJO de un
+// payment_batches (batchId NOT NULL) rendido de forma INDEPENDIENTE de sus
+// hermanos. A diferencia de ResolvedBatchSplitInstrument/
+// ResolvedBatchCheckInstrument (que representan el instrumento de COBRANZA
+// del batch entero — payment_batch_splits/received_checks, pensado para
+// cuando el batch se rinde de una sola vez), este instrumento es el de
+// SALIDA propio de esta rendición: método/importe con el que Curini le paga
+// a la compañía por ESTA cuota puntual, desacoplado de cómo entró el dinero
+// originalmente. paymentBatchId es puramente denormalizado (trazabilidad de
+// "de qué lote vino") — nunca fuerza consumir su instrumento de cobranza.
+export interface ResolvedBatchChildPaymentInstrument {
+  kind: "batch_child_payment";
+  remittanceItemId: number;
+  paymentId: number;
+  paymentBatchId: number;
+  method: string;
+  amountCents: number;
+}
+
 export type ResolvedInstrument =
   | ResolvedPaymentSplitInstrument
   | ResolvedPaymentSplitCheckInstrument
   | ResolvedBatchSplitInstrument
   | ResolvedBatchCheckInstrument
-  | ResolvedCashEntryInstrument;
+  | ResolvedCashEntryInstrument
+  | ResolvedBatchChildPaymentInstrument;
 
 /**
  * Pago standalone (payments.batchId IS NULL). Siempre tiene >=1
@@ -228,6 +248,31 @@ export function resolveCashEntryInstrument(params: {
   };
 }
 
+/**
+ * Migración 0029 — payment hijo de batch rendido por su cuenta. No arrastra
+ * (ni lee) los payment_batch_splits/received_checks del batch: el instrumento
+ * acá es el de SALIDA de esta rendición puntual (method/amountCents), no el
+ * de cobranza. Validar que method sea un método contable real es
+ * responsabilidad del endpoint (evita un import circular con caja-summary.ts,
+ * que ya importa de este archivo).
+ */
+export function resolveBatchChildPaymentInstrument(params: {
+  remittanceItemId: number;
+  paymentId: number;
+  paymentBatchId: number;
+  method: string;
+  amountCents: number;
+}): ResolvedBatchChildPaymentInstrument {
+  return {
+    kind: "batch_child_payment",
+    remittanceItemId: params.remittanceItemId,
+    paymentId: params.paymentId,
+    paymentBatchId: params.paymentBatchId,
+    method: params.method,
+    amountCents: params.amountCents,
+  };
+}
+
 // ─── Construcción de allocations (paso B) ─────────────────────────────────────
 
 export interface AllocationDraft {
@@ -306,6 +351,18 @@ export function buildRemittanceAllocations(instruments: ReadonlyArray<ResolvedIn
           method: instrument.method,
           amountCents: instrument.amountCents,
         };
+      case "batch_child_payment":
+        return {
+          remittanceItemId: instrument.remittanceItemId,
+          paymentId: instrument.paymentId,
+          paymentSplitId: null,
+          paymentBatchId: instrument.paymentBatchId,
+          paymentBatchSplitId: null,
+          receivedCheckId: null,
+          cashEntryId: null,
+          method: instrument.method,
+          amountCents: instrument.amountCents,
+        };
     }
   });
 }
@@ -360,7 +417,7 @@ export function validateAllocationOwnership(
  * dinero ya está una vez en el totalReceivedCents del batch).
  */
 export interface CollectedAmountSource {
-  kind: "standalone_payment" | "batch" | "cash_entry";
+  kind: "standalone_payment" | "batch" | "cash_entry" | "batch_child_payment";
   amountCents: number;
 }
 
@@ -392,52 +449,6 @@ export function validateAllocationTotals(
     };
   }
   return { valid: true, errorMessage: null };
-}
-
-// ─── Batch completo o nada ─────────────────────────────────────────────────────
-
-export interface BatchSiblingPayment {
-  id: number;
-  status: string; // confirmado | pendiente | anulado
-  rendered: number; // 0 | 1
-}
-
-/**
- * Un cobro múltiple se rinde completo o no se rinde — nunca parcial. Rechaza
- * si algún pago INCLUIDO en este POST está anulado o ya rendido, y rechaza
- * si falta incluir algún hermano "pendiente cobrable" (confirmado, todavía
- * no rendido) del mismo batch. Las allocations del batch se construyen una
- * sola vez recién después de que esta validación pasa.
- */
-export function assertCompletePaymentBatches(params: {
-  batchId: number;
-  siblings: ReadonlyArray<BatchSiblingPayment>;
-  includedPaymentIds: ReadonlySet<number>;
-}): void {
-  const includedSiblings = params.siblings.filter((p) => params.includedPaymentIds.has(p.id));
-
-  const includedAnulado = includedSiblings.filter((p) => p.status === "anulado");
-  if (includedAnulado.length > 0) {
-    throw new RemittanceAllocationValidationError(
-      `El cobro múltiple ${params.batchId} tiene pago(s) anulado(s) entre los incluidos: ${includedAnulado.map((p) => p.id).join(", ")}. No se puede rendir un pago anulado.`
-    );
-  }
-
-  const includedAlreadyRendered = includedSiblings.filter((p) => p.rendered === 1);
-  if (includedAlreadyRendered.length > 0) {
-    throw new RemittanceAllocationValidationError(
-      `El cobro múltiple ${params.batchId} tiene pago(s) ya rendido(s) entre los incluidos: ${includedAlreadyRendered.map((p) => p.id).join(", ")}.`
-    );
-  }
-
-  const pendingCollectible = params.siblings.filter((p) => p.status === "confirmado" && p.rendered === 0);
-  const missing = pendingCollectible.filter((p) => !params.includedPaymentIds.has(p.id));
-  if (missing.length > 0) {
-    throw new RemittanceAllocationValidationError(
-      `El cobro combinado debe rendirse completo; incluí todas las cuotas del mismo cobro. ` +
-      `Falta(n) el/los pago(s): ${missing.map((p) => p.id).join(", ")} del cobro ${params.batchId}.`
-    );
-  }
 }
 
 // ─── Clasificación histórica (paso E) ─────────────────────────────────────────

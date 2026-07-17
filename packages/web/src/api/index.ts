@@ -64,9 +64,9 @@ import {
   validateCheckStatusTransition, ReceivedCheckValidationError, type NormalizedReceivedCheck,
 } from "../lib/payments/received-checks";
 import {
-  resolveStandalonePaymentInstruments, resolveBatchInstruments, resolveCashEntryInstrument,
+  resolveStandalonePaymentInstruments, resolveCashEntryInstrument, resolveBatchChildPaymentInstrument,
   buildRemittanceAllocations, validateAllocationOwnership, validateAllocationTotals,
-  calculateExpectedCollectedCents, classifyRemittanceAllocationState, assertCompletePaymentBatches,
+  calculateExpectedCollectedCents, classifyRemittanceAllocationState,
   RemittanceAllocationValidationError, type ResolvedInstrument, type CollectedAmountSource,
 } from "../lib/payments/remittance-allocations";
 import {
@@ -74,7 +74,7 @@ import {
   applyManualCashEntryToCartera, collectDistinctExpectedSources, classifyRemittanceForRendido,
   accumulateRemittanceContribution, emptyMoneyBucket, emptyDirectCompanyBucket, emptyRendidoAccumulator,
   centsToPesos, buildAdeudadosDetalle, assertAdeudadosDetalleMatchesTotal, AdeudadosSumMismatchError,
-  type CarteraInconsistency, type BatchForCartera,
+  isContableMethod, type CarteraInconsistency, type BatchForCartera,
 } from "../lib/payments/caja-summary";
 
 const app = new Hono().basePath("/api");
@@ -6817,8 +6817,9 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   if (batchIdsInCartera.size > 0) {
     const batchIdsArr = [...batchIdsInCartera];
     const batchRows = await db.select().from(paymentBatches).where(inArray(paymentBatches.id, batchIdsArr)).all();
-    const childRows = await db.select({ id: payments.id, batchId: payments.batchId, status: payments.status, rendered: payments.rendered })
-      .from(payments).where(inArray(payments.batchId, batchIdsArr)).all();
+    const childRows = await db.select({
+      id: payments.id, batchId: payments.batchId, status: payments.status, rendered: payments.rendered, amount: payments.amount,
+    }).from(payments).where(inArray(payments.batchId, batchIdsArr)).all();
     const batchSplitRows = await db.select().from(paymentBatchSplits).where(inArray(paymentBatchSplits.batchId, batchIdsArr)).all();
     const batchSplitIdsArr = batchSplitRows.map((s: any) => s.id);
     const batchCheckRows = batchSplitIdsArr.length
@@ -6836,10 +6837,10 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
       arr.push({ method: s.method, amountCents: s.amountCents, checks: checksBySplitId.get(s.id) ?? [] });
       splitsByBatchId.set(s.batchId, arr);
     }
-    const childrenByBatchId = new Map<number, { paymentId: number; status: string; rendered: number }[]>();
+    const childrenByBatchId = new Map<number, { paymentId: number; status: string; rendered: number; amountCents: number }[]>();
     for (const c of childRows as any[]) {
       const arr = childrenByBatchId.get(c.batchId) ?? [];
-      arr.push({ paymentId: c.id, status: c.status, rendered: c.rendered });
+      arr.push({ paymentId: c.id, status: c.status, rendered: c.rendered, amountCents: Math.round(c.amount * 100) });
       childrenByBatchId.set(c.batchId, arr);
     }
     for (const b of batchRows as any[]) {
@@ -7456,49 +7457,16 @@ app.post("/remittances", requireAuth(async (c: any) => {
       }
       const allCashEntryRowsById = new Map<number, any>([...cashEntryRows, ...surchargeRowsTx].map((e: any) => [e.id, e]));
 
-      // ── 2. Batches completos — se rinden completos o no se rinden ──
-      const batchIdsInvolved = new Set<number>();
-      for (const p of paymentRows as any[]) if (p.batchId != null) batchIdsInvolved.add(p.batchId);
-
-      const includedPaymentIdsByBatch = new Map<number, Set<number>>();
-      for (const p of paymentRows as any[]) {
-        if (p.batchId == null) continue;
-        const set = includedPaymentIdsByBatch.get(p.batchId) ?? new Set<number>();
-        set.add(p.id);
-        includedPaymentIdsByBatch.set(p.batchId, set);
-      }
-
-      const batchInstrumentsByBatchId = new Map<number, ResolvedInstrument[]>();
-      const batchTotalReceivedCentsById = new Map<number, number>();
-      for (const batchId of batchIdsInvolved) {
-        const siblings = await tx.select({ id: payments.id, status: payments.status, rendered: payments.rendered })
-          .from(payments).where(eq(payments.batchId, batchId)).all();
-        assertCompletePaymentBatches({ batchId, siblings, includedPaymentIds: includedPaymentIdsByBatch.get(batchId)! });
-
-        const batchRow = await tx.select().from(paymentBatches).where(eq(paymentBatches.id, batchId)).get();
-        batchTotalReceivedCentsById.set(batchId, batchRow!.totalReceivedCents);
-
-        const splitsRows = await tx.select().from(paymentBatchSplits).where(eq(paymentBatchSplits.batchId, batchId)).all();
-        const splitIds = splitsRows.map((s: any) => s.id);
-        const checksRows = splitIds.length
-          ? await tx.select().from(receivedChecks).where(inArray(receivedChecks.batchSplitId, splitIds)).all()
-          : [];
-        const checksBySplitId = new Map<number, any[]>();
-        for (const chk of checksRows as any[]) {
-          const arr = checksBySplitId.get(chk.batchSplitId) ?? [];
-          arr.push(chk);
-          checksBySplitId.set(chk.batchSplitId, arr);
-        }
-        const instruments = resolveBatchInstruments({
-          paymentBatchId: batchId,
-          splits: (splitsRows as any[]).map((s) => ({
-            id: s.id, method: s.method, amountCents: s.amountCents,
-            checks: (checksBySplitId.get(s.id) ?? []).map((chk: any) => ({ id: chk.id, amountCents: chk.amountCents })),
-          })),
-        });
-        validateAllocationOwnership(instruments, { paymentBatchId: batchId });
-        batchInstrumentsByBatchId.set(batchId, instruments);
-      }
+      // ── 2. Hijos de batch — rendición por cuota, NO por lote ──
+      // Cobrar por lote (payment_batches) agrupa cuotas solo para cobrarlas
+      // más rápido; NO define cómo se rinden después. Cada payment hijo se
+      // rinde de forma independiente de sus hermanos — ver GUARD de arriba
+      // (rendered/status) para la protección real contra doble rendición.
+      // No se arrastra el instrumento de COBRANZA del batch (payment_batch_
+      // splits/received_checks son cómo entró la plata, no cómo se rinde) —
+      // ver resolveBatchChildPaymentInstrument en remittance-allocations.ts
+      // (Migración 0029) y el paso 5 más abajo, donde se arma el instrumento
+      // de SALIDA propio de cada item.
 
       // ── 3. Crear remittance ──
       const [rem] = await tx.insert(remittances).values({
@@ -7543,19 +7511,30 @@ app.post("/remittances", requireAuth(async (c: any) => {
       // ── 5. Construir allocations + expectedCollectedCents desde instrumentos reales ──
       const allInstruments: ResolvedInstrument[] = [];
       const collectedSources: CollectedAmountSource[] = [];
-      const batchIdsCounted = new Set<number>();
 
       for (const { item, row } of insertedItems) {
         if (item.source === "payment") {
           const p = paymentsById.get(item.sourceId);
           if (p.batchId != null) {
-            // Las allocations del batch se construyen una sola vez, sin importar
-            // cuántos remittance_items (uno por cada hijo) referencien pagos de él.
-            if (!batchIdsCounted.has(p.batchId)) {
-              batchIdsCounted.add(p.batchId);
-              allInstruments.push(...batchInstrumentsByBatchId.get(p.batchId)!);
-              collectedSources.push({ kind: "batch", amountCents: batchTotalReceivedCentsById.get(p.batchId)! });
+            // Rendición por cuota (Migración 0029): este payment hijo de
+            // batch se rinde por su cuenta, con su propio instrumento de
+            // SALIDA — nunca el instrumento de cobranza del batch entero (ver
+            // comentario del paso 2). method es obligatorio acá porque deja
+            // de poder inferirse de payment_batch_splits: representa cómo
+            // Curini le paga a la compañía esta cuota puntual, no cómo cobró
+            // originalmente al cliente.
+            const method = item.paymentMethod;
+            if (!method || !isContableMethod(method)) {
+              throw new RemittanceAllocationValidationError(
+                `El pago ${item.sourceId} (hijo de un cobro por lote) necesita un método de rendición real (efectivo, transferencia, cheque, link_pago o transferencia_compania) para poder rendirse por separado del resto del lote.`
+              );
             }
+            const amountCents = Math.round(p.amount * 100);
+            const instrument = resolveBatchChildPaymentInstrument({
+              remittanceItemId: row.id, paymentId: p.id, paymentBatchId: p.batchId, method, amountCents,
+            });
+            allInstruments.push(instrument);
+            collectedSources.push({ kind: "batch_child_payment", amountCents });
           } else {
             const splitsRows = await tx.select().from(paymentSplits).where(eq(paymentSplits.paymentId, item.sourceId)).all();
             // Migración 0028: un split method='cheque' de este pago standalone
@@ -7586,26 +7565,33 @@ app.post("/remittances", requireAuth(async (c: any) => {
             collectedSources.push({ kind: "standalone_payment", amountCents: Math.round(p.amount * 100) });
           }
         } else if (item.source === "cash_entry") {
+          // Rendición por cuota (Migración 0029): un recargo Pronto Pago de
+          // un hijo de batch YA NO comparte instrumento con ningún split del
+          // batch (el batch entero dejó de arrastrarse) — necesita su propia
+          // allocation, exactamente igual que el recargo de un pago
+          // standalone. Antes de esta migración se omitía a propósito
+          // (`isBatchSurcharge`) porque ese dinero ya estaba una sola vez en
+          // la allocation del payment_batch_split del batch; ese camino ya
+          // no existe.
           const e = allCashEntryRowsById.get(item.sourceId);
-          const isSurcharge = e.entryType === "pronto_pago_surcharge";
-          let linkedPayment: any = isSurcharge && e.paymentId != null ? paymentsById.get(e.paymentId) : undefined;
-          if (isSurcharge && e.paymentId != null && !linkedPayment) {
-            linkedPayment = await tx.select().from(payments).where(eq(payments.id, e.paymentId)).get();
+          let method = e.paymentMethod;
+          if (e.entryType === "pronto_pago_surcharge" && e.paymentId != null) {
+            const linkedPayment = paymentsById.get(e.paymentId);
+            if (linkedPayment?.batchId != null) {
+              // cash_entries.paymentMethod de un recargo de batch es "lote"
+              // (heredado del padre al crearlo, nunca un método real — ver
+              // POST /payment-batches) — se usa el método de rendición
+              // elegido para la cuota que lo generó, en esta misma request
+              // (ya validado como método contable real más arriba).
+              const parentItem = paymentSourceItems.find((it: any) => it.sourceId === e.paymentId);
+              method = parentItem?.paymentMethod ?? method;
+            }
           }
-          const isBatchSurcharge = isSurcharge && linkedPayment?.batchId != null;
-          // Recargo Pronto Pago de un hijo de batch: el remittance_item se crea
-          // igual (comportamiento sin cambios), pero NO genera allocation propia
-          // — ese dinero ya está una sola vez en la allocation del
-          // payment_batch_split del batch (ver totalReceivedCents = base +
-          // surcharge, validado en la creación del batch). Generar una allocation
-          // aparte acá duplicaría el conteo.
-          if (!isBatchSurcharge) {
-            const instrument = resolveCashEntryInstrument({
-              remittanceItemId: row.id, cashEntryId: item.sourceId, method: e.paymentMethod, amountCents: Math.round(e.amount * 100),
-            });
-            allInstruments.push(instrument);
-            collectedSources.push({ kind: "cash_entry", amountCents: Math.round(e.amount * 100) });
-          }
+          const instrument = resolveCashEntryInstrument({
+            remittanceItemId: row.id, cashEntryId: item.sourceId, method, amountCents: Math.round(e.amount * 100),
+          });
+          allInstruments.push(instrument);
+          collectedSources.push({ kind: "cash_entry", amountCents: Math.round(e.amount * 100) });
         }
         // installment / manual_debt: sin instrumento real, cero allocations.
       }
@@ -7770,6 +7756,7 @@ app.get("/remittances/pending", requireAuth(async (c: any) => {
       paymentMethod: payments.paymentMethod,
       paymentDate: payments.paymentDate,
       policyId: payments.policyId,
+      batchId: payments.batchId,
       manualPayer: payments.manualPayer,
       manualPolicyNumber: payments.manualPolicyNumber,
       manualCompany: payments.manualCompany,
@@ -7835,6 +7822,14 @@ app.get("/remittances/pending", requireAuth(async (c: any) => {
         sourceId: p.id,
         amount: p.amount,
         paymentMethod: p.paymentMethod,
+        // Rendición por cuota (Migración 0029): el frontend necesita saber
+        // si este payment es hijo de un cobro por lote (batchId != null) para
+        // saber si el "medio de rendición" que el usuario elija en el modal
+        // realmente reemplaza el instrumento contable (hijo de lote, sí) o
+        // es solo informativo (standalone, pendiente de backend — ver
+        // resolveStandalonePaymentInstruments, que sigue atado a los
+        // payment_splits reales).
+        batchId: p.batchId,
         paymentDate: p.paymentDate,
         dueDate: (p.installmentDueDate as string | null) ?? (p.paymentDueDate as string | null) ?? null,
         clientName: p.insuredName || p.manualPayer || "—",

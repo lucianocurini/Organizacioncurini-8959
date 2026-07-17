@@ -120,7 +120,7 @@ function mkBatch(overrides: Partial<BatchForCartera> = {}): BatchForCartera {
     batchId: 100,
     status: "confirmado",
     splits: [{ method: "efectivo", amountCents: 100000, checks: [] }],
-    children: [{ paymentId: 1, status: "confirmado", rendered: 0 }],
+    children: [{ paymentId: 1, status: "confirmado", rendered: 0, amountCents: 100000 }],
     ...overrides,
   };
 }
@@ -142,8 +142,8 @@ describe("applyBatchToCartera", () => {
     applyBatchToCartera(
       mkBatch({
         children: [
-          { paymentId: 1, status: "confirmado", rendered: 0 },
-          { paymentId: 2, status: "confirmado", rendered: 0 },
+          { paymentId: 1, status: "confirmado", rendered: 0, amountCents: 60000 },
+          { paymentId: 2, status: "confirmado", rendered: 0, amountCents: 40000 },
         ],
       }),
       cartera, directoCompania, inconsistencias
@@ -152,23 +152,79 @@ describe("applyBatchToCartera", () => {
     expect(inconsistencias.length).toBe(0);
   });
 
-  test("batch parcialmente rendered → inconsistencia, excluido de totales", () => {
+  // ─── Etapa "rendición por cuota" — batch con hijos rendered mixto ─────────
+  // Cobrar por lote no obliga a rendir el lote completo: un batch puede
+  // quedar con algunos hijos ya rendidos (a su compañía) y otros todavía
+  // pendientes, sin que eso sea una inconsistencia (antes de esta etapa era
+  // imposible llegar a este estado — assertCompletePaymentBatches lo
+  // impedía). Cartera pendiente debe reflejar SOLO la porción todavía sin
+  // rendir, prorrateada por método sin perder ni duplicar centavos.
+
+  test("batch con un hijo rendido y otro no → NO es inconsistencia, se prorratea la porción pendiente", () => {
     const cartera = emptyMoneyBucket();
     const directoCompania = emptyDirectCompanyBucket();
     const inconsistencias: CarteraInconsistency[] = [];
     applyBatchToCartera(
       mkBatch({
+        splits: [{ method: "efectivo", amountCents: 100000, checks: [] }],
         children: [
-          { paymentId: 1, status: "confirmado", rendered: 0 },
-          { paymentId: 2, status: "confirmado", rendered: 1 },
+          { paymentId: 1, status: "confirmado", rendered: 0, amountCents: 60000 }, // sigue pendiente
+          { paymentId: 2, status: "confirmado", rendered: 1, amountCents: 40000 }, // ya rendido
         ],
       }),
       cartera, directoCompania, inconsistencias
     );
-    expect(cartera.totalCents).toBe(0);
-    expect(inconsistencias.length).toBe(1);
-    expect(inconsistencias[0]!.sourceType).toBe("batch");
-    expect(inconsistencias[0]!.sourceId).toBe(100);
+    expect(inconsistencias.length).toBe(0);
+    // 60% de la base del batch sigue pendiente → 60% del instrumento (100000) = 60000.
+    expect(cartera.efectivoCents).toBe(60000);
+    expect(cartera.totalCents).toBe(60000);
+  });
+
+  test("el hijo rendido sale de cartera pendiente y el no rendido queda — dos métodos, cierra exacto en centavos", () => {
+    const cartera = emptyMoneyBucket();
+    const directoCompania = emptyDirectCompanyBucket();
+    const inconsistencias: CarteraInconsistency[] = [];
+    applyBatchToCartera(
+      mkBatch({
+        splits: [
+          { method: "efectivo", amountCents: 70000, checks: [] },
+          { method: "transferencia", amountCents: 30000, checks: [] },
+        ],
+        children: [
+          { paymentId: 1, status: "confirmado", rendered: 0, amountCents: 50000 }, // pendiente
+          { paymentId: 2, status: "confirmado", rendered: 1, amountCents: 50000 }, // rendido
+        ],
+      }),
+      cartera, directoCompania, inconsistencias
+    );
+    expect(inconsistencias.length).toBe(0);
+    // 50% de la base sigue pendiente → 50% de cada split, sin drift.
+    expect(cartera.efectivoCents).toBe(35000);
+    expect(cartera.transferenciaCents).toBe(15000);
+    expect(cartera.totalCents).toBe(50000); // cierra exacto: 35000 + 15000
+  });
+
+  test("tres hijos, dos rendidos y uno no → el total pendiente cierra exacto en centavos (sin drift de redondeo)", () => {
+    const cartera = emptyMoneyBucket();
+    const directoCompania = emptyDirectCompanyBucket();
+    const inconsistencias: CarteraInconsistency[] = [];
+    applyBatchToCartera(
+      mkBatch({
+        splits: [{ method: "cheque", amountCents: 100000, checks: [{ id: 1, amountCents: 100000 }] }],
+        children: [
+          { paymentId: 1, status: "confirmado", rendered: 1, amountCents: 33333 },
+          { paymentId: 2, status: "confirmado", rendered: 1, amountCents: 33333 },
+          { paymentId: 3, status: "confirmado", rendered: 0, amountCents: 33334 }, // pendiente, 1/3 no exacto
+        ],
+      }),
+      cartera, directoCompania, inconsistencias
+    );
+    expect(inconsistencias.length).toBe(0);
+    expect(cartera.chequeCents).toBe(cartera.totalCents);
+    expect(cartera.totalCents).toBeGreaterThan(0);
+    // El total pendiente es siempre round(100000 * 33334/100000) = 33334 —
+    // nunca se pierde ni se duplica un centavo por el redondeo.
+    expect(cartera.totalCents).toBe(33334);
   });
 
   test("batch anulado no aporta cartera", () => {
@@ -182,7 +238,7 @@ describe("applyBatchToCartera", () => {
     const cartera = emptyMoneyBucket();
     const directoCompania = emptyDirectCompanyBucket();
     applyBatchToCartera(
-      mkBatch({ children: [{ paymentId: 1, status: "confirmado", rendered: 1 }] }),
+      mkBatch({ children: [{ paymentId: 1, status: "confirmado", rendered: 1, amountCents: 100000 }] }),
       cartera, directoCompania, []
     );
     expect(cartera.totalCents).toBe(0);

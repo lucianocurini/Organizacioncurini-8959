@@ -21,7 +21,11 @@ import {
   validateBatchSplitsForm, updateSplitMethodPreservingChecks, splitsToPaymentSplitsPayload,
 } from "@/lib/payment-batch-form";
 import { CheckSubForm } from "@/components/payments/CheckSubForm";
-import { getPendingItemPaymentGroup } from "@/lib/rendicion-pending";
+import {
+  getPendingItemPaymentGroup, isBatchChildPendingPayment,
+  computeDefaultRendicionMethod, attachRendicionMethod, CONTABLE_METHODS,
+  RENDICION_METHOD_LABELS, getRendicionItemMethodLabel,
+} from "@/lib/rendicion-pending";
 
 function formatCurrency(v: number, short = false) {
   if (short) {
@@ -38,7 +42,19 @@ const METHOD_LABELS: Record<string, string> = {
   cheque: "Cheque",
   link_pago: "Link de Pago",
   transferencia_compania: "Transf. a Compañía",
+  // payments.paymentMethod="lote" es el valor que POST /payment-batches le
+  // pone a todo hijo de un cobro por lote — nunca un medio de cobro real
+  // (ver isBatchChildPendingPayment). Se etiqueta distinto para que se note
+  // en el paso 1 del modal que ese ítem no tiene un medio de cobro propio.
+  lote: "Cobro por lote",
 };
+
+// RENDICION_METHOD_LABELS (medios de rendición seleccionables, mismo set que
+// CONTABLE_METHODS de la migración 0029) vive en rendicion-pending.ts —
+// deliberadamente separado de METHOD_LABELS de arriba: "transferencia" en
+// contexto de rendición es "Transferencia", nunca "Transf. cuenta propia"
+// (esa distinción es propia del medio de COBRO, ver comentario en
+// rendicion-pending.ts).
 
 const BREAKDOWN_LABELS: Record<string, string> = {
   efectivo: "Efectivo",
@@ -53,6 +69,7 @@ const METHOD_COLORS: Record<string, string> = {
   cheque: "bg-yellow-500/20 text-yellow-400 border-yellow-500/30",
   link_pago: "bg-purple-500/20 text-purple-400 border-purple-500/30",
   transferencia_compania: "bg-orange-500/20 text-orange-400 border-orange-500/30",
+  lote: "bg-indigo-500/20 text-indigo-300 border-indigo-500/30",
 };
 
 // Métodos que van directo a la compañía
@@ -1181,6 +1198,14 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
   const [debtorItems, setDebtorItems] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
 
+  // Medio de rendición: independiente del medio de cobro original (ver
+  // rendicion-pending.ts). Se aplica a TODOS los ítems seleccionados al
+  // armar el payload — nunca se manda silenciosamente el paymentMethod
+  // original. rendicionMethodTouched evita pisar una elección manual del
+  // usuario si vuelve al paso 1 y cambia la selección.
+  const [rendicionMethod, setRendicionMethod] = useState<string>("efectivo");
+  const [rendicionMethodTouched, setRendicionMethodTouched] = useState(false);
+
   // ── Estado para ítems manuales ───────────────────────────────────────────────
   const [manualForm, setManualForm] = useState({ insured: "", policy: "", company: "", period: "", amount: "", notes: "" });
   const [manualItems, setManualItems] = useState<any[]>([]);
@@ -1256,6 +1281,24 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
   const autoSurchargeTotal = totalSurchargeCount * PP_SURCHARGE;
   const expectedTotal = totalSeleccionado + autoSurchargeTotal;
 
+  // Cuántos de los ítems seleccionados son hijos de lote (el medio de
+  // rendición elegido SÍ reemplaza su instrumento contable real, Migración
+  // 0029) vs. standalone/manuales (por ahora solo informativo — ver
+  // rendicion-pending.ts). Maneja la nota de aviso más abajo.
+  const batchChildSelectedCount = selectedCobradas.filter(isBatchChildPendingPayment).length;
+  const limitedSelectedCount = selectedItems.length - batchChildSelectedCount;
+
+  // Al entrar al paso 2 (o cambiar la selección sin haber tocado el
+  // selector a mano todavía), proponer como default el medio de cobro real
+  // si todos los ítems seleccionados comparten uno solo — si no, un default
+  // neutro. Nunca pisa una elección manual previa del usuario.
+  useEffect(() => {
+    if (step === "pago" && !rendicionMethodTouched) {
+      setRendicionMethod(computeDefaultRendicionMethod(selectedCobradas));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step]);
+
   const filteredPending = pendingVisible.filter((i: any) => {
     if (!search) return true;
     const q = search.toLowerCase();
@@ -1285,13 +1328,16 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
       if (Number(breakdown.transferencia) > 0) bd.transferencia = Number(breakdown.transferencia);
       if (Number(breakdown.cheque) > 0) bd.cheque = Number(breakdown.cheque);
 
-      await api.post("/api/remittances", {
-        date,
-        canal,
-        notes: notes || null,
-        paymentBreakdown: bd,
-        prontoPagoSurcharge: canal === "pronto_pago" ? 800 : 0,
-        items: selectedItems.map(i => ({
+      // El medio de rendición elegido por el usuario se aplica a TODOS los
+      // ítems de este payload — attachRendicionMethod nunca deja pasar el
+      // paymentMethod de cobro original (ver rendicion-pending.ts). Para
+      // hijos de lote esto reemplaza de verdad el instrumento contable
+      // (Migración 0029); para standalone/manuales queda guardado como
+      // informativo (remittance_items.paymentMethod) — el asiento contable
+      // real sigue atado al medio de cobro real hasta que exista una
+      // migración análoga a 0029 para ese caso.
+      const itemsPayload = attachRendicionMethod(
+        selectedItems.map(i => ({
           source: i.source,
           sourceId: i.sourceId,
           amount: i.amount,
@@ -1305,8 +1351,17 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
           clientName: i.clientName,
           policyNumber: i.policyNumber,
           companyName: i.companyName,
-          paymentMethod: i.paymentMethod || null,
         })),
+        rendicionMethod,
+      );
+
+      await api.post("/api/remittances", {
+        date,
+        canal,
+        notes: notes || null,
+        paymentBreakdown: bd,
+        prontoPagoSurcharge: canal === "pronto_pago" ? 800 : 0,
+        items: itemsPayload,
       });
       toast.success("Rendición registrada");
       onSaved();
@@ -1599,6 +1654,35 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                 </div>
               )}
 
+              {/* Medio de rendición — independiente del medio de cobro original */}
+              <div>
+                <label className="text-xs text-white/50 mb-1 block">Medio de rendición *</label>
+                <select value={rendicionMethod}
+                  onChange={e => { setRendicionMethod(e.target.value); setRendicionMethodTouched(true); }}
+                  className="w-full px-3 py-2 bg-[#0a0f1e] border border-white/10 rounded-lg text-sm text-white focus:outline-none focus:border-blue-500">
+                  {CONTABLE_METHODS.map(m => (
+                    <option key={m} value={m}>{RENDICION_METHOD_LABELS[m]}</option>
+                  ))}
+                </select>
+                <p className="text-xs text-white/30 mt-1">
+                  Cómo Curini le rinde esta plata a la compañía — no tiene por qué coincidir con el medio con el que
+                  se cobró originalmente (ej. cobrado con cheque, rendido por transferencia).
+                </p>
+                {batchChildSelectedCount > 0 && (
+                  <p className="text-xs text-indigo-300/80 mt-1">
+                    ✓ {batchChildSelectedCount} hijo{batchChildSelectedCount !== 1 ? "s" : ""} de cobro por lote — el medio elegido
+                    reemplaza su instrumento contable real.
+                  </p>
+                )}
+                {limitedSelectedCount > 0 && (
+                  <p className="text-xs text-yellow-400/70 mt-1">
+                    ⚠ {limitedSelectedCount} ítem{limitedSelectedCount !== 1 ? "s" : ""} individual{limitedSelectedCount !== 1 ? "es" : ""} o manual{limitedSelectedCount !== 1 ? "es" : ""} —
+                    por ahora este campo es solo informativo para esos casos: el asiento contable sigue usando el medio de cobro
+                    real (pendiente de backend).
+                  </p>
+                )}
+              </div>
+
               {/* Métodos de pago */}
               <div>
                 <label className="text-xs text-white/50 mb-2 block">Cómo se paga a la compañía (puede mezclar métodos)</label>
@@ -1849,8 +1933,14 @@ function RendicionesTab() {
                               <p className="text-sm text-white truncate">{item.clientName}</p>
                               <p className="text-xs text-white/40">{item.companyName} · {item.policyNumber}</p>
                             </div>
+                            {/* item.paymentMethod acá es el MEDIO DE RENDICIÓN (remittance_items.
+                                paymentMethod) — nunca el medio de cobro original. METHOD_LABELS
+                                (usado en la tabla de Pagos/Cobros) le dice a "transferencia"
+                                "Transf. cuenta propia", una etiqueta que solo tiene sentido en el
+                                contexto de cobro. Acá usamos getRendicionItemMethodLabel, que no
+                                arrastra esa distinción (ver rendicion-pending.ts). */}
                             <span className={cn("text-xs px-1.5 py-0.5 rounded border shrink-0", METHOD_COLORS[item.paymentMethod] || "text-gray-400 border-gray-500/30")}>
-                              {METHOD_LABELS[item.paymentMethod] || item.paymentMethod}
+                              {getRendicionItemMethodLabel(item.paymentMethod)}
                             </span>
                             <span className={cn("text-sm font-medium shrink-0 w-24 text-right",
                               item.debtorStatus === "adeudado" && !item.paidAt ? "text-red-400" : "text-white")}>
