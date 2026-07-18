@@ -6791,6 +6791,35 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   const debtsLegacy = await db.select().from(cashDebts)
     .where(eq(cashDebts.status, "pendiente")).all();
 
+  // ── Adelantos/recuperos de cuotas reales rendidas como adeudadas ──────────
+  // Fuente única: remittance_items con source='installment' de rendiciones
+  // confirmadas. El ADELANTO (salida de Caja) es CUALQUIER ítem así, sin
+  // importar su debtorStatus actual — es un hecho histórico fechado por
+  // remittances.date que no se borra cuando la deuda se cobra después (regla
+  // de negocio: el adelanto queda visible aunque se recupere). El RECUPERO
+  // (ingreso) es el subconjunto ya cerrado (debtorStatus='pagado' con paidAt
+  // seteado, ver POST /remittances/items/:id/collect) — su importe YA está
+  // contado en totalCobrado/cobradoPeriodo a través del payment real que
+  // collect crea (payments.status='confirmado' entra en allPayments/
+  // periodPayments sin importar payments.rendered), así que acá es solo un
+  // SUBTOTAL informativo: nunca se vuelve a sumar a cajaNeta/totalCobrado/
+  // diferencia/cobradoPeriodo.
+  const installmentDebtItems = await db.select({
+    id: remittanceItems.id,
+    amount: remittanceItems.amount,
+    debtorStatus: remittanceItems.debtorStatus,
+    paidAt: remittanceItems.paidAt,
+    sourceId: remittanceItems.sourceId,
+    remittanceDate: remittances.date,
+  }).from(remittanceItems)
+    .innerJoin(remittances, eq(remittanceItems.remittanceId, remittances.id))
+    .where(and(eq(remittanceItems.source, "installment"), eq(remittances.status, "confirmada")))
+    .all();
+
+  const adelantosAdeudados = installmentDebtItems.reduce((s: number, i: any) => s + i.amount, 0);
+  const recuperoItems = installmentDebtItems.filter((i: any) => i.debtorStatus === "pagado" && i.paidAt != null);
+  const recuperosAdeudados = recuperoItems.reduce((s: number, i: any) => s + i.amount, 0);
+
   // ── Cartera pendiente — instrumentos reales (src/lib/payments/caja-summary.ts) ──
   // recargosProntoPago es una categoría separada — el recargo fijo de $800
   // no es plata cobrada en efectivo/transferencia/cheque, es un cargo
@@ -7084,6 +7113,8 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   let cobradoPeriodo = 0;
   let rendidoPeriodo = 0;
   let gastosPeriodo  = 0;
+  let adelantosAdeudadosPeriodo = 0;
+  let recuperosAdeudadosPeriodo = 0;
   let cpPComisiones  = 0;
   let cpPAportes     = 0;
   let cpPReintegros  = 0;
@@ -7129,6 +7160,35 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
       .filter((e: any) => e.date >= periodFrom! && e.date <= periodTo!)
       .reduce((s: number, e: any) => s + (e.amount || 0), 0);
 
+    // Adelanto del período: fechado por remittances.date (cuándo Curini puso
+    // la plata), nunca por remittance_items.paidAt (eso es la fecha en la
+    // que la deuda se cerró, no en la que salió el adelanto).
+    adelantosAdeudadosPeriodo = installmentDebtItems
+      .filter((i: any) => i.remittanceDate >= periodFrom! && i.remittanceDate <= periodTo!)
+      .reduce((s: number, i: any) => s + i.amount, 0);
+
+    // Recupero del período: fechado por payments.paymentDate (el cobro real
+    // posterior a través de POST /remittances/items/:id/collect), nunca por
+    // remittance_items.paidAt — paidAt solo cierra la deuda, no es una fecha
+    // de movimiento de Caja (regla de negocio explícita: "si paidAt se usa
+    // solo para cerrar deuda, no usarlo para sumar ingreso si ya existe
+    // paymentDate"). Este importe YA está adentro de cobradoPeriodo (allPayments
+    // no filtra por rendered) — acá se recalcula aparte solo para exponerlo
+    // como subtotal informativo, JAMÁS se suma de nuevo a cobradoPeriodo/flujoNeto.
+    const recuperoInstallmentIds = recuperoItems
+      .map((i: any) => i.sourceId)
+      .filter((sid: any): sid is number => sid != null);
+    if (recuperoInstallmentIds.length > 0) {
+      const recoveryPaymentRows = await db.select({
+        installmentId: payments.installmentId, amount: payments.amount, paymentDate: payments.paymentDate,
+      }).from(payments)
+        .where(and(inArray(payments.installmentId, recuperoInstallmentIds), eq(payments.status, "confirmado")))
+        .all();
+      recuperosAdeudadosPeriodo = recoveryPaymentRows
+        .filter((p: any) => (p.paymentDate as string) >= periodFrom! && (p.paymentDate as string) <= periodTo!)
+        .reduce((s: number, p: any) => s + p.amount, 0);
+    }
+
     // Caja propia del período
     cpPComisiones = allCommissions.filter((c: any) => c.status !== "anulado" && c.date >= periodFrom! && c.date <= periodTo!).reduce((s: number, c: any) => s + c.amount, 0);
     cpPAportes    = ownMovements.filter((m: any) => m.type === "aporte" && m.date >= periodFrom! && m.date <= periodTo!).reduce((s: number, m: any) => s + m.amount, 0);
@@ -7158,6 +7218,13 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     totalAdeudado,
     totalAdeudadoRendiciones,
     totalAdeudadoLegacy,
+    // Histórico completo (todas las rendiciones confirmadas) de cuotas
+    // reales rendidas como adeudadas — ver query de installmentDebtItems más
+    // arriba. adelantosAdeudados NUNCA baja cuando una deuda se cobra (queda
+    // como hecho histórico); recuperosAdeudados es un subtotal informativo ya
+    // incluido en totalCobrado, no se resta de cajaNeta/diferencia acá.
+    adelantosAdeudados,
+    recuperosAdeudados,
     adeudadosDetalle,
     totalGastos,
     gastosMes,
@@ -7182,14 +7249,22 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
       comisiones: allCommissions.length,
       iva: allIva.length,
     },
-    // Totales del período solicitado (null si no se pasaron parámetros)
+    // Totales del período solicitado (null si no se pasaron parámetros).
+    // adelantosAdeudados: salida real de Caja del período (fechada por
+    // remittances.date) — se resta en flujoNeto porque es plata que salió y
+    // ningún otro campo del período la contaba hasta ahora. recuperosAdeudados
+    // es informativo: ya está adentro de `cobrado` (payments.rendered no
+    // filtra ahí), así que NO se suma de nuevo en flujoNeto — solo se expone
+    // para poder mostrar cuánto de `cobrado` es recuperación de adeudadas.
     periodo: periodFrom && periodTo ? {
       from:       periodFrom,
       to:         periodTo,
       cobrado:    cobradoPeriodo,
       rendido:    rendidoPeriodo,
       gastos:     gastosPeriodo,
-      flujoNeto:  cobradoPeriodo - rendidoPeriodo - gastosPeriodo,
+      adelantosAdeudados: adelantosAdeudadosPeriodo,
+      recuperosAdeudados: recuperosAdeudadosPeriodo,
+      flujoNeto:  cobradoPeriodo - rendidoPeriodo - gastosPeriodo - adelantosAdeudadosPeriodo,
     } : null,
     cajaPropia: {
       historico: {
@@ -7700,12 +7775,190 @@ app.delete("/remittances/:id", requireAdmin(async (c: any) => {
   }
 }));
 
-// PATCH /api/remittances/items/:id/paid — marcar adeudado como cobrado
+// PATCH /api/remittances/items/:id/paid — marcar adeudado como cobrado. Solo
+// para manual_debt (deuda de mostrador, sin cuota real detrás) — un
+// source="installment" tiene una policy_installment real esperando quedar
+// "pagada" y un cobro real que registrar, así que debe pasar siempre por
+// POST /remittances/items/:id/collect (ver más abajo), nunca por acá. Sin
+// esta guarda, este toggle podía "cerrar" una deuda real sin dejar rastro
+// del cobro ni actualizar policy_installments — exactamente la inconsistencia
+// que collect existe para evitar.
 app.patch("/remittances/items/:id/paid", requireAuth(async (c: any) => {
   const id = Number(c.req.param("id"));
+  const item = await db.select({ source: remittanceItems.source }).from(remittanceItems)
+    .where(eq(remittanceItems.id, id)).get();
+  if (item?.source === "installment") {
+    return c.json({
+      error: "Esta adeudada corresponde a una cuota real — registrá el cobro con POST /remittances/items/:id/collect, no con este endpoint.",
+    }, 409);
+  }
   await db.update(remittanceItems).set({ debtorStatus: "pagado", paidAt: new Date() })
     .where(eq(remittanceItems.id, id));
   return c.json({ ok: true });
+}));
+
+// POST /api/remittances/items/:id/collect — cobro real posterior de una
+// cuota que se rindió como adeudada (source="installment"): el asegurado le
+// paga a Curini el importe que la agencia ya había adelantado a la compañía
+// al rendirla (ver GUARD de POST /remittances más abajo, sección "installment
+// / manual_debt: sin instrumento real"). Cierra la deuda con un payment real
+// que nace YA rendido (rendered=1) — esa plata NUNCA vuelve a rendirse a la
+// compañía, porque ya fue reportada como adeudada en su momento. No crea
+// remittance_allocations (no hay instrumento de rendición nuevo que
+// reconciliar: esto no es una rendición, es el cierre de una deuda) ni toca
+// la rendición original salvo el estado de este ítem puntual.
+app.post("/remittances/items/:id/collect", requireAuth(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const user = c.get("user");
+  const body = await c.req.json().catch(() => ({}));
+
+  if (body.paymentDate && !/^\d{4}-\d{2}-\d{2}$/.test(body.paymentDate)) {
+    return c.json({ error: "Formato de fecha de pago inválido. Use YYYY-MM-DD." }, 400);
+  }
+
+  try {
+    const payment = await db.transaction(async (tx) => {
+      // Reconsultar dentro de la tx (mismo criterio que POST /remittances):
+      // nunca confiar en un estado leído antes de tomar el lock de escritura.
+      const item = await tx.select().from(remittanceItems).where(eq(remittanceItems.id, id)).get();
+      if (!item) throw new RemittanceAllocationValidationError(`El ítem de rendición ${id} no existe.`);
+      if (item.source !== "installment") {
+        throw new RemittanceAllocationValidationError(
+          `El ítem ${id} no corresponde a una cuota real (source="${item.source}") — solo cuotas reales pueden cobrarse por esta vía.`
+        );
+      }
+      if (item.debtorStatus !== "adeudado") {
+        throw new RemittanceAllocationValidationError(
+          `El ítem ${id} no está adeudado (debtorStatus="${item.debtorStatus}") — ya fue cobrado o nunca fue una deuda.`
+        );
+      }
+      if (item.sourceId == null) {
+        throw new RemittanceAllocationValidationError(`El ítem ${id} no tiene una cuota real vinculada (sourceId nulo).`);
+      }
+
+      const installmentRow = await tx.select({
+        id: policyInstallments.id, amount: policyInstallments.amount,
+        policyId: policyInstallments.policyId, status: policyInstallments.status,
+      }).from(policyInstallments).where(eq(policyInstallments.id, item.sourceId)).get();
+      if (!installmentRow) throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} no existe.`);
+      // Mismo criterio que POST /payments: nunca un segundo pago confirmado
+      // sobre una cuota ya pagada — acá además es la señal de que este mismo
+      // collect ya se ejecutó antes (double-submit), incluso si por alguna
+      // corrupción de datos debtorStatus no se llegó a actualizar.
+      if (installmentRow.status === "pagada") {
+        throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} ya está pagada.`);
+      }
+
+      // Nunca pagos parciales (mismo invariante que POST /payments): el
+      // importe del cobro es siempre el de la cuota real, nunca lo que
+      // mande el body — solo su desglose de medios puede variar.
+      const rawSplits = Array.isArray(body.splits) && body.splits.length > 0
+        ? body.splits
+        : [{ method: body.paymentMethod, amount: installmentRow.amount, notes: null }];
+
+      let normalizedSplits;
+      try {
+        normalizedSplits = validateAndNormalizeSplits({ paymentAmount: installmentRow.amount, splits: rawSplits });
+      } catch (e: any) {
+        if (e instanceof SplitValidationError) throw new RemittanceAllocationValidationError(e.message);
+        throw e;
+      }
+
+      const splitGroup = classifySplitGroup(normalizedSplits.splits);
+      if (splitGroup === "mixed") {
+        throw new RemittanceAllocationValidationError(
+          "No se pueden combinar medios propios con pagos directos a la compañía en el cobro de una adeudada."
+        );
+      }
+
+      let splitsWithChecks: { method: string; amountCents: number; notes: string | null; checks: NormalizedReceivedCheck[] }[];
+      try {
+        splitsWithChecks = normalizedSplits.splits.map((split, i) => {
+          const rawChecks = rawSplits[i]?.checks;
+          if (split.method === "cheque") {
+            if (!Array.isArray(rawChecks) || rawChecks.length === 0) {
+              throw new ReceivedCheckValidationError(`El medio de pago cheque (ítem ${i + 1}) debe incluir al menos un cheque.`);
+            }
+            const checks = rawChecks.map((raw: any, j: number) => normalizeReceivedCheck(raw, `cheque ${j + 1} del ítem ${i + 1}`));
+            const totalsCheck = validateChecksMatchSplit(checks, split.amountCents);
+            if (!totalsCheck.valid) throw new ReceivedCheckValidationError(totalsCheck.errorMessage!);
+            return { ...split, checks };
+          }
+          if (Array.isArray(rawChecks) && rawChecks.length > 0) {
+            throw new ReceivedCheckValidationError(`El ítem ${i + 1} (${split.method}) no puede incluir cheques.`);
+          }
+          return { ...split, checks: [] };
+        });
+      } catch (e: any) {
+        if (e instanceof ReceivedCheckValidationError) throw new RemittanceAllocationValidationError(e.message);
+        throw e;
+      }
+
+      const resolvedPaymentMethod = normalizedSplits.splits.length === 1
+        ? normalizedSplits.splits[0]!.method
+        : "combinado";
+
+      const [p] = await tx.insert(payments).values({
+        policyId: installmentRow.policyId,
+        installmentId: installmentRow.id,
+        amount: installmentRow.amount,
+        paymentMethod: resolvedPaymentMethod,
+        paymentDate: body.paymentDate || new Date().toISOString().slice(0, 10),
+        notes: body.notes || null,
+        status: "confirmado",
+        // Nace YA rendido — ver comentario del endpoint. Nunca debe
+        // ofrecerse en /remittances/pending ni en los selectores de cobro
+        // (que ya excluyen policy_installments.rendered=1, no payments.
+        // rendered, así que esto es lo único que lo saca de circulación).
+        rendered: 1,
+        renderedAt: new Date(),
+        createdBy: user?.id || null,
+      }).returning();
+
+      for (const s of splitsWithChecks) {
+        const [insertedSplit] = await tx.insert(paymentSplits).values({
+          paymentId: p!.id, method: s.method, amountCents: s.amountCents, notes: s.notes,
+        }).returning();
+        if (s.checks.length > 0) {
+          await tx.insert(receivedChecks).values(s.checks.map((chk) => ({
+            paymentSplitId: insertedSplit!.id,
+            checkNumber: chk.checkNumber,
+            bankName: chk.bankName,
+            bankCode: chk.bankCode,
+            drawerName: chk.drawerName,
+            drawerDocument: chk.drawerDocument,
+            issueDate: chk.issueDate,
+            dueDate: chk.dueDate,
+            amountCents: chk.amountCents,
+            currency: chk.currency,
+            status: "en_cartera",
+            notes: chk.notes,
+            receivedAt: new Date(),
+            createdBy: user.id,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          })));
+        }
+      }
+
+      // Cierre atómico: la cuota real queda pagada y el ítem de rendición
+      // deja de estar adeudado — nunca se toca remittances (la rendición
+      // original) ni se crea una allocation nueva (sección "NO" del pedido).
+      await tx.update(policyInstallments).set({ status: "pagada" }).where(eq(policyInstallments.id, installmentRow.id));
+      await tx.update(remittanceItems).set({ debtorStatus: "pagado", paidAt: new Date() }).where(eq(remittanceItems.id, id));
+
+      return p!;
+    });
+
+    const splitsRows = await db.select().from(paymentSplits).where(eq(paymentSplits.paymentId, payment.id)).all();
+    return c.json({ ok: true, payment: { ...payment, splits: splitsRows } }, 201);
+  } catch (e: any) {
+    if (e instanceof RemittanceAllocationValidationError) {
+      return c.json({ error: e.message }, 409);
+    }
+    console.error("[POST /remittances/items/:id/collect]", e?.message, e);
+    return c.json({ error: "No se pudo registrar el cobro" }, 500);
+  }
 }));
 
 // GET /api/remittances/uncollected — cuotas no cobradas y no rendidas (para rendir sin cobro previo)
@@ -7866,12 +8119,15 @@ app.get("/remittances/adeudados", requireAuth(async (c: any) => {
   const items = await db.select({
     id: remittanceItems.id,
     remittanceId: remittanceItems.remittanceId,
+    source: remittanceItems.source,
+    sourceId: remittanceItems.sourceId,
     amount: remittanceItems.amount,
     clientName: remittanceItems.clientName,
     policyNumber: remittanceItems.policyNumber,
     companyName: remittanceItems.companyName,
     paymentMethod: remittanceItems.paymentMethod,
     createdAt: remittanceItems.createdAt,
+    paidAt: remittanceItems.paidAt,
     remittanceDate: remittances.date,
     remittanceCanal: remittances.canal,
   })

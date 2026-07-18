@@ -927,22 +927,18 @@ export default function CajaPage() {
                     </div>
                   </div>
                 )}
-                {/* Diferencia de caja — temporalmente oculto.
-                    Mezcla cartera + adeudados + gastos históricos en un solo número;
-                    se reemplazará con un indicador de dinero propio en etapa posterior. */}
-                {/* <div className={`rounded-xl p-5 mb-5 flex items-center justify-between ${summary.diferencia >= 0 ? "bg-green-900/30 border border-green-500/30" : "bg-red-900/30 border border-red-500/30"}`}>
-                  <div>
-                    <p className="text-xs text-white/50 mb-1">Diferencia de caja</p>
-                    <p className={`text-3xl font-bold ${summary.diferencia >= 0 ? "text-green-400" : "text-red-400"}`}>
-                      {fmt(summary.diferencia)}
-                    </p>
-                    <p className="text-xs text-white/40 mt-1">En cartera − Adeudados</p>
-                  </div>
-                  <AlertCircle size={36} className={summary.diferencia >= 0 ? "text-green-500/40" : "text-red-500/40"} />
-                </div> */}
-
                 {/* Tarjetas detalle */}
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  {/* Diferencia de caja — saldo neto (cartera − adeudados − gastos). Baja
+                      cuando se rinde una cuota real como adeudada (Curini adelantó esa
+                      plata) y vuelve a subir exacto cuando se registra el cobro posterior
+                      (ver POST /remittances/items/:id/collect) — sin fórmula nueva, es el
+                      mismo campo `diferencia` que ya calculaba el backend. */}
+                  <div className={`rounded-xl p-4 border ${summary.diferencia >= 0 ? "bg-green-900/20 border-green-500/30" : "bg-red-900/20 border-red-500/30"}`}>
+                    <p className={`text-xs mb-1 ${summary.diferencia >= 0 ? "text-green-400/70" : "text-red-400/70"}`}>Diferencia de caja</p>
+                    <p className={`text-lg font-bold ${summary.diferencia >= 0 ? "text-green-400" : "text-red-400"}`}>{fmt(summary.diferencia)}</p>
+                    <p className="text-xs text-white/30 mt-0.5">En cartera − Adeudados</p>
+                  </div>
                   <div className="bg-white/5 rounded-xl p-4">
                     <p className="text-xs text-white/40 mb-1">Total cobrado</p>
                     <p className="text-lg font-bold text-white">{fmt(summary.totalCobrado)}</p>

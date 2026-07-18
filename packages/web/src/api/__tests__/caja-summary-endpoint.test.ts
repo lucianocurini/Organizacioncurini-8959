@@ -58,6 +58,13 @@ async function callPostBatch(body: Record<string, any>) {
   return { status: res.status, body: await res.json() };
 }
 
+async function callCollectItem(itemId: number, body: Record<string, any> = {}) {
+  const res = await app.fetch(new Request(`http://localhost/api/remittances/items/${itemId}/collect`, {
+    method: "POST", headers: authHeaders(), body: JSON.stringify(body),
+  }));
+  return { status: res.status, body: await res.json() };
+}
+
 // ─── Borrado determinista (nunca silencioso) ───────────────────────────────
 //
 // Solo SQLITE_BUSY/SQLITE_LOCKED son transitorios y ameritan reintento (con
@@ -899,6 +906,90 @@ describe("GET /api/cash/summary — adeudadosDetalle", () => {
       expect(new Set(newItems.map((i: any) => i.id)).size).toBe(2);
     } finally {
       await cleanupRemittance(remId);
+    }
+  });
+});
+
+describe("GET /api/cash/summary — adelantos/recuperos de adeudadas (cuotas reales)", () => {
+  test("3. adelantosAdeudados sube por el importe rendido, fechado por remittances.date", async () => {
+    const before = (await getSummary()).body;
+
+    const [policyReal] = await db.insert(policies).values({
+      policyNumber: `${PREFIX}-ADEL-${Date.now()}`, type: "automotor", status: "activa",
+      companyId, insuredId, startDate: "2027-01-01", endDate: "2027-12-31", createdBy: userId,
+    }).returning({ id: policies.id });
+    const realPolicyId = policyReal!.id;
+    const [instRow] = await db.insert(policyInstallments).values({
+      policyId: realPolicyId, number: 1, dueDate: FIXTURE_DATE, amount: 900, status: "pendiente", rendered: 0,
+    }).returning({ id: policyInstallments.id });
+    const instId = instRow!.id;
+
+    let remId: number | undefined;
+    try {
+      const res = await callPostRemittance({
+        date: FIXTURE_DATE, canal: "directo", paymentBreakdown: { efectivo: 900 },
+        items: [{ source: "installment", sourceId: instId, amount: 900, debtorStatus: "adeudado" }],
+      });
+      expect(res.status).toBe(200);
+      remId = res.body.id;
+
+      const after = (await getSummary()).body;
+      expect(after.adelantosAdeudados - before.adelantosAdeudados).toBeCloseTo(900, 2);
+      // No es dinero real cobrado — no debe mover cartera ni rendido.
+      expect(after.cartera.total - before.cartera.total).toBeCloseTo(0, 2);
+      expect(after.rendidoPorMetodo.total - before.rendidoPorMetodo.total).toBeCloseTo(0, 2);
+
+      const period = await getSummary(`?from=${FIXTURE_DATE}&to=${FIXTURE_DATE}`);
+      expect(period.body.periodo.adelantosAdeudados).toBeGreaterThanOrEqual(900);
+    } finally {
+      if (remId !== undefined) await cleanupRemittance(remId);
+      await deleteWithRetry(() => db.delete(policyInstallments).where(eq(policyInstallments.id, instId)));
+      await deleteWithRetry(() => db.delete(policies).where(eq(policies.id, realPolicyId)));
+    }
+  });
+
+  test("6/7. el cobro posterior de una adeudada suma como ingreso una sola vez — cajaNeta no duplica", async () => {
+    const [policyReal] = await db.insert(policies).values({
+      policyNumber: `${PREFIX}-RECUP-${Date.now()}`, type: "automotor", status: "activa",
+      companyId, insuredId, startDate: "2027-01-01", endDate: "2027-12-31", createdBy: userId,
+    }).returning({ id: policies.id });
+    const realPolicyId = policyReal!.id;
+    const [instRow] = await db.insert(policyInstallments).values({
+      policyId: realPolicyId, number: 1, dueDate: FIXTURE_DATE, amount: 650, status: "pendiente", rendered: 0,
+    }).returning({ id: policyInstallments.id });
+    const instId = instRow!.id;
+
+    const rem = await callPostRemittance({
+      date: FIXTURE_DATE, canal: "directo", paymentBreakdown: { efectivo: 650 },
+      items: [{ source: "installment", sourceId: instId, amount: 650, debtorStatus: "adeudado" }],
+    });
+    expect(rem.status).toBe(200);
+    const remId = rem.body.id as number;
+    const item = await db.select({ id: remittanceItems.id }).from(remittanceItems).where(eq(remittanceItems.remittanceId, remId)).get();
+
+    const beforeCollect = (await getSummary()).body;
+    let paymentId: number | undefined;
+    try {
+      const collect = await callCollectItem(item!.id, { paymentDate: FIXTURE_DATE, paymentMethod: "efectivo" });
+      expect(collect.status).toBe(201);
+      paymentId = collect.body.payment.id;
+
+      const afterCollect = (await getSummary()).body;
+      // 6. suma una sola vez a lo históricamente cobrado.
+      expect(afterCollect.totalCobrado - beforeCollect.totalCobrado).toBeCloseTo(650, 2);
+      expect(afterCollect.recuperosAdeudados - beforeCollect.recuperosAdeudados).toBeCloseTo(650, 2);
+      // 7. cajaNeta (pendiente de rendir) NO se mueve — el payment nace rendered=1.
+      expect(afterCollect.cajaNeta.total - beforeCollect.cajaNeta.total).toBeCloseTo(0, 2);
+      expect(afterCollect.cartera.total - beforeCollect.cartera.total).toBeCloseTo(0, 2);
+      // El adelanto histórico ya estaba contado desde que se rindió (antes de
+      // este snapshot "before") y NO se borra al cobrarse — el collect no lo
+      // mueve para nada, sigue existiendo intacto.
+      expect(afterCollect.adelantosAdeudados - beforeCollect.adelantosAdeudados).toBeCloseTo(0, 2);
+    } finally {
+      if (paymentId !== undefined) await cleanupPayment(paymentId);
+      await cleanupRemittance(remId);
+      await deleteWithRetry(() => db.delete(policyInstallments).where(eq(policyInstallments.id, instId)));
+      await deleteWithRetry(() => db.delete(policies).where(eq(policies.id, realPolicyId)));
     }
   });
 });

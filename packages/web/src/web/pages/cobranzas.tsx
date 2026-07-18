@@ -1211,9 +1211,45 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
   const [manualItems, setManualItems] = useState<any[]>([]);
   const [showManualForm, setShowManualForm] = useState(false);
 
+  // ── Estado para cuotas reales adeudadas (source="installment") ──────────────
+  // A diferencia de manualItems (texto libre, sin FK real), estas vienen de
+  // /api/remittances/uncollected — cuotas reales todavía no cobradas ni
+  // rendidas. Siempre nacen debtorStatus="adeudado": no tiene sentido elegir
+  // acá una cuota real para "rendir como pagada" (eso ya lo cubre el flujo
+  // normal de selectedCobradas, que solo lista pagos/cobros ya confirmados).
+  const [showInstallmentSearch, setShowInstallmentSearch] = useState(false);
+  const [installmentSearch, setInstallmentSearch] = useState("");
+  const [installmentResults, setInstallmentResults] = useState<any[]>([]);
+  const [installmentItems, setInstallmentItems] = useState<any[]>([]);
+
   useEffect(() => {
     api.get("/api/remittances/pending").then(d => { setPending(d); setLoadingPending(false); });
   }, []);
+
+  useEffect(() => {
+    if (!showInstallmentSearch) return;
+    const t = setTimeout(() => {
+      const qs = installmentSearch.trim() ? `?insured=${encodeURIComponent(installmentSearch.trim())}` : "";
+      api.get(`/api/remittances/uncollected${qs}`).then(setInstallmentResults).catch(() => setInstallmentResults([]));
+    }, 300);
+    return () => clearTimeout(t);
+  }, [installmentSearch, showInstallmentSearch]);
+
+  function addInstallmentItem(inst: any) {
+    if (installmentItems.some(i => i.sourceId === inst.id)) return;
+    setInstallmentItems(prev => [...prev, {
+      source: "installment",
+      sourceId: inst.id,
+      amount: inst.amount,
+      clientName: inst.insuredName,
+      policyNumber: inst.policyNumber,
+      companyName: inst.companyName,
+      paymentMethod: null,
+    }]);
+  }
+  function removeInstallmentItem(sourceId: number) {
+    setInstallmentItems(prev => prev.filter(i => i.sourceId !== sourceId));
+  }
 
   const key = (item: any) => item._uid != null ? `manual_debt:${item._uid}` : `${item.source}:${item.sourceId}`;
 
@@ -1263,7 +1299,7 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
 
   const pendingVisible = pending.filter((i: any) => i.entryType !== "pronto_pago_surcharge");
   const selectedCobradas = pendingVisible.filter((i: any) => selected.has(key(i)));
-  const selectedItems = [...selectedCobradas, ...manualItems];
+  const selectedItems = [...selectedCobradas, ...manualItems, ...installmentItems];
   const totalSeleccionado = selectedItems.reduce((s, i) => s + i.amount, 0);
   const totalBreakdown = (Number(breakdown.efectivo) || 0) + (Number(breakdown.transferencia) || 0) +
     (Number(breakdown.cheque) || 0);
@@ -1344,10 +1380,13 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
           // Un payment confirmado (source='payment') NUNCA puede mandarse como
           // adeudado, sin importar el estado de debtorItems — la UI ya no
           // ofrece el toggle para ese source, pero esto es defensivo (no
-          // depender solo de que el checkbox esté oculto).
+          // depender solo de que el checkbox esté oculto). Un source=
+          // "installment" (cuota real elegida en el buscador de abajo)
+          // siempre es adeudado — no existe otro motivo para agregar una
+          // cuota real por esa vía en vez de por selectedCobradas.
           debtorStatus: i.source === "payment"
             ? "pagado"
-            : (i.source === "manual_debt" || debtorItems.has(key(i))) ? "adeudado" : "pagado",
+            : (i.source === "manual_debt" || i.source === "installment" || debtorItems.has(key(i))) ? "adeudado" : "pagado",
           clientName: i.clientName,
           policyNumber: i.policyNumber,
           companyName: i.companyName,
@@ -1611,6 +1650,77 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                     </div>
                   )}
                 </div>
+
+                {/* ── Cuota real adeudada (vinculada a policy_installments) ──── */}
+                <div className="mt-3 pt-3 border-t border-white/5">
+                  <button
+                    type="button"
+                    onClick={() => setShowInstallmentSearch(v => !v)}
+                    className="flex items-center gap-1.5 text-xs text-white/40 hover:text-white/70 transition-colors"
+                  >
+                    <Plus size={12} />
+                    {showInstallmentSearch ? "Cancelar búsqueda" : "Agregar cuota adeudada existente"}
+                  </button>
+
+                  {showInstallmentSearch && (
+                    <div className="mt-3 p-3 bg-red-950/20 border border-red-500/20 rounded-lg space-y-2">
+                      <p className="text-xs text-red-400/70 font-medium">
+                        Cuota real todavía no cobrada — Curini adelanta este importe a la compañía y queda como deuda del asegurado.
+                      </p>
+                      <input
+                        placeholder="Buscar por asegurado..."
+                        value={installmentSearch}
+                        onChange={e => setInstallmentSearch(e.target.value)}
+                        className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-sm text-white placeholder-white/25 focus:outline-none focus:border-red-500/50"
+                      />
+                      <div className="max-h-40 overflow-y-auto space-y-1">
+                        {installmentResults
+                          .filter((r: any) => !installmentItems.some(i => i.sourceId === r.id))
+                          .map((r: any) => (
+                            <button
+                              type="button"
+                              key={r.id}
+                              onClick={() => addInstallmentItem(r)}
+                              className="w-full flex items-center justify-between gap-3 px-3 py-2 rounded-lg border border-white/10 bg-white/3 hover:bg-white/8 text-left transition-colors"
+                            >
+                              <div className="min-w-0">
+                                <p className="text-sm text-white truncate">{r.insuredName}</p>
+                                <p className="text-xs text-white/40">{r.companyName} · Póliza {r.policyNumber} · Cuota #{r.number} · vence {r.dueDate}</p>
+                              </div>
+                              <span className="text-sm font-semibold text-white shrink-0">{fmt(r.amount)}</span>
+                            </button>
+                          ))}
+                        {installmentSearch.trim() && installmentResults.length === 0 && (
+                          <p className="text-xs text-white/30 text-center py-2">Sin resultados.</p>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {installmentItems.length > 0 && (
+                    <div className="mt-2 space-y-1">
+                      {installmentItems.map(item => (
+                        <div key={item.sourceId} className="flex items-center gap-3 px-3 py-2.5 rounded-lg border bg-red-900/20 border-red-500/30">
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm text-white truncate">{item.clientName}</p>
+                            <p className="text-xs text-white/40">{item.companyName} · {item.policyNumber}</p>
+                          </div>
+                          <div className="text-right shrink-0">
+                            <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>
+                            <span className="text-xs text-red-400 border border-red-500/30 bg-red-900/20 px-1.5 py-0.5 rounded">Adeudado</span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => removeInstallmentItem(item.sourceId)}
+                            className="p-1 text-white/30 hover:text-red-400 shrink-0 transition-colors"
+                          >
+                            <X size={14} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           ) : (
@@ -1732,13 +1842,15 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
               <div className="bg-white/3 border border-white/8 rounded-lg p-3">
                 <p className="text-xs text-white/40 mb-2">
                   {selectedCobradas.length > 0 && `${selectedCobradas.length} cobradas`}
-                  {selectedCobradas.length > 0 && manualItems.length > 0 && " · "}
+                  {selectedCobradas.length > 0 && (manualItems.length > 0 || installmentItems.length > 0) && " · "}
                   {manualItems.length > 0 && <span className="text-orange-400/70">{manualItems.length} manuales (adeudadas)</span>}
+                  {manualItems.length > 0 && installmentItems.length > 0 && " · "}
+                  {installmentItems.length > 0 && <span className="text-red-400/70">{installmentItems.length} cuota{installmentItems.length !== 1 ? "s" : ""} real{installmentItems.length !== 1 ? "es" : ""} (adeudadas)</span>}
                   {" — "}{fmt(totalSeleccionado)}
                 </p>
                 <div className="space-y-1 max-h-32 overflow-y-auto">
                   {selectedItems.map(i => {
-                    const isDebtor = i.source === "manual_debt" || debtorItems.has(key(i));
+                    const isDebtor = i.source === "manual_debt" || i.source === "installment" || debtorItems.has(key(i));
                     return (
                       <div key={key(i)} className="flex justify-between text-xs">
                         <span className="text-white/60 truncate mr-2">{i.clientName} · {i.companyName}</span>
@@ -1970,9 +2082,19 @@ function RendicionesTab() {
 }
 
 // ─── Tab Adeudados de Rendiciones ─────────────────────────────────────────────
+// Origen de un remittance_item adeudado — solo distingue lo que puede volver
+// de /api/remittances/adeudados (cash_debt_legacy vive en otra tabla/endpoint
+// y se gestiona aparte, en Caja → "Nuevo adeudado" — no se toca acá).
+function adeudadoOriginLabel(source: string): string {
+  return source === "installment" ? "Cuota real" : "Deuda manual";
+}
+
 function AdeudadosTab() {
   const [items, setItems] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [collectingId, setCollectingId] = useState<number | null>(null);
+  const [collectForm, setCollectForm] = useState({ paymentMethod: "efectivo", paymentDate: new Date().toISOString().slice(0, 10) });
+  const [collecting, setCollecting] = useState(false);
 
   const fmt = (n: number) => n.toLocaleString("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 0 });
 
@@ -1991,6 +2113,30 @@ function AdeudadosTab() {
     await api.patch(`/api/remittances/items/${id}/paid`, {});
     toast.success("Marcado como cobrado");
     load();
+  }
+
+  function startCollect(id: number) {
+    setCollectingId(id);
+    setCollectForm({ paymentMethod: "efectivo", paymentDate: new Date().toISOString().slice(0, 10) });
+  }
+
+  // Cuota real (source="installment"): el cobro registra un payment real —
+  // nunca el toggle de markPaid, que no crea ningún cobro ni actualiza la
+  // cuota (ver guard de PATCH /remittances/items/:id/paid en el backend).
+  async function confirmCollect(id: number) {
+    setCollecting(true);
+    try {
+      await api.post(`/api/remittances/items/${id}/collect`, {
+        paymentMethod: collectForm.paymentMethod,
+        paymentDate: collectForm.paymentDate,
+      });
+      toast.success("Cobro registrado — la cuota quedó pagada y la deuda cerrada");
+      setCollectingId(null);
+      load();
+    } catch (err: any) {
+      toast.error(err?.message || "Error al registrar el cobro");
+    }
+    setCollecting(false);
   }
 
   const total = items.reduce((s, i) => s + i.amount, 0);
@@ -2014,26 +2160,73 @@ function AdeudadosTab() {
         </div>
       ) : (
         <div className="space-y-2">
-          {items.map((item: any) => (
-            <div key={item.id} className="bg-[#0d1424] border border-red-500/20 rounded-xl px-4 py-3 flex items-center gap-4">
-              <AlertCircle size={16} className="text-red-400 shrink-0" />
-              <div className="flex-1 min-w-0">
-                <p className="text-sm text-white font-medium">{item.clientName}</p>
-                <p className="text-xs text-white/40">{item.companyName} · Póliza {item.policyNumber}</p>
-                <p className="text-xs text-white/30 mt-0.5">
-                  Rendición del {item.remittanceDate} ·{" "}
-                  <span className={cn("", CANAL_COLORS[item.remittanceCanal]?.replace("bg-", "text-").split(" ")[0])}>
-                    {CANAL_LABELS[item.remittanceCanal] || item.remittanceCanal}
-                  </span>
-                </p>
+          {items.map((item: any) => {
+            const isInstallment = item.source === "installment";
+            return (
+              <div key={item.id} className="bg-[#0d1424] border border-red-500/20 rounded-xl px-4 py-3">
+                <div className="flex items-center gap-4">
+                  <AlertCircle size={16} className="text-red-400 shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm text-white font-medium truncate">{item.clientName}</p>
+                      <span className={cn("text-[10px] px-1.5 py-0.5 rounded border shrink-0",
+                        isInstallment ? "text-red-400 border-red-500/30 bg-red-900/20" : "text-orange-400 border-orange-500/30 bg-orange-900/20")}>
+                        {adeudadoOriginLabel(item.source)}
+                      </span>
+                    </div>
+                    <p className="text-xs text-white/40">{item.companyName} · Póliza {item.policyNumber}</p>
+                    <p className="text-xs text-white/30 mt-0.5">
+                      Rendición del {item.remittanceDate} ·{" "}
+                      <span className={cn("", CANAL_COLORS[item.remittanceCanal]?.replace("bg-", "text-").split(" ")[0])}>
+                        {CANAL_LABELS[item.remittanceCanal] || item.remittanceCanal}
+                      </span>
+                    </p>
+                  </div>
+                  <p className="text-base font-bold text-red-400 shrink-0">{fmt(item.amount)}</p>
+                  {isInstallment ? (
+                    <button onClick={() => startCollect(item.id)}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-green-600 hover:bg-green-500 text-white text-xs font-medium rounded-lg transition-all shrink-0">
+                      <Check size={12} /> Registrar cobro
+                    </button>
+                  ) : (
+                    <button onClick={() => markPaid(item.id)}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-green-600 hover:bg-green-500 text-white text-xs font-medium rounded-lg transition-all shrink-0">
+                      <Check size={12} /> Cobrado
+                    </button>
+                  )}
+                </div>
+
+                {isInstallment && collectingId === item.id && (
+                  <div className="mt-3 pt-3 border-t border-white/10 flex items-end gap-2">
+                    <div>
+                      <label className="text-xs text-white/50 mb-1 block">Medio de cobro</label>
+                      <select value={collectForm.paymentMethod}
+                        onChange={e => setCollectForm(f => ({ ...f, paymentMethod: e.target.value }))}
+                        className="px-3 py-1.5 bg-[#0a0f1e] border border-white/10 rounded-lg text-sm text-white focus:outline-none focus:border-green-500">
+                        <option value="efectivo">Efectivo</option>
+                        <option value="transferencia">Transferencia</option>
+                        <option value="cheque">Cheque</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs text-white/50 mb-1 block">Fecha</label>
+                      <input type="date" value={collectForm.paymentDate}
+                        onChange={e => setCollectForm(f => ({ ...f, paymentDate: e.target.value }))}
+                        className="px-3 py-1.5 bg-[#0a0f1e] border border-white/10 rounded-lg text-sm text-white focus:outline-none focus:border-green-500" />
+                    </div>
+                    <button disabled={collecting} onClick={() => confirmCollect(item.id)}
+                      className="px-3 py-1.5 bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white text-xs font-medium rounded-lg transition-all">
+                      Confirmar cobro
+                    </button>
+                    <button disabled={collecting} onClick={() => setCollectingId(null)}
+                      className="px-3 py-1.5 bg-white/5 hover:bg-white/10 text-white/60 text-xs rounded-lg transition-all">
+                      Cancelar
+                    </button>
+                  </div>
+                )}
               </div>
-              <p className="text-base font-bold text-red-400 shrink-0">{fmt(item.amount)}</p>
-              <button onClick={() => markPaid(item.id)}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-green-600 hover:bg-green-500 text-white text-xs font-medium rounded-lg transition-all shrink-0">
-                <Check size={12} /> Cobrado
-              </button>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
