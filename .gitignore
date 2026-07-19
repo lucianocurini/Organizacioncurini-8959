@@ -57,6 +57,12 @@ local-audits/
 # siguen ignorados por la regla de arriba.
 !/.env.test
 
+# Local R2 backup test credentials (Fase 3B) — nunca commitear. No cae bajo
+# el patrón .env*.local de arriba porque termina en "-local" (guion), no
+# ".local" (punto) — regla explícita y redundante a propósito, mismo criterio
+# que las reglas de backups de producción más arriba.
+packages/web/.env.r2-local
+
 # caches
 .eslintcache
 .cache
