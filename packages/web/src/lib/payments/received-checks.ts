@@ -176,6 +176,32 @@ export interface PossibleCheckDuplicate {
   strength: "weak" | "strong";
 }
 
+// ─── Vigencia para detección de duplicados ─────────────────────────────────────
+
+/** Estados de la operación (batch o payment) de la que cuelga un cheque existente. */
+export interface CheckDuplicateOriginStatus {
+  checkStatus: ReceivedCheckStatus;
+  batchStatus?: string | null;
+  paymentStatus?: string | null;
+}
+
+/**
+ * Un cheque existente solo cuenta para bloquear/advertir un alta nueva como
+ * duplicado si sigue vigente: ni el cheque en sí, ni el batch del que
+ * proviene (si vino de un batch_split), ni el payment individual del que
+ * proviene (si vino de un payment_split) están anulados. Se chequean las
+ * tres fuentes por separado — nunca alcanza con una sola — porque hay
+ * cheques legacy vinculados a operaciones anuladas cuyo status propio quedó
+ * desactualizado (antes de la migración 0028, que empezó a transicionar
+ * received_checks a "anulado" al anular el batch/payment que los originó).
+ */
+export function isCheckActiveForDuplicateCheck(origin: CheckDuplicateOriginStatus): boolean {
+  if (origin.checkStatus === "anulado") return false;
+  if (origin.batchStatus === "anulado") return false;
+  if (origin.paymentStatus === "anulado") return false;
+  return true;
+}
+
 /**
  * Detecta candidatos a duplicado por banco+número (coincidencia mínima) y
  * marca "strong" cuando además coinciden importe, vencimiento y librador.
@@ -183,7 +209,9 @@ export interface PossibleCheckDuplicate {
  * endpoint decida (409 con confirmación explícita, ver index.ts) o para que
  * una futura UI advierta. drawerName null en ambos lados NO cuenta como
  * coincidencia de librador (no hay dato para comparar, no es evidencia de
- * duplicado).
+ * duplicado). El caller es responsable de que `existing` ya venga filtrado a
+ * cheques vigentes (ver isCheckActiveForDuplicateCheck) — esta función no
+ * conoce batches ni payments, solo compara los campos del cheque.
  */
 export function findPossibleCheckDuplicates(
   candidate: Pick<NormalizedReceivedCheck, "checkNumber" | "bankName" | "amountCents" | "dueDate" | "drawerName">,

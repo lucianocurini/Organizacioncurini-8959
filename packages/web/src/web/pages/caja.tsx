@@ -929,11 +929,12 @@ export default function CajaPage() {
                 )}
                 {/* Tarjetas detalle */}
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                  {/* Diferencia de caja — saldo neto (cartera − adeudados − gastos). Baja
-                      cuando se rinde una cuota real como adeudada (Curini adelantó esa
-                      plata) y vuelve a subir exacto cuando se registra el cobro posterior
-                      (ver POST /remittances/items/:id/collect) — sin fórmula nueva, es el
-                      mismo campo `diferencia` que ya calculaba el backend. */}
+                  {/* Diferencia de caja — saldo neto (cartera − adeudados, sin restar
+                      gastos: son un movimiento de Caja propia, no de la cartera del
+                      asegurado). Baja cuando se rinde una cuota real como adeudada
+                      (Curini adelantó esa plata) y vuelve a subir exacto cuando se
+                      registra el cobro posterior (ver POST /remittances/items/:id/collect)
+                      — es el mismo campo `diferencia` que ya calculaba el backend. */}
                   <div className={`rounded-xl p-4 border ${summary.diferencia >= 0 ? "bg-green-900/20 border-green-500/30" : "bg-red-900/20 border-red-500/30"}`}>
                     <p className={`text-xs mb-1 ${summary.diferencia >= 0 ? "text-green-400/70" : "text-red-400/70"}`}>Diferencia de caja</p>
                     <p className={`text-lg font-bold ${summary.diferencia >= 0 ? "text-green-400" : "text-red-400"}`}>{fmt(summary.diferencia)}</p>

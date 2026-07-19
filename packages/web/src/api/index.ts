@@ -62,6 +62,7 @@ import {
 import {
   normalizeReceivedCheck, validateChecksMatchSplit, findPossibleCheckDuplicates,
   validateCheckStatusTransition, ReceivedCheckValidationError, type NormalizedReceivedCheck,
+  isCheckActiveForDuplicateCheck, type ExistingCheckForDuplicateCheck,
 } from "../lib/payments/received-checks";
 import {
   resolveStandalonePaymentInstruments, resolveCashEntryInstrument, resolveBatchChildPaymentInstrument,
@@ -2508,16 +2509,15 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
   }
 
   // Detección informativa de posibles cheques duplicados (banco+número contra
-  // toda la cartera existente). Nunca bloquea sola — solo si hay coincidencia
-  // Y el caller no mandó confirmPossibleDuplicates:true. La confirmación NO
-  // saltea ninguna otra validación (ya corrieron todas arriba).
+  // la cartera VIGENTE — ver loadActiveExistingChecksForDuplicateCheck, un
+  // cheque de una operación anulada nunca cuenta). Nunca bloquea sola — solo
+  // si hay coincidencia Y el caller no mandó confirmPossibleDuplicates:true.
+  // La confirmación NO saltea ninguna otra validación (ya corrieron todas
+  // arriba).
   const allNewChecks = splitsWithChecks.flatMap((s) => s.checks);
   if (allNewChecks.length > 0) {
     const bankNames = [...new Set(allNewChecks.map((chk) => chk.bankName))];
-    const existingChecks = await db.select({
-      id: receivedChecks.id, checkNumber: receivedChecks.checkNumber, bankName: receivedChecks.bankName,
-      amountCents: receivedChecks.amountCents, dueDate: receivedChecks.dueDate, drawerName: receivedChecks.drawerName,
-    }).from(receivedChecks).where(inArray(receivedChecks.bankName, bankNames)).all();
+    const existingChecks = await loadActiveExistingChecksForDuplicateCheck(db, bankNames);
 
     const duplicates = allNewChecks
       .map((chk) => ({ bankName: chk.bankName, checkNumber: chk.checkNumber, matches: findPossibleCheckDuplicates(chk, existingChecks) }))
@@ -2907,12 +2907,13 @@ app.get("/payment-batches/:id", requireAuth(async (c: any) => {
   const checksBelongOnlyToCheckSplits = checksRows.every((chk) => chequeSplitIds.has(chk.batchSplitId));
   const invalidCheckStatuses = checksRows.filter((chk) => !CHECK_VALID_STATUSES.has(chk.status)).map((chk) => chk.id);
 
-  // Posibles duplicados entre los cheques de ESTE batch y toda la cartera
-  // (incluye otros batches) — una sola consulta por los bancos involucrados.
+  // Posibles duplicados entre los cheques de ESTE batch y la cartera VIGENTE
+  // (incluye otros batches, excluye operaciones anuladas) — una sola
+  // consulta por los bancos involucrados.
   let possibleDuplicateChecks: Array<{ checkId: number; matches: ReturnType<typeof findPossibleCheckDuplicates> }> = [];
   if (checksRows.length > 0) {
     const bankNames = [...new Set(checksRows.map((chk) => chk.bankName))];
-    const candidates = await db.select().from(receivedChecks).where(inArray(receivedChecks.bankName, bankNames)).all();
+    const candidates = await loadActiveExistingChecksForDuplicateCheck(db, bankNames);
     possibleDuplicateChecks = checksRows
       .map((chk) => ({ checkId: chk.id, matches: findPossibleCheckDuplicates(chk, candidates.filter((o) => o.id !== chk.id)) }))
       .filter((d) => d.matches.length > 0);
@@ -3176,6 +3177,41 @@ app.patch("/payment-batches/:id", requireAuth(async (c: any) => {
 // individual): se resuelven ambos orígenes por separado y se devuelve
 // `source` para que el frontend sepa cuál de los dos (`batch`/`payment`)
 // viene poblado.
+// PROBLEMA 3 del hotfix de cheques: la detección de posibles duplicados
+// (findPossibleCheckDuplicates) solo debe comparar contra cheques VIGENTES.
+// Un cheque cuyo batch o payment de origen fue anulado no debe bloquear ni
+// advertir como duplicado un alta nueva con el mismo banco+número, aunque el
+// propio received_checks.status no haya quedado sincronizado (legacy, antes
+// de la migración 0028) — ver isCheckActiveForDuplicateCheck. Una sola
+// consulta con LEFT JOIN a ambos orígenes posibles (batch xor payment, nunca
+// ambos) cubre los tres casos: cheque anulado, batch anulado, payment
+// anulado.
+async function loadActiveExistingChecksForDuplicateCheck(
+  dbOrTx: any,
+  bankNames: string[]
+): Promise<ExistingCheckForDuplicateCheck[]> {
+  if (bankNames.length === 0) return [];
+  const rows = await dbOrTx.select({
+    id: receivedChecks.id,
+    checkNumber: receivedChecks.checkNumber,
+    bankName: receivedChecks.bankName,
+    amountCents: receivedChecks.amountCents,
+    dueDate: receivedChecks.dueDate,
+    drawerName: receivedChecks.drawerName,
+    checkStatus: receivedChecks.status,
+    batchStatus: paymentBatches.status,
+    paymentStatus: payments.status,
+  }).from(receivedChecks)
+    .leftJoin(paymentBatchSplits, eq(receivedChecks.batchSplitId, paymentBatchSplits.id))
+    .leftJoin(paymentBatches, eq(paymentBatchSplits.batchId, paymentBatches.id))
+    .leftJoin(paymentSplits, eq(receivedChecks.paymentSplitId, paymentSplits.id))
+    .leftJoin(payments, eq(paymentSplits.paymentId, payments.id))
+    .where(inArray(receivedChecks.bankName, bankNames))
+    .all();
+
+  return (rows as any[]).filter(isCheckActiveForDuplicateCheck);
+}
+
 async function loadBatchOriginChecks(dbOrTx: any, extraWhere?: any) {
   const conditions = [isNotNull(receivedChecks.batchSplitId)];
   if (extraWhere) conditions.push(extraWhere);
@@ -3269,11 +3305,10 @@ app.get("/received-checks", requireAuth(async (c: any) => {
 
   // Posibles duplicados: una sola consulta contra los bancos involucrados
   // (de ambos orígenes juntos, porque received_checks es una única tabla
-  // compartida), no una por cheque.
+  // compartida), no una por cheque. Solo cheques vigentes — ver
+  // loadActiveExistingChecksForDuplicateCheck.
   const bankNames = [...new Set([...batchRows.map((r) => r.check.bankName), ...paymentRows.map((r) => r.check.bankName)])];
-  const duplicateCandidates = bankNames.length > 0
-    ? await db.select().from(receivedChecks).where(inArray(receivedChecks.bankName, bankNames)).all()
-    : [];
+  const duplicateCandidates = await loadActiveExistingChecksForDuplicateCheck(db, bankNames);
 
   const batchResult = batchRows.map((r) => {
     const children = childrenByBatchId.get(r.batch.id) ?? [];
@@ -3346,8 +3381,8 @@ app.get("/received-checks/:id", requireAuth(async (c: any) => {
       insuredId: ch.insured?.id ?? null, insuredName: ch.insured?.name ?? null,
       manualPayer: ch.payment.manualPayer, manualPolicyNumber: ch.payment.manualPolicyNumber,
     })));
-    const otherChecksSameBank = await db.select().from(receivedChecks)
-      .where(and(eq(receivedChecks.bankName, batchRow.check.bankName), ne(receivedChecks.id, id))).all();
+    const otherChecksSameBank = (await loadActiveExistingChecksForDuplicateCheck(db, [batchRow.check.bankName]))
+      .filter((o) => o.id !== id);
     const possibleDuplicates = findPossibleCheckDuplicates(batchRow.check, otherChecksSameBank);
 
     return c.json({
@@ -3370,8 +3405,8 @@ app.get("/received-checks/:id", requireAuth(async (c: any) => {
     insuredId: paymentRow.insured?.id ?? null, insuredName: paymentRow.insured?.name ?? null,
     manualPayer: paymentRow.payment.manualPayer, manualPolicyNumber: paymentRow.payment.manualPolicyNumber,
   }]);
-  const otherChecksSameBank = await db.select().from(receivedChecks)
-    .where(and(eq(receivedChecks.bankName, paymentRow.check.bankName), ne(receivedChecks.id, id))).all();
+  const otherChecksSameBank = (await loadActiveExistingChecksForDuplicateCheck(db, [paymentRow.check.bankName]))
+    .filter((o) => o.id !== id);
   const possibleDuplicates = findPossibleCheckDuplicates(paymentRow.check, otherChecksSameBank);
 
   return c.json({
@@ -7106,8 +7141,13 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   const cajaRecargosProntoPago = cartera.recargosProntoPago;
   const cajaNeta = cartera.total; // Pendiente de rendir actual
 
-  // Diferencia = caja neta - adeudados - gastos (campo conservado sin cambios)
-  const diferencia = cajaNeta - totalAdeudado - totalGastos;
+  // Diferencia de caja/cartera = pendiente total de rendir (cajaNeta) menos
+  // adeudados. Los gastos NO se restan acá — son un movimiento de Caja
+  // propia (ver cpResultadoOp/cpSaldoPropio más abajo), no parte de la
+  // cartera pendiente de rendir del asegurado (hotfix: restarlos generaba
+  // una diferencia negativa incorrecta que no reflejaba ningún faltante
+  // real de cartera).
+  const diferencia = cajaNeta - totalAdeudado;
 
   // ── Totales del período (solo si se recibieron parámetros válidos) ─────────
   let cobradoPeriodo = 0;

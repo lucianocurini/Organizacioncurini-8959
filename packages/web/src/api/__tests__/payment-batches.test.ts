@@ -76,6 +76,18 @@ async function callGetBatch(id: number) {
   return { status: res.status, body: await res.json() };
 }
 
+async function callCancelBatch(id: number, body: Record<string, any> = { confirm: true }) {
+  const res = await app.fetch(new Request(`http://localhost/api/payment-batches/${id}/cancel`, {
+    method: "POST", headers: authHeaders(), body: JSON.stringify(body),
+  }));
+  return { status: res.status, body: await res.json() };
+}
+
+async function callGetReceivedChecks(query: string) {
+  const res = await app.fetch(new Request(`http://localhost/api/received-checks${query}`, { headers: authHeaders() }));
+  return { status: res.status, body: await res.json() };
+}
+
 async function callPutPayment(id: number, body: Record<string, any>) {
   const res = await app.fetch(new Request(`http://localhost/api/payments/${id}`, {
     method: "PUT", headers: authHeaders(), body: JSON.stringify(body),
@@ -1072,6 +1084,200 @@ describe("30/31. Posible cheque duplicado", () => {
       items: [{ installmentId: instId }],
       splits: [{ method: "cheque", amount: 1000, checks: [mkCheckPayload({ amount: 900 })] }],
       confirmPossibleDuplicates: true,
+    });
+    expect(status).toBe(400);
+  });
+});
+
+describe("PROBLEMA 3 (hotfix) — cheque de operación anulada no cuenta como duplicado", () => {
+  test("1. mismo banco/número asociado a batch ACTIVO → detecta duplicado (sigue bloqueando)", async () => {
+    const policyId1 = await mkPolicy(insuredId, companyId);
+    const inst1 = await mkInstallment(policyId1, 1, "2027-01-01", 1000);
+    const bankName = `${PREFIX} Banco P3-1`;
+    const checkNumber = `P3-1-${Date.now()}`;
+
+    const first = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: inst1 }],
+      splits: [{ method: "cheque", amount: 1000, checks: [{ checkNumber, bankName, dueDate: "2027-06-01", amount: 1000 }] }],
+    });
+    expect(first.status).toBe(201);
+
+    const policyId2 = await mkPolicy(insuredId, companyId);
+    const inst2 = await mkInstallment(policyId2, 1, "2027-01-01", 1000);
+    const second = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: inst2 }],
+      splits: [{ method: "cheque", amount: 1000, checks: [{ checkNumber, bankName, dueDate: "2027-06-01", amount: 1000 }] }],
+    });
+    expect(second.status).toBe(409);
+    expect(second.body.code).toBe("CHECK_POSSIBLE_DUPLICATE");
+  });
+
+  test("2. mismo banco/número asociado a batch ANULADO → NO detecta duplicado, permite cargarlo", async () => {
+    const policyId1 = await mkPolicy(insuredId, companyId);
+    const inst1 = await mkInstallment(policyId1, 1, "2027-01-01", 1000);
+    const bankName = `${PREFIX} Banco P3-2`;
+    const checkNumber = `P3-2-${Date.now()}`;
+
+    const first = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: inst1 }],
+      splits: [{ method: "cheque", amount: 1000, checks: [{ checkNumber, bankName, dueDate: "2027-06-01", amount: 1000 }] }],
+    });
+    expect(first.status).toBe(201);
+
+    const cancelRes = await callCancelBatch(first.body.id);
+    expect(cancelRes.status).toBe(200);
+
+    const policyId2 = await mkPolicy(insuredId, companyId);
+    const inst2 = await mkInstallment(policyId2, 1, "2027-01-01", 1000);
+    const second = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: inst2 }],
+      splits: [{ method: "cheque", amount: 1000, checks: [{ checkNumber, bankName, dueDate: "2027-06-01", amount: 1000 }] }],
+    });
+    expect(second.status).toBe(201);
+  });
+
+  test("3. cheque con received_checks.status='anulado' pero legacy (batch todavía 'confirmado') → NO detecta duplicado", async () => {
+    const policyId1 = await mkPolicy(insuredId, companyId);
+    const inst1 = await mkInstallment(policyId1, 1, "2027-01-01", 1000);
+    const bankName = `${PREFIX} Banco P3-3`;
+    const checkNumber = `P3-3-${Date.now()}`;
+
+    const first = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: inst1 }],
+      splits: [{ method: "cheque", amount: 1000, checks: [{ checkNumber, bankName, dueDate: "2027-06-01", amount: 1000 }] }],
+    });
+    expect(first.status).toBe(201);
+
+    // Simula el caso legacy descripto en el hotfix: el cheque quedó
+    // "anulado" a mano (o por una vía previa a la migración 0028) sin que se
+    // haya anulado el batch que lo originó.
+    const splits = await db.select().from(paymentBatchSplits).where(eq(paymentBatchSplits.batchId, first.body.id)).all();
+    const checkRows = await db.select().from(receivedChecks).where(inArray(receivedChecks.batchSplitId, splits.map(s => s.id))).all();
+    await db.update(receivedChecks).set({ status: "anulado" }).where(inArray(receivedChecks.id, checkRows.map(c => c.id)));
+
+    const policyId2 = await mkPolicy(insuredId, companyId);
+    const inst2 = await mkInstallment(policyId2, 1, "2027-01-01", 1000);
+    const second = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: inst2 }],
+      splits: [{ method: "cheque", amount: 1000, checks: [{ checkNumber, bankName, dueDate: "2027-06-01", amount: 1000 }] }],
+    });
+    expect(second.status).toBe(201);
+  });
+
+  test("4. cheque asociado a payment INDIVIDUAL anulado → NO detecta duplicado", async () => {
+    const policyId1 = await mkPolicy(insuredId, companyId);
+    const inst1 = await mkInstallment(policyId1, 1, "2027-01-01", 1000);
+    const bankName = `${PREFIX} Banco P3-4`;
+    const checkNumber = `P3-4-${Date.now()}`;
+
+    const [payment] = await db.insert(payments).values({
+      policyId: policyId1, amount: 1000, paymentMethod: "cheque", paymentDate: "2027-01-01",
+      status: "confirmado", installmentId: inst1, createdBy: userId,
+    }).returning();
+    paymentIdsToClean.push(payment!.id);
+    const [split] = await db.insert(paymentSplits).values({
+      paymentId: payment!.id, method: "cheque", amountCents: 100000,
+    }).returning();
+    await db.insert(receivedChecks).values({
+      paymentSplitId: split!.id, checkNumber, bankName, dueDate: "2027-06-01",
+      amountCents: 100000, status: "en_cartera", receivedAt: new Date(), createdBy: userId,
+      createdAt: new Date(), updatedAt: new Date(),
+    });
+
+    const cancelRes = await callPutPayment(payment!.id, { status: "anulado" });
+    expect(cancelRes.status).toBe(200);
+
+    const policyId2 = await mkPolicy(insuredId, companyId);
+    const inst2 = await mkInstallment(policyId2, 1, "2027-01-01", 1000);
+    const second = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: inst2 }],
+      splits: [{ method: "cheque", amount: 1000, checks: [{ checkNumber, bankName, dueDate: "2027-06-01", amount: 1000 }] }],
+    });
+    expect(second.status).toBe(201);
+  });
+
+  test("5. un duplicado anulado y otro activo con el mismo número → SÍ detecta duplicado por el activo", async () => {
+    const policyId1 = await mkPolicy(insuredId, companyId);
+    const inst1 = await mkInstallment(policyId1, 1, "2027-01-01", 1000);
+    const bankName = `${PREFIX} Banco P3-5`;
+    const checkNumber = `P3-5-${Date.now()}`;
+
+    const first = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: inst1 }],
+      splits: [{ method: "cheque", amount: 1000, checks: [{ checkNumber, bankName, dueDate: "2027-06-01", amount: 1000 }] }],
+    });
+    expect(first.status).toBe(201);
+    await callCancelBatch(first.body.id);
+
+    // Un segundo cheque activo, mismo banco+número, cargado con confirmación
+    // (porque en ese momento coincidía contra el ya-anulado — no debería
+    // haber bloqueado, pero se confirma igual para simplificar el fixture).
+    const policyId2 = await mkPolicy(insuredId, companyId);
+    const inst2 = await mkInstallment(policyId2, 1, "2027-01-01", 1000);
+    const second = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: inst2 }],
+      splits: [{ method: "cheque", amount: 1000, checks: [{ checkNumber, bankName, dueDate: "2027-06-01", amount: 1000 }] }],
+    });
+    expect(second.status).toBe(201);
+
+    const policyId3 = await mkPolicy(insuredId, companyId);
+    const inst3 = await mkInstallment(policyId3, 1, "2027-01-01", 1000);
+    const third = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: inst3 }],
+      splits: [{ method: "cheque", amount: 1000, checks: [{ checkNumber, bankName, dueDate: "2027-06-01", amount: 1000 }] }],
+    });
+    expect(third.status).toBe(409);
+    expect(third.body.code).toBe("CHECK_POSSIBLE_DUPLICATE");
+  });
+
+  test("6. flujo de cobro por lote reutilizando un cheque de una operación anulada permite continuar sin confirmación explícita", async () => {
+    const policyId1 = await mkPolicy(insuredId, companyId);
+    const inst1 = await mkInstallment(policyId1, 1, "2027-01-01", 500);
+    const bankName = `${PREFIX} Banco P3-6`;
+    const checkNumber = `P3-6-${Date.now()}`;
+
+    const first = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: inst1 }],
+      splits: [{ method: "cheque", amount: 500, checks: [{ checkNumber, bankName, dueDate: "2027-06-01", amount: 500 }] }],
+    });
+    expect(first.status).toBe(201);
+    await callCancelBatch(first.body.id);
+
+    const policyId2 = await mkPolicy(insuredId, companyId);
+    const inst2 = await mkInstallment(policyId2, 1, "2027-01-01", 500);
+    // Sin confirmPossibleDuplicates:true — el cheque reutilizado viene de una
+    // operación anulada, no debe requerir confirmación para continuar.
+    const second = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: inst2 }],
+      splits: [{ method: "cheque", amount: 500, checks: [{ checkNumber, bankName, dueDate: "2027-06-01", amount: 500 }] }],
+    });
+    expect(second.status).toBe(201);
+
+    const checks = await getChecksForBatch(second.body.id);
+    expect(checks.length).toBe(1);
+    expect(checks[0]!.amountCents).toBe(50000);
+  });
+
+  test("7. no rompe la validación de importes exactos del cheque tras el fix de duplicados", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+
+    const { status } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "cheque", amount: 1000, checks: [mkCheckPayload({ amount: 900 })] }],
     });
     expect(status).toBe(400);
   });

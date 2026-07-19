@@ -8,7 +8,7 @@ import { test, expect, describe } from "bun:test";
 import {
   normalizeReceivedCheck, validateReceivedCheckFields, validateCheckDate,
   sumReceivedChecksCents, validateChecksMatchSplit, validateCheckStatusTransition,
-  findPossibleCheckDuplicates, isCheckAvailableForRemittance,
+  findPossibleCheckDuplicates, isCheckAvailableForRemittance, isCheckActiveForDuplicateCheck,
   ReceivedCheckValidationError, type ReceivedCheckInput, type ExistingCheckForDuplicateCheck,
 } from "../../lib/payments/received-checks";
 
@@ -181,6 +181,34 @@ describe("findPossibleCheckDuplicates", () => {
   test("18. no lanza ninguna excepción aunque haya duplicado 'strong'", () => {
     const candidate = normalizeReceivedCheck(input({ drawerName: "Juan Pérez" }));
     expect(() => findPossibleCheckDuplicates(candidate, [existing()])).not.toThrow();
+  });
+});
+
+// ─── PROBLEMA 3 (hotfix) — vigencia de un cheque existente para duplicados ────
+
+describe("isCheckActiveForDuplicateCheck", () => {
+  test("cheque en_cartera sin batch ni payment anulados → vigente", () => {
+    expect(isCheckActiveForDuplicateCheck({ checkStatus: "en_cartera" })).toBe(true);
+  });
+
+  test("checkStatus='anulado' → no vigente, aunque no haya info de batch/payment", () => {
+    expect(isCheckActiveForDuplicateCheck({ checkStatus: "anulado" })).toBe(false);
+  });
+
+  test("batchStatus='anulado' (aunque el cheque en sí no esté marcado) → no vigente (caso legacy)", () => {
+    expect(isCheckActiveForDuplicateCheck({ checkStatus: "en_cartera", batchStatus: "anulado" })).toBe(false);
+  });
+
+  test("paymentStatus='anulado' (aunque el cheque en sí no esté marcado) → no vigente (caso legacy)", () => {
+    expect(isCheckActiveForDuplicateCheck({ checkStatus: "entregado_compania", paymentStatus: "anulado" })).toBe(false);
+  });
+
+  test("batchStatus='confirmado' → vigente", () => {
+    expect(isCheckActiveForDuplicateCheck({ checkStatus: "en_cartera", batchStatus: "confirmado" })).toBe(true);
+  });
+
+  test("paymentStatus='confirmado' → vigente", () => {
+    expect(isCheckActiveForDuplicateCheck({ checkStatus: "en_cartera", paymentStatus: "confirmado" })).toBe(true);
   });
 });
 

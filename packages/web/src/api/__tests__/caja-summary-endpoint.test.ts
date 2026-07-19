@@ -703,6 +703,33 @@ describe("GET /api/cash/summary — sin regresión en gastos/comisiones/dinero p
       if (expId !== undefined) await deleteWithRetry(() => db.delete(cashExpenses).where(eq(cashExpenses.id, expId!)));
     }
   });
+
+  // Hotfix (punto A): diferencia de caja/cartera = pendiente total de rendir
+  // (cajaNeta) - adeudados. Los gastos son un movimiento de Caja propia, no
+  // deben restarse de la diferencia de cartera del asegurado.
+  test("diferencia = cajaNeta - totalAdeudado, sin restar gastos", async () => {
+    const before = (await getSummary()).body;
+    expect(before.diferencia).toBeCloseTo(before.cajaNeta.total - before.totalAdeudado, 2);
+
+    let expId: number | undefined;
+    try {
+      const [exp] = await db.insert(cashExpenses).values({
+        date: FIXTURE_DATE, description: `${PREFIX} gasto diferencia`, amount: 9999, type: "gasto_operativo",
+        paymentMethod: "efectivo", status: "registrado", createdBy: userId,
+      }).returning({ id: cashExpenses.id });
+      expId = exp!.id;
+
+      const after = (await getSummary()).body;
+      // El gasto sí impacta totalGastos (ver test de arriba) pero NO debe
+      // mover diferencia — antes del fix, un gasto grande podía volver la
+      // diferencia negativa sin que faltara nada real en cartera.
+      expect(after.totalGastos - before.totalGastos).toBeCloseTo(9999, 2);
+      expect(after.diferencia - before.diferencia).toBeCloseTo(0, 2);
+      expect(after.diferencia).toBeCloseTo(after.cajaNeta.total - after.totalAdeudado, 2);
+    } finally {
+      if (expId !== undefined) await deleteWithRetry(() => db.delete(cashExpenses).where(eq(cashExpenses.id, expId!)));
+    }
+  });
 });
 
 describe("GET /api/cash/summary — adeudadosDetalle", () => {
