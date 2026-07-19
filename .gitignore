@@ -63,6 +63,12 @@ local-audits/
 # que las reglas de backups de producción más arriba.
 packages/web/.env.r2-local
 
+# Credenciales de R2 + Turso producción para la primera prueba real de
+# backup prod → R2 (Fase 3B/3C). Mismo motivo que la regla de arriba: no cae
+# bajo ningún patrón .env* existente. Contiene credenciales reales — nunca
+# commitear.
+packages/web/.env.r2-prod
+
 # caches
 .eslintcache
 .cache
