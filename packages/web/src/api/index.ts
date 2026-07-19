@@ -31,6 +31,7 @@ import {
   ivaEntries,
   ownMoneyMovements,
 } from "./database/schema";
+import { buildFullBackup, validateFullBackup, EXPECTED_BUSINESS_TABLES } from "./backup/full-backup";
 import { nanoid } from "nanoid";
 import {
   gmailSearch,
@@ -3836,68 +3837,26 @@ app.delete("/tasks/:id", requireAuth(async (c: any) => {
   return c.json({ ok: true }, 200);
 }));
 
-// GET /backup — full DB dump (admin only)
+// GET /backup — full DB dump, todas las tablas de negocio (admin only)
 app.get("/backup", requireAuth(async (c: any) => {
   const user = c.get("user");
   if (user.role !== "admin") return c.json({ error: "Forbidden" }, 403);
 
-  const [
-    allUsers,
-    allCompanies,
-    allInsureds,
-    allPolicies,
-    allPayments,
-    allDeliveries,
-    allClaims,
-    allInstallments,
-    allRebillings,
-    allInsuredPersons,
-    allFleetVehicles,
-    allTaskTemplates,
-    allTasks,
-    allImportLogs,
-  ] = await Promise.all([
-    db.select().from(users),
-    db.select().from(companies),
-    db.select().from(insureds),
-    db.select().from(policies),
-    db.select().from(payments),
-    db.select().from(deliveries),
-    db.select().from(claims),
-    db.select().from(policyInstallments),
-    db.select().from(rebillings),
-    db.select().from(policyInsuredPersons),
-    db.select().from(policyFleetVehicles),
-    db.select().from(taskTemplates),
-    db.select().from(tasks),
-    db.select().from(importLogs),
-  ]);
+  const backup = await buildFullBackup(db.$client, {
+    environment: process.env.NODE_ENV ?? "production",
+    databaseUrl: process.env.DATABASE_URL ?? "",
+  });
 
-  // Strip passwords from users
-  const safeUsers = allUsers.map(({ password, ...u }) => u);
+  const validation = validateFullBackup(backup, EXPECTED_BUSINESS_TABLES);
+  if (!validation.ok) {
+    return c.json({ error: "Backup incompleto o inconsistente", details: validation.errors }, 500);
+  }
+  if (validation.warnings.length > 0) {
+    console.warn("GET /backup — warnings:", validation.warnings);
+  }
 
-  const backup = {
-    version: 1,
-    exportedAt: new Date().toISOString(),
-    tables: {
-      users: safeUsers,
-      companies: allCompanies,
-      insureds: allInsureds,
-      policies: allPolicies,
-      payments: allPayments,
-      deliveries: allDeliveries,
-      claims: allClaims,
-      policyInstallments: allInstallments,
-      rebillings: allRebillings,
-      policyInsuredPersons: allInsuredPersons,
-      policyFleetVehicles: allFleetVehicles,
-      taskTemplates: allTaskTemplates,
-      tasks: allTasks,
-      importLogs: allImportLogs,
-    },
-  };
-
-  const filename = `curini-backup-${new Date().toISOString().substring(0, 10)}.json`;
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const filename = `organizacion-curini-full-backup-${ts}.json`;
   return new Response(JSON.stringify(backup, null, 2), {
     status: 200,
     headers: {
