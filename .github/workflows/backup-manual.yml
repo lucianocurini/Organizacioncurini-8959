@@ -1,10 +1,15 @@
 name: Manual production backup
 
-# Fase 4A — solo workflow_dispatch (disparo manual desde la pestaña Actions).
-# NO hay schedule/cron todavía — eso es una fase separada, a activar después
-# de validar esto.
+# Fase 4B — se mantiene workflow_dispatch (disparo manual desde la pestaña
+# Actions) y se agrega schedule diario. "30 6 * * *" = 06:30 UTC = 03:30
+# Argentina (UTC-3, sin horario de verano). La retención sigue en dry-run acá
+# también: no se agregó CONFIRM_BACKUP_RETENTION_DELETE, así que la corrida
+# diaria nunca borra objetos de R2 por sí sola — activar el borrado real es
+# una decisión separada, todavía no tomada.
 on:
   workflow_dispatch: {}
+  schedule:
+    - cron: "30 6 * * *"
 
 jobs:
   backup:
