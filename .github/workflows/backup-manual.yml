@@ -1,0 +1,52 @@
+name: Manual production backup
+
+# Fase 4A — solo workflow_dispatch (disparo manual desde la pestaña Actions).
+# NO hay schedule/cron todavía — eso es una fase separada, a activar después
+# de validar esto.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  backup:
+    name: Run production backup → R2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        working-directory: packages/web
+        run: bun install
+
+      # Corre el mismo entrypoint trackeado que se usa localmente
+      # (packages/web/src/api/backup/run-full-backup.ts) — script y
+      # workflow comparten la misma lógica, no hay una versión "de CI"
+      # separada.
+      #
+      # CONFIRM_BACKUP_RETENTION_DELETE NO está definida a propósito: sin
+      # ella, la retención corre siempre en dry-run (lista qué borraría,
+      # nunca borra de verdad). Activarla es una decisión separada, no algo
+      # que este workflow deba hacer todavía.
+      #
+      # Todas las credenciales salen de GitHub Secrets (Settings → Secrets
+      # and variables → Actions) — nunca hardcodeadas acá. R2_PREFIX y los
+      # dos CONFIRM_* de esta corrida no son secretos (son config fija de
+      # este backup), así que van como valores literales.
+      - name: Run full backup and upload to R2
+        working-directory: packages/web
+        run: bun src/api/backup/run-full-backup.ts
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_AUTH_TOKEN: ${{ secrets.DATABASE_AUTH_TOKEN }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_PREFIX: curini-prod/
+          CONFIRM_FULL_BACKUP_PROD: "1"
+          CONFIRM_BACKUP_UPLOAD: "1"
