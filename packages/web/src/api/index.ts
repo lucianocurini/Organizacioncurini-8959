@@ -30,6 +30,7 @@ import {
   commissionEntries,
   ivaEntries,
   ownMoneyMovements,
+  insuredAccountMovements,
 } from "./database/schema";
 import { buildFullBackup, validateFullBackup, EXPECTED_BUSINESS_TABLES } from "./backup/full-backup";
 import { nanoid } from "nanoid";
@@ -54,7 +55,7 @@ import {
 import {
   normalizeBatchItems, normalizeBatchSplits, validateInstallmentsEligibility,
   calculateBaseAmountCents, resolveBatchSplitGroup, calculateApplicableRivadaviaSurcharges,
-  calculateBatchTotals, validateBatchTotals, resolveBatchInsuredId, PaymentBatchValidationError,
+  calculateBatchTotals, resolveBatchInsuredId, PaymentBatchValidationError,
   SURCHARGE_AMOUNT_CENTS, type BatchItemContext, type NormalizedPaymentBatchSplit,
   type NormalizedPaymentBatchItem,
   checkBatchCancellable, findDisallowedBatchPatchFields, canPatchBatch,
@@ -78,6 +79,9 @@ import {
   centsToPesos, buildAdeudadosDetalle, assertAdeudadosDetalleMatchesTotal, AdeudadosSumMismatchError,
   isContableMethod, type CarteraInconsistency, type BatchForCartera,
 } from "../lib/payments/caja-summary";
+import {
+  calculateBatchReceivedAppliedDifference, validateInsuredAccountMovement, InsuredAccountValidationError,
+} from "../lib/payments/insured-account";
 
 const app = new Hono().basePath("/api");
 
@@ -2515,13 +2519,83 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
   const applicableSurchargeSet = new Set(applicableSurchargeContexts);
   const surchargeAmountCents = applicableSurchargeContexts.length * SURCHARGE_AMOUNT_CENTS;
 
-  // 9. Total recibido = base + recargos.
+  // 9. Total APLICADO = base + recargos (totals.totalReceivedCents — columna
+  // legacy, sin cambio de nombre ni de significado: sigue siendo lo imputado
+  // a cuotas, nunca dinero real por sí sola).
   const totals = calculateBatchTotals(baseAmountCents, surchargeAmountCents);
 
-  // 10. La suma de los medios cargados debe coincidir exactamente con el total.
-  const totalsCheck = validateBatchTotals(totals, normalizedSplits);
-  if (!totalsCheck.valid) {
-    return c.json({ error: totalsCheck.errorMessage }, 400);
+  // 10. Dinero real RECIBIDO vs APLICADO (Fase 2B — sobrantes/faltantes, ver
+  // diagnóstico de diseño cerrado 2026-07-21 y Migración 0030).
+  // receivedCents = SUM(splits) — dinero real: un cheque nunca se "achica"
+  // para cerrar contra las cuotas elegidas (validateChecksMatchSplit, sin
+  // cambios, sigue exigiendo que la suma de cheques cierre EXACTO contra su
+  // split cheque — la diferencia se resuelve acá, a nivel de TOTAL del
+  // cobro, nunca a nivel de un instrumento físico individual).
+  // appliedCents = totals.totalReceivedCents, lo imputado a las cuotas
+  // elegidas — no cambia con esta fase.
+  //
+  // Si difieren, el caller debe resolverlo EXPLÍCITAMENTE con
+  // accountDifferenceResolution — el backend nunca inventa a qué asegurado
+  // atribuir la diferencia, ni aplica un saldo a favor preexistente todavía
+  // (fase posterior). Sin diferencia, comportamiento idéntico al de antes de
+  // esta fase (ni siquiera se mira accountDifferenceResolution si vino).
+  const appliedCents = totals.totalReceivedCents;
+  const receivedCents = normalizedSplits.reduce((sum, s) => sum + s.amountCents, 0);
+  const difference = calculateBatchReceivedAppliedDifference(receivedCents, appliedCents);
+
+  let accountMovementToCreate: { type: "saldo_a_favor" | "saldo_deudor"; reason: string | null } | null = null;
+
+  if (difference.kind !== "exacto") {
+    const expectedAction = difference.kind; // "saldo_a_favor" | "saldo_deudor" — únicas 2 acciones soportadas en esta fase
+    const resolution = body.accountDifferenceResolution;
+
+    if (resolution == null || typeof resolution !== "object") {
+      return c.json({
+        error:
+          `La suma de los medios ($${(receivedCents / 100).toFixed(2)}) no coincide con el total a aplicar a las cuotas ` +
+          `($${(appliedCents / 100).toFixed(2)}). Indicá accountDifferenceResolution.action ("saldo_a_favor" o ` +
+          `"saldo_deudor") para continuar.`,
+        code: "PAYMENT_BATCH_AMOUNT_DIFFERENCE",
+        receivedCents, appliedCents, differenceCents: difference.differenceCents,
+      }, 400);
+    }
+    // Cualquier action fuera de las 2 soportadas hoy (incluido, a propósito,
+    // un futuro "ajuste_manual"/"devolucion_inmediata" — Caso D, no
+    // implementado todavía) se rechaza acá con un mensaje explícito, en vez
+    // de caer silenciosamente a ningún branch.
+    if (resolution.action !== "saldo_a_favor" && resolution.action !== "saldo_deudor") {
+      return c.json({ error: `accountDifferenceResolution.action no soportada en esta etapa: "${resolution.action}".` }, 400);
+    }
+    if (resolution.action !== expectedAction) {
+      return c.json({
+        error:
+          `accountDifferenceResolution.action ("${resolution.action}") no coincide con el sentido real de la diferencia ` +
+          `("${expectedAction}").`,
+      }, 400);
+    }
+    // Multiasegurado (Regla 5) y 100% manual_payment sin asegurado real
+    // (Caso B) comparten la misma señal: resolveBatchInsuredId ya devuelve
+    // null en ambos casos — ningún dueño único al que atribuir la diferencia.
+    if (derivedInsuredId == null) {
+      return c.json({
+        error:
+          "No se puede determinar un único asegurado real para asignar la diferencia de este cobro (el cobro mezcla más de " +
+          "un asegurado, o es una imputación 100% manual sin asegurado real). Separá este cobro para poder generar el saldo.",
+      }, 400);
+    }
+    const reason = typeof resolution.reason === "string" && resolution.reason.trim() ? resolution.reason.trim() : null;
+    try {
+      validateInsuredAccountMovement({
+        insuredId: derivedInsuredId,
+        type: resolution.action,
+        signedAmountCents: difference.differenceCents,
+        reason,
+      });
+    } catch (e: any) {
+      if (e instanceof InsuredAccountValidationError) return c.json({ error: e.message }, 400);
+      throw e;
+    }
+    accountMovementToCreate = { type: resolution.action, reason };
   }
 
   // Detección informativa de posibles cheques duplicados (banco+número contra
@@ -2568,6 +2642,9 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
       baseAmountCents: totals.baseAmountCents,
       surchargeAmountCents: totals.surchargeAmountCents,
       totalReceivedCents: totals.totalReceivedCents,
+      // Fase 2B: dinero real recibido — SIEMPRE SUM(splits), sin excepción
+      // (Regla 3), esté o no esté "exacto" contra lo aplicado.
+      receivedAmountCents: receivedCents,
       paymentDate: body.paymentDate,
       status: "confirmado",
       notes: body.notes || null,
@@ -2617,6 +2694,13 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
       }
     }
 
+    // Único hijo "sin ambigüedad" del batch — solo se usa para
+    // relatedPaymentId/relatedInstallmentId de un eventual saldo_deudor (ver
+    // más abajo). Con 2+ ítems no hay forma no ambigua de elegir "la cuota
+    // relacionada" entre varias, así que esos campos quedan null a propósito
+    // (decisión documentada, ver Regla 4C del pedido).
+    let singleChildId: number | null = null;
+
     for (let idx = 0; idx < contexts.length; idx++) {
       const ctxItem = contexts[idx]!;
       const display = displays[idx]!;
@@ -2644,6 +2728,8 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
         createdBy: user.id,
       }).returning();
 
+      if (contexts.length === 1) singleChildId = child!.id;
+
       if (applicableSurchargeSet.has(ctxItem)) {
         await tx.insert(cashEntries).values({
           clientName: display.insuredName ?? "—",
@@ -2665,6 +2751,29 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
       if (ctxItem.kind === "installment") {
         await recalculateInstallmentPaymentStatus(tx, ctxItem.installmentId!);
       }
+    }
+
+    // Fase 2B: movimiento de cuenta corriente por la diferencia
+    // recibido/aplicado, ya validado por completo antes de abrir esta
+    // transacción (derivedInsuredId real único + accountDifferenceResolution
+    // consistente) — acá solo se escribe.
+    if (accountMovementToCreate) {
+      const singleItem = contexts.length === 1 ? contexts[0]! : null;
+      await tx.insert(insuredAccountMovements).values({
+        insuredId: derivedInsuredId!,
+        type: accountMovementToCreate.type,
+        signedAmountCents: difference.differenceCents,
+        status: "activo",
+        originBatchId: batch!.id,
+        relatedPaymentId: accountMovementToCreate.type === "saldo_deudor" ? singleChildId : null,
+        relatedInstallmentId:
+          accountMovementToCreate.type === "saldo_deudor" && singleItem?.kind === "installment"
+            ? singleItem.installmentId
+            : null,
+        reason: accountMovementToCreate.reason,
+        createdBy: user.id,
+        createdAt: new Date(),
+      });
     }
 
     return batch!.id;
@@ -2939,7 +3048,15 @@ app.get("/payment-batches/:id", requireAuth(async (c: any) => {
     baseMatchesChildren: baseFromChildren === batch.baseAmountCents,
     surchargeMatchesEntries: surchargeFromEntries === batch.surchargeAmountCents,
     totalMatchesBasePlusSurcharge: (batch.baseAmountCents + batch.surchargeAmountCents) === batch.totalReceivedCents,
-    splitsMatchTotal: splitsSum === batch.totalReceivedCents,
+    // Fase 2B: splitsSum (dinero real) puede diferir de totalReceivedCents
+    // (aplicado) A PROPÓSITO cuando el batch tiene un sobrante/faltante
+    // resuelto vía accountDifferenceResolution — comparar contra
+    // receivedAmountCents (siempre = SUM(splits) en batches nuevos, Regla 3)
+    // en vez de totalReceivedCents evita marcar esos batches como
+    // "inconsistentes". Fallback a totalReceivedCents solo por si alguna
+    // fila quedara sin backfillear (no debería pasar — Migración 0030
+    // backfillea el 100%).
+    splitsMatchTotal: splitsSum === (batch.receivedAmountCents ?? batch.totalReceivedCents),
     checkSplitsHaveChecks,
     checkAmountsMatchSplits,
     checksBelongOnlyToCheckSplits,

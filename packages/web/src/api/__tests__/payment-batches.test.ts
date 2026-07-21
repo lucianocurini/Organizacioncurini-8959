@@ -11,6 +11,7 @@ import { database as db } from "../database/index";
 import {
   users, sessions, policies, companies, insureds, policyInstallments,
   payments, paymentSplits, paymentBatches, paymentBatchSplits, cashEntries, receivedChecks, cashDebts,
+  insuredAccountMovements,
 } from "../database/schema";
 import { eq, inArray, and } from "drizzle-orm";
 
@@ -99,6 +100,10 @@ async function getChildren(batchId: number) {
   return db.select().from(payments).where(eq(payments.batchId, batchId)).all();
 }
 
+async function getMovementsForBatch(batchId: number) {
+  return db.select().from(insuredAccountMovements).where(eq(insuredAccountMovements.originBatchId, batchId)).all();
+}
+
 let checkCounter = 0;
 function mkCheckPayload(overrides: Record<string, any> = {}) {
   checkCounter++;
@@ -132,7 +137,22 @@ beforeAll(async () => {
             .where(inArray(payments.id, payIds)).all()
         : [];
       const batchIds = [...new Set(batchRows.map((r: any) => r.id))];
+      // Fase 2B: insured_account_movements.related_payment_id/origin_batch_id
+      // referencian payments/payment_batches — debe limpiarse ANTES de borrar
+      // CUALQUIERA de los dos (FK real bajo @libsql/client, foreign_keys=ON
+      // por defecto), o el DELETE bulk de payments de más abajo falla ENTERO
+      // por un solo id todavía referenciado (bug real detectado y corregido
+      // en Fase 2B — ver mismo comentario en afterAll).
+      if (batchIds.length) await db.delete(insuredAccountMovements).where(inArray(insuredAccountMovements.originBatchId, batchIds)).catch(() => {});
       if (payIds.length) await db.delete(cashEntries).where(inArray(cashEntries.paymentId, payIds)).catch(() => {});
+      // received_checks.payment_split_id referencia payment_splits — debe
+      // limpiarse ANTES de borrar los splits (mismo bug de orden que el de
+      // insured_account_movements arriba, ver comentario del mismo fix en afterAll).
+      if (payIds.length) {
+        const standaloneSplitRows = await db.select({ id: paymentSplits.id }).from(paymentSplits).where(inArray(paymentSplits.paymentId, payIds)).all();
+        const standaloneSplitIds = standaloneSplitRows.map(s => s.id);
+        if (standaloneSplitIds.length) await db.delete(receivedChecks).where(inArray(receivedChecks.paymentSplitId, standaloneSplitIds)).catch(() => {});
+      }
       if (payIds.length) await db.delete(paymentSplits).where(inArray(paymentSplits.paymentId, payIds)).catch(() => {});
       if (payIds.length) await db.delete(payments).where(inArray(payments.id, payIds)).catch(() => {});
       if (batchIds.length) {
@@ -169,8 +189,27 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  // Fase 2B: insured_account_movements.related_payment_id/origin_batch_id
+  // referencian payments/payment_batches — debe limpiarse ANTES de borrar
+  // CUALQUIERA de los dos (FK real bajo @libsql/client, foreign_keys=ON por
+  // defecto). Si esto corre después, el DELETE bulk de `payments` de más
+  // abajo falla ENTERO por un solo id todavía referenciado — silenciado por
+  // el .catch(() => {}) de esa línea, pero deja huérfanos: los 101 payments
+  // hijos, sus 76 payment_batches, y en cascada las policies/insureds/user
+  // de este archivo (bug real detectado y corregido en Fase 2B).
+  if (batchIdsToClean.length) {
+    await db.delete(insuredAccountMovements).where(inArray(insuredAccountMovements.originBatchId, batchIdsToClean)).catch(() => {});
+  }
   if (paymentIdsToClean.length) {
     await db.delete(cashEntries).where(inArray(cashEntries.paymentId, paymentIdsToClean)).catch(() => {});
+    // received_checks.payment_split_id referencia payment_splits — debe
+    // limpiarse ANTES de borrar los splits (mismo tipo de bug de orden que
+    // el de insured_account_movements arriba; test 4 de este archivo cuelga
+    // un cheque de un payment_split standalone, ver mkCheckPayload/test "4.
+    // cheque asociado a payment INDIVIDUAL anulado").
+    const standaloneSplitRows = await db.select({ id: paymentSplits.id }).from(paymentSplits).where(inArray(paymentSplits.paymentId, paymentIdsToClean)).all();
+    const standaloneSplitIds = standaloneSplitRows.map(s => s.id);
+    if (standaloneSplitIds.length) await db.delete(receivedChecks).where(inArray(receivedChecks.paymentSplitId, standaloneSplitIds)).catch(() => {});
     await db.delete(paymentSplits).where(inArray(paymentSplits.paymentId, paymentIdsToClean)).catch(() => {});
   }
   const allChildIds: number[] = [];
@@ -2276,5 +2315,257 @@ describe("70. PUT/DELETE individual de un hijo manual_payment libre sigue bloque
       method: "DELETE", headers: authHeaders(),
     }));
     expect(res.status).toBe(409);
+  });
+});
+
+// ─── 71-77: Fase 2B — sobrantes/faltantes (accountDifferenceResolution) ───
+
+describe("71. Batch exacto (sin diferencia) — comportamiento sin cambios", () => {
+  test("receivedAmountCents = totalReceivedCents, sin insured_account_movements", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1000 }],
+    });
+    expect(status).toBe(201);
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.totalReceivedCents).toBe(100000);
+    expect(batch!.receivedAmountCents).toBe(100000);
+    const movements = await getMovementsForBatch(body.id);
+    expect(movements.length).toBe(0);
+  });
+
+  test("accountDifferenceResolution presente pero sin diferencia real → se ignora, batch exacto igual", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1000 }],
+      accountDifferenceResolution: { action: "saldo_a_favor" },
+    });
+    expect(status).toBe(201);
+    const movements = await getMovementsForBatch(body.id);
+    expect(movements.length).toBe(0);
+  });
+});
+
+describe("72. Cheque mayor al aplicado → saldo a favor", () => {
+  test("split cheque $1100 contra 1 cuota de $1000 con accountDifferenceResolution saldo_a_favor → 201, +10000 saldo_a_favor", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const checkNumber = `CHK-72-${Date.now()}`;
+
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "cheque", amount: 1100, checks: [{ checkNumber, bankName: `${PREFIX} Banco`, dueDate: "2027-06-01", amount: 1100 }] }],
+      accountDifferenceResolution: { action: "saldo_a_favor" },
+    });
+    expect(status).toBe(201);
+
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.totalReceivedCents).toBe(100000); // aplicado — sin cambios
+    expect(batch!.receivedAmountCents).toBe(110000); // real recibido
+
+    // El cheque NUNCA se achica — queda por su importe físico completo.
+    const checks = await getChecksForBatch(body.id);
+    expect(checks.length).toBe(1);
+    expect(checks[0]!.amountCents).toBe(110000);
+
+    const movements = await getMovementsForBatch(body.id);
+    expect(movements.length).toBe(1);
+    expect(movements[0]!.type).toBe("saldo_a_favor");
+    expect(movements[0]!.signedAmountCents).toBe(10000);
+    expect(movements[0]!.insuredId).toBe(insuredId);
+    expect(movements[0]!.status).toBe("activo");
+    expect(movements[0]!.originBatchId).toBe(body.id);
+  });
+});
+
+describe("73. Cheque menor al aplicado (mismas cuotas) → saldo deudor", () => {
+  test("split cheque $900 contra 1 cuota de $1000 con accountDifferenceResolution saldo_deudor → 201, -10000 saldo_deudor", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const checkNumber = `CHK-73-${Date.now()}`;
+
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "cheque", amount: 900, checks: [{ checkNumber, bankName: `${PREFIX} Banco`, dueDate: "2027-06-01", amount: 900 }] }],
+      accountDifferenceResolution: { action: "saldo_deudor", reason: "cheque acordado por menor valor" },
+    });
+    expect(status).toBe(201);
+
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.totalReceivedCents).toBe(100000);
+    expect(batch!.receivedAmountCents).toBe(90000);
+
+    // La cuota se marca pagada por su importe APLICADO (nominal), sin cambios.
+    const installment = await getInstallment(instId);
+    expect(installment!.status).toBe("pagada");
+
+    const movements = await getMovementsForBatch(body.id);
+    expect(movements.length).toBe(1);
+    expect(movements[0]!.type).toBe("saldo_deudor");
+    expect(movements[0]!.signedAmountCents).toBe(-10000);
+    expect(movements[0]!.reason).toBe("cheque acordado por menor valor");
+    expect(movements[0]!.status).toBe("activo");
+
+    // Único ítem del batch → relatedPaymentId/relatedInstallmentId se completan sin ambigüedad.
+    const children = await getChildren(body.id);
+    expect(movements[0]!.relatedInstallmentId).toBe(instId);
+    expect(movements[0]!.relatedPaymentId).toBe(children[0]!.id);
+  });
+
+  test("saldo_deudor sin reason → 400 (obligatorio a nivel app), nada se escribe", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const before = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 900 }],
+      accountDifferenceResolution: { action: "saldo_deudor" },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain("reason");
+    const after = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    expect(after.length).toBe(before.length);
+  });
+});
+
+describe("74. Diferencia sin accountDifferenceResolution → 400, nada se escribe", () => {
+  test("sobrante sin resolución → 400, no crea batch/pagos/movimientos, la cuota sigue pendiente", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const before = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1100 }],
+    });
+    expect(status).toBe(400);
+    expect(body.code).toBe("PAYMENT_BATCH_AMOUNT_DIFFERENCE");
+
+    const after = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    expect(after.length).toBe(before.length);
+    const installment = await getInstallment(instId);
+    expect(installment!.status).toBe("pendiente");
+  });
+
+  test("action no soportada (Caso D, todavía no implementado) → 400 explícito", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1100 }],
+      accountDifferenceResolution: { action: "ajuste_manual" },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain("no soportada");
+  });
+
+  test("action no coincide con el sentido real de la diferencia → 400", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1100 }], // sobrante → debería ser "saldo_a_favor"
+      accountDifferenceResolution: { action: "saldo_deudor", reason: "x" },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain("no coincide con el sentido real");
+  });
+});
+
+describe("75. Multiasegurado con diferencia → 400 en esta primera versión", () => {
+  test("saldo_a_favor con 2 insuredId reales distintos en el batch → 400", async () => {
+    const policyA = await mkPolicy(insuredId, companyId);
+    const instA = await mkInstallment(policyA, 1, "2027-01-01", 1000);
+    const policyB = await mkPolicy(otherInsuredId, companyId);
+    const instB = await mkInstallment(policyB, 1, "2027-01-01", 500);
+    const before = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+
+    const { status, body } = await callPost({
+      paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instA }, { installmentId: instB }],
+      splits: [{ method: "efectivo", amount: 1600 }], // aplicado=1500, recibido=1600 → sobrante $100
+      accountDifferenceResolution: { action: "saldo_a_favor" },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain("único asegurado real");
+    const after = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    expect(after.length).toBe(before.length);
+  });
+
+  test("saldo_deudor con 2 insuredId reales distintos en el batch → 400", async () => {
+    const policyA = await mkPolicy(insuredId, companyId);
+    const instA = await mkInstallment(policyA, 1, "2027-01-01", 1000);
+    const policyB = await mkPolicy(otherInsuredId, companyId);
+    const instB = await mkInstallment(policyB, 1, "2027-01-01", 500);
+
+    const { status, body } = await callPost({
+      paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instA }, { installmentId: instB }],
+      splits: [{ method: "efectivo", amount: 1400 }], // aplicado=1500, recibido=1400 → faltante $100
+      accountDifferenceResolution: { action: "saldo_deudor", reason: "x" },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain("único asegurado real");
+  });
+
+  test("saldo_a_favor en batch 100% manual_payment (sin insuredId real) → 400", async () => {
+    const { status, body } = await callPost({
+      paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "manual_payment", manualPayer: "Cliente sin póliza (71)", amount: 1000 }],
+      splits: [{ method: "efectivo", amount: 1100 }],
+      accountDifferenceResolution: { action: "saldo_a_favor" },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain("único asegurado real");
+  });
+});
+
+describe("76. El cheque físico sigue cerrando EXACTO contra su split (sin excepción por accountDifferenceResolution)", () => {
+  test("suma de cheques distinta al importe del split → 400 igual que antes, aunque venga accountDifferenceResolution", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const checkNumber = `CHK-76-${Date.now()}`;
+
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      // split cheque dice $1100, pero el cheque cargado es de $1050 — inconsistencia física, no una diferencia recibido/aplicado real.
+      splits: [{ method: "cheque", amount: 1100, checks: [{ checkNumber, bankName: `${PREFIX} Banco`, dueDate: "2027-06-01", amount: 1050 }] }],
+      accountDifferenceResolution: { action: "saldo_a_favor" },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain("no coincide");
+  });
+});
+
+describe("77. POST /payments standalone sigue exacto/legacy — no acepta diferencias", () => {
+  test("splits que no suman el importe del pago → 400, sin importar accountDifferenceResolution (campo inexistente en este endpoint)", async () => {
+    const res = await app.fetch(new Request("http://localhost/api/payments", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        manualPayer: "X", manualPolicyNumber: "MAN-BATCH-77", manualCompany: "TestCo",
+        amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+        splits: [{ method: "efectivo", amount: 1100 }],
+        accountDifferenceResolution: { action: "saldo_a_favor" },
+      }),
+    }));
+    expect(res.status).toBe(400);
   });
 });
