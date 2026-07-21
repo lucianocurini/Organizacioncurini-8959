@@ -188,6 +188,15 @@ export const paymentBatches = sqliteTable("payment_batches", {
   cancelledAt: integer("cancelled_at", { mode: "timestamp" }),
   cancelledBy: integer("cancelled_by").references(() => users.id),
   cancellationReason: text("cancellation_reason"),
+  // Migración 0030 (sobrantes/faltantes, Fase 2A): dinero REAL recibido (debe
+  // coincidir con SUM(paymentBatchSplits.amountCents) del batch) —
+  // totalReceivedCents arriba NO cambia de significado, sigue siendo lo
+  // APLICADO/imputado a cuotas (baseAmountCents + surchargeAmountCents).
+  // Backfill histórico: receivedAmountCents = totalReceivedCents, porque
+  // hasta esta migración ambos eran siempre iguales por invariante. Ver
+  // src/lib/payments/insured-account.ts para los helpers que usan la
+  // diferencia entre ambos.
+  receivedAmountCents: integer("received_amount_cents"),
 });
 
 // Etapa 4A: medios reales de un payment_batches — una sola vez por medio,
@@ -527,6 +536,58 @@ export const remittanceAllocations = sqliteTable("remittance_allocations", {
   cashEntryId: integer("cash_entry_id").references(() => cashEntries.id),
   method: text("method").notNull(), // mismo vocabulario que payment_splits.method
   amountCents: integer("amount_cents").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+});
+
+// ─── CUENTA CORRIENTE DEL ASEGURADO (sobrantes/faltantes) ──────────────────
+//
+// Migración 0030, Fase 2A. Ledger CON SIGNO por asegurado real: positivo =
+// saldo a favor (crédito), negativo = saldo deudor (débito). Saldo vigente =
+// SUM(signedAmountCents) WHERE status='activo'. insuredId es siempre
+// requerido (NOT NULL) — el caso sin asegurado real (batch 100%
+// manual_payment) usa paymentAmountAdjustments más abajo, nunca esta tabla.
+//
+// reason es obligatorio A NIVEL APLICACIÓN (no hay CHECK de DB) para
+// ajuste_manual/devolucion_saldo_favor/saldo_deudor; authorizedBy es
+// obligatorio a nivel app únicamente para ajuste_manual — mismo criterio que
+// el resto del proyecto de no encodear reglas de negocio condicionales en
+// CHECKs de esquema. Ver src/lib/payments/insured-account.ts para los
+// helpers puros que leen/escriben este ledger y calculan cómo cada tipo de
+// movimiento afecta (o no) a Caja.
+export const insuredAccountMovements = sqliteTable("insured_account_movements", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  insuredId: integer("insured_id").notNull().references(() => insureds.id),
+  // saldo_a_favor | saldo_deudor | aplicacion_saldo_favor | cobro_saldo_deudor
+  // | devolucion_saldo_favor | ajuste_manual — CHECK en la migración 0030.
+  type: text("type").notNull(),
+  signedAmountCents: integer("signed_amount_cents").notNull(),
+  status: text("status").notNull().default("activo"), // activo | anulado
+  originPaymentId: integer("origin_payment_id").references(() => payments.id),
+  originBatchId: integer("origin_batch_id").references(() => paymentBatches.id),
+  relatedPaymentId: integer("related_payment_id").references(() => payments.id),
+  relatedInstallmentId: integer("related_installment_id").references(() => policyInstallments.id),
+  reason: text("reason"),
+  authorizedBy: integer("authorized_by").references(() => users.id),
+  createdBy: integer("created_by").notNull().references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  settledAt: integer("settled_at", { mode: "timestamp" }),
+  notes: text("notes"),
+});
+
+// Ajuste manual PURO para el caso sin asegurado real (batch 100%
+// manual_payment, insuredId null por diseño — ver comentario de paymentBatches
+// arriba). amountCents con signo; exactamente uno de paymentId/paymentBatchId
+// (CHECK XOR en la migración 0030). A diferencia de insuredAccountMovements,
+// reason/authorizedBy son SIEMPRE obligatorios a nivel DB (NOT NULL) — todo
+// registro acá es por definición un ajuste administrativo, sin excepción.
+export const paymentAmountAdjustments = sqliteTable("payment_amount_adjustments", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  paymentId: integer("payment_id").references(() => payments.id),
+  paymentBatchId: integer("payment_batch_id").references(() => paymentBatches.id),
+  amountCents: integer("amount_cents").notNull(),
+  reason: text("reason").notNull(),
+  authorizedBy: integer("authorized_by").notNull().references(() => users.id),
+  createdBy: integer("created_by").notNull().references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 });
 
