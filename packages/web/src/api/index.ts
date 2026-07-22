@@ -2879,6 +2879,12 @@ app.get("/payment-batches", requireAuth(async (c: any) => {
     status: paymentBatches.status,
     baseAmountCents: paymentBatches.baseAmountCents,
     totalReceivedCents: paymentBatches.totalReceivedCents,
+    // Fase 2G: dinero REAL recibido (ver comentario de cabecera de
+    // receivedAmountCents en schema.ts) — sin este campo, el listado
+    // "Cobros por lote recientes" no tiene forma de distinguir un
+    // sobrante/faltante de un cobro exacto. Mismo campo ya expuesto en
+    // GET /payment-batches/:id (Fase 2F) — nunca se cambia su significado.
+    receivedAmountCents: paymentBatches.receivedAmountCents,
     notes: paymentBatches.notes,
     createdAt: paymentBatches.createdAt,
   }).from(paymentBatches)
@@ -2952,6 +2958,7 @@ app.get("/payment-batches", requireAuth(async (c: any) => {
       status: b.status,
       totalAmountCents: b.baseAmountCents,
       totalReceivedCents: b.totalReceivedCents,
+      receivedAmountCents: b.receivedAmountCents,
       itemCount: itemCounts.get(b.id) ?? 0,
       splitCount: splitCounts.get(b.id) ?? 0,
       checkCount: checkCounts.get(b.id) ?? 0,
@@ -3015,6 +3022,26 @@ app.get("/payment-batches/:id", requireAuth(async (c: any) => {
       .all()
     : [];
 
+  // Fase 2F: movimiento de cuenta corriente que este batch (o alguno de sus
+  // hijos) originó por un sobrante/faltante (Fase 2B) — mismo criterio de
+  // búsqueda que loadBatchCancelContext (Fase 2D, sección de anulación más
+  // abajo), reutilizado acá SOLO para lectura/mostrar en el comprobante
+  // (nunca se anula ni se crea nada desde este endpoint GET). Como máximo hay
+  // un movimiento propio de este batch en la práctica (accountMovementToCreate
+  // es 0 o 1 por creación, ver POST /payment-batches), pero se devuelve el
+  // array completo tal cual, sin asumir cardinalidad, para no ocultar un caso
+  // inesperado (ej. status="anulado" tras una anulación posterior del batch).
+  const accountMovementConditions = [eq(insuredAccountMovements.originBatchId, id)];
+  if (childIds.length > 0) accountMovementConditions.push(inArray(insuredAccountMovements.originPaymentId, childIds));
+  const accountMovements = await db.select({
+    id: insuredAccountMovements.id,
+    insuredId: insuredAccountMovements.insuredId,
+    type: insuredAccountMovements.type,
+    signedAmountCents: insuredAccountMovements.signedAmountCents,
+    status: insuredAccountMovements.status,
+    reason: insuredAccountMovements.reason,
+  }).from(insuredAccountMovements).where(or(...accountMovementConditions)).all();
+
   const baseFromChildren = childRows.reduce((s, r) => s + Math.round(r.payment.amount * 100), 0);
   const surchargeFromEntries = surcharges.reduce((s, e) => s + Math.round(e.amount * 100), 0);
   const splitsSum = splitsRows.reduce((s, sp) => s + sp.amountCents, 0);
@@ -3066,7 +3093,7 @@ app.get("/payment-batches/:id", requireAuth(async (c: any) => {
     possibleDuplicateChecks,
   };
 
-  return c.json({ batch, insuredSummary, items: childRows, splits: splitsWithChecksOut, surcharges, integrity }, 200);
+  return c.json({ batch, insuredSummary, items: childRows, splits: splitsWithChecksOut, surcharges, integrity, accountMovements }, 200);
 }));
 
 // ─── ANULACIÓN DE UN LOTE CONFIRMADO (corrección segura, con trazabilidad) ──

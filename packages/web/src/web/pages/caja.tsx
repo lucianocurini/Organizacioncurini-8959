@@ -570,6 +570,7 @@ export default function CajaPage() {
     cobrados: true,
     cartera: false,
     adeudados: true,
+    cuentaCorriente: true,
     comisiones: true,
     gastos: true,
     movimientosPropios: true,
@@ -1869,6 +1870,87 @@ export default function CajaPage() {
               )}
             </div>
           </Section>
+
+          {/* ─── Cuenta corriente de asegurados (Fase 2C — sobrantes/faltantes) ── */}
+          {/* Fuente: summary.cuentaCorriente (insured_account_movements) — nunca
+              se mezcla con Adeudados/Rendiciones (Regla 6 del pedido). Campo
+              opcional: si un backend/caché más viejo no lo trae todavía, la
+              sección se muestra vacía sin romper el resto de la página. */}
+          <Section
+            title="Cuenta corriente de asegurados"
+            badge={summary?.cuentaCorriente?.byInsured.length || undefined}
+            badgeColor="bg-purple-600"
+            open={sections.cuentaCorriente}
+            onToggle={() => toggleSection("cuentaCorriente")}
+          >
+            <div className="p-4 space-y-4">
+              <p className="text-xs text-white/40">
+                Sobrantes y faltantes de cobros. El saldo a favor es dinero que ya está físicamente en caja pero
+                pertenece al asegurado (no es ganancia ni gasto); el saldo deudor es un importe pendiente de
+                recuperar del asegurado (no es dinero cobrado todavía).
+              </p>
+              {!summary?.cuentaCorriente ? (
+                <div className="text-center py-6 text-white/30 text-sm">Sin datos de cuenta corriente disponibles.</div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                    <div className="bg-blue-900/20 border border-blue-500/20 rounded-xl p-4">
+                      <p className="text-xs text-white/40 mb-1">Saldos a favor pendientes</p>
+                      <p className="text-lg font-bold text-blue-400">{fmt(summary.cuentaCorriente.saldosAFavorPendientes)}</p>
+                      <p className="text-xs text-white/25 mt-0.5">Informativo — nunca se resta de Caja</p>
+                    </div>
+                    <div className="bg-orange-900/20 border border-orange-500/20 rounded-xl p-4">
+                      <p className="text-xs text-white/40 mb-1">Saldos deudores pendientes</p>
+                      <p className="text-lg font-bold text-orange-400">{fmt(summary.cuentaCorriente.saldosDeudoresPendientes)}</p>
+                      <p className="text-xs text-white/25 mt-0.5">Informativo — no es dinero cobrado</p>
+                    </div>
+                    <div className="bg-emerald-900/20 border border-emerald-500/20 rounded-xl p-4">
+                      <p className="text-xs text-white/40 mb-1">Crédito activo en caja</p>
+                      <p className="text-lg font-bold text-emerald-400">{fmt(summary.cuentaCorriente.creditoActivoEnCaja)}</p>
+                      <p className="text-xs text-white/25 mt-0.5">Dinero real en caja que pertenece al asegurado</p>
+                    </div>
+                    <div className="bg-white/5 rounded-xl p-4">
+                      <p className="text-xs text-white/40 mb-1">Crédito regularizado</p>
+                      <p className="text-lg font-bold text-white">{fmt(summary.cuentaCorriente.creditoRegularizado)}</p>
+                      <p className="text-xs text-white/25 mt-0.5">Cancela un ajuste manual — nunca mueve el total</p>
+                    </div>
+                    <div className="bg-emerald-900/20 border border-emerald-500/20 rounded-xl p-4">
+                      <p className="text-xs text-white/40 mb-1">Cobros de saldo deudor</p>
+                      <p className="text-lg font-bold text-emerald-400">{fmt(summary.cuentaCorriente.cobrosSaldoDeudor)}</p>
+                      <p className="text-xs text-white/25 mt-0.5">Dinero real cobrado para saldar una deuda previa</p>
+                    </div>
+                  </div>
+
+                  {summary.cuentaCorriente.byInsured.length > 0 && (
+                    <div>
+                      <p className="text-xs text-white/30 uppercase tracking-wider mb-2 font-medium">Saldo por asegurado</p>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="text-white/40 border-b border-white/10">
+                              <th className="text-left py-2 pr-4">Asegurado</th>
+                              <th className="text-right py-2">Saldo</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {summary.cuentaCorriente.byInsured.map((b) => (
+                              <tr key={b.insuredId} className="border-b border-white/5">
+                                <td className="py-2 pr-4 text-white/70">Asegurado #{b.insuredId}</td>
+                                <td className={`py-2 text-right font-bold ${b.balance >= 0 ? "text-blue-400" : "text-orange-400"}`}>
+                                  {fmt(b.balance)} {b.balance >= 0 ? "(a favor)" : "(deudor)"}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </Section>
+
           {/* ─── Movimientos propios ───────────────────────────────────────── */}
           <Section
             title="Movimientos propios"

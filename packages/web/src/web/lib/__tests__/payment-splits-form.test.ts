@@ -211,6 +211,42 @@ describe("Caso 15 — direct_company no es 'own'", () => {
   });
 });
 
+// ─── Fase 2E — options.allowAmountDifference (sobrantes/faltantes en "Cobrar
+// en lote", ver payment-batch-form.ts). Por defecto (sin options, o
+// options.allowAmountDifference:false) el comportamiento es idéntico al de
+// siempre — el pago individual (cobranzas.tsx) nunca pasa esta opción.
+
+describe("validateSplitsForm — options.allowAmountDifference", () => {
+  test("sin options: suma distinta al total sigue bloqueando (comportamiento por defecto sin cambios)", () => {
+    const splits = [createSplitRow("efectivo", "900")];
+    expect(validateSplitsForm("1000", splits).valid).toBe(false);
+  });
+
+  test("allowAmountDifference:false explícito: mismo bloqueo que el default", () => {
+    const splits = [createSplitRow("efectivo", "900")];
+    expect(validateSplitsForm("1000", splits, { allowAmountDifference: false }).valid).toBe(false);
+  });
+
+  test("allowAmountDifference:true: suma menor al total ya no bloquea (faltante permitido)", () => {
+    const splits = [createSplitRow("efectivo", "900")];
+    const result = validateSplitsForm("1000", splits, { allowAmountDifference: true });
+    expect(result.valid).toBe(true);
+    expect(result.group).toBe("own");
+  });
+
+  test("allowAmountDifference:true: suma mayor al total ya no bloquea (sobrante permitido)", () => {
+    const splits = [createSplitRow("efectivo", "1200")];
+    expect(validateSplitsForm("1000", splits, { allowAmountDifference: true }).valid).toBe(true);
+  });
+
+  test("allowAmountDifference:true sigue exigiendo método y bloqueando 'mixed' igual que antes", () => {
+    const splits = [createSplitRow("efectivo", "500"), createSplitRow("transferencia_compania", "500")];
+    const result = validateSplitsForm("1000", splits, { allowAmountDifference: true });
+    expect(result.valid).toBe(false);
+    expect(result.group).toBe("mixed");
+  });
+});
+
 // ─── 16/17/18. Payload ───────────────────────────────────────────────────────
 
 describe("Caso 16/17 — payload para POST/PUT", () => {

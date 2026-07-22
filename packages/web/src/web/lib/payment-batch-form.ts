@@ -42,9 +42,16 @@ import { isValidCalendarDate } from "../../lib/installments/plan";
 import { classifySplitGroup } from "../../lib/payments/splits";
 import { SURCHARGE_AMOUNT_CENTS } from "../../lib/payments/batches";
 import { isSurchargeAbsorbedByGroup } from "../../lib/payments/policy-economic-group";
+import {
+  calculateBatchReceivedAppliedDifference,
+  type BatchReceivedAppliedDifference, type BatchReceivedAppliedKind,
+} from "../../lib/payments/insured-account";
 
-export type { SplitGroup };
-export { computeSplitTotals, groupSplitsByMethod, amountStringToCentsStrict, MIXED_GROUP_ERROR, SURCHARGE_AMOUNT_CENTS };
+export type { SplitGroup, BatchReceivedAppliedDifference, BatchReceivedAppliedKind };
+export {
+  computeSplitTotals, groupSplitsByMethod, amountStringToCentsStrict, MIXED_GROUP_ERROR, SURCHARGE_AMOUNT_CENTS,
+  calculateBatchReceivedAppliedDifference,
+};
 
 // ─── 1. Cuota pendiente (fila de resultado de búsqueda, GET /installments/pending-for-payment) ──
 
@@ -579,10 +586,19 @@ export interface BatchSplitsValidationResult {
  * contra el importe OBJETIVO (base + recargo estimado si corresponde, ver
  * calculateBatchTargetAmountCents — nunca solo la base) y agrega la regla
  * propia de cheques: cada split "cheque" necesita >=1 cheque válido cuya
- * suma sea exacta al importe de ese split.
+ * suma sea exacta al importe de ESE split — esto nunca se relaja, ni
+ * siquiera con options.allowAmountDifference (Fase 2E): un cheque real
+ * jamás se "achica" para cerrar contra ninguna cifra, solo el TOTAL del
+ * cobro puede diferir del aplicado (ver BatchPaymentModal, que es el único
+ * caller que pasa allowAmountDifference:true — el pago individual standalone
+ * en cobranzas.tsx sigue exigiendo coincidencia exacta).
  */
-export function validateBatchSplitsForm(targetAmountCents: number, splits: BatchSplitFormRow[]): BatchSplitsValidationResult {
-  const base = validateSplitsForm(String(targetAmountCents / 100), splits);
+export function validateBatchSplitsForm(
+  targetAmountCents: number,
+  splits: BatchSplitFormRow[],
+  options?: { allowAmountDifference?: boolean },
+): BatchSplitsValidationResult {
+  const base = validateSplitsForm(String(targetAmountCents / 100), splits, options);
   if (!base.valid) return base;
 
   for (const split of splits) {
@@ -610,6 +626,91 @@ export function validateBatchSplitsForm(targetAmountCents: number, splits: Batch
 /** Misma condición que el resto de la app: deshabilita el botón de confirmar mientras guarda o mientras el formulario no es válido. */
 export function isBatchSubmitDisabled(saving: boolean, splitsValid: boolean, hasSelection: boolean): boolean {
   return saving || !splitsValid || !hasSelection;
+}
+
+// ─── 7B. Resolución de sobrante/faltante (Fase 2E — UI de accountDifferenceResolution) ──
+// Cuando SUM(splits) (dinero real, ver validateBatchSplitsForm con
+// allowAmountDifference:true) difiere del importe aplicado a las cuotas
+// (target = base + recargo), el backend exige un accountDifferenceResolution
+// explícito (ver POST /payment-batches, index.ts) — este bloque arma y valida
+// esa resolución en el cliente, con el mismo criterio exacto que el backend
+// vuelve a chequear con datos reales (nunca se confía solo en esto: el
+// backend es la última autoridad, ver normalizeBatchSubmitError para cuando
+// igual rechaza).
+
+export interface BatchDifferenceResolutionFormState {
+  action: "saldo_a_favor" | "saldo_deudor" | null;
+  reason: string;
+}
+
+export function emptyBatchDifferenceResolutionForm(): BatchDifferenceResolutionFormState {
+  return { action: null, reason: "" };
+}
+
+export interface BatchDifferenceValidationResult {
+  valid: boolean;
+  errorMessage: string | null;
+}
+
+/**
+ * "exacto" (sin diferencia) siempre es válido sin necesidad de ninguna
+ * resolución — comportamiento idéntico a antes de esta fase. Con diferencia:
+ *  - exige un único asegurado real en el carrito (cartInsuredKind==="single"
+ *    — mismo criterio que resolveBatchInsuredId/derivedInsuredId del
+ *    backend: "multiple" o "manual-only" no tienen un dueño único al que
+ *    atribuir el sobrante/faltante).
+ *  - exige que el caller haya elegido la ÚNICA acción que corresponde al
+ *    sentido real de la diferencia (nunca se ofrece elegir la otra).
+ *  - exige reason no vacío específicamente para saldo_deudor (mismo
+ *    REASON_REQUIRED_TYPES que valida el backend en insured-account.ts).
+ */
+export function validateBatchDifferenceResolution(
+  difference: BatchReceivedAppliedDifference,
+  resolution: BatchDifferenceResolutionFormState,
+  cartInsuredKind: CartInsuredSummary["kind"],
+): BatchDifferenceValidationResult {
+  if (difference.kind === "exacto") return { valid: true, errorMessage: null };
+
+  if (cartInsuredKind !== "single") {
+    return {
+      valid: false,
+      errorMessage:
+        "No se puede determinar un único asegurado real para asignar esta diferencia (el cobro mezcla más de un " +
+        "asegurado, o es una imputación 100% manual sin asegurado real). Separá este cobro para poder continuar.",
+    };
+  }
+  if (resolution.action == null) {
+    return {
+      valid: false,
+      errorMessage: difference.kind === "saldo_a_favor"
+        ? "Hay un sobrante: elegí \"Saldo a favor del asegurado\" para poder confirmar el cobro."
+        : "Hay un faltante: elegí \"Saldo deudor del asegurado\" para poder confirmar el cobro.",
+    };
+  }
+  if (resolution.action !== difference.kind) {
+    return {
+      valid: false,
+      errorMessage: `La resolución elegida ("${resolution.action}") no coincide con el sentido real de la diferencia ("${difference.kind}").`,
+    };
+  }
+  if (resolution.action === "saldo_deudor" && !resolution.reason.trim()) {
+    return { valid: false, errorMessage: "El motivo es obligatorio para registrar un saldo deudor." };
+  }
+  return { valid: true, errorMessage: null };
+}
+
+export interface AccountDifferenceResolutionPayload {
+  action: "saldo_a_favor" | "saldo_deudor";
+  reason?: string | null;
+}
+
+/** null si todavía no se eligió ninguna acción — nunca se manda un payload a medio construir. */
+export function buildAccountDifferenceResolutionPayload(
+  resolution: BatchDifferenceResolutionFormState,
+): AccountDifferenceResolutionPayload | null {
+  if (resolution.action == null) return null;
+  const reason = resolution.reason.trim();
+  return { action: resolution.action, reason: reason || null };
 }
 
 // ─── 8. Payload final — POST /api/payment-batches ───────────────────────────
@@ -657,6 +758,10 @@ export interface PaymentBatchCreatePayload {
   notes?: string | null;
   applyProntoPagoSurcharge?: boolean;
   confirmPossibleDuplicates?: boolean;
+  // Fase 2E: solo presente cuando SUM(splits) difiere de lo aplicado a las
+  // cuotas — nunca se manda ni siquiera con valor null cuando no hay
+  // diferencia (mismo criterio que el backend: "ni siquiera se mira si vino").
+  accountDifferenceResolution?: AccountDifferenceResolutionPayload;
 }
 
 /**
@@ -674,6 +779,7 @@ export function buildPaymentBatchPayload(params: {
   notes?: string | null;
   applyProntoPagoSurcharge?: boolean;
   confirmPossibleDuplicates?: boolean;
+  accountDifferenceResolution?: AccountDifferenceResolutionPayload | null;
 }): PaymentBatchCreatePayload {
   return {
     paymentDate: params.paymentDate,
@@ -711,6 +817,7 @@ export function buildPaymentBatchPayload(params: {
     notes: params.notes || null,
     applyProntoPagoSurcharge: params.applyProntoPagoSurcharge,
     confirmPossibleDuplicates: params.confirmPossibleDuplicates,
+    ...(params.accountDifferenceResolution ? { accountDifferenceResolution: params.accountDifferenceResolution } : {}),
   };
 }
 
@@ -729,6 +836,9 @@ export interface PaymentBatchSummary {
   status: string;
   totalAmountCents: number;
   totalReceivedCents: number;
+  // Fase 2G: dinero REAL recibido (ver receivedCentsOf) — nullable solo por
+  // defensividad de tipos, igual que en PaymentBatchDetail.batch (Fase 2F).
+  receivedAmountCents: number | null;
   itemCount: number;
   splitCount: number;
   checkCount: number;
@@ -772,10 +882,33 @@ export interface BatchInsuredSummary {
   insuredDisplay: string;
 }
 
+/**
+ * Fase 2F: movimiento de cuenta corriente que este batch (o alguno de sus
+ * hijos) originó por un sobrante/faltante (Fase 2B) — GET /payment-batches/:id
+ * lo devuelve tal cual quedó en insured_account_movements, para que el
+ * comprobante pueda mostrar la resolución real (tipo + motivo) en vez de
+ * volver a inferirla solo por el signo de la diferencia.
+ */
+export interface BatchDetailAccountMovement {
+  id: number;
+  insuredId: number;
+  type: string;
+  signedAmountCents: number;
+  status: string;
+  reason: string | null;
+}
+
 export interface PaymentBatchDetail {
   batch: {
     id: number; insuredId: number | null; baseAmountCents: number; surchargeAmountCents: number;
-    totalReceivedCents: number; paymentDate: string; status: string; notes: string | null; createdAt: string;
+    totalReceivedCents: number;
+    // Fase 2B: dinero REAL recibido (SUM(splits) al momento de crear el
+    // batch) — puede diferir de totalReceivedCents (aplicado/imputado, ver
+    // comentario de cabecera del archivo). Nullable solo por defensividad de
+    // tipos (la columna es nullable en el schema, aunque la Migración 0030
+    // backfilleó el 100% de los batches históricos) — ver receivedCentsOf.
+    receivedAmountCents: number | null;
+    paymentDate: string; status: string; notes: string | null; createdAt: string;
     cancelledAt: string | null; cancellationReason: string | null;
   };
   insuredSummary: BatchInsuredSummary;
@@ -783,6 +916,54 @@ export interface PaymentBatchDetail {
   splits: PaymentBatchDetailSplit[];
   surcharges: Array<{ id: number; amount: number }>;
   integrity: Record<string, unknown>;
+  accountMovements: BatchDetailAccountMovement[];
+}
+
+// ─── Fase 2F — comprobante consistente con sobrantes/faltantes ─────────────
+// batch.totalReceivedCents SIEMPRE fue (y sigue siendo) lo APLICADO/imputado
+// a las cuotas — nunca dinero real por sí solo (nombre legacy, sin cambio de
+// significado desde antes de Fase 2B). Mostrarlo bajo el label "Total
+// recibido" es lo que generaba el riesgo: con un sobrante/faltante resuelto,
+// el comprobante mentía sobre cuánto dinero real entró. receivedCentsOf +
+// calculateBatchReceivedAppliedDifference (ya usado en el modal de creación,
+// Fase 2E) son la única fuente para decidir qué mostrar acá — nunca se
+// recalcula la diferencia de otra forma.
+
+/**
+ * Dinero real recibido de un batch, con fallback seguro para el caso
+ * defensivo de un valor nulo (la columna es nullable en el schema, aunque la
+ * Migración 0030 backfilleó el 100% de los batches históricos a
+ * receivedAmountCents = totalReceivedCents — antes de esa migración ambos
+ * eran siempre iguales por invariante, así que el fallback nunca inventa un
+ * número: reproduce exactamente el valor que ya tenía ese batch).
+ */
+export function receivedCentsOf(batch: Pick<PaymentBatchDetail["batch"], "receivedAmountCents" | "totalReceivedCents">): number {
+  return batch.receivedAmountCents ?? batch.totalReceivedCents;
+}
+
+export interface BatchDifferenceResolutionDisplay {
+  action: "saldo_a_favor" | "saldo_deudor";
+  reason: string | null;
+  status: string;
+}
+
+/**
+ * Busca, entre los accountMovements que devuelve GET /payment-batches/:id, el
+ * que corresponde a la resolución del sobrante/faltante de ESTE batch (el
+ * único tipo que accountDifferenceResolution puede crear hoy, ver POST
+ * /payment-batches) — null si el batch nunca tuvo diferencia, o si por algún
+ * motivo no se encontró (no debería pasar en un batch con diferencia real:
+ * el backend siempre crea el movimiento en la misma transacción que el
+ * batch). status="anulado" indica que el batch fue anulado después (Fase 2D)
+ * y este movimiento se anuló junto con él — el comprobante debe indicarlo,
+ * nunca mostrarlo como si siguiera vigente.
+ */
+export function findBatchDifferenceResolution(
+  accountMovements: ReadonlyArray<BatchDetailAccountMovement>,
+): BatchDifferenceResolutionDisplay | null {
+  const movement = accountMovements.find((m) => m.type === "saldo_a_favor" || m.type === "saldo_deudor");
+  if (!movement) return null;
+  return { action: movement.type as "saldo_a_favor" | "saldo_deudor", reason: movement.reason, status: movement.status };
 }
 
 /** true si el ítem del detalle es un cobro manual de cualquier tipo (sin cuota — installment viene null del backend). */
@@ -881,6 +1062,15 @@ export interface BatchCancelSurchargeEntry {
   rendered: number;
 }
 
+/** Fase 2D: un insured_account_movement que este batch (o alguno de sus hijos) originó. */
+export interface BatchCancelAccountMovement {
+  id: number;
+  type: string;
+  signedAmountCents: number;
+  status: string;
+  insuredId: number;
+}
+
 export interface PaymentBatchCancelCheckResponse {
   canCancel: boolean;
   status: string;
@@ -890,6 +1080,17 @@ export interface PaymentBatchCancelCheckResponse {
   checks: BatchCancelCheckRow[];
   remittanceLinks: { allocationCount: number; itemCount: number };
   surchargeEntries: BatchCancelSurchargeEntry[];
+  // Fase 2D: separado a propósito de `canCancel`/`blockingReasons` de arriba
+  // (esos son sobre el ESTADO del batch/cheques/rendición) — esto es sobre la
+  // seguridad de anular la cuenta corriente del asegurado (ver
+  // isSafeToCancelAccountMovementOrigin, backend). Un batch puede tener
+  // canCancel=true acá y aun así no ser anulable de verdad — ver
+  // isBatchTrulyCancellable, que combina ambos.
+  accountMovements: {
+    canCancel: boolean;
+    blockReasons: string[];
+    items: BatchCancelAccountMovement[];
+  };
 }
 
 export interface PaymentBatchCancelResult {
@@ -935,9 +1136,24 @@ export function canShowEditButton(batchStatus: string): boolean {
   return batchStatus === "confirmado";
 }
 
-/** El botón final de "Anular cobro" (destructivo) exige el checkbox tildado Y que cancel-check haya dado canCancel=true. */
+/**
+ * Fase 2D: un batch solo es REALMENTE anulable si ambos chequeos lo permiten
+ * — el de estado (canCancel, cheques/rendición/carrera) Y el de cuenta
+ * corriente (accountMovements.canCancel, ver isSafeToCancelAccountMovementOrigin
+ * en el backend). Ninguno de los dos implica el otro.
+ */
+export function isBatchTrulyCancellable(check: PaymentBatchCancelCheckResponse): boolean {
+  return check.canCancel && check.accountMovements.canCancel;
+}
+
+/** Todas las razones de bloqueo juntas (estado + cuenta corriente), para mostrar en un único listado. */
+export function combinedCancelBlockingReasons(check: PaymentBatchCancelCheckResponse): string[] {
+  return [...check.blockingReasons, ...check.accountMovements.blockReasons];
+}
+
+/** El botón final de "Anular cobro" (destructivo) exige el checkbox tildado Y que cancel-check haya dado luz verde en ambos chequeos. */
 export function isCancelConfirmationValid(check: PaymentBatchCancelCheckResponse | null, checkboxConfirmed: boolean): boolean {
-  return check != null && check.canCancel && checkboxConfirmed;
+  return check != null && isBatchTrulyCancellable(check) && checkboxConfirmed;
 }
 
 export interface PaymentBatchCancelPayload {

@@ -15,6 +15,7 @@ import { database as db } from "../database/index";
 import {
   users, sessions, policies, companies, insureds, policyInstallments,
   payments, paymentSplits, paymentBatches, paymentBatchSplits, cashEntries, receivedChecks,
+  insuredAccountMovements,
 } from "../database/schema";
 import { eq, inArray } from "drizzle-orm";
 
@@ -106,6 +107,11 @@ beforeAll(async () => {
             .where(inArray(payments.id, payIds)).all()
         : [];
       const batchIds = [...new Set(batchRows.map((r: any) => r.id))];
+      // Fase 2G (tests de receivedAmountCents/accountDifferenceResolution):
+      // insured_account_movements.origin_batch_id referencia payment_batches
+      // — debe limpiarse ANTES de borrar payments/paymentBatches más abajo,
+      // mismo bug de orden ya corregido en Fase 2B (ver payment-batches.test.ts).
+      if (batchIds.length) await db.delete(insuredAccountMovements).where(inArray(insuredAccountMovements.originBatchId, batchIds)).catch(warn("insuredAccountMovements"));
       if (payIds.length) await db.delete(cashEntries).where(inArray(cashEntries.paymentId, payIds)).catch(warn("cashEntries"));
       if (payIds.length) await db.delete(paymentSplits).where(inArray(paymentSplits.paymentId, payIds)).catch(warn("paymentSplits"));
       if (payIds.length) await db.delete(payments).where(inArray(payments.id, payIds)).catch(warn("payments"));
@@ -160,6 +166,16 @@ afterAll(async () => {
     ...byPolicyId.map((c) => c.id),
     ...paymentIdsToClean,
   ])];
+
+  // Fase 2G: insured_account_movements.origin_batch_id referencia
+  // payment_batches — debe limpiarse ANTES de borrar payments/paymentBatches
+  // más abajo (mismo bug de orden ya corregido en Fase 2B, ver
+  // payment-batches.test.ts). Sin este paso, los nuevos tests de
+  // receivedAmountCents/accountDifferenceResolution de este archivo dejan
+  // movimientos huérfanos que bloquean el DELETE de payments por FK.
+  if (batchIdsToClean.length) {
+    await db.delete(insuredAccountMovements).where(inArray(insuredAccountMovements.originBatchId, batchIdsToClean));
+  }
 
   if (allPaymentIds.length) {
     await db.delete(cashEntries).where(inArray(cashEntries.paymentId, allPaymentIds));
@@ -400,6 +416,58 @@ describe("GET /api/payment-batches — listado", () => {
     expect(row.insuredName).toBeDefined();
     // una sola fila por batch, no una por cada payment/split
     expect(body.filter((b: any) => b.id === created.body.id).length).toBe(1);
+  });
+
+  // ─── Fase 2G — receivedAmountCents en el listado (para "Cobros por lote recientes") ──
+  test("batch exacto: receivedAmountCents = totalReceivedCents", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-06-01", 1000);
+    const created = await callPost({
+      insuredId, paymentDate: "2027-06-05", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1000 }],
+    });
+    expect(created.status).toBe(201);
+
+    const { body } = await callListBatches(`?insuredId=${insuredId}`);
+    const row = body.find((b: any) => b.id === created.body.id);
+    expect(row.totalReceivedCents).toBe(100000);
+    expect(row.receivedAmountCents).toBe(100000);
+  });
+
+  test("batch con sobrante (cheque mayor): receivedAmountCents > totalReceivedCents en el listado", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-06-01", 1000);
+    const checkNumber = `CHK-LIST-78-${Date.now()}`;
+    const created = await callPost({
+      insuredId, paymentDate: "2027-06-05", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "cheque", amount: 1100, checks: [{ checkNumber, bankName: `${PREFIX} Banco`, dueDate: "2027-06-01", amount: 1100 }] }],
+      accountDifferenceResolution: { action: "saldo_a_favor" },
+    });
+    expect(created.status).toBe(201);
+
+    const { body } = await callListBatches(`?insuredId=${insuredId}`);
+    const row = body.find((b: any) => b.id === created.body.id);
+    expect(row.totalReceivedCents).toBe(100000); // aplicado — sin cambios
+    expect(row.receivedAmountCents).toBe(110000); // real recibido
+  });
+
+  test("batch con faltante: receivedAmountCents < totalReceivedCents en el listado", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-06-01", 1000);
+    const created = await callPost({
+      insuredId, paymentDate: "2027-06-05", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 900 }],
+      accountDifferenceResolution: { action: "saldo_deudor", reason: "faltante acordado" },
+    });
+    expect(created.status).toBe(201);
+
+    const { body } = await callListBatches(`?insuredId=${insuredId}`);
+    const row = body.find((b: any) => b.id === created.body.id);
+    expect(row.totalReceivedCents).toBe(100000);
+    expect(row.receivedAmountCents).toBe(90000);
   });
 
   test("filtro insuredId funciona", async () => {

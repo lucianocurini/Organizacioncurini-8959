@@ -2,6 +2,7 @@ import { test, expect, describe } from "bun:test";
 import {
   type PendingInstallmentForPayment, type BatchSplitFormRow, type BatchCartItem,
   type ManualPaymentFormState, type PaymentBatchDetailItem, type PaymentBatchCancelCheckResponse,
+  type BatchDifferenceResolutionFormState, type BatchDetailAccountMovement, type PaymentBatchDetail,
   summarizeCartInsureds, calculateCartTotal, getInstallmentRowState, addInstallmentToCart, removeFromCart, cartItemKey,
   emptyManualPaymentForm, validateManualPaymentForm, buildManualCartItemFromForm, addManualPaymentToCart,
   estimateProntoPagoSurchargeCents, calculateBatchTargetAmountCents,
@@ -11,9 +12,12 @@ import {
   isBatchSubmitDisabled, buildPaymentBatchPayload, normalizeBatchSubmitError,
   isManualBatchDetailItem, isFreeformManualBatchDetailItem, describeBatchDetailItem, batchDetailItemInsuredLabel,
   describeBatchCancelImpact, canShowCancelButton, canShowEditButton, isCancelConfirmationValid, buildBatchCancelPayload,
+  isBatchTrulyCancellable, combinedCancelBlockingReasons,
   emptyBatchEditForm, validateBatchEditForm, buildBatchPatchPayload, BATCH_CORRECTION_HINT,
   MIXED_GROUP_ERROR, SURCHARGE_AMOUNT_CENTS,
   updateSplitMethodPreservingChecks, splitsToPaymentSplitsPayload,
+  calculateBatchReceivedAppliedDifference, emptyBatchDifferenceResolutionForm, validateBatchDifferenceResolution,
+  buildAccountDifferenceResolutionPayload, receivedCentsOf, findBatchDifferenceResolution,
 } from "../payment-batch-form";
 
 function pendingItem(overrides: Partial<PendingInstallmentForPayment> = {}): PendingInstallmentForPayment {
@@ -514,6 +518,202 @@ describe("validateBatchSplitsForm — métodos propios vs. directos (importe obj
   });
 });
 
+// ─── Fase 2E — validateBatchSplitsForm con allowAmountDifference (sobrantes/faltantes) ──
+
+describe("validateBatchSplitsForm — options.allowAmountDifference (Cobrar en lote)", () => {
+  test("sin options: sigue exigiendo coincidencia exacta (comportamiento sin cambios)", () => {
+    const splits: BatchSplitFormRow[] = [createBatchSplitRow("efectivo", "900")];
+    expect(validateBatchSplitsForm(100000, splits).valid).toBe(false);
+  });
+
+  test("con allowAmountDifference:true, un faltante en el total ya no bloquea", () => {
+    const splits: BatchSplitFormRow[] = [createBatchSplitRow("efectivo", "900")];
+    const result = validateBatchSplitsForm(100000, splits, { allowAmountDifference: true });
+    expect(result.valid).toBe(true);
+  });
+
+  test("con allowAmountDifference:true, un sobrante en el total ya no bloquea", () => {
+    const splits: BatchSplitFormRow[] = [createBatchSplitRow("efectivo", "1500")];
+    const result = validateBatchSplitsForm(100000, splits, { allowAmountDifference: true });
+    expect(result.valid).toBe(true);
+  });
+
+  test("con allowAmountDifference:true, un cheque real mayor al target (600) vs cuota (500) es válido — el cheque nunca se achica", () => {
+    let splits: BatchSplitFormRow[] = [createBatchSplitRow("cheque", "600")];
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    splits = updateCheckInSplit(splits, splits[0]!.uid, splits[0]!.checks[0]!.uid, {
+      checkNumber: "1", bankName: "Nación", dueDate: "2027-06-01", amount: "600",
+    });
+    const result = validateBatchSplitsForm(50000, splits, { allowAmountDifference: true });
+    expect(result.valid).toBe(true);
+  });
+
+  test("con allowAmountDifference:true, el cheque sigue exigiendo que su propia suma cierre exacto contra SU split (nunca se relaja)", () => {
+    let splits: BatchSplitFormRow[] = [createBatchSplitRow("cheque", "600")];
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    splits = updateCheckInSplit(splits, splits[0]!.uid, splits[0]!.checks[0]!.uid, {
+      checkNumber: "1", bankName: "Nación", dueDate: "2027-06-01", amount: "550", // no coincide con el split (600)
+    });
+    const result = validateBatchSplitsForm(50000, splits, { allowAmountDifference: true });
+    expect(result.valid).toBe(false);
+  });
+
+  test("con allowAmountDifference:true, 'mixed' sigue bloqueando igual que siempre", () => {
+    const splits: BatchSplitFormRow[] = [
+      createBatchSplitRow("efectivo", "500"), createBatchSplitRow("transferencia_compania", "500"),
+    ];
+    const result = validateBatchSplitsForm(100000, splits, { allowAmountDifference: true });
+    expect(result.valid).toBe(false);
+    expect(result.errorMessage).toBe(MIXED_GROUP_ERROR);
+  });
+});
+
+// ─── Fase 2E — calculateBatchReceivedAppliedDifference / validateBatchDifferenceResolution ──
+
+describe("calculateBatchReceivedAppliedDifference (re-exportado de insured-account.ts)", () => {
+  test("recibido == aplicado → 'exacto'", () => {
+    expect(calculateBatchReceivedAppliedDifference(100000, 100000)).toEqual({ kind: "exacto", differenceCents: 0 });
+  });
+  test("recibido > aplicado → 'saldo_a_favor' (sobrante)", () => {
+    const result = calculateBatchReceivedAppliedDifference(150000, 100000);
+    expect(result.kind).toBe("saldo_a_favor");
+    expect(result.differenceCents).toBe(50000);
+  });
+  test("recibido < aplicado → 'saldo_deudor' (faltante)", () => {
+    const result = calculateBatchReceivedAppliedDifference(80000, 100000);
+    expect(result.kind).toBe("saldo_deudor");
+    expect(result.differenceCents).toBe(-20000);
+  });
+});
+
+describe("validateBatchDifferenceResolution", () => {
+  function resolution(overrides: Partial<BatchDifferenceResolutionFormState> = {}): BatchDifferenceResolutionFormState {
+    return { ...emptyBatchDifferenceResolutionForm(), ...overrides };
+  }
+
+  test("sin diferencia ('exacto'): siempre válido, sin importar la resolución ni el carrito", () => {
+    const exact = calculateBatchReceivedAppliedDifference(100000, 100000);
+    expect(validateBatchDifferenceResolution(exact, resolution(), "multiple").valid).toBe(true);
+  });
+
+  test("sobrante sin ninguna acción elegida → inválido, pide elegir saldo a favor", () => {
+    const sobrante = calculateBatchReceivedAppliedDifference(150000, 100000);
+    const result = validateBatchDifferenceResolution(sobrante, resolution(), "single");
+    expect(result.valid).toBe(false);
+    expect(result.errorMessage).toContain("Saldo a favor");
+  });
+
+  test("sobrante con acción 'saldo_a_favor' → válido, sin necesidad de motivo", () => {
+    const sobrante = calculateBatchReceivedAppliedDifference(150000, 100000);
+    const result = validateBatchDifferenceResolution(sobrante, resolution({ action: "saldo_a_favor" }), "single");
+    expect(result.valid).toBe(true);
+  });
+
+  test("sobrante con acción incorrecta ('saldo_deudor') → inválido", () => {
+    const sobrante = calculateBatchReceivedAppliedDifference(150000, 100000);
+    const result = validateBatchDifferenceResolution(sobrante, resolution({ action: "saldo_deudor" }), "single");
+    expect(result.valid).toBe(false);
+    expect(result.errorMessage).toContain("no coincide");
+  });
+
+  test("faltante sin ninguna acción elegida → inválido, pide elegir saldo deudor", () => {
+    const faltante = calculateBatchReceivedAppliedDifference(80000, 100000);
+    const result = validateBatchDifferenceResolution(faltante, resolution(), "single");
+    expect(result.valid).toBe(false);
+    expect(result.errorMessage).toContain("Saldo deudor");
+  });
+
+  test("faltante con acción correcta pero SIN motivo → inválido (motivo obligatorio)", () => {
+    const faltante = calculateBatchReceivedAppliedDifference(80000, 100000);
+    const result = validateBatchDifferenceResolution(faltante, resolution({ action: "saldo_deudor", reason: "" }), "single");
+    expect(result.valid).toBe(false);
+    expect(result.errorMessage).toContain("motivo");
+  });
+
+  test("faltante con acción correcta Y motivo → válido", () => {
+    const faltante = calculateBatchReceivedAppliedDifference(80000, 100000);
+    const result = validateBatchDifferenceResolution(
+      faltante, resolution({ action: "saldo_deudor", reason: "cheque rechazado parcialmente" }), "single",
+    );
+    expect(result.valid).toBe(true);
+  });
+
+  test("carrito 'multiple' (varios asegurados) → siempre inválido aunque haya acción y motivo", () => {
+    const faltante = calculateBatchReceivedAppliedDifference(80000, 100000);
+    const result = validateBatchDifferenceResolution(
+      faltante, resolution({ action: "saldo_deudor", reason: "motivo" }), "multiple",
+    );
+    expect(result.valid).toBe(false);
+    expect(result.errorMessage).toContain("único asegurado real");
+  });
+
+  test("carrito 'manual-only' (100% manual, sin asegurado real) → siempre inválido", () => {
+    const sobrante = calculateBatchReceivedAppliedDifference(150000, 100000);
+    const result = validateBatchDifferenceResolution(sobrante, resolution({ action: "saldo_a_favor" }), "manual-only");
+    expect(result.valid).toBe(false);
+  });
+
+  test("carrito 'empty' → inválido (no hay ningún asegurado que identificar)", () => {
+    const sobrante = calculateBatchReceivedAppliedDifference(150000, 100000);
+    expect(validateBatchDifferenceResolution(sobrante, resolution({ action: "saldo_a_favor" }), "empty").valid).toBe(false);
+  });
+});
+
+describe("buildAccountDifferenceResolutionPayload", () => {
+  test("action null → null (nada que mandar)", () => {
+    expect(buildAccountDifferenceResolutionPayload(emptyBatchDifferenceResolutionForm())).toBeNull();
+  });
+  test("saldo_a_favor sin motivo → reason null", () => {
+    const payload = buildAccountDifferenceResolutionPayload({ action: "saldo_a_favor", reason: "" });
+    expect(payload).toEqual({ action: "saldo_a_favor", reason: null });
+  });
+  test("saldo_deudor con motivo → reason recortado", () => {
+    const payload = buildAccountDifferenceResolutionPayload({ action: "saldo_deudor", reason: "  cheque menor  " });
+    expect(payload).toEqual({ action: "saldo_deudor", reason: "cheque menor" });
+  });
+});
+
+describe("buildPaymentBatchPayload — accountDifferenceResolution (Fase 2E)", () => {
+  test("sin accountDifferenceResolution: la clave no aparece en el payload (importe exacto, comportamiento sin cambios)", () => {
+    const payload = buildPaymentBatchPayload({
+      paymentDate: "2027-06-01",
+      cart: [installmentCartItem({ amount: 1000 })],
+      splits: [createBatchSplitRow("efectivo", "1000")],
+    });
+    expect("accountDifferenceResolution" in payload).toBe(false);
+  });
+
+  test("accountDifferenceResolution: null explícito → tampoco se incluye la clave", () => {
+    const payload = buildPaymentBatchPayload({
+      paymentDate: "2027-06-01",
+      cart: [installmentCartItem({ amount: 1000 })],
+      splits: [createBatchSplitRow("efectivo", "1000")],
+      accountDifferenceResolution: null,
+    });
+    expect("accountDifferenceResolution" in payload).toBe(false);
+  });
+
+  test("con sobrante resuelto: se incluye exactamente {action, reason}", () => {
+    const payload = buildPaymentBatchPayload({
+      paymentDate: "2027-06-01",
+      cart: [installmentCartItem({ amount: 500 })],
+      splits: [createBatchSplitRow("efectivo", "600")],
+      accountDifferenceResolution: { action: "saldo_a_favor", reason: null },
+    });
+    expect(payload.accountDifferenceResolution).toEqual({ action: "saldo_a_favor", reason: null });
+  });
+
+  test("con faltante resuelto: incluye el motivo tal cual se lo pasaron", () => {
+    const payload = buildPaymentBatchPayload({
+      paymentDate: "2027-06-01",
+      cart: [installmentCartItem({ amount: 500 })],
+      splits: [createBatchSplitRow("efectivo", "400")],
+      accountDifferenceResolution: { action: "saldo_deudor", reason: "cheque rechazado parcialmente" },
+    });
+    expect(payload.accountDifferenceResolution).toEqual({ action: "saldo_deudor", reason: "cheque rechazado parcialmente" });
+  });
+});
+
 describe("cheques — obligatorios y validados por split método=cheque", () => {
   test("split cheque sin ningún cheque cargado → inválido", () => {
     const splits: BatchSplitFormRow[] = [createBatchSplitRow("cheque", "1000")];
@@ -659,6 +859,74 @@ describe("buildPaymentBatchPayload — payload discriminado (3 sources), sin ins
   });
 });
 
+// ─── Fase 2F — comprobante consistente con sobrantes/faltantes ─────────────
+
+function batchOf(overrides: Partial<PaymentBatchDetail["batch"]> = {}): PaymentBatchDetail["batch"] {
+  return {
+    id: 1, insuredId: 100, baseAmountCents: 100000, surchargeAmountCents: 0,
+    totalReceivedCents: 100000, receivedAmountCents: 100000,
+    paymentDate: "2027-06-01", status: "confirmado", notes: null, createdAt: "2027-06-01T00:00:00.000Z",
+    cancelledAt: null, cancellationReason: null,
+    ...overrides,
+  };
+}
+
+describe("receivedCentsOf", () => {
+  test("batch exacto: devuelve receivedAmountCents (igual a totalReceivedCents)", () => {
+    expect(receivedCentsOf(batchOf())).toBe(100000);
+  });
+
+  test("sobrante: devuelve receivedAmountCents real, distinto de totalReceivedCents", () => {
+    const batch = batchOf({ totalReceivedCents: 100000, receivedAmountCents: 110000 });
+    expect(receivedCentsOf(batch)).toBe(110000);
+  });
+
+  test("faltante: devuelve receivedAmountCents real, menor a totalReceivedCents", () => {
+    const batch = batchOf({ totalReceivedCents: 100000, receivedAmountCents: 90000 });
+    expect(receivedCentsOf(batch)).toBe(90000);
+  });
+
+  test("batch histórico sin receivedAmountCents (null): fallback seguro a totalReceivedCents", () => {
+    const batch = batchOf({ totalReceivedCents: 75000, receivedAmountCents: null });
+    expect(receivedCentsOf(batch)).toBe(75000);
+    // La diferencia calculada sobre el fallback siempre da "exacto" — nunca inventa un sobrante/faltante inexistente.
+    expect(calculateBatchReceivedAppliedDifference(receivedCentsOf(batch), batch.totalReceivedCents).kind).toBe("exacto");
+  });
+});
+
+describe("findBatchDifferenceResolution", () => {
+  function movement(overrides: Partial<BatchDetailAccountMovement> = {}): BatchDetailAccountMovement {
+    return { id: 1, insuredId: 100, type: "saldo_a_favor", signedAmountCents: 10000, status: "activo", reason: null, ...overrides };
+  }
+
+  test("sin movimientos → null (batch exacto, nunca tuvo diferencia)", () => {
+    expect(findBatchDifferenceResolution([])).toBeNull();
+  });
+
+  test("con un movimiento saldo_a_favor → lo encuentra con su motivo", () => {
+    const result = findBatchDifferenceResolution([movement({ type: "saldo_a_favor", reason: "cheque redondeado" })]);
+    expect(result).toEqual({ action: "saldo_a_favor", reason: "cheque redondeado", status: "activo" });
+  });
+
+  test("con un movimiento saldo_deudor → lo encuentra, reason puede ser null si no vino", () => {
+    const result = findBatchDifferenceResolution([movement({ type: "saldo_deudor", reason: null })]);
+    expect(result).toEqual({ action: "saldo_deudor", reason: null, status: "activo" });
+  });
+
+  test("movimiento anulado (batch cancelado después) → status se preserva como 'anulado'", () => {
+    const result = findBatchDifferenceResolution([movement({ status: "anulado" })]);
+    expect(result?.status).toBe("anulado");
+  });
+
+  test("ignora otros tipos de movimiento que no son la resolución de diferencia (defensivo)", () => {
+    const result = findBatchDifferenceResolution([
+      movement({ id: 1, type: "ajuste_manual" as any }),
+      movement({ id: 2, type: "saldo_deudor" }),
+    ]);
+    expect(result?.action).toBe("saldo_deudor");
+  });
+});
+
 describe("comprobante — descripción de ítems (cuota / cobro manual con póliza / imputación libre)", () => {
   function detailItem(overrides: Partial<PaymentBatchDetailItem> = {}): PaymentBatchDetailItem {
     return {
@@ -777,6 +1045,7 @@ function cancelCheckResponse(overrides: Partial<PaymentBatchCancelCheckResponse>
     checks: [],
     remittanceLinks: { allocationCount: 0, itemCount: 0 },
     surchargeEntries: [],
+    accountMovements: { canCancel: true, blockReasons: [], items: [] },
     ...overrides,
   };
 }
@@ -833,6 +1102,50 @@ describe("isCancelConfirmationValid", () => {
   });
   test("canCancel=true y checkbox tildado → válido", () => {
     expect(isCancelConfirmationValid(cancelCheckResponse(), true)).toBe(true);
+  });
+
+  // ─── Fase 2D/2E — seguridad de cuenta corriente al anular (accountMovements) ──
+  test("canCancel=true pero accountMovements.canCancel=false → inválido aunque el checkbox esté tildado", () => {
+    const check = cancelCheckResponse({
+      accountMovements: { canCancel: false, blockReasons: ["requiere revisión manual"], items: [] },
+    });
+    expect(isCancelConfirmationValid(check, true)).toBe(false);
+  });
+  test("ambos canCancel=true (batch y cuenta corriente) y checkbox tildado → válido", () => {
+    const check = cancelCheckResponse({
+      accountMovements: { canCancel: true, blockReasons: [], items: [] },
+    });
+    expect(isCancelConfirmationValid(check, true)).toBe(true);
+  });
+});
+
+describe("isBatchTrulyCancellable / combinedCancelBlockingReasons (Fase 2D)", () => {
+  test("ambos canCancel=true → truly cancellable, sin razones de bloqueo", () => {
+    const check = cancelCheckResponse();
+    expect(isBatchTrulyCancellable(check)).toBe(true);
+    expect(combinedCancelBlockingReasons(check)).toEqual([]);
+  });
+
+  test("batch bloqueado (canCancel=false) pero cuenta corriente segura → sigue sin ser anulable", () => {
+    const check = cancelCheckResponse({ canCancel: false, blockingReasons: ["hay una rendición vinculada"] });
+    expect(isBatchTrulyCancellable(check)).toBe(false);
+    expect(combinedCancelBlockingReasons(check)).toEqual(["hay una rendición vinculada"]);
+  });
+
+  test("batch anulable pero cuenta corriente requiere revisión manual → no es realmente anulable", () => {
+    const check = cancelCheckResponse({
+      accountMovements: { canCancel: false, blockReasons: ["el movimiento 5 ya fue consumido por otra operación"], items: [] },
+    });
+    expect(isBatchTrulyCancellable(check)).toBe(false);
+    expect(combinedCancelBlockingReasons(check)).toEqual(["el movimiento 5 ya fue consumido por otra operación"]);
+  });
+
+  test("combinedCancelBlockingReasons junta ambas listas cuando las dos bloquean", () => {
+    const check = cancelCheckResponse({
+      canCancel: false, blockingReasons: ["razón de estado"],
+      accountMovements: { canCancel: false, blockReasons: ["razón de cuenta corriente"], items: [] },
+    });
+    expect(combinedCancelBlockingReasons(check)).toEqual(["razón de estado", "razón de cuenta corriente"]);
   });
 });
 

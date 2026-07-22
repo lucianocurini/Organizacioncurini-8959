@@ -53,6 +53,24 @@ export interface CarteraInconsistencyDTO {
   reason: string;
 }
 
+// Fase 2C — sobrantes/faltantes de cuenta corriente de asegurados (ver
+// insured-account.ts en el backend). Informativo, nunca se mezcla con
+// adeudadosDetalle/totalAdeudado (Regla 6 del pedido de sobrantes/faltantes).
+export interface CuentaCorrienteInsuredBalance {
+  insuredId: number;
+  /** positivo = a favor del asegurado, negativo = deudor. */
+  balance: number;
+}
+
+export interface CuentaCorriente {
+  saldosAFavorPendientes: number;
+  saldosDeudoresPendientes: number;
+  creditoActivoEnCaja: number;
+  creditoRegularizado: number;
+  cobrosSaldoDeudor: number;
+  byInsured: CuentaCorrienteInsuredBalance[];
+}
+
 export interface CashSummaryPeriodo {
   from: string;
   to: string;
@@ -118,6 +136,9 @@ export interface CashSummary {
   totalGastos: number;
   gastosMes: number;
   diferencia: number;
+  // Opcional: un backend/caché más viejo puede no incluirlo todavía — la UI
+  // debe tolerar su ausencia sin romper (ver hasCuentaCorriente en caja.tsx).
+  cuentaCorriente?: CuentaCorriente;
   comisiones: { totalMes: number; totalAnio: number };
   iva: { totalMes: number; totalAnio: number };
   gananciaNeta: number;

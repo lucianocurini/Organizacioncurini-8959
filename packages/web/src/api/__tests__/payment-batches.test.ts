@@ -2569,3 +2569,85 @@ describe("77. POST /payments standalone sigue exacto/legacy — no acepta difere
     expect(res.status).toBe(400);
   });
 });
+
+// ─── 78. Fase 2F — GET /payment-batches/:id expone receivedAmountCents y accountMovements ──
+
+describe("78. GET /payment-batches/:id — datos para el comprobante (Fase 2F)", () => {
+  test("batch exacto: receivedAmountCents = totalReceivedCents, accountMovements vacío", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1000 }],
+    });
+
+    const { status, body } = await callGetBatch(created.id);
+    expect(status).toBe(200);
+    expect(body.batch.receivedAmountCents).toBe(100000);
+    expect(body.batch.totalReceivedCents).toBe(100000);
+    expect(body.accountMovements).toEqual([]);
+  });
+
+  test("sobrante (cheque mayor): receivedAmountCents > totalReceivedCents, accountMovements incluye el saldo_a_favor con su motivo", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const checkNumber = `CHK-78A-${Date.now()}`;
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "cheque", amount: 1100, checks: [{ checkNumber, bankName: `${PREFIX} Banco`, dueDate: "2027-06-01", amount: 1100 }] }],
+      accountDifferenceResolution: { action: "saldo_a_favor", reason: "cheque redondeado por el asegurado" },
+    });
+
+    const { status, body } = await callGetBatch(created.id);
+    expect(status).toBe(200);
+    expect(body.batch.receivedAmountCents).toBe(110000);
+    expect(body.batch.totalReceivedCents).toBe(100000);
+    // El cheque nunca se achica en la respuesta del detalle tampoco.
+    expect(body.splits[0].checks[0].amountCents).toBe(110000);
+    expect(body.accountMovements.length).toBe(1);
+    expect(body.accountMovements[0].type).toBe("saldo_a_favor");
+    expect(body.accountMovements[0].signedAmountCents).toBe(10000);
+    expect(body.accountMovements[0].reason).toBe("cheque redondeado por el asegurado");
+    expect(body.accountMovements[0].status).toBe("activo");
+  });
+
+  test("faltante: receivedAmountCents < totalReceivedCents, accountMovements incluye el saldo_deudor con su motivo obligatorio", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 900 }],
+      accountDifferenceResolution: { action: "saldo_deudor", reason: "faltante acordado con el asegurado" },
+    });
+
+    const { status, body } = await callGetBatch(created.id);
+    expect(status).toBe(200);
+    expect(body.batch.receivedAmountCents).toBe(90000);
+    expect(body.batch.totalReceivedCents).toBe(100000);
+    expect(body.accountMovements.length).toBe(1);
+    expect(body.accountMovements[0].type).toBe("saldo_deudor");
+    expect(body.accountMovements[0].signedAmountCents).toBe(-10000);
+    expect(body.accountMovements[0].reason).toBe("faltante acordado con el asegurado");
+  });
+
+  test("anular el batch anula también el movimiento — accountMovements refleja status='anulado'", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 900 }],
+      accountDifferenceResolution: { action: "saldo_deudor", reason: "faltante a anular" },
+    });
+
+    const cancel = await callCancelBatch(created.id);
+    expect(cancel.status).toBe(200);
+
+    const { body } = await callGetBatch(created.id);
+    expect(body.accountMovements.length).toBe(1);
+    expect(body.accountMovements[0].status).toBe("anulado");
+  });
+});

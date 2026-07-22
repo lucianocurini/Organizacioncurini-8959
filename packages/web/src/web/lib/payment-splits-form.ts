@@ -132,8 +132,20 @@ export const MIXED_GROUP_ERROR =
  * el disabled del botón Guardar como DENTRO de handleSave (no depender solo
  * del disabled — un evento perdido o un estado stale no debe dejar pasar un
  * guardado inválido).
+ *
+ * options.allowAmountDifference (Fase 2E, sobrantes/faltantes en "Cobrar en
+ * lote" — ver payment-batch-form.ts): cuando es true, SUM(splits) puede
+ * diferir del importe objetivo sin bloquear acá — el caller (siempre
+ * validateBatchSplitsForm, nunca el pago individual standalone) es quien
+ * exige una resolución explícita de esa diferencia por separado. Por
+ * defecto false — preserva el comportamiento exacto de siempre para el pago
+ * individual (POST/PUT /payments, que nunca admite sobrante/faltante).
  */
-export function validateSplitsForm(totalAmountRaw: string, splits: PaymentSplitFormRow[]): SplitsValidationResult {
+export function validateSplitsForm(
+  totalAmountRaw: string,
+  splits: PaymentSplitFormRow[],
+  options?: { allowAmountDifference?: boolean },
+): SplitsValidationResult {
   if (splits.length === 0) {
     return { valid: false, group: null, errorMessage: "Agregá al menos un medio de pago." };
   }
@@ -157,7 +169,7 @@ export function validateSplitsForm(totalAmountRaw: string, splits: PaymentSplitF
   if (totals.totalCents == null) {
     return { valid: false, group, errorMessage: "Ingresá un importe total válido." };
   }
-  if (totals.diferenciaCents !== 0) {
+  if (!options?.allowAmountDifference && totals.diferenciaCents !== 0) {
     const abs = Math.abs(totals.diferenciaCents!) / 100;
     const msg = totals.diferenciaCents! > 0
       ? `Faltan distribuir $${abs.toFixed(2)}.`

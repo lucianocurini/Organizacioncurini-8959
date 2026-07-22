@@ -9,7 +9,7 @@ import { cn, formatCurrency, formatCurrencyCents } from "@/lib/utils";
 import {
   type PendingInstallmentForPayment, type BatchSplitFormRow, type PaymentBatchSummary,
   type PaymentBatchDetail, type BatchCartItem, type ManualPaymentFormState,
-  type PaymentBatchCancelCheckResponse, type BatchEditFormState,
+  type PaymentBatchCancelCheckResponse, type BatchEditFormState, type BatchDifferenceResolutionFormState,
   summarizeCartInsureds, calculateCartTotal, getInstallmentRowState, addInstallmentToCart, removeFromCart,
   cartItemKey, emptyManualPaymentForm, validateManualPaymentForm, addManualPaymentToCart,
   estimateProntoPagoSurchargeCents, calculateBatchTargetAmountCents,
@@ -19,7 +19,10 @@ import {
   isBatchSubmitDisabled, buildPaymentBatchPayload, normalizeBatchSubmitError,
   isManualBatchDetailItem, describeBatchDetailItem, batchDetailItemInsuredLabel,
   canShowCancelButton, canShowEditButton, describeBatchCancelImpact, isCancelConfirmationValid,
+  isBatchTrulyCancellable, combinedCancelBlockingReasons,
   buildBatchCancelPayload, emptyBatchEditForm, validateBatchEditForm, buildBatchPatchPayload, BATCH_CORRECTION_HINT,
+  calculateBatchReceivedAppliedDifference, emptyBatchDifferenceResolutionForm, validateBatchDifferenceResolution,
+  buildAccountDifferenceResolutionPayload, receivedCentsOf, findBatchDifferenceResolution,
 } from "@/lib/payment-batch-form";
 import { CheckSubForm } from "./CheckSubForm";
 
@@ -555,7 +558,29 @@ export function PendingInstallmentsBatchTab() {
                   )}
                 </div>
                 <div className="flex items-center gap-3">
-                  <span className="text-white font-mono">{formatCurrency(b.totalReceivedCents / 100)}</span>
+                  {/* Fase 2G: b.totalReceivedCents es lo APLICADO (legacy) —
+                      nunca dinero real por sí solo. Mismo criterio que el
+                      comprobante (Fase 2F): sin diferencia se muestra un
+                      único número (comportamiento sin cambios); con
+                      sobrante/faltante se agregan las 2 líneas de contexto,
+                      nunca se llama "Total recibido" al aplicado. */}
+                  {(() => {
+                    const receivedCents = receivedCentsOf(b);
+                    const difference = calculateBatchReceivedAppliedDifference(receivedCents, b.totalReceivedCents);
+                    if (difference.kind === "exacto") {
+                      return <span className="text-white font-mono">{formatCurrencyCents(receivedCents)}</span>;
+                    }
+                    const isSobrante = difference.kind === "saldo_a_favor";
+                    return (
+                      <div className="flex flex-col items-end leading-tight">
+                        <span className="text-white font-mono">{formatCurrencyCents(receivedCents)}</span>
+                        <span className="text-white/35 font-mono text-[10px]">Aplicado a cuotas: {formatCurrencyCents(b.totalReceivedCents)}</span>
+                        <span className={cn("font-mono text-[10px] font-medium", isSobrante ? "text-emerald-400" : "text-red-400")}>
+                          {isSobrante ? "Sobrante" : "Faltante"}: {formatCurrencyCents(Math.abs(difference.differenceCents))}
+                        </span>
+                      </div>
+                    );
+                  })()}
                   {canShowEditButton(b.status) && (
                     <button onClick={() => setEditingBatchId(b.id)} title="Editar datos" className="text-white/40 hover:text-white">
                       <Pencil className="w-3.5 h-3.5" />
@@ -647,11 +672,22 @@ function BatchPaymentModal({
   const [submitting, setSubmitting] = useState(false);
   let submissionLock = false; // guard sincrónico además del estado `submitting` — ver nota en handleSubmit
 
+  // Fase 2E: sobrantes/faltantes — cómo resolver la diferencia entre el
+  // dinero real recibido (SUM(splits)) y lo aplicado a las cuotas (target).
+  const [differenceResolution, setDifferenceResolution] = useState<BatchDifferenceResolutionFormState>(emptyBatchDifferenceResolutionForm());
+
   const subtotal = calculateCartTotal(cart);
   const targetCents = calculateBatchTargetAmountCents(cart, splits);
   const surchargeCents = targetCents - Math.round(subtotal * 100);
-  const validation = validateBatchSplitsForm(targetCents, splits);
+  // allowAmountDifference:true — a diferencia del pago individual
+  // (cobranzas.tsx), acá SUM(splits) puede legítimamente no coincidir con el
+  // target: la diferencia se resuelve más abajo (ver validateBatchDifferenceResolution),
+  // nunca bloqueada acá.
+  const validation = validateBatchSplitsForm(targetCents, splits, { allowAmountDifference: true });
   const totals = computeSplitTotals(String(targetCents / 100), splits);
+  const cartInsuredSummary = summarizeCartInsureds(cart);
+  const difference = calculateBatchReceivedAppliedDifference(totals.distributedCents, targetCents);
+  const differenceValidation = validateBatchDifferenceResolution(difference, differenceResolution, cartInsuredSummary.kind);
 
   function setSplitsAndSync(next: BatchSplitFormRow[]) {
     const target = calculateBatchTargetAmountCents(cart, next);
@@ -665,7 +701,17 @@ function BatchPaymentModal({
     setSplitsAndSync(removeBatchSplitRow(splits, uid));
   }
   function handleUpdateSplit(uid: string, patch: Partial<Pick<BatchSplitFormRow, "method" | "amount">>) {
-    setSplitsAndSync(updateBatchSplitRow(splits, uid, patch));
+    // Fase 2E: un cambio de IMPORTE en el único split nunca se vuelve a
+    // pisar con el target (a diferencia de un cambio de MÉTODO, que sigue
+    // autocompletando como antes) — así el usuario puede declarar un cheque
+    // real mayor o menor a lo aplicado, sin que la UI se lo "achique" solo
+    // porque hay un único medio de pago (Regla 5 del pedido).
+    const next = updateBatchSplitRow(splits, uid, patch);
+    if (next.length === 1 && patch.amount === undefined) {
+      setSplitsAndSync(next);
+    } else {
+      setSplits(next);
+    }
   }
 
   async function handleSubmit() {
@@ -681,10 +727,16 @@ function BatchPaymentModal({
       submissionLock = false;
       return;
     }
+    if (!differenceValidation.valid) {
+      toast.error(differenceValidation.errorMessage ?? "Resolvé la diferencia entre lo recibido y lo aplicado.");
+      submissionLock = false;
+      return;
+    }
     setSubmitting(true);
     try {
       const payload = buildPaymentBatchPayload({
         paymentDate, cart, splits, notes: notes || null,
+        accountDifferenceResolution: difference.kind !== "exacto" ? buildAccountDifferenceResolutionPayload(differenceResolution) : null,
       });
       const result = await api.post("/api/payment-batches", payload);
       onCreated(result.id);
@@ -697,7 +749,7 @@ function BatchPaymentModal({
     }
   }
 
-  const disabled = isBatchSubmitDisabled(submitting, validation.valid, cart.length > 0);
+  const disabled = isBatchSubmitDisabled(submitting, validation.valid && differenceValidation.valid, cart.length > 0);
 
   return (
     <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 p-4 overflow-y-auto">
@@ -787,7 +839,7 @@ function BatchPaymentModal({
                       {PAYMENT_METHODS.map((m) => <option key={m} value={m}>{METHOD_LABELS[m]}</option>)}
                     </select>
                     <input type="number" value={split.amount} onChange={(e) => handleUpdateSplit(split.uid, { amount: e.target.value })}
-                      placeholder="0.00" disabled={splits.length === 1}
+                      placeholder="0.00"
                       className="w-32 px-2 py-1.5 bg-white/5 border border-white/10 rounded text-white text-xs outline-none focus:border-blue-500 disabled:opacity-60" />
                     {splits.length > 1 && (
                       <button onClick={() => handleRemoveSplit(split.uid)} className="text-white/40 hover:text-red-400">
@@ -817,6 +869,66 @@ function BatchPaymentModal({
             </div>
             {validation.errorMessage && (
               <p className="mt-2 text-xs text-red-400">{validation.errorMessage}</p>
+            )}
+
+            {/* Fase 2E: sobrante/faltante — dinero real (SUM(splits)) distinto
+                de lo aplicado a las cuotas seleccionadas (target). Nunca se
+                muestra si coinciden (difference.kind === "exacto"): mismo
+                comportamiento que antes de esta fase. */}
+            {validation.valid && difference.kind !== "exacto" && (
+              <div className={cn(
+                "mt-3 rounded-xl border p-3 space-y-2",
+                difference.kind === "saldo_a_favor" ? "bg-emerald-500/10 border-emerald-500/20" : "bg-red-500/10 border-red-500/20"
+              )}>
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className={cn("w-3.5 h-3.5 flex-shrink-0", difference.kind === "saldo_a_favor" ? "text-emerald-400" : "text-red-400")} />
+                  <p className={cn("text-xs font-semibold", difference.kind === "saldo_a_favor" ? "text-emerald-300" : "text-red-300")}>
+                    {difference.kind === "saldo_a_favor" ? "Sobrante" : "Faltante"}: {formatCurrencyCents(Math.abs(difference.differenceCents))}
+                  </p>
+                </div>
+                <p className="text-xs text-white/60">
+                  {difference.kind === "saldo_a_favor"
+                    ? "Se recibió más dinero real del que se aplica a las cuotas seleccionadas (ej. un cheque mayor a la cuota). El cheque/medio queda por su importe real — nunca se achica."
+                    : "Se recibió menos dinero real del que se aplica a las cuotas seleccionadas."}
+                </p>
+
+                {cartInsuredSummary.kind !== "single" ? (
+                  <p className="text-xs text-amber-300">
+                    No se puede resolver esta diferencia: el cobro {cartInsuredSummary.kind === "multiple" ? "mezcla varios asegurados" : "es 100% manual, sin asegurado real"}.
+                    Separá este cobro en uno por asegurado para poder continuar.
+                  </p>
+                ) : (
+                  <>
+                    <label className="flex items-start gap-2 text-xs text-white/70">
+                      <input
+                        type="radio"
+                        checked={differenceResolution.action === difference.kind}
+                        onChange={() => setDifferenceResolution((f) => ({ ...f, action: difference.kind as "saldo_a_favor" | "saldo_deudor" }))}
+                        className="mt-0.5 accent-blue-600"
+                      />
+                      {difference.kind === "saldo_a_favor" ? "Registrar como saldo a favor del asegurado" : "Registrar como saldo deudor del asegurado"}
+                    </label>
+                    <div>
+                      <label className="text-xs text-white/50 block mb-1">
+                        Motivo {difference.kind === "saldo_deudor" ? "*" : "(opcional)"}
+                      </label>
+                      <textarea
+                        value={differenceResolution.reason}
+                        onChange={(e) => setDifferenceResolution((f) => ({ ...f, reason: e.target.value }))}
+                        rows={2}
+                        placeholder={difference.kind === "saldo_a_favor" ? "Ej: el cheque recibido fue mayor al importe de las cuotas..." : "Ej: el cheque recibido fue menor al importe de las cuotas..."}
+                        className={cn(
+                          "w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white text-sm outline-none resize-none",
+                          difference.kind === "saldo_a_favor" ? "focus:border-emerald-500" : "focus:border-red-500"
+                        )}
+                      />
+                    </div>
+                    {differenceValidation.errorMessage && (
+                      <p className="text-xs text-red-400">{differenceValidation.errorMessage}</p>
+                    )}
+                  </>
+                )}
+              </div>
             )}
           </div>
 
@@ -923,10 +1035,58 @@ function BatchReceiptModal({
             </div>
           )}
 
-          <div className="flex justify-between items-center px-3 py-2 bg-emerald-500/10 border border-emerald-500/20 rounded-xl">
-            <span className="text-emerald-300 text-sm font-medium">Total recibido</span>
-            <span className="text-white font-mono font-semibold">{formatCurrency(detail.batch.totalReceivedCents / 100)}</span>
-          </div>
+          {/* Fase 2F: batch.totalReceivedCents SIEMPRE fue lo APLICADO a las
+              cuotas (nombre legacy) — nunca dinero real por sí solo. Con
+              diferencia (sobrante/faltante), mostrar solo ese número bajo
+              "Total recibido" mentía sobre cuánto entró de verdad (ver
+              receivedCentsOf/calculateBatchReceivedAppliedDifference). Sin
+              diferencia, se muestra igual que siempre — sin ruido nuevo. */}
+          {(() => {
+            const receivedCents = receivedCentsOf(detail.batch);
+            const difference = calculateBatchReceivedAppliedDifference(receivedCents, detail.batch.totalReceivedCents);
+            if (difference.kind === "exacto") {
+              return (
+                <div className="flex justify-between items-center px-3 py-2 bg-emerald-500/10 border border-emerald-500/20 rounded-xl">
+                  <span className="text-emerald-300 text-sm font-medium">Total recibido</span>
+                  <span className="text-white font-mono font-semibold">{formatCurrencyCents(receivedCents)}</span>
+                </div>
+              );
+            }
+            const isSobrante = difference.kind === "saldo_a_favor";
+            const resolution = findBatchDifferenceResolution(detail.accountMovements);
+            return (
+              <div className={cn(
+                "rounded-xl border p-3 space-y-1.5",
+                isSobrante ? "bg-emerald-500/10 border-emerald-500/20" : "bg-red-500/10 border-red-500/20"
+              )}>
+                <div className="flex justify-between text-xs">
+                  <span className="text-white/60">Total recibido real</span>
+                  <span className="text-white font-mono font-semibold">{formatCurrencyCents(receivedCents)}</span>
+                </div>
+                <div className="flex justify-between text-xs">
+                  <span className="text-white/60">Total aplicado a cuotas</span>
+                  <span className="text-white font-mono">{formatCurrencyCents(detail.batch.totalReceivedCents)}</span>
+                </div>
+                <div className={cn(
+                  "flex justify-between text-sm font-medium pt-1.5 border-t",
+                  isSobrante ? "text-emerald-300 border-emerald-500/20" : "text-red-300 border-red-500/20"
+                )}>
+                  <span>{isSobrante ? "Sobrante" : "Faltante"}</span>
+                  <span className="font-mono">{formatCurrencyCents(Math.abs(difference.differenceCents))}</span>
+                </div>
+                <div className="text-xs text-white/70">
+                  <span className="text-white/40">Resolución: </span>
+                  {resolution
+                    ? (resolution.action === "saldo_a_favor" ? "Saldo a favor del asegurado" : "Saldo deudor del asegurado")
+                    : "sin resolución registrada"}
+                  {resolution?.status === "anulado" && <span className="text-red-400"> (anulada junto con el cobro)</span>}
+                </div>
+                {resolution?.reason && (
+                  <p className="text-xs text-white/50 italic">"{resolution.reason}"</p>
+                )}
+              </div>
+            );
+          })()}
 
           {Object.values(detail.integrity).some((v) => v === false || (Array.isArray(v) && v.length > 0)) && (
             <div className="flex items-start gap-2 px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-xl text-xs text-amber-300">
@@ -1066,14 +1226,14 @@ function CancelBatchModal({ batchId, onClose, onCancelled }: { batchId: number; 
           </div>
         ) : !check ? (
           <div className="p-8 text-center text-white/40">No se pudo verificar este cobro.</div>
-        ) : !check.canCancel ? (
+        ) : !isBatchTrulyCancellable(check) ? (
           <div className="p-6 space-y-3">
             <div className="flex items-start gap-2 px-3 py-2 bg-red-500/10 border border-red-500/20 rounded-xl text-sm text-red-300">
               <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
               <div>
                 <p className="font-medium mb-1">Este cobro no se puede anular todavía.</p>
                 <ul className="list-disc list-inside space-y-0.5 text-xs text-red-300/90">
-                  {check.blockingReasons.map((r, i) => <li key={i}>{r}</li>)}
+                  {combinedCancelBlockingReasons(check).map((r, i) => <li key={i}>{r}</li>)}
                 </ul>
               </div>
             </div>
