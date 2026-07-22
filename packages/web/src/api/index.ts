@@ -2030,15 +2030,30 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
         }
       }
     } else {
-      // applyProntoPagoSurcharge absent: sync descriptive fields on existing unrendered surcharge
-      if (existingSurcharge && !existingSurcharge.rendered && hasContableChange) {
-        await tx.update(cashEntries).set({
-          paymentMethod: effectivePaymentMethod,
-          paymentDate: effectivePaymentDate,
-          clientName: resolvedClient ?? existingSurcharge.clientName,
-          policyNumber: resolvedPolicyNumber ?? existingSurcharge.policyNumber,
-          companyName: resolvedCompany ?? existingSurcharge.companyName,
-        }).where(eq(cashEntries.id, existingSurcharge.id));
+      // applyProntoPagoSurcharge absent: el caller no tocó el checkbox (el
+      // frontend deja de mandarlo apenas la póliza/compañía efectiva deja de
+      // ser Rivadavia — ver showSurchargeCheckbox en cobranzas.tsx), pero el
+      // pago puede haber dejado de calificar igual (se corrigió la póliza a
+      // otra compañía, o el grupo de medios dejó de ser "own"). Sin este
+      // chequeo el recargo existente quedaba huérfano sin borrarse: seguía
+      // contando como real en GET /remittances/pending y en el total de
+      // POST /remittances aunque el pago ya no fuera de Rivadavia (hotfix
+      // Pronto Pago Rivadavia — mismo criterio de "sigue calificando" que la
+      // rama applyProntoPagoSurcharge===true de arriba).
+      if (existingSurcharge && !existingSurcharge.rendered) {
+        const isRivadavia = resolvedCompany?.toLowerCase().includes("rivadavia") ?? false;
+        const stillQualifies = isRivadavia && finalSplitGroup === "own" && effectiveStatus !== "anulado";
+        if (!stillQualifies) {
+          await tx.delete(cashEntries).where(eq(cashEntries.id, existingSurcharge.id));
+        } else if (hasContableChange) {
+          await tx.update(cashEntries).set({
+            paymentMethod: effectivePaymentMethod,
+            paymentDate: effectivePaymentDate,
+            clientName: resolvedClient ?? existingSurcharge.clientName,
+            policyNumber: resolvedPolicyNumber ?? existingSurcharge.policyNumber,
+            companyName: resolvedCompany ?? existingSurcharge.companyName,
+          }).where(eq(cashEntries.id, existingSurcharge.id));
+        }
       }
     }
 
@@ -7459,11 +7474,31 @@ app.post("/remittances", requireAuth(async (c: any) => {
             eq(cashEntries.entryType, "pronto_pago_surcharge"),
             eq(cashEntries.rendered, 0),
           )).all();
-        for (const s of sRows) {
-          if (s.paymentId != null) {
-            surchargeMap.set(s.paymentId, s);
-            surchargeExtra += s.amount;
+        // Defensa (hotfix Pronto Pago Rivadavia): un cash_entry de recargo
+        // puede haber quedado huérfano si el pago que lo originó fue editado
+        // después a otra compañía sin pasar por applyProntoPagoSurcharge
+        // (ver PUT /payments) — nunca confiar en la sola existencia del
+        // cash_entry, siempre re-validar contra la compañía ACTUAL del pago
+        // antes de sumarlo al total a cobrar.
+        const surchargePaymentIds = sRows.map((s: any) => s.paymentId).filter((id: any) => id != null);
+        const currentCompanyByPaymentId = new Map<number, string>();
+        if (surchargePaymentIds.length > 0) {
+          const currentCompanyRows = await db.select({
+            id: payments.id, manualCompany: payments.manualCompany, companyName: companies.name,
+          }).from(payments)
+            .leftJoin(policies, eq(payments.policyId, policies.id))
+            .leftJoin(companies, eq(policies.companyId, companies.id))
+            .where(inArray(payments.id, surchargePaymentIds)).all();
+          for (const r of currentCompanyRows) {
+            currentCompanyByPaymentId.set(r.id, (r.companyName ?? r.manualCompany ?? "") as string);
           }
+        }
+        for (const s of sRows) {
+          if (s.paymentId == null) continue;
+          const currentCompany = currentCompanyByPaymentId.get(s.paymentId) ?? "";
+          if (!currentCompany.toLowerCase().includes("rivadavia")) continue;
+          surchargeMap.set(s.paymentId, s);
+          surchargeExtra += s.amount;
         }
       }
       // Recargo por manual_debt de Rivadavia (sin cash_entry previo — se suma al total de la rendición)
@@ -8088,7 +8123,14 @@ app.get("/remittances/pending", requireAuth(async (c: any) => {
         policyNumber: p.policyNumber || p.manualPolicyNumber || "—",
         companyName: p.companyName || p.manualCompany || "—",
         notes: p.notes,
-        hasSurcharge: surchargePmtSet.has(p.id),
+        // Defensa (hotfix Pronto Pago Rivadavia): igual que en POST
+        // /remittances, la sola presencia del cash_entry no alcanza — si el
+        // pago fue editado después a otra compañía sin pasar por
+        // applyProntoPagoSurcharge, el cash_entry puede haber quedado
+        // huérfano. Re-validar contra la compañía ACTUAL evita que el
+        // preview del modal muestre un recargo que el backend no va a
+        // cobrar (y viceversa).
+        hasSurcharge: surchargePmtSet.has(p.id) && String(p.companyName ?? p.manualCompany ?? "").toLowerCase().includes("rivadavia"),
         splits,
         paymentGroup,
       };

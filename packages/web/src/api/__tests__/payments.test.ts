@@ -1286,3 +1286,216 @@ describe("3B.33-38. Recargo Pronto Pago — categoría separada en Caja", () => 
     expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(800);
   });
 });
+
+// ─── Hotfix Pronto Pago Rivadavia — recargo huérfano tras editar la póliza ────
+// Reportado en producción: al armar una rendición de canal "pronto_pago" con
+// varias cuotas de El Norte + una de Rivadavia, el modal mostraba 2 × $800 en
+// vez de 1 × $800. Causa real: un pago que alguna vez fue Rivadavia y luego
+// se corrigió a otra compañía (PUT /payments sin enviar
+// applyProntoPagoSurcharge, porque el frontend deja de mostrar el checkbox
+// apenas la póliza deja de ser Rivadavia) dejaba su cash_entry
+// pronto_pago_surcharge activo y huérfano — GET /remittances/pending y POST
+// /remittances lo seguían contando como si el pago siguiera siendo de
+// Rivadavia. Los tests de acá simulan tanto la prevención (edición vía PUT)
+// como la defensa ante datos ya huérfanos de antes de este fix (reasignación
+// directa en DB, sin pasar por PUT).
+describe("Hotfix Pronto Pago Rivadavia — recargo huérfano", () => {
+  test("39. PUT sin applyProntoPagoSurcharge: si el pago pasa a una póliza no-Rivadavia, borra el recargo huérfano", async () => {
+    const rivPolicyId = await mkRivadaviaPolicy();
+    const elNortePolicyId = await mkPolicy();
+    const { body: created } = await callPost({
+      policyId: rivPolicyId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    const surchargesBefore = await db.select().from(cashEntries)
+      .where(and(eq(cashEntries.paymentId, created.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surchargesBefore.length).toBe(1);
+
+    // Mismo flujo real del frontend: se corrige la póliza del pago, el
+    // checkbox de recargo ya no se muestra (showSurchargeCheckbox=false) y
+    // applyProntoPagoSurcharge nunca viaja en el body.
+    const { status } = await callPut(created.id, { policyId: elNortePolicyId });
+    expect(status).toBe(200);
+
+    const surchargesAfter = await db.select().from(cashEntries)
+      .where(and(eq(cashEntries.paymentId, created.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
+    expect(surchargesAfter.length).toBe(0);
+  });
+
+  test("40. GET /remittances/pending no cuenta un recargo huérfano de un pago ya no-Rivadavia (datos huérfanos previos al fix)", async () => {
+    const rivPolicyId = await mkRivadaviaPolicy();
+    const elNortePolicyId = await mkPolicy();
+    const { body: created } = await callPost({
+      policyId: rivPolicyId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    paymentIdsToClean.push(created.id);
+    // Reasignación directa en DB (no vía PUT): simula un recargo que ya
+    // había quedado huérfano en producción ANTES de este hotfix.
+    await db.update(payments).set({ policyId: elNortePolicyId }).where(eq(payments.id, created.id));
+
+    const res = await app.fetch(new Request("http://localhost/api/remittances/pending", { headers: authHeaders() }));
+    const list = await res.json();
+    const row = list.find((r: any) => r.source === "payment" && r.sourceId === created.id);
+    expect(row).toBeDefined();
+    expect(row.hasSurcharge).toBe(false);
+  });
+
+  test("41. POST /remittances (pronto_pago): un recargo huérfano no se cobra ni se incluye como remittanceItem", async () => {
+    const rivPolicyId = await mkRivadaviaPolicy();
+    const elNortePolicyId = await mkPolicy();
+    const { body: orphanPayment } = await callPost({
+      policyId: rivPolicyId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    paymentIdsToClean.push(orphanPayment.id);
+    await db.update(payments).set({ policyId: elNortePolicyId }).where(eq(payments.id, orphanPayment.id));
+
+    const res = await app.fetch(new Request("http://localhost/api/remittances", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        date: "2027-01-02", canal: "pronto_pago",
+        paymentBreakdown: { efectivo: 1000 },
+        items: [{ source: "payment", sourceId: orphanPayment.id, amount: 1000, debtorStatus: "pagado" }],
+      }),
+    }));
+    // Sin el fix, el backend sumaría el recargo huérfano ($1800) y esto
+    // fallaría con 400 por no coincidir con paymentBreakdown ($1000).
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    remittanceIdsToClean.push(body.id);
+    const remRow = await db.select().from(remittances).where(eq(remittances.id, body.id)).get();
+    expect(remRow?.totalAmount).toBe(1000);
+
+    const items = await db.select().from(remittanceItems).where(eq(remittanceItems.remittanceId, body.id)).all();
+    expect(items.length).toBe(1);
+    expect(items.every((it) => it.source !== "cash_entry")).toBe(true);
+  });
+
+  test("42. Escenario reportado: 3 cuotas El Norte (una con recargo huérfano) + 1 Rivadavia real → recargo total $800, no $1600", async () => {
+    const rivPolicyId = await mkRivadaviaPolicy();
+    const elNortePolicyId = await mkPolicy();
+
+    const { body: rivPayment } = await callPost({
+      policyId: rivPolicyId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    paymentIdsToClean.push(rivPayment.id);
+
+    const { body: orphanPayment } = await callPost({
+      policyId: rivPolicyId, amount: 500, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    paymentIdsToClean.push(orphanPayment.id);
+    await db.update(payments).set({ policyId: elNortePolicyId }).where(eq(payments.id, orphanPayment.id));
+
+    const { body: elNorte2 } = await callPost({
+      policyId: elNortePolicyId, amount: 300, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    paymentIdsToClean.push(elNorte2.id);
+    const { body: elNorte3 } = await callPost({
+      policyId: elNortePolicyId, amount: 200, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    paymentIdsToClean.push(elNorte3.id);
+
+    const totalBase = 1000 + 500 + 300 + 200;
+    const res = await app.fetch(new Request("http://localhost/api/remittances", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        date: "2027-01-02", canal: "pronto_pago",
+        paymentBreakdown: { efectivo: totalBase + 800 },
+        prontoPagoSurcharge: 800,
+        items: [
+          { source: "payment", sourceId: rivPayment.id, amount: 1000, debtorStatus: "pagado" },
+          { source: "payment", sourceId: orphanPayment.id, amount: 500, debtorStatus: "pagado" },
+          { source: "payment", sourceId: elNorte2.id, amount: 300, debtorStatus: "pagado" },
+          { source: "payment", sourceId: elNorte3.id, amount: 200, debtorStatus: "pagado" },
+        ],
+      }),
+    }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    remittanceIdsToClean.push(body.id);
+    const remRow = await db.select().from(remittances).where(eq(remittances.id, body.id)).get();
+    expect(remRow?.totalAmount).toBe(totalBase + 800);
+
+    const items = await db.select().from(remittanceItems).where(eq(remittanceItems.remittanceId, body.id)).all();
+    const surchargeItems = items.filter((it) => it.source === "cash_entry");
+    expect(surchargeItems.length).toBe(1);
+    expect(surchargeItems[0]!.amount).toBe(800);
+  });
+
+  test("43. 0 Rivadavia entre los ítems seleccionados → sin recargo, canal pronto_pago no fuerza nada", async () => {
+    const elNortePolicyId = await mkPolicy();
+    const { body: created } = await callPost({
+      policyId: elNortePolicyId, amount: 400, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    paymentIdsToClean.push(created.id);
+
+    const res = await app.fetch(new Request("http://localhost/api/remittances", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        date: "2027-01-02", canal: "pronto_pago",
+        paymentBreakdown: { efectivo: 400 },
+        items: [{ source: "payment", sourceId: created.id, amount: 400, debtorStatus: "pagado" }],
+      }),
+    }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    remittanceIdsToClean.push(body.id);
+    const remRow = await db.select().from(remittances).where(eq(remittances.id, body.id)).get();
+    expect(remRow?.totalAmount).toBe(400);
+
+    const items = await db.select().from(remittanceItems).where(eq(remittanceItems.remittanceId, body.id)).all();
+    expect(items.length).toBe(1);
+  });
+
+  test("44. 2 pólizas Rivadavia distintas seleccionadas → $1600, cada una con su propio recargo (no se deduplica entre pólizas distintas)", async () => {
+    const rivPolicyA = await mkRivadaviaPolicy();
+    const rivPolicyB = await mkRivadaviaPolicy();
+    const { body: paymentA } = await callPost({
+      policyId: rivPolicyA, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    paymentIdsToClean.push(paymentA.id);
+    const { body: paymentB } = await callPost({
+      policyId: rivPolicyB, amount: 700, paymentMethod: "efectivo", paymentDate: "2027-01-01",
+    });
+    paymentIdsToClean.push(paymentB.id);
+
+    const res = await app.fetch(new Request("http://localhost/api/remittances", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        date: "2027-01-02", canal: "pronto_pago",
+        paymentBreakdown: { efectivo: 1000 + 700 + 1600 },
+        items: [
+          { source: "payment", sourceId: paymentA.id, amount: 1000, debtorStatus: "pagado" },
+          { source: "payment", sourceId: paymentB.id, amount: 700, debtorStatus: "pagado" },
+        ],
+      }),
+    }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    remittanceIdsToClean.push(body.id);
+    const remRow = await db.select().from(remittances).where(eq(remittances.id, body.id)).get();
+    expect(remRow?.totalAmount).toBe(1000 + 700 + 1600);
+
+    const items = await db.select().from(remittanceItems).where(eq(remittanceItems.remittanceId, body.id)).all();
+    const surchargeItems = items.filter((it) => it.source === "cash_entry");
+    expect(surchargeItems.length).toBe(2);
+    expect(surchargeItems.reduce((s, it) => s + it.amount, 0)).toBe(1600);
+  });
+
+  test("45. manual_debt con compañía 'Rivadavia' tipeada a mano sigue sumando el recargo (regla explícita existente, sin policyId real)", async () => {
+    const res = await app.fetch(new Request("http://localhost/api/remittances", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        date: "2027-01-02", canal: "pronto_pago",
+        paymentBreakdown: { efectivo: 300 + 800 },
+        items: [{
+          source: "manual_debt", sourceId: null, amount: 300, debtorStatus: "adeudado",
+          clientName: "Deudor Manual", policyNumber: "MAN-RIV-045", companyName: "Rivadavia",
+        }],
+      }),
+    }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    remittanceIdsToClean.push(body.id);
+    const remRow = await db.select().from(remittances).where(eq(remittances.id, body.id)).get();
+    expect(remRow?.totalAmount).toBe(300 + 800);
+  });
+});
