@@ -12,7 +12,7 @@ import { database as db } from "../database/index";
 import {
   users, sessions, policies, companies, insureds, policyInstallments,
   payments, paymentSplits, paymentBatches, paymentBatchSplits, cashEntries, receivedChecks,
-  remittances, remittanceItems, remittanceAllocations,
+  remittances, remittanceItems, remittanceAllocations, insuredAccountMovements,
 } from "../database/schema";
 import { eq, inArray } from "drizzle-orm";
 
@@ -113,6 +113,31 @@ async function createSimpleBatch(dueDate = "2027-06-01", amount = 1000) {
   return { batchId: body.id as number, instId, amount };
 }
 
+/** Batch de una cuota con diferencia recibido/aplicado ya resuelta (Fase 2B) — genera 1 insured_account_movement. */
+async function createBatchWithDifference(
+  action: "saldo_a_favor" | "saldo_deudor", cuotaAmount: number, receivedAmount: number, reason = "diferencia de prueba"
+) {
+  const policyId = await mkPolicy();
+  const instId = await mkInstallment(policyId, "2027-06-01", cuotaAmount);
+  const { status, body } = await callPost({
+    insuredId, paymentDate: "2027-06-01", notes: null,
+    items: [{ installmentId: instId }],
+    splits: [{ method: "efectivo", amount: receivedAmount }],
+    accountDifferenceResolution: { action, reason },
+  });
+  expect(status).toBe(201);
+  return { batchId: body.id as number, instId, policyId };
+}
+
+async function getAccountMovementsForBatch(batchId: number) {
+  return db.select().from(insuredAccountMovements).where(eq(insuredAccountMovements.originBatchId, batchId)).all();
+}
+
+async function cashSummary() {
+  const res = await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }));
+  return res.json();
+}
+
 beforeAll(async () => {
   const prevUser = await db.select({ id: users.id }).from(users).where(eq(users.email, USER_EMAIL)).get();
   if (prevUser) {
@@ -127,6 +152,10 @@ beforeAll(async () => {
           .where(inArray(payments.id, payIds)).all()
         : [];
       const batchIds = [...new Set(batchRows.map((r: any) => r.id))];
+      // Fase 2D: insured_account_movements.originBatchId referencia
+      // payment_batches.id — debe limpiarse antes que los batches.
+      if (batchIds.length) await db.delete(insuredAccountMovements).where(inArray(insuredAccountMovements.originBatchId, batchIds)).catch(() => {});
+      await db.delete(insuredAccountMovements).where(eq(insuredAccountMovements.createdBy, prevUser.id)).catch(() => {});
       if (payIds.length) await db.delete(cashEntries).where(inArray(cashEntries.paymentId, payIds)).catch(() => {});
       if (payIds.length) await db.delete(paymentSplits).where(inArray(paymentSplits.paymentId, payIds)).catch(() => {});
       if (payIds.length) await db.delete(payments).where(inArray(payments.id, payIds)).catch(() => {});
@@ -166,6 +195,12 @@ afterAll(async () => {
     await db.delete(remittanceItems).where(inArray(remittanceItems.remittanceId, remittanceIdsToClean)).catch(() => {});
     await db.delete(remittances).where(inArray(remittances.id, remittanceIdsToClean)).catch(() => {});
   }
+  // Fase 2D: idem beforeAll — limpiar antes de borrar los batches que referencian.
+  if (batchIdsToClean.length) {
+    await db.delete(insuredAccountMovements).where(inArray(insuredAccountMovements.originBatchId, batchIdsToClean)).catch(() => {});
+  }
+  await db.delete(insuredAccountMovements).where(eq(insuredAccountMovements.createdBy, userId)).catch(() => {});
+
   const allChildIds: number[] = [];
   if (batchIdsToClean.length) {
     const children = await db.select({ id: payments.id }).from(payments).where(inArray(payments.batchId, batchIdsToClean)).all();
@@ -474,6 +509,182 @@ describe("POST /payment-batches/:id/cancel", () => {
   test("batch inexistente → 404", async () => {
     const { status } = await callCancel(999999999, { confirm: true });
     expect(status).toBe(404);
+  });
+});
+
+// ─── Fase 2D — cuenta corriente de asegurados al cancelar un batch ─────────
+//
+// Ver isSafeToCancelAccountMovementOrigin (insured-account.ts) y
+// resolveAccountMovementCancelPlan (index.ts): anular el
+// insured_account_movement que un batch originó (saldo_a_favor/saldo_deudor,
+// Fase 2B) es seguro solo si el resto del pool GLOBAL activo del mismo
+// asegurado sigue alcanzando para explicar todo lo ya consumido/cobrado — si
+// no, se bloquea con 409 ACCOUNT_MOVEMENT_REQUIRES_MANUAL_REVIEW en vez de
+// adivinar una reversa.
+describe("POST /payment-batches/:id/cancel — Fase 2D: cuenta corriente de asegurados", () => {
+  test("1. batch exacto sin cuenta corriente — comportamiento igual que antes", async () => {
+    const { batchId } = await createSimpleBatch("2027-06-01", 1000);
+    const { status, body } = await callCancel(batchId, { confirm: true });
+    expect(status).toBe(200);
+    expect(body.voidedAccountMovementIds).toEqual([]);
+    const movements = await getAccountMovementsForBatch(batchId);
+    expect(movements.length).toBe(0);
+  });
+
+  test("2. batch con saldo a favor — el movimiento se anula, la cuenta corriente cierra y creditoActivoEnCaja vuelve a 0 sin inflar cajaNeta", async () => {
+    const before = await cashSummary();
+    const { batchId } = await createBatchWithDifference("saldo_a_favor", 1000, 1100);
+
+    const afterCreate = await cashSummary();
+    expect(afterCreate.cuentaCorriente.saldosAFavorPendientes - before.cuentaCorriente.saldosAFavorPendientes).toBeCloseTo(100, 2);
+    expect(afterCreate.cuentaCorriente.creditoActivoEnCaja - before.cuentaCorriente.creditoActivoEnCaja).toBeCloseTo(100, 2);
+    expect(afterCreate.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(1100, 2);
+
+    const { status, body } = await callCancel(batchId, { confirm: true });
+    expect(status).toBe(200);
+    expect(body.voidedAccountMovementIds.length).toBe(1);
+
+    const movements = await getAccountMovementsForBatch(batchId);
+    expect(movements.length).toBe(1);
+    expect(movements[0]!.status).toBe("anulado");
+
+    const afterCancel = await cashSummary();
+    // Cuenta corriente vuelve exactamente al estado previo a crear el batch.
+    expect(afterCancel.cuentaCorriente.saldosAFavorPendientes - before.cuentaCorriente.saldosAFavorPendientes).toBeCloseTo(0, 2);
+    expect(afterCancel.cuentaCorriente.creditoActivoEnCaja - before.cuentaCorriente.creditoActivoEnCaja).toBeCloseTo(0, 2);
+    // cajaNeta tampoco queda inflada — el payment hijo también se anuló, así
+    // que cartera.total vuelve a 0 igual que el crédito.
+    expect(afterCancel.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(0, 2);
+  });
+
+  test("3. batch con saldo deudor — el movimiento se anula y la cuenta corriente cierra", async () => {
+    const before = await cashSummary();
+    const { batchId } = await createBatchWithDifference("saldo_deudor", 1000, 900);
+
+    const afterCreate = await cashSummary();
+    expect(afterCreate.cuentaCorriente.saldosDeudoresPendientes - before.cuentaCorriente.saldosDeudoresPendientes).toBeCloseTo(100, 2);
+
+    const { status, body } = await callCancel(batchId, { confirm: true });
+    expect(status).toBe(200);
+    expect(body.voidedAccountMovementIds.length).toBe(1);
+
+    const movements = await getAccountMovementsForBatch(batchId);
+    expect(movements[0]!.status).toBe("anulado");
+
+    const afterCancel = await cashSummary();
+    expect(afterCancel.cuentaCorriente.saldosDeudoresPendientes - before.cuentaCorriente.saldosDeudoresPendientes).toBeCloseTo(0, 2);
+  });
+
+  test("4. batch con cheque mayor a la cuota (received_checks real) — el cheque se anula igual que siempre y el saldo a favor no queda activo", async () => {
+    const policyId = await mkPolicy();
+    const instId = await mkInstallment(policyId, "2027-06-01", 1000);
+    const { status: postStatus, body: created } = await callPost({
+      insuredId, paymentDate: "2027-06-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{
+        method: "cheque", amount: 1100,
+        checks: [{ checkNumber: `${PREFIX}-CHK-${Date.now()}`, bankName: "Banco Test", dueDate: "2027-07-01", amount: 1100 }],
+      }],
+      accountDifferenceResolution: { action: "saldo_a_favor", reason: "cheque recibido de más" },
+    });
+    expect(postStatus).toBe(201);
+    const batchId = created.id as number;
+
+    const checksBefore = await getChecksForBatch(batchId);
+    expect(checksBefore.length).toBe(1);
+    expect(checksBefore[0]!.status).toBe("en_cartera");
+
+    const { status } = await callCancel(batchId, { confirm: true });
+    expect(status).toBe(200);
+
+    const checksAfter = await getChecksForBatch(batchId);
+    expect(checksAfter[0]!.status).toBe("anulado"); // comportamiento existente, sin cambios
+
+    const movements = await getAccountMovementsForBatch(batchId);
+    expect(movements[0]!.status).toBe("anulado"); // el saldo a favor no queda activo
+  });
+
+  test("5. batch con 2 cuotas del mismo asegurado real — anula solo el movimiento de ESTE batch, nunca el de otro", async () => {
+    // Otro batch independiente, con su propio saldo a favor, que debe quedar intacto.
+    const other = await createBatchWithDifference("saldo_a_favor", 500, 550);
+    const otherMovementBefore = (await getAccountMovementsForBatch(other.batchId))[0]!;
+    expect(otherMovementBefore.status).toBe("activo");
+
+    const policyId = await mkPolicy();
+    const inst1 = await mkInstallment(policyId, "2027-06-01", 600);
+    const inst2 = await mkInstallment(policyId, "2027-06-02", 400);
+    const { status: postStatus, body: created } = await callPost({
+      insuredId, paymentDate: "2027-06-01", notes: null,
+      items: [{ installmentId: inst1 }, { installmentId: inst2 }],
+      splits: [{ method: "efectivo", amount: 1100 }], // 1000 aplicado + 100 sobrante
+      accountDifferenceResolution: { action: "saldo_a_favor", reason: "2 cuotas, 1 asegurado" },
+    });
+    expect(postStatus).toBe(201);
+    const batchId = created.id as number;
+
+    const { status } = await callCancel(batchId, { confirm: true });
+    expect(status).toBe(200);
+
+    const thisMovement = (await getAccountMovementsForBatch(batchId))[0]!;
+    expect(thisMovement.status).toBe("anulado");
+
+    // El otro batch nunca se tocó.
+    const otherMovementAfter = (await getAccountMovementsForBatch(other.batchId))[0]!;
+    expect(otherMovementAfter.status).toBe("activo");
+
+    await callCancel(other.batchId, { confirm: true }); // limpieza: deja todo cancelado
+  });
+
+  test("6. batch 100% manual (sin asegurado real) — cancelar no crea ni intenta anular cuenta corriente inexistente", async () => {
+    const { status: postStatus, body: created } = await callPost({
+      paymentDate: "2027-06-01", notes: null,
+      items: [{ source: "manual_payment", manualPayer: `${PREFIX} Manual Cancel`, amount: 700, description: "cobro suelto" }],
+      splits: [{ method: "efectivo", amount: 700 }],
+    });
+    expect(postStatus).toBe(201);
+    const batchId = created.id as number;
+
+    const { status, body } = await callCancel(batchId, { confirm: true });
+    expect(status).toBe(200);
+    expect(body.voidedAccountMovementIds).toEqual([]);
+    expect(await getAccountMovementsForBatch(batchId)).toEqual([]);
+  });
+
+  test("7. saldo a favor ya consumido entero por otra operación — bloquea con 409 ACCOUNT_MOVEMENT_REQUIRES_MANUAL_REVIEW, sin tocar nada", async () => {
+    const { batchId } = await createBatchWithDifference("saldo_a_favor", 1000, 1100);
+    const movementBefore = (await getAccountMovementsForBatch(batchId))[0]!;
+
+    // Se consume el crédito entero vía aplicacion_saldo_favor (simulado
+    // directo — sin endpoint propio todavía, ver Fase 2C). "Anchor" payment
+    // sin splits/importe real: solo hace falta que exista para
+    // relatedPaymentId (ver insured-account.ts).
+    const [anchor] = await db.insert(payments).values({
+      amount: 0, paymentMethod: "efectivo", paymentDate: "2027-06-01", status: "confirmado", rendered: 0, createdBy: userId,
+    }).returning({ id: payments.id });
+    const anchorId = anchor!.id;
+    const [applyMovement] = await db.insert(insuredAccountMovements).values({
+      insuredId, type: "aplicacion_saldo_favor", signedAmountCents: -10000, status: "activo",
+      relatedPaymentId: anchorId, reason: "aplicado a cuota futura", createdBy: userId, createdAt: new Date(),
+    }).returning({ id: insuredAccountMovements.id });
+
+    try {
+      const { status, body } = await callCancel(batchId, { confirm: true });
+      expect(status).toBe(409);
+      expect(body.code).toBe("ACCOUNT_MOVEMENT_REQUIRES_MANUAL_REVIEW");
+      expect(Array.isArray(body.blockingReasons)).toBe(true);
+      expect(body.blockingReasons.length).toBeGreaterThan(0);
+
+      // Rollback completo: nada se tocó.
+      const batch = await getBatch(batchId);
+      expect(batch!.status).toBe("confirmado");
+      const children = await getChildren(batchId);
+      expect(children.every((c) => c.status === "confirmado")).toBe(true);
+      const movementAfter = await db.select().from(insuredAccountMovements).where(eq(insuredAccountMovements.id, movementBefore.id)).get();
+      expect(movementAfter!.status).toBe("activo");
+    } finally {
+      await db.delete(insuredAccountMovements).where(eq(insuredAccountMovements.id, applyMovement!.id)).catch(() => {});
+      await db.delete(payments).where(eq(payments.id, anchorId)).catch(() => {});
+    }
   });
 });
 

@@ -144,6 +144,18 @@ export interface BatchForCartera {
   status: string; // payment_batches.status: confirmado | anulado
   splits: ReadonlyArray<BatchSplitForCartera>;
   children: ReadonlyArray<BatchChildForCartera>;
+  // Fase 2C (sobrantes/faltantes): dinero APLICADO/imputado del batch
+  // completo (payment_batches.totalReceivedCents = base + recargo). Cuando
+  // difiere de SUM(splits) (dinero real) porque el batch tiene una
+  // diferencia ya resuelta vía accountDifferenceResolution (Fase 2B,
+  // Migración 0030), la porción "sobrante" (real > aplicado) NUNCA debe
+  // contarse acá — se contabiliza exclusivamente vía creditoActivoEnCajaCents
+  // (ver insured-account.ts), sin importar si la cuota asociada ya se rindió
+  // o no; sumar ambos duplicaría el sobrante mientras la cuota sigue
+  // pendiente. undefined = sin diferencia conocida (todo batch previo a Fase
+  // 2B, o backfill 1:1 de la Migración 0030): se comporta exactamente igual
+  // que antes de esta fase (sin cap).
+  appliedAmountCents?: number;
 }
 
 /**
@@ -193,25 +205,31 @@ export function applyBatchToCartera(
 
   const totalChildrenAmountCents = confirmedChildren.reduce((s, c) => s + c.amountCents, 0);
   const pendingChildrenAmountCents = pendingChildren.reduce((s, c) => s + c.amountCents, 0);
-  const allPending = totalChildrenAmountCents > 0 && pendingChildrenAmountCents === totalChildrenAmountCents;
+
+  // Fase 2C: la base a prorratear/repartir nunca puede superar lo APLICADO
+  // del batch — un sobrante real (SUM(splits) > appliedAmountCents) se
+  // excluye acá y se contabiliza aparte, siempre, vía creditoActivoEnCajaCents
+  // (ver comentario de BatchForCartera.appliedAmountCents más arriba). Un
+  // faltante (SUM(splits) < appliedAmountCents) usa el real sin cambios —
+  // nunca se "infla" Caja con plata que no llegó. Sin diferencia conocida
+  // (appliedAmountCents undefined, o igual al real — todo batch previo a
+  // Fase 2B), min(real, aplicado) = real: comportamiento idéntico a antes.
+  const realSplitsTotalCents = batch.splits.reduce((s, sp) => s + sp.amountCents, 0);
+  const appliedTotalCents = batch.appliedAmountCents ?? realSplitsTotalCents;
+  const cappedTotalCents = Math.min(realSplitsTotalCents, appliedTotalCents);
 
   // splitCentsToApply[i] = cuánto de CADA split del batch corresponde a la
-  // porción todavía pendiente de rendir. Caso común (nadie se rindió
-  // todavía): el split completo, mismo comportamiento exacto que antes de
-  // esta etapa. Caso mixto: se prorratea en proporción a cuánto de la base
-  // del batch (suma de payments.amount de sus hijos) sigue sin rendir —
-  // una sola operación de redondeo por batch (el total prorrateado), y
-  // apportionCents reparte ese total exacto entre los splits sin drift.
-  let splitCentsToApply: number[];
-  if (allPending) {
-    splitCentsToApply = batch.splits.map((s) => s.amountCents);
-  } else {
-    const totalReceivedCents = batch.splits.reduce((s, sp) => s + sp.amountCents, 0);
-    const pendingTargetCents = totalChildrenAmountCents > 0
-      ? Math.round((totalReceivedCents * pendingChildrenAmountCents) / totalChildrenAmountCents)
-      : 0;
-    splitCentsToApply = apportionCents(pendingTargetCents, batch.splits.map((s) => s.amountCents));
-  }
+  // porción todavía pendiente de rendir, sobre la base ya capeada arriba.
+  // Caso común (nadie se rindió todavía, sin diferencia): el split completo,
+  // mismo comportamiento exacto que antes de esta etapa. Caso mixto y/o con
+  // diferencia: se prorratea en proporción a cuánto de la base del batch
+  // (suma de payments.amount de sus hijos) sigue sin rendir — una sola
+  // operación de redondeo por batch (el total prorrateado), y apportionCents
+  // reparte ese total exacto entre los splits (como pesos) sin drift.
+  const pendingTargetCents = totalChildrenAmountCents > 0
+    ? Math.round((cappedTotalCents * pendingChildrenAmountCents) / totalChildrenAmountCents)
+    : 0;
+  const splitCentsToApply = apportionCents(pendingTargetCents, batch.splits.map((s) => s.amountCents));
 
   batch.splits.forEach((split, i) => {
     const cents = splitCentsToApply[i]!;
@@ -507,6 +525,42 @@ export function accumulateRemittanceContribution(contribution: RemittanceContrib
     acc.legacyUnknownMethods[key] = (acc.legacyUnknownMethods[key] ?? 0) + valuePesos;
     acc.otrosLegacyCents += Math.round(valuePesos * 100);
   }
+}
+
+// ─── Fase 2C — Caja total incluyendo cuenta corriente de asegurados ────────
+//
+// cajaNeta (dinero real físicamente en la oficina, pendiente de rendir) =
+//   cartera.totalCents           — instrumentos reales pendientes de rendir
+//                                   (ya excluye el sobrante de un batch con
+//                                   diferencia, ver applyBatchToCartera)
+// + creditoActivoEnCajaCents     — sobrante todavía sin consumir/rendir
+//                                   (insured-account.ts, calculateCreditActiveInCaja)
+// + creditoRegularizadoCents     — espejo positivo de un ajuste_manual que
+//                                   redujo crédito (insured-account.ts,
+//                                   calculateCreditRegularizedInCaja) — se
+//                                   suma exactamente para CANCELAR la resta
+//                                   que ya aplicó creditoActivoEnCajaCents,
+//                                   así un ajuste_manual nunca mueve el total
+// + cobrosSaldoDeudorCents       — dinero real que entra a saldar una deuda
+//                                   de cuenta corriente previa (insured-
+//                                   account.ts, calculateCobroSaldoDeudorInCaja)
+//
+// Nunca se resta saldosAFavorPendientesCents/saldosDeudoresPendientesCents
+// acá — son puramente informativos de cuenta corriente (Regla 2/3 del pedido:
+// "no restar saldos a favor de Caja", "no sumar saldos deudores como dinero
+// real"), ya reflejados indirectamente a través de los 3 términos de arriba.
+export function calculateCajaNetaTotalCents(params: {
+  carteraTotalCents: number;
+  creditoActivoEnCajaCents: number;
+  creditoRegularizadoCents: number;
+  cobrosSaldoDeudorCents: number;
+}): number {
+  return (
+    params.carteraTotalCents +
+    params.creditoActivoEnCajaCents +
+    params.creditoRegularizadoCents +
+    params.cobrosSaldoDeudorCents
+  );
 }
 
 // ─── Conversión a pesos (frontera pública de la API) ───────────────────────

@@ -22,7 +22,7 @@ import {
   users, sessions, insureds, companies, policies, policyInstallments,
   payments, paymentSplits, paymentBatches, paymentBatchSplits, receivedChecks,
   cashEntries, cashExpenses, commissionEntries, ownMoneyMovements, cashDebts,
-  remittances, remittanceItems, remittanceAllocations,
+  remittances, remittanceItems, remittanceAllocations, insuredAccountMovements,
 } from "../database/schema";
 import { eq, inArray } from "drizzle-orm";
 
@@ -170,6 +170,11 @@ async function cleanupCashDebt(id: number) {
 }
 
 async function cleanupBatch(batchId: number) {
+  // Fase 2C: un batch creado con accountDifferenceResolution deja un
+  // insured_account_movements con originBatchId=batchId — con foreign_keys=ON
+  // (@libsql/client) el DELETE de payment_batches revienta si esto no se
+  // borra primero (no-op para batches sin diferencia, que es la mayoría).
+  await deleteWithRetry(() => db.delete(insuredAccountMovements).where(eq(insuredAccountMovements.originBatchId, batchId)));
   const splitRows = await db.select({ id: paymentBatchSplits.id }).from(paymentBatchSplits).where(eq(paymentBatchSplits.batchId, batchId)).all();
   const splitIds = splitRows.map((s) => s.id);
   if (splitIds.length) await deleteWithRetry(() => db.delete(receivedChecks).where(inArray(receivedChecks.batchSplitId, splitIds)));
@@ -179,6 +184,10 @@ async function cleanupBatch(batchId: number) {
   await deleteWithRetry(() => db.delete(payments).where(eq(payments.batchId, batchId)));
   await deleteWithRetry(() => db.delete(paymentBatchSplits).where(eq(paymentBatchSplits.batchId, batchId)));
   await deleteWithRetry(() => db.delete(paymentBatches).where(eq(paymentBatches.id, batchId)));
+}
+
+async function cleanupInsuredAccountMovement(id: number) {
+  await deleteWithRetry(() => db.delete(insuredAccountMovements).where(eq(insuredAccountMovements.id, id)));
 }
 
 async function cleanupRemittance(id: number) {
@@ -197,6 +206,11 @@ async function purgeStaleFixturesFor(prevUserId: number) {
 
   const staleBatches = await db.select({ id: paymentBatches.id }).from(paymentBatches).where(eq(paymentBatches.createdBy, prevUserId)).all();
   for (const b of staleBatches) await cleanupBatch(b.id);
+
+  // Fase 2C: movimientos de cuenta corriente creados directo (sin batch) por
+  // un test previo abortado — insuredId/createdBy referencian insureds/users,
+  // deben limpiarse antes de esas dos tablas.
+  await deleteWithRetry(() => db.delete(insuredAccountMovements).where(eq(insuredAccountMovements.createdBy, prevUserId)));
 
   const stalePayments = await db.select({ id: payments.id }).from(payments).where(eq(payments.createdBy, prevUserId)).all();
   for (const p of stalePayments) await cleanupPayment(p.id);
@@ -239,6 +253,11 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  // Fase 2C: insured_account_movements.insuredId/createdBy referencian
+  // insureds/users — debe limpiarse antes de borrar cualquiera de las dos
+  // (si algún test de esta corrida no limpió el suyo en su propio finally).
+  await deleteWithRetry(() => db.delete(insuredAccountMovements).where(eq(insuredAccountMovements.createdBy, userId)));
+
   // Orden obligatorio: insureds.created_by referencia users.id — borrar el
   // usuario antes que el asegurado revienta con FOREIGN KEY constraint
   // failed (bug real detectado al quitar el .catch(() => {}) silencioso que
@@ -252,11 +271,13 @@ afterAll(async () => {
   const leftoverEntries = await db.select({ id: cashEntries.id }).from(cashEntries).where(eq(cashEntries.createdBy, userId)).all();
   const leftoverBatches = await db.select({ id: paymentBatches.id }).from(paymentBatches).where(eq(paymentBatches.createdBy, userId)).all();
   const leftoverRemittances = await db.select({ id: remittances.id }).from(remittances).where(eq(remittances.createdBy, userId)).all();
+  const leftoverMovements = await db.select({ id: insuredAccountMovements.id }).from(insuredAccountMovements).where(eq(insuredAccountMovements.createdBy, userId)).all();
   const leftoverDebts = await db.select({ id: cashDebts.id }).from(cashDebts).where(eq(cashDebts.createdBy, userId)).all();
   expect(leftoverPayments.length).toBe(0);
   expect(leftoverEntries.length).toBe(0);
   expect(leftoverBatches.length).toBe(0);
   expect(leftoverRemittances.length).toBe(0);
+  expect(leftoverMovements.length).toBe(0);
   expect(leftoverDebts.length).toBe(0);
 });
 
@@ -1019,4 +1040,219 @@ describe("GET /api/cash/summary — adelantos/recuperos de adeudadas (cuotas rea
       await deleteWithRetry(() => db.delete(policies).where(eq(policies.id, realPolicyId)));
     }
   });
+});
+
+// ─── Fase 2C — Caja + cuenta corriente de asegurados (sobrantes/faltantes) ───
+//
+// Reglas aprobadas (ver diagnóstico 2026-07-21b/c y src/lib/payments/
+// insured-account.ts): Caja = dinero real cobrado, nunca resta un saldo a
+// favor ni suma un saldo deudor como si fuera plata real. Los movimientos
+// que todavía no tienen un endpoint propio (aplicacion_saldo_favor,
+// devolucion_saldo_favor, ajuste_manual, cobro_saldo_deudor — solo
+// saldo_a_favor/saldo_deudor se generan hoy vía POST /payment-batches con
+// accountDifferenceResolution) se insertan acá directo en la tabla, para
+// probar exclusivamente la capa de CÁLCULO de Caja (objetivo de esta fase),
+// no un flujo de creación que todavía no existe.
+describe("GET /api/cash/summary — Fase 2C: cuenta corriente de asegurados", () => {
+  async function mkRealInstallment(amountPesos: number) {
+    const [policyReal] = await db.insert(policies).values({
+      policyNumber: `${PREFIX}-CTA-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      type: "automotor", status: "activa", companyId, insuredId,
+      startDate: "2027-01-01", endDate: "2027-12-31", createdBy: userId,
+    }).returning({ id: policies.id });
+    const policyId = policyReal!.id;
+    const [instRow] = await db.insert(policyInstallments).values({
+      policyId, number: 1, dueDate: FIXTURE_DATE, amount: amountPesos, status: "pendiente", rendered: 0,
+    }).returning({ id: policyInstallments.id });
+    return { policyId, instId: instRow!.id };
+  }
+
+  async function cleanupRealInstallment(policyId: number, instId: number) {
+    await deleteWithRetry(() => db.delete(policyInstallments).where(eq(policyInstallments.id, instId)));
+    await deleteWithRetry(() => db.delete(policies).where(eq(policies.id, policyId)));
+  }
+
+  test("1. pago exacto — Caja igual que antes, cuenta corriente en cero", async () => {
+    const before = (await getSummary()).body;
+    const { paymentId } = await mkStandalonePayment({ amount: 1000, splits: [{ method: "efectivo", amountCents: 100000 }] });
+    try {
+      const after = (await getSummary()).body;
+      expect(after.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(1000, 2);
+      expect(after.cuentaCorriente.saldosAFavorPendientes - before.cuentaCorriente.saldosAFavorPendientes).toBeCloseTo(0, 2);
+      expect(after.cuentaCorriente.saldosDeudoresPendientes - before.cuentaCorriente.saldosDeudoresPendientes).toBeCloseTo(0, 2);
+    } finally {
+      await cleanupPayment(paymentId);
+    }
+  });
+
+  test("2-5. sobrante $10.000 (cheque $110.000/cuota $100.000): ciclo completo hasta aplicar y rendir la cuota futura", async () => {
+    const { policyId, instId } = await mkRealInstallment(1000);
+    const before = (await getSummary()).body;
+
+    // 2. Cheque $1100 recibido / $1000 aplicado a la cuota → sobrante $100.
+    const created = await callPostBatch({
+      paymentDate: FIXTURE_DATE, insuredId,
+      items: [{ source: "installment", installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1100 }],
+      applyProntoPagoSurcharge: false,
+      accountDifferenceResolution: { action: "saldo_a_favor", reason: "Cheque recibido de más" },
+    });
+    expect(created.status).toBe(201);
+    const batchId = created.body.id as number;
+    const childRow = await db.select({ id: payments.id }).from(payments).where(eq(payments.batchId, batchId)).get();
+    const childPaymentId = childRow!.id;
+
+    let anchorPaymentId: number | undefined;
+    let applyMovementId: number | undefined;
+    try {
+      // 2. Antes de rendir la cuota: Caja sube el total real ($1100) — $1000
+      // capeado en cartera-pendiente + $100 de crédito activo.
+      const afterBatch = (await getSummary()).body;
+      expect(afterBatch.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(1100, 2);
+      expect(afterBatch.cuentaCorriente.saldosAFavorPendientes - before.cuentaCorriente.saldosAFavorPendientes).toBeCloseTo(100, 2);
+      expect(afterBatch.cuentaCorriente.creditoActivoEnCaja - before.cuentaCorriente.creditoActivoEnCaja).toBeCloseTo(100, 2);
+
+      // 3. Se rinde la cuota original (simulado directo, aislado del flujo de
+      // POST /remittances — mismo criterio que el resto de este archivo).
+      await db.update(payments).set({ rendered: 1, renderedAt: new Date() }).where(eq(payments.id, childPaymentId));
+      const afterRender = (await getSummary()).body;
+      // Caja baja a solo el sobrante ($100) — nunca se pierde.
+      expect(afterRender.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(100, 2);
+      // La cuenta corriente sigue exactamente igual — rendir la cuota
+      // original no consume el crédito.
+      expect(afterRender.cuentaCorriente.saldosAFavorPendientes - before.cuentaCorriente.saldosAFavorPendientes).toBeCloseTo(100, 2);
+
+      // 4. Se aplica el saldo a favor a una cuota futura — "anchor" payment
+      // sin splits/importe real (relatedPaymentId solo necesita existir para
+      // saber si esa cuota futura ya se rindió; no hay endpoint todavía que
+      // arme esto de punta a punta, ver comentario de cabecera).
+      const [anchor] = await db.insert(payments).values({
+        amount: 0, paymentMethod: "efectivo", paymentDate: FIXTURE_DATE, status: "confirmado", rendered: 0, createdBy: userId,
+      }).returning({ id: payments.id });
+      anchorPaymentId = anchor!.id;
+      const [movementRow] = await db.insert(insuredAccountMovements).values({
+        insuredId, type: "aplicacion_saldo_favor", signedAmountCents: -10000, status: "activo",
+        originBatchId: batchId, relatedPaymentId: anchorPaymentId, reason: "Aplicado a cuota futura",
+        createdBy: userId, createdAt: new Date(),
+      }).returning({ id: insuredAccountMovements.id });
+      applyMovementId = movementRow!.id;
+
+      const afterApply = (await getSummary()).body;
+      // La cuenta corriente cierra a 0 (SUM simple, sin condicionar por rendered).
+      expect(afterApply.cuentaCorriente.saldosAFavorPendientes - before.cuentaCorriente.saldosAFavorPendientes).toBeCloseTo(0, 2);
+      // Caja NO se mueve: no entró dinero nuevo, y la cuota futura todavía no se rindió.
+      expect(afterApply.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(100, 2);
+
+      // 5. Se rinde la cuota futura (el "anchor") — recién ahí Caja baja el sobrante.
+      await db.update(payments).set({ rendered: 1, renderedAt: new Date() }).where(eq(payments.id, anchorPaymentId));
+      const afterRenderFuture = (await getSummary()).body;
+      expect(afterRenderFuture.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(0, 2);
+    } finally {
+      if (applyMovementId !== undefined) await cleanupInsuredAccountMovement(applyMovementId);
+      if (anchorPaymentId !== undefined) await cleanupPayment(anchorPaymentId);
+      await cleanupBatch(batchId);
+      await cleanupRealInstallment(policyId, instId);
+    }
+  });
+
+  test("6. devolución de saldo a favor: Caja baja, cuenta corriente cierra", async () => {
+    const before = (await getSummary()).body;
+    const [favor] = await db.insert(insuredAccountMovements).values({
+      insuredId, type: "saldo_a_favor", signedAmountCents: 15000, status: "activo",
+      reason: null, createdBy: userId, createdAt: new Date(),
+    }).returning({ id: insuredAccountMovements.id });
+    const favorId = favor!.id;
+    let devolutionId: number | undefined;
+    try {
+      const afterFavor = (await getSummary()).body;
+      expect(afterFavor.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(150, 2);
+
+      const [devolution] = await db.insert(insuredAccountMovements).values({
+        insuredId, type: "devolucion_saldo_favor", signedAmountCents: -15000, status: "activo",
+        reason: "Devolución al asegurado", createdBy: userId, createdAt: new Date(),
+      }).returning({ id: insuredAccountMovements.id });
+      devolutionId = devolution!.id;
+
+      const afterDevolution = (await getSummary()).body;
+      // Caja baja: la plata realmente salió de la oficina.
+      expect(afterDevolution.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(0, 2);
+      expect(afterDevolution.cuentaCorriente.saldosAFavorPendientes - before.cuentaCorriente.saldosAFavorPendientes).toBeCloseTo(0, 2);
+    } finally {
+      if (devolutionId !== undefined) await cleanupInsuredAccountMovement(devolutionId);
+      await cleanupInsuredAccountMovement(favorId);
+    }
+  });
+
+  test("7. ajuste manual de saldo a favor: Caja no baja, cuenta corriente cierra, creditoRegularizado refleja la reclasificación", async () => {
+    const before = (await getSummary()).body;
+    const [favor] = await db.insert(insuredAccountMovements).values({
+      insuredId, type: "saldo_a_favor", signedAmountCents: 20000, status: "activo",
+      reason: null, createdBy: userId, createdAt: new Date(),
+    }).returning({ id: insuredAccountMovements.id });
+    const favorId = favor!.id;
+    let adjustmentId: number | undefined;
+    try {
+      const [adjustment] = await db.insert(insuredAccountMovements).values({
+        insuredId, type: "ajuste_manual", signedAmountCents: -20000, status: "activo",
+        reason: "Regularización administrativa", authorizedBy: userId, createdBy: userId, createdAt: new Date(),
+      }).returning({ id: insuredAccountMovements.id });
+      adjustmentId = adjustment!.id;
+
+      const after = (await getSummary()).body;
+      // Caja NUNCA se mueve por un ajuste manual — sigue teniendo la plata.
+      expect(after.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(200, 2);
+      // Cuenta corriente cierra.
+      expect(after.cuentaCorriente.saldosAFavorPendientes - before.cuentaCorriente.saldosAFavorPendientes).toBeCloseTo(0, 2);
+      // La reclasificación queda explícita en creditoRegularizado.
+      expect(after.cuentaCorriente.creditoRegularizado - before.cuentaCorriente.creditoRegularizado).toBeCloseTo(200, 2);
+      expect(after.cuentaCorriente.creditoActivoEnCaja - before.cuentaCorriente.creditoActivoEnCaja).toBeCloseTo(0, 2);
+    } finally {
+      if (adjustmentId !== undefined) await cleanupInsuredAccountMovement(adjustmentId);
+      await cleanupInsuredAccountMovement(favorId);
+    }
+  });
+
+  test("8-9. saldo deudor (faltante $100) no suma Caja; el cobro posterior sí suma como dinero real y cierra la deuda", async () => {
+    const { policyId, instId } = await mkRealInstallment(1000);
+    const before = (await getSummary()).body;
+
+    // 8. Cheque $900 recibido / $1000 aplicado a la cuota → faltante $100.
+    const created = await callPostBatch({
+      paymentDate: FIXTURE_DATE, insuredId,
+      items: [{ source: "installment", installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 900 }],
+      applyProntoPagoSurcharge: false,
+      accountDifferenceResolution: { action: "saldo_deudor", reason: "Cheque recibido de menos" },
+    });
+    expect(created.status).toBe(201);
+    const batchId = created.body.id as number;
+
+    let cobroId: number | undefined;
+    try {
+      const afterBatch = (await getSummary()).body;
+      // Caja sube solo lo realmente recibido ($900) — nunca los $1000 aplicados.
+      expect(afterBatch.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(900, 2);
+      expect(afterBatch.cuentaCorriente.saldosDeudoresPendientes - before.cuentaCorriente.saldosDeudoresPendientes).toBeCloseTo(100, 2);
+
+      // 9. Cobro del saldo deudor — dinero real nuevo que entra a saldar la deuda
+      // (sin endpoint propio todavía, ver comentario de cabecera del describe).
+      const [cobro] = await db.insert(insuredAccountMovements).values({
+        insuredId, type: "cobro_saldo_deudor", signedAmountCents: 10000, status: "activo",
+        reason: null, createdBy: userId, createdAt: new Date(),
+      }).returning({ id: insuredAccountMovements.id });
+      cobroId = cobro!.id;
+
+      const afterCobro = (await getSummary()).body;
+      expect(afterCobro.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(1000, 2);
+      expect(afterCobro.cuentaCorriente.saldosDeudoresPendientes - before.cuentaCorriente.saldosDeudoresPendientes).toBeCloseTo(0, 2);
+    } finally {
+      if (cobroId !== undefined) await cleanupInsuredAccountMovement(cobroId);
+      await cleanupBatch(batchId);
+      await cleanupRealInstallment(policyId, instId);
+    }
+  });
+
+  // 10. No mezclar con cash_debts/Adeudados — cubierto por los describe
+  // "adeudadosDetalle"/"adelantos y recuperos" de este mismo archivo, que
+  // no se tocaron en esta fase y siguen pasando (ver corrida completa).
 });

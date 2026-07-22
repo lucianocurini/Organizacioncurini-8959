@@ -308,3 +308,32 @@ export function calculateCobroSaldoDeudorInCaja(movements: ReadonlyArray<Insured
   }
   return total;
 }
+
+// ─── Fase 2D: seguridad al cancelar un batch con movimiento de cuenta corriente ───
+//
+// El pool de crédito/deuda de un asegurado es GLOBAL a propósito (ver
+// calculateCreditActiveInCaja) — no hay FIFO ni tracking por origen, así que
+// ningún movimiento de consumo (aplicacion_saldo_favor/devolucion_saldo_favor/
+// ajuste_manual que reduce crédito, o cobro_saldo_deudor) puede atribuirse de
+// forma confiable a UN origen específico (un batch/pago puntual) cuando el
+// asegurado tiene más de uno.
+//
+// Anular el insured_account_movement que un batch originó (al cancelarlo) es
+// matemáticamente seguro SOLO SI, sacando ese movimiento puntual del pool, lo
+// que queda del resto del pool activo de ese mismo asegurado TODAVÍA alcanza
+// para explicar todo lo que ya se consumió/cobró — si no alcanza, una parte
+// de ese consumo necesariamente vino de este origen específico, y no hay
+// forma segura de revertirlo automáticamente (ver POST
+// /payment-batches/:id/cancel, 409 ACCOUNT_MOVEMENT_REQUIRES_MANUAL_REVIEW).
+// No es una heurística: es una prueba — si el resto alcanza, este origen por
+// definición no hizo falta para cubrir el consumo y sigue intacto.
+export function isSafeToCancelAccountMovementOrigin(params: {
+  /** Valor absoluto del propio movimiento (saldo_a_favor o saldo_deudor) que el batch/pago originó. */
+  thisOriginAmountCents: number;
+  /** Valor absoluto del pool activo total de ese asegurado en la misma dirección (crédito o deuda), INCLUYE thisOriginAmountCents. */
+  totalActivePoolCents: number;
+  /** Valor absoluto de lo ya consumido/cobrado activo de ese asegurado en la misma dirección. */
+  totalActiveConsumptionCents: number;
+}): boolean {
+  return params.totalActiveConsumptionCents <= params.totalActivePoolCents - params.thisOriginAmountCents;
+}

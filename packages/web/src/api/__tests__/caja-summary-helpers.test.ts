@@ -22,6 +22,7 @@ import {
   buildAdeudadosDetalle,
   assertAdeudadosDetalleMatchesTotal,
   AdeudadosSumMismatchError,
+  calculateCajaNetaTotalCents,
   type CarteraInconsistency,
   type BatchForCartera,
   type RemittanceDebtRowForDetalle,
@@ -299,6 +300,125 @@ describe("applyBatchToCartera", () => {
     );
     expect(cartera.totalCents).toBe(0);
     expect(directoCompania.transferenciaCompaniaCents).toBe(100000);
+  });
+
+  // ─── Fase 2C — sobrantes/faltantes: cartera nunca cuenta más que lo aplicado ───
+  // Un batch con diferencia (Fase 2B) tiene SUM(splits) != appliedAmountCents.
+  // El sobrante (real > aplicado) se excluye siempre de cartera-pendiente —
+  // se contabiliza exclusivamente vía creditoActivoEnCajaCents (insured-
+  // account.ts), nunca acá, sin importar el estado de rendido de la cuota.
+
+  test("sobrante (cheque $1100 / aplicado $1000): cartera pendiente cuenta solo lo aplicado, nunca el sobrante", () => {
+    const cartera = emptyMoneyBucket();
+    const directoCompania = emptyDirectCompanyBucket();
+    applyBatchToCartera(
+      mkBatch({
+        splits: [{ method: "cheque", amountCents: 110000, checks: [{ id: 1, amountCents: 110000 }] }],
+        children: [{ paymentId: 1, status: "confirmado", rendered: 0, amountCents: 100000 }],
+        appliedAmountCents: 100000,
+      }),
+      cartera, directoCompania, []
+    );
+    // No 110000 — el sobrante ($10000) nunca entra acá.
+    expect(cartera.chequeCents).toBe(100000);
+    expect(cartera.totalCents).toBe(100000);
+  });
+
+  test("faltante (cheque $900 / aplicado $1000): cartera pendiente usa el real, nunca infla con lo que no llegó", () => {
+    const cartera = emptyMoneyBucket();
+    const directoCompania = emptyDirectCompanyBucket();
+    applyBatchToCartera(
+      mkBatch({
+        splits: [{ method: "cheque", amountCents: 90000, checks: [{ id: 1, amountCents: 90000 }] }],
+        children: [{ paymentId: 1, status: "confirmado", rendered: 0, amountCents: 100000 }],
+        appliedAmountCents: 100000,
+      }),
+      cartera, directoCompania, []
+    );
+    // No 100000 — nunca se cuenta plata que no llegó realmente.
+    expect(cartera.chequeCents).toBe(90000);
+    expect(cartera.totalCents).toBe(90000);
+  });
+
+  test("sin diferencia (appliedAmountCents === real): comportamiento idéntico a sin Fase 2C", () => {
+    const cartera = emptyMoneyBucket();
+    const directoCompania = emptyDirectCompanyBucket();
+    applyBatchToCartera(
+      mkBatch({
+        splits: [{ method: "efectivo", amountCents: 100000, checks: [] }],
+        appliedAmountCents: 100000,
+      }),
+      cartera, directoCompania, []
+    );
+    expect(cartera.efectivoCents).toBe(100000);
+  });
+
+  test("sobrante con batch totalmente rendido: cartera pendiente cae a 0 igual que antes (el sobrante lo carga creditoActivoEnCajaCents, no acá)", () => {
+    const cartera = emptyMoneyBucket();
+    const directoCompania = emptyDirectCompanyBucket();
+    applyBatchToCartera(
+      mkBatch({
+        splits: [{ method: "cheque", amountCents: 110000, checks: [{ id: 1, amountCents: 110000 }] }],
+        children: [{ paymentId: 1, status: "confirmado", rendered: 1, amountCents: 100000 }],
+        appliedAmountCents: 100000,
+      }),
+      cartera, directoCompania, []
+    );
+    expect(cartera.totalCents).toBe(0);
+  });
+
+  test("sobrante con hijo mixto (parcial rendido) — se prorratea sobre la base capeada, sin drift", () => {
+    const cartera = emptyMoneyBucket();
+    const directoCompania = emptyDirectCompanyBucket();
+    applyBatchToCartera(
+      mkBatch({
+        splits: [{ method: "cheque", amountCents: 220000, checks: [{ id: 1, amountCents: 220000 }] }],
+        children: [
+          { paymentId: 1, status: "confirmado", rendered: 0, amountCents: 100000 }, // pendiente
+          { paymentId: 2, status: "confirmado", rendered: 1, amountCents: 100000 }, // rendido
+        ],
+        appliedAmountCents: 200000, // real 220000, aplicado 200000 → sobrante 20000 excluido
+      }),
+      cartera, directoCompania, []
+    );
+    // Base capeada 200000, 50% pendiente → 100000 (nunca 110000, la mitad del real).
+    expect(cartera.chequeCents).toBe(100000);
+  });
+});
+
+describe("calculateCajaNetaTotalCents", () => {
+  test("suma cartera + crédito activo + crédito regularizado + cobros de saldo deudor", () => {
+    const total = calculateCajaNetaTotalCents({
+      carteraTotalCents: 100000,
+      creditoActivoEnCajaCents: 10000,
+      creditoRegularizadoCents: 0,
+      cobrosSaldoDeudorCents: 0,
+    });
+    expect(total).toBe(110000);
+  });
+
+  test("un ajuste_manual (creditoActivo baja, creditoRegularizado sube en espejo) nunca mueve el total", () => {
+    const antesDelAjuste = calculateCajaNetaTotalCents({
+      carteraTotalCents: 0, creditoActivoEnCajaCents: 10000, creditoRegularizadoCents: 0, cobrosSaldoDeudorCents: 0,
+    });
+    const despuesDelAjuste = calculateCajaNetaTotalCents({
+      carteraTotalCents: 0, creditoActivoEnCajaCents: 0, creditoRegularizadoCents: 10000, cobrosSaldoDeudorCents: 0,
+    });
+    expect(despuesDelAjuste).toBe(antesDelAjuste);
+  });
+
+  test("cobro de saldo deudor suma Caja como dinero real", () => {
+    const total = calculateCajaNetaTotalCents({
+      carteraTotalCents: 90000, creditoActivoEnCajaCents: 0, creditoRegularizadoCents: 0, cobrosSaldoDeudorCents: 10000,
+    });
+    expect(total).toBe(100000);
+  });
+
+  test("sin ningún movimiento de cuenta corriente, cajaNeta = cartera.total (sin regresión)", () => {
+    const total = calculateCajaNetaTotalCents({
+      carteraTotalCents: 50000, creditoActivoEnCajaCents: 0, creditoRegularizadoCents: 0, cobrosSaldoDeudorCents: 0,
+    });
+    expect(total).toBe(50000);
   });
 });
 

@@ -77,10 +77,12 @@ import {
   applyManualCashEntryToCartera, collectDistinctExpectedSources, classifyRemittanceForRendido,
   accumulateRemittanceContribution, emptyMoneyBucket, emptyDirectCompanyBucket, emptyRendidoAccumulator,
   centsToPesos, buildAdeudadosDetalle, assertAdeudadosDetalleMatchesTotal, AdeudadosSumMismatchError,
-  isContableMethod, type CarteraInconsistency, type BatchForCartera,
+  isContableMethod, calculateCajaNetaTotalCents, type CarteraInconsistency, type BatchForCartera,
 } from "../lib/payments/caja-summary";
 import {
   calculateBatchReceivedAppliedDifference, validateInsuredAccountMovement, InsuredAccountValidationError,
+  summarizeInsuredAccountBalances, calculateCreditActiveInCaja, calculateCreditRegularizedInCaja,
+  calculateCobroSaldoDeudorInCaja, isSafeToCancelAccountMovementOrigin, type InsuredAccountMovementForCaja,
 } from "../lib/payments/insured-account";
 
 const app = new Hono().basePath("/api");
@@ -3118,7 +3120,99 @@ async function loadBatchCancelContext(dbOrTx: any, batchId: number) {
     ? await dbOrTx.select({ id: remittanceItems.id }).from(remittanceItems).where(or(...itemConditions)).all()
     : [];
 
-  return { batch, childRows, childIds, surcharges, checkRows, allocationCount: allocationRows.length, itemCount: itemRows.length };
+  // Fase 2D: insured_account_movements que "claramente pertenecen" a este
+  // batch — originados directo por él (originBatchId), o por alguno de sus
+  // pagos hijos (originPaymentId). Ningún endpoint escribe originPaymentId
+  // todavía (solo originBatchId, vía POST /payment-batches con
+  // accountDifferenceResolution — Fase 2B), pero se contempla para no dejar
+  // un movimiento futuro huérfano si algún día se genera así.
+  const accountMovementConditions = [eq(insuredAccountMovements.originBatchId, batchId)];
+  if (childIds.length > 0) accountMovementConditions.push(inArray(insuredAccountMovements.originPaymentId, childIds));
+  const accountMovements = await dbOrTx.select().from(insuredAccountMovements)
+    .where(or(...accountMovementConditions)).all();
+  const accountPlan = await resolveAccountMovementCancelPlan(dbOrTx, accountMovements);
+
+  return {
+    batch, childRows, childIds, surcharges, checkRows,
+    allocationCount: allocationRows.length, itemCount: itemRows.length,
+    accountMovements, accountPlan,
+  };
+}
+
+// ─── Fase 2D: seguridad de cuenta corriente al cancelar un batch ───────────
+interface AccountMovementCancelPlan {
+  safe: boolean;
+  blockReasons: string[];
+  movementIdsToVoid: number[];
+}
+
+/**
+ * Para cada insured_account_movement activo que este batch (o alguno de sus
+ * hijos) originó, decide si anularlo es matemáticamente seguro — ver
+ * isSafeToCancelAccountMovementOrigin (insured-account.ts). Un movimiento ya
+ * anulado no vuelve a evaluarse (nada que anular de nuevo — idempotencia).
+ * Nunca escribe nada: solo decide qué haría falta anular y qué lo bloquea.
+ */
+async function resolveAccountMovementCancelPlan(
+  dbOrTx: any,
+  accountMovements: ReadonlyArray<any>
+): Promise<AccountMovementCancelPlan> {
+  const activeOwnMovements = accountMovements.filter((m: any) => m.status === "activo");
+  if (activeOwnMovements.length === 0) return { safe: true, blockReasons: [], movementIdsToVoid: [] };
+
+  const blockReasons: string[] = [];
+  const movementIdsToVoid: number[] = [];
+
+  for (const m of activeOwnMovements as any[]) {
+    if (m.type !== "saldo_a_favor" && m.type !== "saldo_deudor") {
+      // Otro tipo originado directo por un batch/pago (ningún endpoint lo
+      // genera así hoy) — no consume ni cierra nada del pool por sí mismo,
+      // se anula sin chequeo adicional.
+      movementIdsToVoid.push(m.id);
+      continue;
+    }
+
+    // Pool GLOBAL del mismo asegurado, sin este movimiento — nunca se
+    // escribe nada acá, solo lectura para decidir.
+    const siblingRows = await dbOrTx.select().from(insuredAccountMovements)
+      .where(and(eq(insuredAccountMovements.insuredId, m.insuredId), ne(insuredAccountMovements.id, m.id)))
+      .all();
+    const activeSiblings = (siblingRows as any[]).filter((s) => s.status === "activo");
+
+    const thisOriginAmountCents = Math.abs(m.signedAmountCents);
+    let totalActivePoolCents = thisOriginAmountCents;
+    let totalActiveConsumptionCents = 0;
+
+    if (m.type === "saldo_a_favor") {
+      for (const s of activeSiblings) {
+        if (s.type === "saldo_a_favor") totalActivePoolCents += s.signedAmountCents;
+        else if (s.type === "aplicacion_saldo_favor" || s.type === "devolucion_saldo_favor") {
+          totalActiveConsumptionCents += Math.abs(s.signedAmountCents);
+        } else if (s.type === "ajuste_manual" && s.signedAmountCents < 0) {
+          totalActiveConsumptionCents += Math.abs(s.signedAmountCents);
+        }
+      }
+    } else {
+      // saldo_deudor
+      for (const s of activeSiblings) {
+        if (s.type === "saldo_deudor") totalActivePoolCents += Math.abs(s.signedAmountCents);
+        else if (s.type === "cobro_saldo_deudor") totalActiveConsumptionCents += Math.abs(s.signedAmountCents);
+      }
+    }
+
+    const safe = isSafeToCancelAccountMovementOrigin({ thisOriginAmountCents, totalActivePoolCents, totalActiveConsumptionCents });
+    if (safe) {
+      movementIdsToVoid.push(m.id);
+    } else {
+      blockReasons.push(
+        `El movimiento de cuenta corriente ${m.id} (${m.type}) del asegurado ${m.insuredId} ya fue parcial o totalmente ` +
+        `consumido/cobrado por otra operación de su cuenta corriente — no se puede determinar de forma segura que ` +
+        `anularlo no afecte esa otra operación. Requiere revisión manual antes de anular este cobro.`
+      );
+    }
+  }
+
+  return { safe: blockReasons.length === 0, blockReasons, movementIdsToVoid };
 }
 
 function buildCancelCheckInput(ctx: NonNullable<Awaited<ReturnType<typeof loadBatchCancelContext>>>) {
@@ -3157,12 +3251,32 @@ app.get("/payment-batches/:id/cancel-check", requireAuth(async (c: any) => {
     checks: ctx.checkRows.map((chk: any) => ({ id: chk.id, checkNumber: chk.checkNumber, bankName: chk.bankName, amountCents: chk.amountCents, status: chk.status })),
     remittanceLinks: { allocationCount: ctx.allocationCount, itemCount: ctx.itemCount },
     surchargeEntries: ctx.surcharges.map((s: any) => ({ id: s.id, amountCents: Math.round(s.amount * 100), rendered: s.rendered })),
+    // Fase 2D: movimientos de cuenta corriente que este cobro originó y si
+    // anularlos es seguro — ver resolveAccountMovementCancelPlan.
+    accountMovements: {
+      canCancel: ctx.accountPlan.safe,
+      blockReasons: ctx.accountPlan.blockReasons,
+      items: ctx.accountMovements.map((m: any) => ({
+        id: m.id, type: m.type, signedAmountCents: m.signedAmountCents, status: m.status, insuredId: m.insuredId,
+      })),
+    },
   }, 200);
 }));
 
 class BatchCancelRaceConditionError extends Error {
   constructor(public reasons: string[]) {
     super(`El cobro cambió mientras se procesaba la anulación: ${reasons.join(" ")}`);
+  }
+}
+
+// Fase 2D: distinto de BatchCancelRaceConditionError a propósito — esto
+// nunca es una condición de carrera (el batch en sí sigue siendo anulable),
+// es una ambigüedad real e inherente al pool GLOBAL de cuenta corriente (ver
+// isSafeToCancelAccountMovementOrigin) que requiere ojo humano, nunca una
+// reversa automática adivinada.
+class AccountMovementReviewRequiredError extends Error {
+  constructor(public reasons: string[]) {
+    super(`Requiere revisión manual de cuenta corriente antes de anular: ${reasons.join(" ")}`);
   }
 }
 
@@ -3189,6 +3303,16 @@ app.post("/payment-batches/:id/cancel", requireAuth(async (c: any) => {
   if (!preCheck.canCancel) {
     return c.json({ error: "No se puede anular este cobro.", blockingReasons: preCheck.blockingReasons }, 409);
   }
+  // Fase 2D: chequeo aparte del anterior — nunca se mezcla con
+  // blockingReasons genéricos, para que el caller pueda distinguir "estado
+  // del batch/cheques/rendición" de "ambigüedad real de cuenta corriente".
+  if (!preCtx.accountPlan.safe) {
+    return c.json({
+      error: "No se puede anular este cobro sin revisión manual de su cuenta corriente.",
+      code: "ACCOUNT_MOVEMENT_REQUIRES_MANUAL_REVIEW",
+      blockingReasons: preCtx.accountPlan.blockReasons,
+    }, 409);
+  }
 
   try {
     const result = await db.transaction(async (tx) => {
@@ -3201,6 +3325,7 @@ app.post("/payment-batches/:id/cancel", requireAuth(async (c: any) => {
       }
       const check = checkBatchCancellable(buildCancelCheckInput(ctx));
       if (!check.canCancel) throw new BatchCancelRaceConditionError(check.blockingReasons);
+      if (!ctx.accountPlan.safe) throw new AccountMovementReviewRequiredError(ctx.accountPlan.blockReasons);
 
       const now = new Date();
 
@@ -3231,6 +3356,22 @@ app.post("/payment-batches/:id/cancel", requireAuth(async (c: any) => {
         await tx.update(receivedChecks).set({ status: "anulado", cancelledAt: now, updatedAt: now }).where(eq(receivedChecks.id, chk.id));
       }
 
+      // Fase 2D: insured_account_movements que este batch (o alguno de sus
+      // hijos) originó, ya confirmados como seguros de anular por
+      // resolveAccountMovementCancelPlan — nunca se borran, nunca se crea un
+      // movimiento nuevo, solo status→anulado. El WHERE con status='activo'
+      // es defensivo (idempotencia): si por cualquier motivo ya estaba
+      // anulado, este UPDATE no hace nada.
+      if (ctx.accountPlan.movementIdsToVoid.length > 0) {
+        await tx.update(insuredAccountMovements).set({
+          status: "anulado",
+          notes: `Anulado automáticamente al cancelar el cobro ${id}.`,
+        }).where(and(
+          inArray(insuredAccountMovements.id, ctx.accountPlan.movementIdsToVoid),
+          eq(insuredAccountMovements.status, "activo"),
+        ));
+      }
+
       return {
         alreadyCancelled: false,
         batch: updatedBatch,
@@ -3238,12 +3379,20 @@ app.post("/payment-batches/:id/cancel", requireAuth(async (c: any) => {
         freedInstallmentIds: ctx.childRows.filter((r: any) => r.payment.installmentId != null).map((r: any) => r.payment.installmentId),
         voidedSurchargeEntryIds: ctx.surcharges.map((s: any) => s.id),
         voidedCheckIds: ctx.checkRows.map((chk: any) => chk.id),
+        voidedAccountMovementIds: ctx.accountPlan.movementIdsToVoid,
       };
     });
     return c.json({ ok: true, ...result }, 200);
   } catch (e: any) {
     if (e instanceof BatchCancelRaceConditionError) {
       return c.json({ error: "No se puede anular este cobro.", blockingReasons: e.reasons }, 409);
+    }
+    if (e instanceof AccountMovementReviewRequiredError) {
+      return c.json({
+        error: "No se puede anular este cobro sin revisión manual de su cuenta corriente.",
+        code: "ACCOUNT_MOVEMENT_REQUIRES_MANUAL_REVIEW",
+        blockingReasons: e.reasons,
+      }, 409);
     }
     throw e;
   }
@@ -7003,6 +7152,10 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
         batchId: b.id, status: b.status,
         splits: splitsByBatchId.get(b.id) ?? [],
         children: childrenByBatchId.get(b.id) ?? [],
+        // Fase 2C: dinero APLICADO del batch — si difiere de SUM(splits) por
+        // un sobrante/faltante resuelto (Fase 2B), applyBatchToCartera nunca
+        // cuenta acá más que esto (el sobrante vive en creditoActivoEnCajaCents).
+        appliedAmountCents: b.totalReceivedCents,
       };
       applyBatchToCartera(batchForCartera, carteraBucket, directoCompaniaBucket, carteraInconsistencias);
     }
@@ -7213,6 +7366,54 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   // Ganancia neta del mes = comisiones del mes - gastos del mes
   const gananciaNeta = comisionesMes - gastosMes;
 
+  // ── Fase 2C: cuenta corriente de asegurados (sobrantes/faltantes) ─────────
+  // Fuente única: insured_account_movements (Migración 0030) — nunca se
+  // mezcla con cash_debts/Adeudados/remittance_items (Regla 6 del pedido).
+  // relatedPaymentId solo importa para aplicacion_saldo_favor (necesita saber
+  // si esa cuota futura ya se rindió, ver calculateCreditActiveInCaja) — se
+  // resuelve con una sola query adicional, batcheada.
+  const accountMovementRows = await db.select({
+    id: insuredAccountMovements.id,
+    insuredId: insuredAccountMovements.insuredId,
+    type: insuredAccountMovements.type,
+    signedAmountCents: insuredAccountMovements.signedAmountCents,
+    status: insuredAccountMovements.status,
+    relatedPaymentId: insuredAccountMovements.relatedPaymentId,
+  }).from(insuredAccountMovements).all();
+
+  const relatedPaymentIdsForCredit = [...new Set(
+    accountMovementRows
+      .filter((m: any) => m.type === "aplicacion_saldo_favor" && m.relatedPaymentId != null)
+      .map((m: any) => m.relatedPaymentId as number)
+  )];
+  const relatedPaymentRenderedById = new Map<number, boolean>();
+  if (relatedPaymentIdsForCredit.length > 0) {
+    const relatedRows = await db.select({ id: payments.id, rendered: payments.rendered })
+      .from(payments).where(inArray(payments.id, relatedPaymentIdsForCredit)).all();
+    for (const r of relatedRows as any[]) relatedPaymentRenderedById.set(r.id, r.rendered === 1);
+  }
+
+  const movementsForCaja: InsuredAccountMovementForCaja[] = accountMovementRows.map((m: any) => ({
+    type: m.type,
+    signedAmountCents: m.signedAmountCents,
+    status: m.status,
+    relatedPaymentRendered: m.relatedPaymentId != null ? (relatedPaymentRenderedById.get(m.relatedPaymentId) ?? false) : null,
+  }));
+
+  const insuredBalances = summarizeInsuredAccountBalances(accountMovementRows as any);
+  const creditoActivoEnCajaCents = calculateCreditActiveInCaja(movementsForCaja);
+  const creditoRegularizadoCents = calculateCreditRegularizedInCaja(movementsForCaja);
+  const cobrosSaldoDeudorCents = calculateCobroSaldoDeudorInCaja(movementsForCaja);
+
+  const cuentaCorriente = {
+    saldosAFavorPendientes: centsToPesos(insuredBalances.saldosAFavorPendientesCents),
+    saldosDeudoresPendientes: centsToPesos(insuredBalances.saldosDeudoresPendientesCents),
+    creditoActivoEnCaja: centsToPesos(creditoActivoEnCajaCents),
+    creditoRegularizado: centsToPesos(creditoRegularizadoCents),
+    cobrosSaldoDeudor: centsToPesos(cobrosSaldoDeudorCents),
+    byInsured: insuredBalances.byInsured.map((b) => ({ insuredId: b.insuredId, balance: centsToPesos(b.balanceCents) })),
+  };
+
   // ── Caja propia — histórico ───────────────────────────────────────────────
   const cpComisiones  = allCommissions.filter((c: any) => c.status !== "anulado").reduce((s: number, c: any) => s + c.amount, 0);
   const cpAportes     = ownMovements.filter((m: any) => m.type === "aporte").reduce((s: number, m: any) => s + m.amount, 0);
@@ -7224,13 +7425,23 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   const cpAportesPend = cpAportes - cpReintegros;
 
   // Pendiente de rendir actual: lo cobrado en cuentas propias que aún no fue rendido.
-  // cajaNeta = cartera.total (solo ítems no rendidos, métodos propios).
+  // cajaNeta = cartera.total (ítems no rendidos, métodos propios) + cuenta
+  // corriente de asegurados (Fase 2C — ver calculateCajaNetaTotalCents):
+  // sobrante todavía activo/no consumido, su reclasificación por ajuste
+  // manual (se cancelan entre sí, nunca mueven el total) y cobros reales de
+  // saldo deudor. Nunca se resta cuentaCorriente.saldosAFavorPendientes ni se
+  // suma saldosDeudoresPendientes acá — son puramente informativos.
   // No se resta rendidoPorMetodo porque cartera ya excluye ítems rendidos (rendered=0).
   const cajaEfectivo = cartera.efectivo;
   const cajaTransferencia = cartera.transferencia;
   const cajaCheque = cartera.cheque;
   const cajaRecargosProntoPago = cartera.recargosProntoPago;
-  const cajaNeta = cartera.total; // Pendiente de rendir actual
+  const cajaNeta = centsToPesos(calculateCajaNetaTotalCents({
+    carteraTotalCents: carteraBucket.totalCents,
+    creditoActivoEnCajaCents,
+    creditoRegularizadoCents,
+    cobrosSaldoDeudorCents,
+  })); // Pendiente de rendir actual + cuenta corriente de asegurados
 
   // Diferencia de caja/cartera = pendiente total de rendir (cajaNeta) menos
   // adeudados. Los gastos NO se restan acá — son un movimiento de Caja
@@ -7360,6 +7571,9 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     totalGastos,
     gastosMes,
     diferencia,
+    // Fase 2C: cuenta corriente de asegurados (sobrantes/faltantes) — nunca
+    // se mezcla con adeudadosDetalle/totalAdeudado (Regla 6 del pedido).
+    cuentaCorriente,
     comisiones: {
       totalMes: comisionesMes,
       totalAnio: comisionesAnio,

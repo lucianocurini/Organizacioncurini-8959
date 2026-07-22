@@ -16,6 +16,7 @@ import {
   calculateCreditActiveInCaja,
   calculateCreditRegularizedInCaja,
   calculateCobroSaldoDeudorInCaja,
+  isSafeToCancelAccountMovementOrigin,
   InsuredAccountValidationError,
   type InsuredAccountMovementForBalance,
   type InsuredAccountMovementForCaja,
@@ -331,5 +332,52 @@ describe("calculateCobroSaldoDeudorInCaja", () => {
   test("ignora movimientos anulados", () => {
     const movements = [movCaja({ type: "cobro_saldo_deudor", signedAmountCents: 7000, status: "anulado" })];
     expect(calculateCobroSaldoDeudorInCaja(movements)).toBe(0);
+  });
+});
+
+// ─── isSafeToCancelAccountMovementOrigin (Fase 2D) ─────────────────────────
+
+describe("isSafeToCancelAccountMovementOrigin", () => {
+  test("sin ningún consumo activo — siempre seguro", () => {
+    const safe = isSafeToCancelAccountMovementOrigin({
+      thisOriginAmountCents: 10000, totalActivePoolCents: 10000, totalActiveConsumptionCents: 0,
+    });
+    expect(safe).toBe(true);
+  });
+
+  test("único crédito del asegurado y ya fue consumido entero — no es seguro", () => {
+    // pool=10000 (solo este origen), consumo=10000 → sin este origen quedan
+    // 0, que no alcanzan para explicar el consumo de 10000.
+    const safe = isSafeToCancelAccountMovementOrigin({
+      thisOriginAmountCents: 10000, totalActivePoolCents: 10000, totalActiveConsumptionCents: 10000,
+    });
+    expect(safe).toBe(false);
+  });
+
+  test("hay OTRO crédito del mismo asegurado que alcanza para explicar todo el consumo — seguro", () => {
+    // pool=25000 (10000 de este origen + 15000 de otro), consumo=15000 →
+    // sin este origen quedan 15000, exactamente lo consumido: alcanza.
+    const safe = isSafeToCancelAccountMovementOrigin({
+      thisOriginAmountCents: 10000, totalActivePoolCents: 25000, totalActiveConsumptionCents: 15000,
+    });
+    expect(safe).toBe(true);
+  });
+
+  test("el consumo excede lo que explican los OTROS créditos por un solo peso — no es seguro (borde exacto)", () => {
+    // pool=25000, consumo=15001 → sin este origen quedan 15000, no alcanza
+    // por 1 centavo: una parte del consumo necesariamente vino de acá.
+    const safe = isSafeToCancelAccountMovementOrigin({
+      thisOriginAmountCents: 10000, totalActivePoolCents: 25000, totalActiveConsumptionCents: 15001,
+    });
+    expect(safe).toBe(false);
+  });
+
+  test("mismo razonamiento aplica simétrico para saldo_deudor/cobro_saldo_deudor (pool y consumo en valor absoluto)", () => {
+    // deuda de este origen $100 + otra deuda $50 = pool $150; ya se cobraron
+    // $50 → sin este origen quedan $50, exactamente lo cobrado: alcanza.
+    const safe = isSafeToCancelAccountMovementOrigin({
+      thisOriginAmountCents: 10000, totalActivePoolCents: 15000, totalActiveConsumptionCents: 5000,
+    });
+    expect(safe).toBe(true);
   });
 });
