@@ -20,6 +20,7 @@ import { join } from "path";
 import { applyMigration0021PaymentBatches, type Sql0021Client } from "../../lib/migrations/apply-0021-payment-batches";
 import {
   applyMigration0030InsuredAccountMovements,
+  applyMigration0030InsuredAccountMovementsWork,
   type Sql0030Client,
 } from "../../lib/migrations/apply-0030-insured-account-movements";
 
@@ -381,5 +382,159 @@ describe("0030 — payment_amount_adjustments", () => {
         [batchId, userId, userId]
       )
     ).toThrow();
+  });
+});
+
+// ─── Fase 2H — refactor de atomicidad (statements puros vs. BEGIN/COMMIT) ───
+// applyMigration0030InsuredAccountMovementsWork es el trabajo puro que un
+// futuro apply-0030-prod.ts envolverá con client.transaction("write") de
+// Turso — nunca debe emitir control de transacción por sí mismo (a
+// diferencia de applyMigration0030InsuredAccountMovements, que sí lo hace,
+// pero solo es válido contra bun:sqlite local). Ver comentario de cabecera
+// en apply-0030-insured-account-movements.ts.
+
+describe("0030 — applyMigration0030InsuredAccountMovementsWork no controla transacciones", () => {
+  function wrapRecording(base: Client): { client: Client; sqlLog: string[] } {
+    const sqlLog: string[] = [];
+    return {
+      sqlLog,
+      client: {
+        async execute(sql: string, params: any[] = []) {
+          sqlLog.push(sql.trim());
+          return base.execute(sql, params);
+        },
+      },
+    };
+  }
+
+  test("no emite BEGIN/COMMIT/ROLLBACK — solo ALTER/UPDATE/CREATE/SELECT/PRAGMA", async () => {
+    const base = await makePreMigrationDb();
+    const { client, sqlLog } = wrapRecording(base);
+
+    await applyMigration0030InsuredAccountMovementsWork(client);
+
+    const controlStatements = sqlLog.filter((sql) => /^(BEGIN|COMMIT|ROLLBACK)\b/i.test(sql));
+    expect(controlStatements).toEqual([]);
+  });
+
+  test("el wrapper local (applyMigration0030InsuredAccountMovements) sí emite BEGIN y COMMIT — comportamiento sin cambios", async () => {
+    const base = await makePreMigrationDb();
+    const { client, sqlLog } = wrapRecording(base);
+
+    await applyMigration0030InsuredAccountMovements(client);
+
+    expect(sqlLog.some((sql) => /^BEGIN\b/i.test(sql))).toBe(true);
+    expect(sqlLog.some((sql) => /^COMMIT\b/i.test(sql))).toBe(true);
+    expect(sqlLog.some((sql) => /^ROLLBACK\b/i.test(sql))).toBe(false); // corrida exitosa, nunca hace rollback
+  });
+
+  test("applyMigration0030InsuredAccountMovementsWork funciona igual llamada directa, sin ningún BEGIN/COMMIT alrededor (uso 'crudo', como lo haría un caller que ya gestiona su propia transacción)", async () => {
+    const client = await makePreMigrationDb();
+    const insuredId = insertInsured();
+    insertBatch(insuredId, 100000);
+
+    const summary = await applyMigration0030InsuredAccountMovementsWork(client);
+    expect(summary.receivedAmountColumnAdded).toBe(true);
+    expect(summary.receivedAmountBackfilledRows).toBe(1);
+
+    const rows = await client.execute("SELECT received_amount_cents, total_received_cents FROM payment_batches");
+    expect((rows.rows[0] as any).received_amount_cents).toBe((rows.rows[0] as any).total_received_cents);
+  });
+
+  test("es reentrante llamada 2 veces seguidas sin transacción externa (mismo resultado que la versión con BEGIN/COMMIT)", async () => {
+    const client = await makePreMigrationDb();
+    const insuredId = insertInsured();
+    insertBatch(insuredId, 100000);
+
+    const first = await applyMigration0030InsuredAccountMovementsWork(client);
+    expect(first.receivedAmountColumnAdded).toBe(true);
+
+    const second = await applyMigration0030InsuredAccountMovementsWork(client);
+    expect(second.receivedAmountColumnAdded).toBe(false);
+    expect(second.receivedAmountBackfilledRows).toBe(0);
+    expect(second.insuredAccountMovementsTableAlreadyExisted).toBe(true);
+    expect(second.paymentAmountAdjustmentsTableAlreadyExisted).toBe(true);
+  });
+});
+
+describe("0030 — estado parcial (una pieza ya existe, otras no)", () => {
+  test("insured_account_movements ya existe pero falta la columna y payment_amount_adjustments — completa solo lo que falta, sin error", async () => {
+    const client = await makePreMigrationDb();
+    // Se crea manualmente la tabla insured_account_movements ANTES de correr
+    // la migración (simula un estado parcial real: alguien corrió media
+    // migración, o un despliegue previo interrumpido) — mismo esquema exacto
+    // que crea la migración, para que la detección de columnas no falle.
+    db!.run(`
+      CREATE TABLE insured_account_movements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        insured_id INTEGER NOT NULL REFERENCES insureds(id),
+        type TEXT NOT NULL CHECK (type IN ('saldo_a_favor','saldo_deudor','aplicacion_saldo_favor','cobro_saldo_deudor','devolucion_saldo_favor','ajuste_manual')),
+        signed_amount_cents INTEGER NOT NULL CHECK (signed_amount_cents != 0),
+        status TEXT NOT NULL DEFAULT 'activo' CHECK (status IN ('activo','anulado')),
+        origin_payment_id INTEGER REFERENCES payments(id),
+        origin_batch_id INTEGER REFERENCES payment_batches(id),
+        related_payment_id INTEGER REFERENCES payments(id),
+        related_installment_id INTEGER REFERENCES policy_installments(id),
+        reason TEXT,
+        authorized_by INTEGER REFERENCES users(id),
+        created_by INTEGER NOT NULL REFERENCES users(id),
+        created_at INTEGER NOT NULL,
+        settled_at INTEGER,
+        notes TEXT
+      )
+    `);
+    const insuredId = insertInsured();
+    const userId = insertUser();
+    db!.run(
+      "INSERT INTO insured_account_movements (insured_id, type, signed_amount_cents, created_by, created_at) VALUES (?, 'saldo_a_favor', 5000, ?, 0)",
+      [insuredId, userId]
+    );
+    insertBatch(insuredId, 100000);
+
+    const summary = await applyMigration0030InsuredAccountMovementsWork(client);
+
+    // received_amount_cents y payment_amount_adjustments faltaban -> se completan.
+    expect(summary.receivedAmountColumnAdded).toBe(true);
+    expect(summary.paymentAmountAdjustmentsTableAlreadyExisted).toBe(false);
+    // insured_account_movements ya existía -> se reporta como tal, y NUNCA se recrea.
+    expect(summary.insuredAccountMovementsTableAlreadyExisted).toBe(true);
+
+    const paaTables = await client.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='payment_amount_adjustments'");
+    expect(paaTables.rows.length).toBe(1);
+  });
+
+  test("no recrea insured_account_movements si ya existía — la fila cargada antes de migrar sigue intacta", async () => {
+    const client = await makePreMigrationDb();
+    db!.run(`
+      CREATE TABLE insured_account_movements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        insured_id INTEGER NOT NULL REFERENCES insureds(id),
+        type TEXT NOT NULL CHECK (type IN ('saldo_a_favor','saldo_deudor','aplicacion_saldo_favor','cobro_saldo_deudor','devolucion_saldo_favor','ajuste_manual')),
+        signed_amount_cents INTEGER NOT NULL CHECK (signed_amount_cents != 0),
+        status TEXT NOT NULL DEFAULT 'activo' CHECK (status IN ('activo','anulado')),
+        origin_payment_id INTEGER REFERENCES payments(id),
+        origin_batch_id INTEGER REFERENCES payment_batches(id),
+        related_payment_id INTEGER REFERENCES payments(id),
+        related_installment_id INTEGER REFERENCES policy_installments(id),
+        reason TEXT,
+        authorized_by INTEGER REFERENCES users(id),
+        created_by INTEGER NOT NULL REFERENCES users(id),
+        created_at INTEGER NOT NULL,
+        settled_at INTEGER,
+        notes TEXT
+      )
+    `);
+    const insuredId = insertInsured();
+    const userId = insertUser();
+    db!.run(
+      "INSERT INTO insured_account_movements (insured_id, type, signed_amount_cents, created_by, created_at) VALUES (?, 'saldo_deudor', -3000, ?, 0)",
+      [insuredId, userId]
+    );
+
+    await applyMigration0030InsuredAccountMovementsWork(client);
+
+    const rows = await client.execute("SELECT * FROM insured_account_movements");
+    expect(rows.rows.length).toBe(1);
+    expect((rows.rows[0] as any).signed_amount_cents).toBe(-3000);
   });
 });

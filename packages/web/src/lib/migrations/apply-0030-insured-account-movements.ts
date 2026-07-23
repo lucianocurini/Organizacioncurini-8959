@@ -120,7 +120,30 @@ async function tableColumnNames(db: Sql0030Client, table: string): Promise<Set<s
   return new Set(cols.rows.map((r: any) => r.name));
 }
 
-async function runMigration(db: Sql0030Client): Promise<Migration0030Summary> {
+/**
+ * Trabajo puro de la migración 0030 — SOLO statements de lectura/escritura
+ * (ALTER/UPDATE/CREATE TABLE IF NOT EXISTS/CREATE INDEX IF NOT EXISTS),
+ * SIN emitir BEGIN/COMMIT/ROLLBACK ni tocar PRAGMA foreign_keys. Mismo
+ * criterio que applyMigration0027PaymentBatchCancellation
+ * (apply-0027-payment-batch-cancellation.ts): quien llama decide cómo
+ * envolver la atomicidad según el entorno —
+ *   - dev.db local / tests: applyMigration0030InsuredAccountMovements (más
+ *     abajo) le agrega BEGIN/COMMIT/ROLLBACK con execute() sueltos, válido
+ *     porque bun:sqlite comparte una única conexión real entre llamadas.
+ *   - Turso producción: un script aparte (apply-0030-prod.ts) debe envolver
+ *     esta misma función con client.transaction("write") — un execute()
+ *     suelto NO mantiene sesión entre llamadas HTTP (ver hallazgo de la
+ *     migración 0026, project_etapa_0026_libsql_atomicidad), así que un
+ *     BEGIN/COMMIT emitido acá adentro sería un no-op (sin transacción real)
+ *     o, peor, chocaría con el BEGIN implícito que ya abre
+ *     client.transaction("write") al crearse. Por eso esta función nunca
+ *     debe emitir control de transacción por sí misma.
+ *
+ * No cambia ningún SQL funcional respecto de la versión anterior de este
+ * archivo — es exactamente el cuerpo que antes vivía sin exportar dentro de
+ * applyMigration0030InsuredAccountMovements.
+ */
+export async function applyMigration0030InsuredAccountMovementsWork(db: Sql0030Client): Promise<Migration0030Summary> {
   const paymentBatchesCountBefore = await countRows(db, "payment_batches");
 
   // ─── A. payment_batches.received_amount_cents ────────────────────────────
@@ -184,11 +207,18 @@ async function runMigration(db: Sql0030Client): Promise<Migration0030Summary> {
   };
 }
 
+/**
+ * Uso local/tests (dev.db, bun:sqlite): agrega BEGIN/COMMIT/ROLLBACK
+ * alrededor del trabajo puro de arriba — válido acá porque una única
+ * conexión bun:sqlite sí mantiene sesión real entre execute() sueltos. NUNCA
+ * reutilizar este wrapper contra Turso — ver el comentario de
+ * applyMigration0030InsuredAccountMovementsWork.
+ */
 export async function applyMigration0030InsuredAccountMovements(db: Sql0030Client): Promise<Migration0030Summary> {
   await db.execute("BEGIN");
   let summary: Migration0030Summary;
   try {
-    summary = await runMigration(db);
+    summary = await applyMigration0030InsuredAccountMovementsWork(db);
   } catch (e) {
     await db.execute("ROLLBACK");
     throw e;

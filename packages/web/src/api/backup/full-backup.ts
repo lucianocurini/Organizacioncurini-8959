@@ -51,6 +51,11 @@ export const EXPECTED_BUSINESS_TABLES = [
   "rebillings", "task_templates", "tasks", "import_logs", "cash_entries", "cash_debts",
   "remittances", "remittance_items", "remittance_allocations", "cash_expenses",
   "commission_entries", "iva_entries", "own_money_movements",
+  // Migración 0030 (sobrantes/faltantes en cobros) — listBackupTables ya las
+  // capturaba dinámicamente vía sqlite_master antes de este agregado (nunca
+  // fue un gap real de datos), esto solo hace que validateFullBackup las
+  // exija explícitamente como completitud mínima.
+  "insured_account_movements", "payment_amount_adjustments",
 ] as const;
 
 // sessions: tokens de auth efímeros, no dato de negocio recuperable — nunca
