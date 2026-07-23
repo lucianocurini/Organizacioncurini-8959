@@ -152,6 +152,12 @@ export default function SiniestroDetail() {
           {/* Cambio de estado rápido */}
           {c.status !== "resuelto" && (
             <div className="flex items-center gap-2">
+              {c.status === "pendiente" && !!p && (
+                <button onClick={() => save({ status: "nuevo" })} disabled={saving}
+                  className="px-3 py-2 bg-blue-600/20 border border-blue-500/30 text-blue-400 text-xs font-medium rounded-lg hover:bg-blue-600/30 transition-all flex items-center gap-1.5">
+                  <CheckSquare className="w-3.5 h-3.5" /> Marcar como definitivo
+                </button>
+              )}
               {c.status === "en_curso" && (
                 <button onClick={() => save({ status: "reclamo_tercero" })}
                   className="px-3 py-2 bg-violet-600/20 border border-violet-500/30 text-violet-400 text-xs font-medium rounded-lg hover:bg-violet-600/30 transition-all flex items-center gap-1.5">

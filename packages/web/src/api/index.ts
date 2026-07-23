@@ -3914,6 +3914,8 @@ app.delete("/users/:id", requireAuth(async (c: any) => {
 }));
 
 // ─── CLAIMS (Siniestros) ──────────────────────────────────────────────────────
+const CLAIM_STATUSES = ["pendiente", "nuevo", "en_curso", "reclamo_tercero", "resuelto"];
+
 app.get("/claims", requireAuth(async (c: any) => {
   const q = c.req.query("search") || "";
   const statusFilter = c.req.query("status") || "";
@@ -3964,12 +3966,20 @@ app.post("/claims", requireAuth(async (c: any) => {
   const user = c.get("user");
   const body = await c.req.json();
   const hasPolicyId = body.policyId != null && body.policyId !== "";
+  const hasStatus = body.status != null && body.status !== "";
+  if (hasStatus && !CLAIM_STATUSES.includes(body.status)) {
+    return c.json({ error: "Estado de siniestro inválido." }, 400);
+  }
+  const status = hasStatus ? body.status : "pendiente";
+  if (status === "nuevo" && !hasPolicyId) {
+    return c.json({ error: "No se puede crear un siniestro definitivo sin una póliza real asociada." }, 400);
+  }
   const [row] = await db
     .insert(claims)
     .values({
       policyId: hasPolicyId ? Number(body.policyId) : null,
       claimNumber: body.claimNumber || null,
-      status: hasPolicyId ? "nuevo" : "pendiente",
+      status,
       manualInsured: body.manualInsured || null,
       manualCompany: body.manualCompany || null,
       manualPolicyNumber: body.manualPolicyNumber || null,
@@ -3984,6 +3994,23 @@ app.post("/claims", requireAuth(async (c: any) => {
 app.put("/claims/:id", requireAuth(async (c: any) => {
   const body = await c.req.json();
   const id = Number(c.req.param("id"));
+  const existing = await db.select().from(claims).where(eq(claims.id, id)).get();
+  if (!existing) return c.json({ error: "No encontrado" }, 404);
+
+  const hasStatusKey = "status" in body;
+  if (hasStatusKey && (body.status == null || body.status === "" || !CLAIM_STATUSES.includes(body.status))) {
+    return c.json({ error: "Estado de siniestro inválido." }, 400);
+  }
+
+  const hasPolicyIdKey = "policyId" in body;
+  const effectivePolicyId = hasPolicyIdKey
+    ? (body.policyId != null && body.policyId !== "" ? Number(body.policyId) : null)
+    : existing.policyId;
+  const effectiveStatus = hasStatusKey ? body.status : existing.status;
+  if (effectiveStatus === "nuevo" && !effectivePolicyId) {
+    return c.json({ error: "No se puede marcar como definitivo un siniestro sin una póliza real asociada." }, 400);
+  }
+
   const update: any = { updatedAt: new Date() };
   const fields = [
     "policyId", "claimNumber", "status", "incidentDate", "incidentTime", "incidentLocation",

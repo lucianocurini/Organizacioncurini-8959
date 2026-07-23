@@ -31,6 +31,9 @@ interface WizardPrefill {
   manualPolicyNumber?: string;
   manualPolicyType?: string;
   manualNotes?: string;
+  // Póliza real ya vinculada (previa con póliza) — mismo shape que las filas de /api/policies
+  // y que devuelve GET /claims ya joineado, para precargar sin pedirla de nuevo.
+  policy?: { policy: any; insured?: any; company?: any };
 }
 
 function NewClaimWizard({ onClose, onSaved, prefill }: {
@@ -38,18 +41,21 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
   onSaved: () => void;
   prefill?: WizardPrefill;
 }) {
+  const hasPrefillPolicy = !!prefill?.policy;
   // If prefill has a claimId, we're converting a pending claim — skip to step 1 selector
-  const isPendingResume = !!(prefill?.claimId && (prefill.manualInsured || prefill.manualCompany || prefill.manualPolicyNumber));
+  const isPendingResume = !!(prefill?.claimId && (prefill.manualInsured || prefill.manualCompany || prefill.manualPolicyNumber || hasPrefillPolicy));
   const [step, setStep] = useState(isPendingResume ? 2 : 1);
   const [loading, setLoading] = useState(false);
   const [policySearch, setPolicySearch] = useState("");
   const [policyResults, setPolicyResults] = useState<any[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
-  const [selectedPolicy, setSelectedPolicy] = useState<any>(null);
+  const [selectedPolicy, setSelectedPolicy] = useState<any>(prefill?.policy ?? null);
   const [claimId, setClaimId] = useState<number | null>(prefill?.claimId ?? null);
 
-  // Manual mode (no policy found)
-  const [manualMode, setManualMode] = useState(isPendingResume);
+  // Manual mode (no policy found) — si la previa ya tiene póliza real, arranca en modo búsqueda (no manual)
+  const [manualMode, setManualMode] = useState(isPendingResume && !hasPrefillPolicy);
+  // Al asociar una póliza real, por defecto se mantiene como previa para no forzar "definitivo" accidentalmente
+  const [keepPreliminary, setKeepPreliminary] = useState(true);
   const [manualInsured, setManualInsured] = useState(prefill?.manualInsured ?? "");
   const [manualCompany, setManualCompany] = useState(prefill?.manualCompany ?? "");
   const [manualPolicyNumber, setManualPolicyNumber] = useState(prefill?.manualPolicyNumber ?? "");
@@ -112,11 +118,13 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
     }
     setLoading(true);
     try {
+      // Asociar una póliza real no debe forzar "definitivo": el checkbox decide.
+      const claimStatus = manualMode ? "pendiente" : (keepPreliminary ? "pendiente" : "nuevo");
       if (prefill?.claimId) {
         // Update existing pending claim
         await api.put(`/api/claims/${prefill.claimId}`, {
           policyId: manualMode ? null : selectedPolicy?.policy?.id,
-          status: manualMode ? "pendiente" : "nuevo",
+          status: claimStatus,
           manualInsured: manualMode ? manualInsured : null,
           manualCompany: manualMode ? manualCompany : null,
           manualPolicyNumber: manualMode ? manualPolicyNumber : null,
@@ -127,6 +135,7 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
       } else {
         const row = await api.post("/api/claims", {
           policyId: manualMode ? null : selectedPolicy?.policy?.id,
+          status: claimStatus,
           manualInsured: manualMode ? manualInsured : undefined,
           manualCompany: manualMode ? manualCompany : undefined,
           manualPolicyNumber: manualMode ? manualPolicyNumber : undefined,
@@ -235,7 +244,7 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
               <h2 className="text-base font-semibold text-white" style={{ fontFamily: "Syne, sans-serif" }}>{title}</h2>
               <p className="text-xs text-gray-500">
                 {step === 1 && "Paso 1 — Seleccioná la póliza"}
-                {step === 2 && (isPendingResume ? "Datos del siniestro — póliza manual" : "Paso 2 — Datos del siniestro")}
+                {step === 2 && (isPendingResume ? (hasPrefillPolicy ? "Datos del siniestro — póliza vinculada" : "Datos del siniestro — póliza manual") : "Paso 2 — Datos del siniestro")}
                 {step === 3 && "Paso 3 — Reclamo a compañía del tercero"}
                 {step === 4 && "Paso 4 — Estado de resolución"}
               </p>
@@ -349,6 +358,20 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
                         <X className="w-4 h-4" />
                       </button>
                     </div>
+                  )}
+
+                  {selectedPolicy && (
+                    <label className="flex items-start gap-2.5 bg-[#0d1424] border border-[#1f2937] rounded-xl px-4 py-3 cursor-pointer hover:border-blue-500/30 transition-colors">
+                      <input type="checkbox" checked={keepPreliminary}
+                        onChange={e => setKeepPreliminary(e.target.checked)}
+                        className="mt-0.5 w-4 h-4 rounded border-gray-600 bg-[#1f2937] accent-blue-600" />
+                      <div>
+                        <p className="text-sm text-gray-200 font-medium">Mantener como previa de carga</p>
+                        <p className="text-xs text-gray-500 mt-0.5">
+                          Podés asociar una póliza ahora y mantener el siniestro como previa hasta completar los datos.
+                        </p>
+                      </div>
+                    </label>
                   )}
 
                   {!selectedPolicy && policyResults.length === 0 && policySearch.length > 1 && !searchLoading && (
@@ -803,7 +826,11 @@ export default function Siniestros() {
             <div className="bg-[#111827] border border-gray-500/20 rounded-2xl overflow-hidden">
               {pendingClaims.map((r: any, idx: number) => {
                 const c = r.claim;
+                const hasPolicy = !!r.policy;
                 const hasManual = c.manualInsured || c.manualCompany || c.manualPolicyNumber;
+                const insuredName = r.insured?.name || c.manualInsured;
+                const companyName = r.company?.name || c.manualCompany;
+                const policyNumber = r.policy?.policyNumber || c.manualPolicyNumber;
                 return (
                   <div key={c.id} className={cn(
                     "flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4 px-4 sm:px-5 py-4 hover:bg-[#1a2540]/30 transition-colors group",
@@ -813,20 +840,30 @@ export default function Siniestros() {
                       <Inbox className="w-4 h-4 text-gray-500" />
                     </div>
                     <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        {c.manualInsured && (
-                          <span className="text-sm text-white font-medium">{c.manualInsured}</span>
-                        )}
-                        {c.manualCompany && (
-                          <span className="text-xs text-gray-400 flex items-center gap-1">
-                            <Building2 className="w-3 h-3" />{c.manualCompany}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-xs px-2 py-0.5 bg-gray-500/15 border border-gray-500/20 text-gray-400 rounded-full">
+                          Previa
+                        </span>
+                        {hasPolicy && (
+                          <span className="text-xs px-2 py-0.5 bg-blue-500/15 border border-blue-500/20 text-blue-400 rounded-full">
+                            Con póliza
                           </span>
                         )}
-                        {!hasManual && <span className="text-sm text-gray-500 italic">Sin datos</span>}
+                        {insuredName && (
+                          <span className="text-sm text-white font-medium">{insuredName}</span>
+                        )}
+                        {companyName && (
+                          <span className="text-xs text-gray-400 flex items-center gap-1">
+                            <Building2 className="w-3 h-3" />{companyName}
+                          </span>
+                        )}
+                        {!hasPolicy && !hasManual && <span className="text-sm text-gray-500 italic">Sin datos</span>}
                       </div>
                       <div className="flex items-center flex-wrap gap-x-3 gap-y-1 mt-0.5">
-                        {c.manualPolicyNumber && (
-                          <span className="text-xs text-gray-500 font-mono">Póliza aprox: {c.manualPolicyNumber}</span>
+                        {policyNumber && (
+                          <span className="text-xs text-gray-500 font-mono">
+                            {hasPolicy ? "Póliza: " : "Póliza aprox: "}{policyNumber}
+                          </span>
                         )}
                         {c.manualPolicyType && POLICY_TYPES[c.manualPolicyType] && (
                           <span className={cn("text-xs px-1.5 py-0.5 rounded border", POLICY_TYPES[c.manualPolicyType].color)}>
@@ -848,6 +885,7 @@ export default function Siniestros() {
                           manualPolicyNumber: c.manualPolicyNumber,
                           manualPolicyType: c.manualPolicyType,
                           manualNotes: c.manualNotes,
+                          policy: hasPolicy ? { policy: r.policy, insured: r.insured, company: r.company } : undefined,
                         })}
                         className="flex items-center gap-1.5 px-3 py-1.5 bg-orange-600/15 border border-orange-500/25 text-orange-400 hover:bg-orange-600/25 text-xs font-medium rounded-lg transition-all">
                         <ArrowRight className="w-3.5 h-3.5" /> Ingresar siniestro
