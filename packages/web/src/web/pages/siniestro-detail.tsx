@@ -6,8 +6,9 @@ import { cn, formatCurrency, formatDate, POLICY_TYPES } from "@/lib/utils";
 import { toast } from "sonner";
 import {
   ArrowLeft, AlertTriangle, Car, Bike, FileText, Calendar, MapPin, User,
-  ShieldAlert, CheckCircle, Clock, Edit, Save, X, CheckSquare, Building2, Inbox, Link2
+  ShieldAlert, CheckCircle, Clock, Edit, Save, X, CheckSquare, Building2, Inbox, Link2, ArrowRight
 } from "lucide-react";
+import { canConvertToThirdPartyClaim } from "@/lib/claim-wizard-status";
 
 const CLAIM_STATUS: Record<string, { label: string; color: string }> = {
   pendiente:       { label: "Pendiente",       color: "bg-gray-500/15 text-gray-400 border-gray-500/20" },
@@ -152,22 +153,28 @@ export default function SiniestroDetail() {
           {/* Cambio de estado rápido */}
           {c.status !== "resuelto" && (
             <div className="flex items-center gap-2">
-              {c.status === "pendiente" && !!p && (
-                <button onClick={() => save({ status: "nuevo" })} disabled={saving}
-                  className="px-3 py-2 bg-blue-600/20 border border-blue-500/30 text-blue-400 text-xs font-medium rounded-lg hover:bg-blue-600/30 transition-all flex items-center gap-1.5">
-                  <CheckSquare className="w-3.5 h-3.5" /> Marcar como definitivo
-                </button>
+              {c.status === "pendiente" && (
+                <Link href={`/siniestros?resume=${c.id}`}>
+                  <a className="px-3 py-2 bg-orange-600/15 border border-orange-500/25 text-orange-400 text-xs font-medium rounded-lg hover:bg-orange-600/25 transition-all flex items-center gap-1.5">
+                    <ArrowRight className="w-3.5 h-3.5" /> Completar siniestro
+                  </a>
+                </Link>
               )}
-              {c.status === "en_curso" && (
-                <button onClick={() => save({ status: "reclamo_tercero" })}
+              {canConvertToThirdPartyClaim(c.status) && (
+                <button onClick={() => {
+                  if (!confirm("Esto va a cambiar el estado a Reclamo tercero. ¿Confirmás?")) return;
+                  save({ status: "reclamo_tercero" });
+                }}
                   className="px-3 py-2 bg-violet-600/20 border border-violet-500/30 text-violet-400 text-xs font-medium rounded-lg hover:bg-violet-600/30 transition-all flex items-center gap-1.5">
-                  <ShieldAlert className="w-3.5 h-3.5" /> Pasar a reclamo
+                  <ShieldAlert className="w-3.5 h-3.5" /> Convertir en reclamo de tercero
                 </button>
               )}
-              <button onClick={() => setEditSection(editSection === "resolver" ? null : "resolver")}
-                className="px-3 py-2 bg-emerald-600/20 border border-emerald-500/30 text-emerald-400 text-xs font-medium rounded-lg hover:bg-emerald-600/30 transition-all flex items-center gap-1.5">
-                <CheckCircle className="w-3.5 h-3.5" /> Resolver
-              </button>
+              {c.status !== "pendiente" && (
+                <button onClick={() => setEditSection(editSection === "resolver" ? null : "resolver")}
+                  className="px-3 py-2 bg-emerald-600/20 border border-emerald-500/30 text-emerald-400 text-xs font-medium rounded-lg hover:bg-emerald-600/30 transition-all flex items-center gap-1.5">
+                  <CheckCircle className="w-3.5 h-3.5" /> Resolver
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -265,11 +272,13 @@ export default function SiniestroDetail() {
                     {row.claim.manualNotes && <Row label="Notas" value={row.claim.manualNotes} />}
                   </div>
                 )}
-                <Link href="/siniestros">
-                  <a className="flex items-center gap-1.5 text-xs text-orange-400 hover:text-orange-300 transition-colors">
-                    <Link2 className="w-3.5 h-3.5" /> Ingresar siniestro desde lista de pendientes
-                  </a>
-                </Link>
+                {c.status === "pendiente" && (
+                  <Link href={`/siniestros?resume=${c.id}`}>
+                    <a className="flex items-center gap-1.5 text-xs text-orange-400 hover:text-orange-300 transition-colors">
+                      <Link2 className="w-3.5 h-3.5" /> Completar siniestro (asociar póliza real)
+                    </a>
+                  </Link>
+                )}
               </div>
             )}
           </Section>

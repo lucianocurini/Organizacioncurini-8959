@@ -9,7 +9,11 @@ import {
   User, MapPin, Calendar, FileSearch, ShieldAlert, CheckSquare, Trash2, Eye,
   Inbox, Building2, ClipboardList,
 } from "lucide-react";
-import { Link } from "wouter";
+import { Link, useLocation, useSearch as useLocationSearch } from "wouter";
+import {
+  computeIsPreliminaryPath, resolveStep1Status, resolveStep2Status, resolveStep3Status,
+  resolveFinishStatus, buildClaimWizardResumeState, type ClaimRecord,
+} from "@/lib/claim-wizard-status";
 
 // ─── Tipos ────────────────────────────────────────────────────────────────────
 const CLAIM_STATUS: Record<string, { label: string; color: string; icon: any }> = {
@@ -26,11 +30,10 @@ const lbl = "block text-xs text-gray-400 mb-1.5";
 // ─── Wizard ───────────────────────────────────────────────────────────────────
 interface WizardPrefill {
   claimId?: number;
-  manualInsured?: string;
-  manualCompany?: string;
-  manualPolicyNumber?: string;
-  manualPolicyType?: string;
-  manualNotes?: string;
+  // Claim completo tal como lo devuelve GET /claims (o GET /claims/:id) en
+  // row.claim — se usa para hidratar TODOS los campos del wizard al retomar
+  // una previa (ver buildClaimWizardResumeState), no solo los manuales.
+  claim?: ClaimRecord;
   // Póliza real ya vinculada (previa con póliza) — mismo shape que las filas de /api/policies
   // y que devuelve GET /claims ya joineado, para precargar sin pedirla de nuevo.
   policy?: { policy: any; insured?: any; company?: any };
@@ -42,9 +45,13 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
   prefill?: WizardPrefill;
 }) {
   const hasPrefillPolicy = !!prefill?.policy;
-  // If prefill has a claimId, we're converting a pending claim — skip to step 1 selector
-  const isPendingResume = !!(prefill?.claimId && (prefill.manualInsured || prefill.manualCompany || prefill.manualPolicyNumber || hasPrefillPolicy));
-  const [step, setStep] = useState(isPendingResume ? 2 : 1);
+  // Si estamos retomando una previa (prefill.claimId), el paso, el modo inicial
+  // y todos los campos de los pasos 2-3 se hidratan desde el claim existente —
+  // ver buildClaimWizardResumeState. Con prefill undefined (alta nueva) devuelve
+  // el mismo estado "vacío" que antes tenían los useState sueltos.
+  const isResuming = !!prefill?.claimId;
+  const resumeState = buildClaimWizardResumeState(prefill?.claim, hasPrefillPolicy);
+  const [step, setStep] = useState<1 | 2 | 3 | 4>(isResuming ? resumeState.initialStep : 1);
   const [loading, setLoading] = useState(false);
   const [policySearch, setPolicySearch] = useState("");
   const [policyResults, setPolicyResults] = useState<any[]>([]);
@@ -52,44 +59,47 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
   const [selectedPolicy, setSelectedPolicy] = useState<any>(prefill?.policy ?? null);
   const [claimId, setClaimId] = useState<number | null>(prefill?.claimId ?? null);
 
-  // Manual mode (no policy found) — si la previa ya tiene póliza real, arranca en modo búsqueda (no manual)
-  const [manualMode, setManualMode] = useState(isPendingResume && !hasPrefillPolicy);
+  // Manual mode (sin póliza real) — siempre arranca en modo búsqueda para dar
+  // la chance de asociar una póliza real antes de caer en carga manual.
+  const [manualMode, setManualMode] = useState(isResuming ? resumeState.initialManualMode : false);
   // Al asociar una póliza real, por defecto se mantiene como previa para no forzar "definitivo" accidentalmente
   const [keepPreliminary, setKeepPreliminary] = useState(true);
-  const [manualInsured, setManualInsured] = useState(prefill?.manualInsured ?? "");
-  const [manualCompany, setManualCompany] = useState(prefill?.manualCompany ?? "");
-  const [manualPolicyNumber, setManualPolicyNumber] = useState(prefill?.manualPolicyNumber ?? "");
-  const [manualPolicyType, setManualPolicyType] = useState(prefill?.manualPolicyType ?? "");
-  const [manualNotes, setManualNotes] = useState(prefill?.manualNotes ?? "");
+  const [manualInsured, setManualInsured] = useState(resumeState.manualInsured);
+  const [manualCompany, setManualCompany] = useState(resumeState.manualCompany);
+  const [manualPolicyNumber, setManualPolicyNumber] = useState(resumeState.manualPolicyNumber);
+  const [manualPolicyType, setManualPolicyType] = useState(resumeState.manualPolicyType);
+  const [manualNotes, setManualNotes] = useState(resumeState.manualNotes);
 
 
 
   // Paso 2 — datos del siniestro
-  const [claimNumber, setClaimNumber] = useState("");
-  const [incidentDate, setIncidentDate] = useState("");
-  const [incidentTime, setIncidentTime] = useState("");
-  const [incidentLocation, setIncidentLocation] = useState("");
-  const [incidentDescription, setIncidentDescription] = useState("");
-  const [damages, setDamages] = useState("");
+  const [claimNumber, setClaimNumber] = useState(resumeState.claimNumber);
+  const [incidentDate, setIncidentDate] = useState(resumeState.incidentDate);
+  const [incidentTime, setIncidentTime] = useState(resumeState.incidentTime);
+  const [incidentLocation, setIncidentLocation] = useState(resumeState.incidentLocation);
+  const [incidentDescription, setIncidentDescription] = useState(resumeState.incidentDescription);
+  const [damages, setDamages] = useState(resumeState.damages);
   // Tercero
-  const [thirdPartyName, setThirdPartyName] = useState("");
-  const [thirdPartyDni, setThirdPartyDni] = useState("");
-  const [thirdPartyPhone, setThirdPartyPhone] = useState("");
-  const [thirdPartyVehiclePlate, setThirdPartyVehiclePlate] = useState("");
-  const [thirdPartyVehicleBrand, setThirdPartyVehicleBrand] = useState("");
-  const [thirdPartyVehicleModel, setThirdPartyVehicleModel] = useState("");
-  const [thirdPartyInsurer, setThirdPartyInsurer] = useState("");
-  const [thirdPartyPolicyNumber, setThirdPartyPolicyNumber] = useState("");
+  const [thirdPartyName, setThirdPartyName] = useState(resumeState.thirdPartyName);
+  const [thirdPartyDni, setThirdPartyDni] = useState(resumeState.thirdPartyDni);
+  const [thirdPartyPhone, setThirdPartyPhone] = useState(resumeState.thirdPartyPhone);
+  const [thirdPartyVehiclePlate, setThirdPartyVehiclePlate] = useState(resumeState.thirdPartyVehiclePlate);
+  const [thirdPartyVehicleBrand, setThirdPartyVehicleBrand] = useState(resumeState.thirdPartyVehicleBrand);
+  const [thirdPartyVehicleModel, setThirdPartyVehicleModel] = useState(resumeState.thirdPartyVehicleModel);
+  const [thirdPartyInsurer, setThirdPartyInsurer] = useState(resumeState.thirdPartyInsurer);
+  const [thirdPartyPolicyNumber, setThirdPartyPolicyNumber] = useState(resumeState.thirdPartyPolicyNumber);
 
-  // Culpabilidad del asegurado (automotor / motovehiculo)
+  // Culpabilidad del asegurado (automotor / motovehiculo) — bandera efímera de
+  // este paso, no se persiste como columna propia: no hay de dónde precargarla
+  // al reabrir, siempre arranca en false (ver claim-wizard-status.ts).
   const [insuredAtFault, setInsuredAtFault] = useState(false);
 
   // Paso 3 — reclamo tercero
-  const [claimFiled, setClaimFiled] = useState(false);
-  const [claimFiledDate, setClaimFiledDate] = useState("");
-  const [claimCompany, setClaimCompany] = useState("");
-  const [claimNumberThird, setClaimNumberThird] = useState("");
-  const [claimNotes, setClaimNotes] = useState("");
+  const [claimFiled, setClaimFiled] = useState(resumeState.claimFiled);
+  const [claimFiledDate, setClaimFiledDate] = useState(resumeState.claimFiledDate);
+  const [claimCompany, setClaimCompany] = useState(resumeState.claimCompany);
+  const [claimNumberThird, setClaimNumberThird] = useState(resumeState.claimNumberThird);
+  const [claimNotes, setClaimNotes] = useState(resumeState.claimNotes);
 
   // Búsqueda de pólizas
   useEffect(() => {
@@ -109,6 +119,11 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
   const hasThirdParty = selectedPolicy?.policy?.type === "automotor" || selectedPolicy?.policy?.type === "motovehiculo"
     || manualPolicyType === "automotor" || manualPolicyType === "motovehiculo";
 
+  // Sin póliza real (manual) jamás se puede finalizar — el backend rechaza
+  // status="nuevo"/definitivo sin policyId. Con póliza real, el checkbox decide.
+  const hasRealPolicy = !manualMode && !!selectedPolicy?.policy?.id;
+  const isPreliminaryPath = computeIsPreliminaryPath(hasRealPolicy, keepPreliminary);
+
   // Paso 1: crear o actualizar siniestro base
   async function handleStep1() {
     if (!manualMode && !selectedPolicy) { toast.error("Seleccioná una póliza o usá el modo manual"); return; }
@@ -118,8 +133,7 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
     }
     setLoading(true);
     try {
-      // Asociar una póliza real no debe forzar "definitivo": el checkbox decide.
-      const claimStatus = manualMode ? "pendiente" : (keepPreliminary ? "pendiente" : "nuevo");
+      const claimStatus = resolveStep1Status(isPreliminaryPath);
       if (prefill?.claimId) {
         // Update existing pending claim
         await api.put(`/api/claims/${prefill.claimId}`, {
@@ -160,28 +174,77 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
     finally { setLoading(false); }
   }
 
+  // Guarda los datos ya ingresados en el paso actual y cierra el wizard sin
+  // avanzar de estado: siempre status="pendiente", disponible en cualquier paso
+  // mientras isPreliminaryPath. No exige ningún campo del alta definitiva.
+  async function saveAsPreliminaryAndExit() {
+    setLoading(true);
+    try {
+      const payload: any = {
+        status: "pendiente",
+        policyId: hasRealPolicy ? selectedPolicy.policy.id : null,
+        claimNumber: claimNumber || null,
+        manualInsured: manualMode ? (manualInsured || null) : null,
+        manualCompany: manualMode ? (manualCompany || null) : null,
+        manualPolicyNumber: manualMode ? (manualPolicyNumber || null) : null,
+        manualPolicyType: manualMode ? (manualPolicyType || null) : null,
+        manualNotes: manualMode ? (manualNotes || null) : null,
+        incidentDate: incidentDate || null,
+        incidentTime: incidentTime || null,
+        incidentLocation: incidentLocation || null,
+        incidentDescription: incidentDescription || null,
+        damages: damages || null,
+      };
+      if (hasThirdParty) {
+        Object.assign(payload, {
+          thirdPartyName: thirdPartyName || null,
+          thirdPartyDni: thirdPartyDni || null,
+          thirdPartyPhone: thirdPartyPhone || null,
+          thirdPartyVehiclePlate: thirdPartyVehiclePlate || null,
+          thirdPartyVehicleBrand: thirdPartyVehicleBrand || null,
+          thirdPartyVehicleModel: thirdPartyVehicleModel || null,
+          thirdPartyInsurer: thirdPartyInsurer || null,
+          thirdPartyPolicyNumber: thirdPartyPolicyNumber || null,
+        });
+      }
+      if (claimId) {
+        await api.put(`/api/claims/${claimId}`, payload);
+      } else {
+        const row = await api.post("/api/claims", payload);
+        setClaimId(row.id);
+      }
+      toast.success("Guardado como previa — podés completarlo más adelante");
+      onSaved();
+    } catch (e: any) { toast.error(e.message); }
+    finally { setLoading(false); }
+  }
+
   // Paso 2: guardar datos del siniestro
   async function handleStep2() {
-    if (!incidentDate) { toast.error("Ingresá la fecha del siniestro"); return; }
+    // La fecha solo es obligatoria para finalizar como siniestro definitivo;
+    // una previa puede seguir sin ella (todavía puede no conocerse).
+    if (!isPreliminaryPath && !incidentDate) { toast.error("Ingresá la fecha del siniestro"); return; }
     setLoading(true);
     try {
       // Si el asegurado es culpable en auto/moto → no hay reclamo, pasa directo a resuelto
-      const finalStatus = (hasThirdParty && insuredAtFault) ? "resuelto" : "en_curso";
+      // (salvo que siga en modo previa, donde toda escritura conserva "pendiente").
+      const finalStatus = resolveStep2Status(isPreliminaryPath, { hasThirdParty, insuredAtFault });
+      const resolvesDirectly = !isPreliminaryPath && hasThirdParty && insuredAtFault;
       await api.put(`/api/claims/${claimId}`, {
         status: finalStatus,
         claimNumber: claimNumber || null,
-        incidentDate, incidentTime, incidentLocation, incidentDescription, damages,
+        incidentDate: incidentDate || null, incidentTime, incidentLocation, incidentDescription, damages,
         ...(hasThirdParty ? {
           thirdPartyName, thirdPartyDni, thirdPartyPhone,
           thirdPartyVehiclePlate, thirdPartyVehicleBrand, thirdPartyVehicleModel,
           thirdPartyInsurer, thirdPartyPolicyNumber,
         } : {}),
-        ...(hasThirdParty && insuredAtFault ? {
+        ...(resolvesDirectly ? {
           resolvedDate: new Date().toISOString().split("T")[0],
           resolutionNotes: "Asegurado responsable — sin reclamo a tercero.",
         } : {}),
       });
-      if (hasThirdParty && insuredAtFault) {
+      if (resolvesDirectly) {
         toast.success("Siniestro marcado como resuelto — sin reclamo");
         onSaved();
         return;
@@ -196,10 +259,10 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
     setLoading(true);
     try {
       if (skip) {
-        await api.put(`/api/claims/${claimId}`, { status: "en_curso" });
+        await api.put(`/api/claims/${claimId}`, { status: resolveStep3Status(isPreliminaryPath, { skip: true }) });
       } else {
         await api.put(`/api/claims/${claimId}`, {
-          status: "reclamo_tercero",
+          status: resolveStep3Status(isPreliminaryPath, { skip: false }),
           claimFiled: claimFiled ? 1 : 0,
           claimFiledDate: claimFiled ? claimFiledDate : null,
           claimCompany, claimNumberThird, claimNotes,
@@ -210,11 +273,13 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
     finally { setLoading(false); }
   }
 
-  // Paso 4: resolución (o terminar sin resolver)
+  // Paso 4: resolución (o terminar sin resolver) — solo alcanzable como acción
+  // definitiva cuando !isPreliminaryPath; en modo previa esta pantalla no se
+  // muestra (ver JSX del paso 4) y se usa saveAsPreliminaryAndExit en su lugar.
   async function handleFinish(resolved = false) {
     setLoading(true);
     try {
-      await api.put(`/api/claims/${claimId}`, { status: resolved ? "resuelto" : "en_curso" });
+      await api.put(`/api/claims/${claimId}`, { status: resolveFinishStatus(isPreliminaryPath, { resolved }) });
       toast.success("Siniestro guardado correctamente");
       onSaved();
     } catch (e: any) { toast.error(e.message); }
@@ -230,6 +295,38 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
 
   const title = prefill?.claimId ? "Ingresar siniestro pendiente" : "Nuevo Siniestro";
 
+  // Control de "mantener como previa" — checkbox real solo tiene sentido con
+  // póliza real (sin ella, el backend nunca deja finalizar). Se muestra en
+  // cualquier paso donde ya haya una póliza elegida, no solo en el paso 1,
+  // porque una previa retomada con póliza real puede arrancar directo en el 2.
+  const preliminaryControls = hasRealPolicy ? (
+    <label className="flex items-start gap-2.5 bg-[#0d1424] border border-[#1f2937] rounded-xl px-4 py-3 cursor-pointer hover:border-blue-500/30 transition-colors">
+      <input type="checkbox" checked={keepPreliminary}
+        onChange={e => setKeepPreliminary(e.target.checked)}
+        className="mt-0.5 w-4 h-4 rounded border-gray-600 bg-[#1f2937] accent-blue-600" />
+      <div>
+        <p className="text-sm text-gray-200 font-medium">Mantener como previa de carga</p>
+        <p className="text-xs text-gray-500 mt-0.5">
+          Esta carga se guardará como previa y podrás completarla más adelante. Desmarcá esta opción
+          recién cuando tengas todos los datos para darla de alta como siniestro definitivo.
+        </p>
+      </div>
+    </label>
+  ) : (
+    <div className="bg-gray-500/10 border border-gray-500/20 rounded-xl px-4 py-3 text-xs text-gray-400 flex items-start gap-2">
+      <Inbox className="w-4 h-4 flex-shrink-0 mt-0.5 text-gray-500" />
+      <p>Esta carga se guardará como previa (sin póliza real vinculada) y podrás completarla más adelante.</p>
+    </div>
+  );
+
+  const saveDraftButton = (
+    <button type="button" onClick={saveAsPreliminaryAndExit} disabled={loading}
+      className="px-4 py-2 bg-gray-600/20 border border-gray-500/30 text-gray-300 text-sm font-medium rounded-lg hover:bg-gray-600/30 disabled:opacity-40 transition-all flex items-center gap-2">
+      {loading && <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />}
+      <Inbox className="w-3.5 h-3.5" /> Guardar previa y salir
+    </button>
+  );
+
   return (
     <div className="fixed inset-0 bg-black/75 flex items-start justify-center z-50 p-4 overflow-y-auto">
       <div className="bg-[#111827] border border-[#1f2937] rounded-2xl w-full max-w-2xl my-4">
@@ -244,7 +341,7 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
               <h2 className="text-base font-semibold text-white" style={{ fontFamily: "Syne, sans-serif" }}>{title}</h2>
               <p className="text-xs text-gray-500">
                 {step === 1 && "Paso 1 — Seleccioná la póliza"}
-                {step === 2 && (isPendingResume ? (hasPrefillPolicy ? "Datos del siniestro — póliza vinculada" : "Datos del siniestro — póliza manual") : "Paso 2 — Datos del siniestro")}
+                {step === 2 && (isResuming ? (hasPrefillPolicy ? "Datos del siniestro — póliza vinculada" : "Datos del siniestro — póliza manual") : "Paso 2 — Datos del siniestro")}
                 {step === 3 && "Paso 3 — Reclamo a compañía del tercero"}
                 {step === 4 && "Paso 4 — Estado de resolución"}
               </p>
@@ -360,19 +457,7 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
                     </div>
                   )}
 
-                  {selectedPolicy && (
-                    <label className="flex items-start gap-2.5 bg-[#0d1424] border border-[#1f2937] rounded-xl px-4 py-3 cursor-pointer hover:border-blue-500/30 transition-colors">
-                      <input type="checkbox" checked={keepPreliminary}
-                        onChange={e => setKeepPreliminary(e.target.checked)}
-                        className="mt-0.5 w-4 h-4 rounded border-gray-600 bg-[#1f2937] accent-blue-600" />
-                      <div>
-                        <p className="text-sm text-gray-200 font-medium">Mantener como previa de carga</p>
-                        <p className="text-xs text-gray-500 mt-0.5">
-                          Podés asociar una póliza ahora y mantener el siniestro como previa hasta completar los datos.
-                        </p>
-                      </div>
-                    </label>
-                  )}
+                  {selectedPolicy && preliminaryControls}
 
                   {!selectedPolicy && policyResults.length === 0 && policySearch.length > 1 && !searchLoading && (
                     <div className="bg-gray-500/5 border border-dashed border-gray-500/20 rounded-xl p-4 text-center">
@@ -430,13 +515,23 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
                 </div>
               )}
 
-              <div className="flex justify-end pt-2">
-                <button onClick={handleStep1} disabled={loading || (!manualMode && !selectedPolicy)}
-                  className="px-5 py-2 bg-orange-600 hover:bg-orange-700 disabled:opacity-40 text-white text-sm font-medium rounded-lg transition-all flex items-center gap-2">
-                  {loading && <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />}
-                  {manualMode ? "Guardar pendiente" : "Continuar"}
-                  {!manualMode && <ChevronRight className="w-4 h-4" />}
-                </button>
+              <div className="flex justify-end gap-2 pt-2">
+                {manualMode ? (
+                  <button onClick={handleStep1} disabled={loading || !manualMode}
+                    className="px-5 py-2 bg-orange-600 hover:bg-orange-700 disabled:opacity-40 text-white text-sm font-medium rounded-lg transition-all flex items-center gap-2">
+                    {loading && <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />}
+                    <Inbox className="w-3.5 h-3.5" /> Guardar previa y salir
+                  </button>
+                ) : (
+                  <>
+                    {selectedPolicy && keepPreliminary && saveDraftButton}
+                    <button onClick={handleStep1} disabled={loading || !selectedPolicy}
+                      className="px-5 py-2 bg-orange-600 hover:bg-orange-700 disabled:opacity-40 text-white text-sm font-medium rounded-lg transition-all flex items-center gap-2">
+                      {loading && <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />}
+                      Continuar <ChevronRight className="w-4 h-4" />
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           )}
@@ -464,11 +559,10 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
                 </div>
               </div>
 
+              {preliminaryControls}
+
               {/* Cuándo */}
               <div>
-                <p className="text-xs text-gray-400 font-medium uppercase tracking-wider mb-3 flex items-center gap-1.5">
-                  <Calendar className="w-3.5 h-3.5" /> Fecha y hora
-                </p>
                 {/* N° de siniestro en la compañía */}
                 <div className="mb-3">
                   <label className={lbl}>N° de siniestro en la compañía <span className="text-gray-600">(opcional)</span></label>
@@ -481,8 +575,8 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
                 </p>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <label className={lbl}>Fecha del siniestro *</label>
-                    <input type="date" className={inp} value={incidentDate} onChange={e => setIncidentDate(e.target.value)} required />
+                    <label className={lbl}>Fecha del siniestro {isPreliminaryPath ? <span className="text-gray-600">(opcional)</span> : "*"}</label>
+                    <input type="date" className={inp} value={incidentDate} onChange={e => setIncidentDate(e.target.value)} required={!isPreliminaryPath} />
                   </div>
                   <div>
                     <label className={lbl}>Hora</label>
@@ -607,11 +701,14 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
                 <button onClick={() => setStep(1)} className="px-4 py-2 bg-[#1f2937] text-gray-300 text-sm rounded-lg hover:bg-[#374151] transition-all flex items-center gap-2">
                   <ChevronLeft className="w-4 h-4" /> Volver
                 </button>
-                <button onClick={handleStep2} disabled={loading}
-                  className="px-5 py-2 bg-orange-600 hover:bg-orange-700 disabled:opacity-40 text-white text-sm font-medium rounded-lg transition-all flex items-center gap-2">
-                  {loading && <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />}
-                  Continuar <ChevronRight className="w-4 h-4" />
-                </button>
+                <div className="flex gap-2">
+                  {isPreliminaryPath && saveDraftButton}
+                  <button onClick={handleStep2} disabled={loading}
+                    className="px-5 py-2 bg-orange-600 hover:bg-orange-700 disabled:opacity-40 text-white text-sm font-medium rounded-lg transition-all flex items-center gap-2">
+                    {loading && <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />}
+                    Continuar <ChevronRight className="w-4 h-4" />
+                  </button>
+                </div>
               </div>
             </div>
           )}
@@ -619,6 +716,8 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
           {/* ── Paso 3: Reclamo tercero ── */}
           {step === 3 && (
             <div className="space-y-4">
+              {preliminaryControls}
+
               <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl px-4 py-3 text-sm text-amber-400 flex items-start gap-2">
                 <ShieldAlert className="w-4 h-4 flex-shrink-0 mt-0.5" />
                 <div>
@@ -675,6 +774,7 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
                   <ChevronLeft className="w-4 h-4" /> Volver
                 </button>
                 <div className="flex gap-2">
+                  {isPreliminaryPath && saveDraftButton}
                   <button onClick={() => handleStep3(true)} disabled={loading}
                     className="px-4 py-2 bg-[#1f2937] text-gray-300 text-sm rounded-lg hover:bg-[#374151] transition-all">
                     Saltar paso
@@ -692,32 +792,52 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
           {/* ── Paso 4: Resolución ── */}
           {step === 4 && (
             <div className="space-y-5">
-              <div className="text-center py-3">
-                <div className="w-14 h-14 rounded-2xl bg-emerald-500/10 flex items-center justify-center mx-auto mb-3">
-                  <CheckCircle className="w-7 h-7 text-emerald-400" />
-                </div>
-                <h3 className="text-lg font-semibold text-white" style={{ fontFamily: "Syne, sans-serif" }}>
-                  El siniestro fue registrado
-                </h3>
-                <p className="text-sm text-gray-400 mt-1">
-                  ¿El siniestro ya está resuelto y cerrado, o sigue en trámite?
-                </p>
-              </div>
+              {isPreliminaryPath ? (
+                <>
+                  <div className="text-center py-3">
+                    <div className="w-14 h-14 rounded-2xl bg-gray-500/10 flex items-center justify-center mx-auto mb-3">
+                      <Inbox className="w-7 h-7 text-gray-400" />
+                    </div>
+                    <h3 className="text-lg font-semibold text-white" style={{ fontFamily: "Syne, sans-serif" }}>
+                      Esta carga sigue como previa
+                    </h3>
+                    <p className="text-sm text-gray-400 mt-1">
+                      Todavía no es un siniestro definitivo — guardá lo cargado y completalo más adelante.
+                    </p>
+                  </div>
+                  {preliminaryControls}
+                  <div className="flex justify-center">{saveDraftButton}</div>
+                </>
+              ) : (
+                <>
+                  <div className="text-center py-3">
+                    <div className="w-14 h-14 rounded-2xl bg-emerald-500/10 flex items-center justify-center mx-auto mb-3">
+                      <CheckCircle className="w-7 h-7 text-emerald-400" />
+                    </div>
+                    <h3 className="text-lg font-semibold text-white" style={{ fontFamily: "Syne, sans-serif" }}>
+                      El siniestro fue registrado
+                    </h3>
+                    <p className="text-sm text-gray-400 mt-1">
+                      ¿El siniestro ya está resuelto y cerrado, o sigue en trámite?
+                    </p>
+                  </div>
 
-              <div className="grid grid-cols-2 gap-3">
-                <button onClick={() => handleFinish(false)} disabled={loading}
-                  className="py-4 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-400 text-sm font-medium hover:bg-amber-500/20 transition-all flex flex-col items-center gap-2">
-                  <Clock className="w-5 h-5" />
-                  Dejar en trámite
-                  <span className="text-xs text-amber-400/60 font-normal">El siniestro sigue en curso</span>
-                </button>
-                <button onClick={() => handleFinish(true)} disabled={loading}
-                  className="py-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 text-sm font-medium hover:bg-emerald-500/20 transition-all flex flex-col items-center gap-2">
-                  <CheckCircle className="w-5 h-5" />
-                  Marcar como resuelto
-                  <span className="text-xs text-emerald-400/60 font-normal">Siniestro cerrado y finalizado</span>
-                </button>
-              </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button onClick={() => handleFinish(false)} disabled={loading}
+                      className="py-4 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-400 text-sm font-medium hover:bg-amber-500/20 transition-all flex flex-col items-center gap-2">
+                      <Clock className="w-5 h-5" />
+                      Dejar en trámite
+                      <span className="text-xs text-amber-400/60 font-normal">El siniestro sigue en curso</span>
+                    </button>
+                    <button onClick={() => handleFinish(true)} disabled={loading}
+                      className="py-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 text-sm font-medium hover:bg-emerald-500/20 transition-all flex flex-col items-center gap-2">
+                      <CheckCircle className="w-5 h-5" />
+                      Marcar como resuelto
+                      <span className="text-xs text-emerald-400/60 font-normal">Siniestro cerrado y finalizado</span>
+                    </button>
+                  </div>
+                </>
+              )}
 
               {loading && (
                 <div className="flex justify-center">
@@ -742,6 +862,8 @@ export default function Siniestros() {
   const [statusFilter, setStatusFilter] = useState("");
   const [showNew, setShowNew] = useState(false);
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
+  const locationSearch = useLocationSearch();
+  const [, navigate] = useLocation();
 
   const load = async () => {
     setLoading(true);
@@ -775,6 +897,26 @@ export default function Siniestros() {
     setWizardPrefill(prefill);
     setShowNew(true);
   }
+
+  // "Completar siniestro" desde el detalle navega a /siniestros?resume=<id> —
+  // acá se abre el wizard con la previa precargada (misma forma de prefill que
+  // usa el botón "Ingresar siniestro" del inbox) y se limpia el query string
+  // para no reabrirlo en un refresh. Abrir el wizard no escribe nada por sí solo.
+  useEffect(() => {
+    const resumeId = new URLSearchParams(locationSearch).get("resume");
+    if (!resumeId) return;
+    navigate("/siniestros", { replace: true });
+    (async () => {
+      try {
+        const row = await api.get(`/api/claims/${resumeId}`);
+        openWizard({
+          claimId: row.claim.id,
+          claim: row.claim,
+          policy: row.policy ? { policy: row.policy, insured: row.insured, company: row.company } : undefined,
+        });
+      } catch (e: any) { toast.error(e.message); }
+    })();
+  }, [locationSearch]);
 
   // Separate pending from the rest
   const pendingClaims = claims.filter((r: any) => r.claim.status === "pendiente");
@@ -880,11 +1022,7 @@ export default function Siniestros() {
                       <button
                         onClick={() => openWizard({
                           claimId: c.id,
-                          manualInsured: c.manualInsured,
-                          manualCompany: c.manualCompany,
-                          manualPolicyNumber: c.manualPolicyNumber,
-                          manualPolicyType: c.manualPolicyType,
-                          manualNotes: c.manualNotes,
+                          claim: c,
                           policy: hasPolicy ? { policy: r.policy, insured: r.insured, company: r.company } : undefined,
                         })}
                         className="flex items-center gap-1.5 px-3 py-1.5 bg-orange-600/15 border border-orange-500/25 text-orange-400 hover:bg-orange-600/25 text-xs font-medium rounded-lg transition-all">
