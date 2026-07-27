@@ -11,6 +11,7 @@ import { PolicyActions } from "@/components/policies/PolicyActions";
 import { ImportModal } from "@/components/policies/ImportModal";
 import { toast } from "sonner";
 import { buildPoliziasQuery, buildPoliziasPath, parsePoliziasFilters, type PoliziasSortKey } from "@/lib/polizas-filters";
+import { sortPolicyRows } from "@/lib/polizas-sort";
 
 interface PolicyRow {
   policy: any;
@@ -95,23 +96,7 @@ export default function Polizas() {
     else { setSortKey(key); setSortDir("asc"); }
   };
 
-  const sorted = [...rows].sort((a, b) => {
-    let va: any, vb: any;
-    switch (sortKey) {
-      case "policyNumber": va = a.policy.policyNumber; vb = b.policy.policyNumber; break;
-      case "insured": va = a.insured?.name || ""; vb = b.insured?.name || ""; break;
-      case "company": va = a.company?.name || ""; vb = b.company?.name || ""; break;
-      case "type": va = a.policy.type; vb = b.policy.type; break;
-      case "status": va = a.policy.status; vb = b.policy.status; break;
-      case "endDate": va = a.policy.endDate; vb = b.policy.endDate; break;
-      case "premium": va = a.policy.premium || 0; vb = b.policy.premium || 0; break;
-      default: va = ""; vb = "";
-    }
-    if (va < vb) return sortDir === "asc" ? -1 : 1;
-    if (va > vb) return sortDir === "asc" ? 1 : -1;
-    // Desempate estable: id descendente.
-    return b.policy.id - a.policy.id;
-  });
+  const sorted = sortPolicyRows(rows, sortKey, sortDir);
 
   const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
   const paged = sorted.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
@@ -365,7 +350,7 @@ export default function Polizas() {
                   <ThSort col="company">Compañía</ThSort>
                   <ThSort col="status">Estado</ThSort>
                   <th className="text-left text-xs text-gray-400 font-medium py-3 px-3 whitespace-nowrap">Cobertura</th>
-                  <ThSort col="endDate">Vigencia</ThSort>
+                  <ThSort col="startDate">Vigencia</ThSort>
                   <ThSort col="premium">Cuota Mens.</ThSort>
                   <th className="text-xs text-gray-400 font-medium py-3 px-3 text-right whitespace-nowrap sticky right-0 bg-[#111827]">Acciones</th>
                 </tr>

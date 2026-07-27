@@ -4,17 +4,18 @@
 import { POLICY_TYPES, STATUS_TYPES } from "./utils";
 
 export const POLIZAS_SORT_KEYS = [
-  "policyNumber", "insured", "company", "type", "status", "endDate", "premium",
+  "policyNumber", "insured", "company", "type", "status", "endDate", "startDate", "premium",
 ] as const;
 export type PoliziasSortKey = typeof POLIZAS_SORT_KEYS[number];
 
 export const POLIZAS_SORT_ORDERS = ["asc", "desc"] as const;
 export type PoliziasSortOrder = typeof POLIZAS_SORT_ORDERS[number];
 
-// Vigencia (endDate) descendente: las pólizas con vencimiento más lejano/reciente
-// aparecen primero y las vencidas quedan al final — mismo campo que la columna
-// "Vigencia" ya usa (endDate), sin crear un criterio paralelo.
-export const DEFAULT_SORT_KEY: PoliziasSortKey = "endDate";
+// Fecha de inicio (startDate) descendente: las pólizas más recientes aparecen
+// primero. "endDate" se conserva como sortKey válido únicamente por
+// compatibilidad con URLs/bookmarks existentes que ya lo usaban como default
+// anterior — el encabezado "Vigencia" de la tabla ahora ordena por startDate.
+export const DEFAULT_SORT_KEY: PoliziasSortKey = "startDate";
 export const DEFAULT_SORT_ORDER: PoliziasSortOrder = "desc";
 export const DEFAULT_PAGE = 1;
 

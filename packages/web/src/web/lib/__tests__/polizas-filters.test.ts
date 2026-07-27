@@ -7,9 +7,9 @@ import {
 } from "../polizas-filters";
 
 describe("Caso A — entrar a /polizas sin query", () => {
-  test("usa endDate desc como orden por defecto (más recientes primero, vencidas al final)", () => {
+  test("usa startDate desc como orden por defecto (pólizas con inicio más reciente primero)", () => {
     const filters = parsePoliziasFilters("");
-    expect(filters.sortBy).toBe("endDate");
+    expect(filters.sortBy).toBe("startDate");
     expect(filters.sortOrder).toBe("desc");
     expect(filters.sortBy).toBe(DEFAULT_SORT_KEY);
     expect(filters.sortOrder).toBe(DEFAULT_SORT_ORDER);
@@ -17,6 +17,14 @@ describe("Caso A — entrar a /polizas sin query", () => {
     expect(filters.q).toBe("");
     expect(filters.type).toBe("");
     expect(filters.status).toBe("");
+  });
+});
+
+describe("Caso A2 — compatibilidad con URLs existentes que usaban endDate", () => {
+  test("sortBy=endDate en la URL sigue siendo válido y se respeta (no cae al default)", () => {
+    const filters = parsePoliziasFilters("sortBy=endDate&sortOrder=desc");
+    expect(filters.sortBy).toBe("endDate");
+    expect(filters.sortOrder).toBe("desc");
   });
 });
 
@@ -87,6 +95,7 @@ describe("Caso D — sortBy/sortOrder/page inválidos caen a defaults seguros", 
 describe("isValidSortKey / isValidSortOrder", () => {
   test("aceptan los valores conocidos", () => {
     expect(isValidSortKey("endDate")).toBe(true);
+    expect(isValidSortKey("startDate")).toBe(true);
     expect(isValidSortKey("premium")).toBe(true);
     expect(isValidSortOrder("asc")).toBe(true);
     expect(isValidSortOrder("desc")).toBe(true);
