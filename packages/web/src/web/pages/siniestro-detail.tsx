@@ -9,6 +9,7 @@ import {
   ShieldAlert, CheckCircle, Clock, Edit, Save, X, CheckSquare, Building2, Inbox, Link2, ArrowRight
 } from "lucide-react";
 import { canConvertToThirdPartyClaim } from "@/lib/claim-wizard-status";
+import { toArgentinaCalendarDay } from "../../lib/dates/argentina-date";
 
 const CLAIM_STATUS: Record<string, { label: string; color: string }> = {
   pendiente:       { label: "Pendiente",       color: "bg-gray-500/15 text-gray-400 border-gray-500/20" },
@@ -75,7 +76,7 @@ export default function SiniestroDetail() {
   }
 
   async function markResolved() {
-    await save({ status: "resuelto", resolved: 1, resolvedDate: resolvedDate || new Date().toISOString().split("T")[0] });
+    await save({ status: "resuelto", resolved: 1, resolvedDate: resolvedDate || toArgentinaCalendarDay() });
   }
 
   const [resolvedDate, setResolvedDate] = useState("");
@@ -188,7 +189,7 @@ export default function SiniestroDetail() {
                 <label className={lbl}>Fecha de resolución</label>
                 <input type="date" className={inp} value={resolvedDate}
                   onChange={e => setResolvedDate(e.target.value)}
-                  defaultValue={new Date().toISOString().split("T")[0]} />
+                  defaultValue={toArgentinaCalendarDay()} />
               </div>
               <div>
                 <label className={lbl}>Monto de liquidación (ARS)</label>
@@ -205,7 +206,7 @@ export default function SiniestroDetail() {
               <button onClick={cancelEdit} className="px-3 py-1.5 bg-[#1f2937] text-gray-300 text-xs rounded-lg hover:bg-[#374151] transition-all">Cancelar</button>
               <button onClick={() => save({
                 status: "resuelto", resolved: 1,
-                resolvedDate: resolvedDate || new Date().toISOString().split("T")[0],
+                resolvedDate: resolvedDate || toArgentinaCalendarDay(),
                 resolutionNotes: resolutionNotes || null,
                 resolutionAmount: resolutionAmount ? Number(resolutionAmount) : null,
               })} disabled={saving}

@@ -3,6 +3,7 @@ import { api } from "@/lib/api";
 import { X, Loader2, ListOrdered, Search, RefreshCw, ChevronRight, Plus, Trash2, UserCheck, Car } from "lucide-react";
 import { toast } from "sonner";
 import { buildInstallmentPlan, addCalendarMonths } from "../../../lib/installments/plan";
+import { toArgentinaCalendarDay } from "../../../lib/dates/argentina-date";
 import { parseExpectedInstallmentsInput } from "@/lib/installments-rebuild";
 
 // ─── Insured Person ───────────────────────────────────────────────────────────
@@ -256,7 +257,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
     paymentMethod: "",
     // Vigencia
     vigencyPeriod: "anual",
-    startDate: new Date().toISOString().split("T")[0],
+    startDate: toArgentinaCalendarDay(),
     endDate: "",
     nextRebillingDate: "",
     notes: "",

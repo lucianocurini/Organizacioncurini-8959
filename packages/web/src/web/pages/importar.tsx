@@ -3,6 +3,7 @@ import { AppLayout } from "@/components/layout/AppLayout";
 import { api } from "@/lib/api";
 import { Upload, FileText, CheckCircle, AlertTriangle, Loader2, ChevronDown, ChevronUp, Edit2, X } from "lucide-react";
 import { toast } from "sonner";
+import { toArgentinaCalendarDay } from "../../lib/dates/argentina-date";
 
 interface ParsedPolicy {
   policyNumber: string;
@@ -789,7 +790,7 @@ export default function Importar() {
   const [batchPreviewLoading, setBatchPreviewLoading] = useState(false);
   const [batchPreview, setBatchPreview] = useState<BatchPreviewSummary | null>(null);
   const [batchDesde, setBatchDesde] = useState("2025-12-01");
-  const [batchHasta, setBatchHasta] = useState(() => new Date().toISOString().split("T")[0]);
+  const [batchHasta, setBatchHasta] = useState(() => toArgentinaCalendarDay());
   const [batchPhase, setBatchPhase] = useState("");
   // Resultados acumulados por mes
   const [monthResults, setMonthResults] = useState<Array<{ label: string; imported: number; rebillings: number; endosos: number; anulaciones: number; duplicados: number; revisar: number; skipped: number; errors: string[] }>>([]);

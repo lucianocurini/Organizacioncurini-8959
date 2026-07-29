@@ -41,12 +41,13 @@ import {
   gmailConfigured,
 } from "../lib/gmail-client";
 import { parseElNorteTxtV2 } from "../lib/parsers/el-norte-v2";
-import { isValidCalendarDate, buildInstallmentPlan, InstallmentPlanError } from "../lib/installments/plan";
+import { isValidCalendarDate, buildInstallmentPlan, InstallmentPlanError, addCalendarDays } from "../lib/installments/plan";
 import { classifyInstallmentsForRebuild, runInstallmentRebuildTransaction, RebuildConflictError, PolicyNotFoundError } from "../lib/installments/rebuild";
 import { parseRebillingPayload, RebillingPayloadError, buildRebillingInstallmentPlan, hasRebillingGroupActivity } from "../lib/installments/rebilling-plan";
 import { classifyRebillingGroupForRebuild, runRebillingRebuildTransaction, RebillingRebuildConflictError, RebillingNotFoundError } from "../lib/installments/rebilling-rebuild";
 import { validateAndNormalizeSplits, SplitValidationError, classifySplitGroup, isDirectCompanyPaymentMethod, type SplitGroup } from "../lib/payments/splits";
 import { recalculateInstallmentPaymentStatus } from "../lib/payments/installment-status";
+import { toArgentinaCalendarDay, resolveArgentinaMonthKey } from "../lib/dates/argentina-date";
 import {
   validateCancellationEffectiveDate, validatePolicyCancellationState, classifyInstallmentsForCancellation,
   appendCancellationNote, isInstallmentNonCollectible, PolicyCancellationValidationError, PolicyAlreadyCancelledError,
@@ -265,7 +266,7 @@ app.get("/policies/:id", requireAuth(async (c: any) => {
     .from(rebillings)
     .where(eq(rebillings.policyId, id))
     .orderBy(desc(rebillings.billingStart));
-  const today = new Date().toISOString().split("T")[0];
+  const today = toArgentinaCalendarDay();
   const instRows = await db
     .select()
     .from(policyInstallments)
@@ -676,7 +677,7 @@ app.get("/policies/:id/installments", requireAuth(async (c: any) => {
     .where(eq(policyInstallments.policyId, Number(c.req.param("id"))))
     .orderBy(policyInstallments.number);
   // auto-update vencida status
-  const today = new Date().toISOString().split("T")[0];
+  const today = toArgentinaCalendarDay();
   for (const row of rows) {
     if (row.status === "pendiente" && row.dueDate < today) {
       await db.update(policyInstallments).set({ status: "vencida" }).where(eq(policyInstallments.id, row.id));
@@ -862,7 +863,7 @@ app.post("/policies", requireAuth(async (c: any) => {
   if (!body.nextRebillingDate) body.nextRebillingDate = null;
   else if (!isValidCalendarDate(body.nextRebillingDate))
     return c.json({ error: `Próxima fecha de refacturación inválida: "${body.nextRebillingDate}"` }, 400);
-  const today = new Date().toISOString().split("T")[0];
+  const today = toArgentinaCalendarDay();
   const daysToEnd = Math.ceil(
     (new Date(body.endDate).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24)
   );
@@ -921,7 +922,7 @@ app.put("/policies/:id", requireAuth(async (c: any) => {
   // al editar cualquier otro campo (ej. solo `notes`), "rehabilitando"
   // silenciosamente la póliza sin pasar por ningún endpoint de rehabilitación.
   if (current.status !== "cancelada") {
-    const today = new Date().toISOString().split("T")[0];
+    const today = toArgentinaCalendarDay();
     const daysToEnd = Math.ceil(
       (new Date(body.endDate).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24)
     );
@@ -1210,8 +1211,12 @@ app.get("/stats", requireAuth(async (c: any) => {
     byCompany[cname].premium += p.policy.premium || 0;
   }
   const totalPremium = vigentes.reduce((s, p) => s + (p.policy.premium || 0), 0);
-  const today = new Date().toISOString().split("T")[0];
-  const in30 = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  const today = toArgentinaCalendarDay();
+  // in30 = today + 30 días calendario (aritmética UTC pura, ver
+  // addCalendarDays) — nunca Date.now()+30d.toISOString(), que mezclaría el
+  // día de Argentina (today) con un cálculo en UTC real, corriendo el rango
+  // en la ventana 21:00–23:59 Arg.
+  const in30 = addCalendarDays(today, 30);
   const upcoming = allPolicies.filter((p) => p.policy.endDate >= today && p.policy.endDate <= in30).length;
   return c.json({ total, activas, vencidas, porVencer, canceladas, byType, byCompany, totalPremium, upcoming }, 200);
 }));
@@ -1253,7 +1258,7 @@ app.post("/policies/import", requireAuth(async (c: any) => {
         results.errors.push(`Fila ${results.imported + results.skipped}: datos incompletos`);
         continue;
       }
-      const today = new Date().toISOString().split("T")[0];
+      const today = toArgentinaCalendarDay();
       const daysToEnd = Math.ceil(
         (new Date(row.endDate).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24)
       );
@@ -3833,7 +3838,7 @@ app.put("/deliveries/:id", requireAuth(async (c: any) => {
 }));
 
 app.patch("/deliveries/:id/complete", requireAuth(async (c: any) => {
-  const today = new Date().toISOString().split("T")[0];
+  const today = toArgentinaCalendarDay();
   const [delivery] = await db
     .update(deliveries)
     .set({ status: "realizado", completedDate: today })
@@ -4085,7 +4090,10 @@ app.delete("/task-templates/:id", requireAuth(async (c: any) => {
 app.get("/tasks", requireAuth(async (c: any) => {
   const user = c.get("user");
   const isAdmin = user.role === "admin";
-  const monthYear = c.req.query("month") || new Date().toISOString().substring(0, 7);
+  // mes operativo de Argentina — new Date().toISOString().substring(0,7) daba
+  // el mes UTC, que se adelanta un mes entero durante las últimas ~3h de
+  // Argentina del último día del mes (ver diagnóstico de fechas locales).
+  const monthYear = c.req.query("month") || toArgentinaCalendarDay().slice(0, 7);
 
   // Auto-generate recurring tasks from active templates if not yet created for this month
   const allTemplates = await db.select().from(taskTemplates).where(eq(taskTemplates.active, 1)).all();
@@ -4275,7 +4283,7 @@ app.post("/import/el-norte", requireAuth(async (c: any) => {
     // XR aplica solo si la marca es Honda (Peugeot 206 XR → automotor)
     else if (brand === "HONDA" && /\b(WAVE|BIZ|TITAN|XR)\b/.test(model)) polType = "motovehiculo";
     else polType = "automotor";
-    const today = new Date().toISOString().split("T")[0];
+    const today = toArgentinaCalendarDay();
     const daysToEnd = Math.ceil((new Date(p.endDate).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24));
     let status = "activa";
     if (daysToEnd < 0) status = "vencida";
@@ -4488,7 +4496,7 @@ app.post("/import/rivadavia", requireAuth(async (c: any) => {
     else if (vt === "riesgos_varios")                 polType = "riesgos_varios";
     else if (vt === "integral_comercio")              polType = "integral_comercio";
     else polType = "automotor";
-    const today = new Date().toISOString().split("T")[0];
+    const today = toArgentinaCalendarDay();
     const daysToEnd = Math.ceil((new Date(p.endDate).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24));
     let status = "activa";
     if (daysToEnd < 0) status = "vencida";
@@ -4788,7 +4796,7 @@ app.post("/import/cooperacion", requireAuth(async (c: any) => {
   }
 
   function resolveStatus(endDate: string): string {
-    const today = new Date().toISOString().split("T")[0];
+    const today = toArgentinaCalendarDay();
     const days = Math.ceil((new Date(endDate).getTime() - new Date(today).getTime()) / 86400000);
     if (days < 0) return "vencida";
     if (days <= 30) return "por_vencer";
@@ -4976,7 +4984,7 @@ app.post("/import/mercantil-andina", requireAuth(async (c: any) => {
   }
 
   function resolveStatus(endDate: string): string {
-    const today = new Date().toISOString().split("T")[0];
+    const today = toArgentinaCalendarDay();
     const days = Math.ceil((new Date(endDate).getTime() - new Date(today).getTime()) / 86400000);
     if (days < 0) return "vencida";
     if (days <= 30) return "por_vencer";
@@ -5229,7 +5237,7 @@ function enResolveTypeAndStatus(p: any): { polType: string; status: string } {
     (brand === "HONDA" && (vehicleSignals.includes("xr") || vehicleSignals.includes("titan")))
   ) polType = "motovehiculo";
   else polType = "automotor";
-  const today = new Date().toISOString().split("T")[0];
+  const today = toArgentinaCalendarDay();
   const daysToEnd = Math.ceil((new Date(p.endDate).getTime() - new Date(today).getTime()) / 86400000);
   let status = "activa";
   if (daysToEnd < 0) status = "vencida";
@@ -5688,11 +5696,8 @@ app.post("/gmail/el-norte/batch-import", requireAuth(async (c: any) => {
 app.post("/gmail/el-norte/daily", requireAuth(async (c: any) => {
   if (!gmailConfigured) return c.json({ error: "Gmail no configurado" }, 503);
   const user = c.get("user");
-  const today = new Date();
-  const yesterday = new Date(today);
-  yesterday.setDate(yesterday.getDate() - 1);
-  const desde = yesterday.toISOString().split("T")[0];
-  const hasta = today.toISOString().split("T")[0];
+  const hasta = toArgentinaCalendarDay();
+  const desde = addCalendarDays(hasta, -1);
 
   const jobId = `en_daily_${Date.now()}`;
   const job = {
@@ -6000,7 +6005,7 @@ app.post("/import/ssn-gde", requireAuth(async (c: any) => {
     else if (vt === "riesgos_varios")    polType = "riesgos_varios";
     else if (vt === "integral_comercio") polType = "integral_comercio";
     else                                 polType = "automotor";
-    const today = new Date().toISOString().split("T")[0];
+    const today = toArgentinaCalendarDay();
     const daysToEnd = Math.ceil((new Date(p.endDate as string).getTime() - new Date(today).getTime()) / 86400000);
     let status = "activa";
     if (daysToEnd < 0) status = "vencida";
@@ -7733,20 +7738,13 @@ app.get("/cash/stats", requireAdmin(async (c: any) => {
   // Agrupar por mes "YYYY-MM"
   const monthMap: Record<string, { cobrado: number; rendido: number }> = {};
 
-  const getMonth = (dateStr: string | null) => {
-    if (!dateStr) return null;
-    const d = new Date(dateStr);
-    if (isNaN(d.getTime())) return null;
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-  };
-
-  const tsToStr = (ts: Date | null | undefined): string | null => {
-    if (!ts) return null;
-    return ts instanceof Date ? ts.toISOString() : String(ts);
-  };
-
+  // Agrupa por mes calendario Argentina — paymentDate (texto "YYYY-MM-DD")
+  // o, si falta, createdAt (timestamp real) vía resolveArgentinaMonthKey.
+  // Antes usaba getFullYear()/getMonth() sobre new Date(...) (hora local
+  // del proceso, no de Argentina) — mismo patrón de bug que la rendición
+  // #115, aplicado a mes en vez de día. Ver lib/dates/argentina-date.ts.
   for (const e of allEntries) {
-    const m = getMonth(e.paymentDate || tsToStr(e.createdAt));
+    const m = resolveArgentinaMonthKey(e.paymentDate || e.createdAt);
     if (!m) continue;
     if (!monthMap[m]) monthMap[m] = { cobrado: 0, rendido: 0 };
     monthMap[m].cobrado += e.amount;
@@ -7754,7 +7752,7 @@ app.get("/cash/stats", requireAdmin(async (c: any) => {
   }
 
   for (const p of allPays) {
-    const m = getMonth(p.paymentDate || tsToStr(p.createdAt));
+    const m = resolveArgentinaMonthKey(p.paymentDate || p.createdAt);
     if (!m) continue;
     if (!monthMap[m]) monthMap[m] = { cobrado: 0, rendido: 0 };
     monthMap[m].cobrado += p.amount;
@@ -8322,7 +8320,7 @@ app.post("/remittances/items/:id/collect", requireAuth(async (c: any) => {
         installmentId: installmentRow.id,
         amount: installmentRow.amount,
         paymentMethod: resolvedPaymentMethod,
-        paymentDate: body.paymentDate || new Date().toISOString().slice(0, 10),
+        paymentDate: body.paymentDate || toArgentinaCalendarDay(),
         notes: body.notes || null,
         status: "confirmado",
         // Nace YA rendido — ver comentario del endpoint. Nunca debe

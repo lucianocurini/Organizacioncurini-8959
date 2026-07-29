@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { cn, formatDate, POLICY_TYPES } from "@/lib/utils";
+import { toArgentinaCalendarDay } from "../../lib/dates/argentina-date";
 import { toast } from "sonner";
 import {
   AlertTriangle, Plus, Search, X, ChevronRight, ChevronLeft,
@@ -240,7 +241,7 @@ function NewClaimWizard({ onClose, onSaved, prefill }: {
           thirdPartyInsurer, thirdPartyPolicyNumber,
         } : {}),
         ...(resolvesDirectly ? {
-          resolvedDate: new Date().toISOString().split("T")[0],
+          resolvedDate: toArgentinaCalendarDay(),
           resolutionNotes: "Asegurado responsable — sin reclamo a tercero.",
         } : {}),
       });

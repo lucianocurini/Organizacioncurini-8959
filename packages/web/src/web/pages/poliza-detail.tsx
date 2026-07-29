@@ -8,6 +8,7 @@ import { PolicyModal } from "@/components/policies/PolicyModal";
 import { RebillingModal } from "@/components/policies/RebillingModal";
 import { toast } from "sonner";
 import { buildInstallmentPlan, InstallmentPlanError } from "../../lib/installments/plan";
+import { toArgentinaCalendarDay } from "../../lib/dates/argentina-date";
 import {
   compareExpectedVsActual, EXPECTED_VS_ACTUAL_LABELS, shouldShowRebuildButton,
   decideRebuildUiAction, buildRebuildRequestBody, summarizeRebuildPlan,
@@ -164,7 +165,7 @@ export default function PolizaDetail() {
   }
 
   // Active rebilling: the one whose period includes today
-  const today = new Date().toISOString().split("T")[0];
+  const today = toArgentinaCalendarDay();
   const activeRebilling = rebillingsList.find(r => r.billingStart <= today && r.billingEnd >= today);
 
   async function deleteRebilling(id: number) {

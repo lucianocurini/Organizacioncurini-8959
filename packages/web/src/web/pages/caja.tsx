@@ -23,6 +23,7 @@ import { useAuth } from "@/lib/auth";
 import { api } from "@/lib/api";
 import { type CashSummary, hasUnverifiedCashSummaryData } from "@/lib/caja-types";
 import { filterPendingCashItems, formatAdeudadoOrigin } from "@/lib/caja-cobrados";
+import { toArgentinaCalendarDay } from "../../lib/dates/argentina-date";
 import {
   ComposedChart,
   Bar,
@@ -87,7 +88,7 @@ const EMPTY_ENTRY = {
   companyName: "",
   amount: "",
   paymentMethod: "efectivo",
-  paymentDate: new Date().toISOString().slice(0, 10),
+  paymentDate: toArgentinaCalendarDay(),
   dueDate: "",
   notes: "",
 };
@@ -109,7 +110,7 @@ function EntryForm({
           companyName: initial.companyName || "",
           amount: String(initial.amount || ""),
           paymentMethod: initial.paymentMethod || "efectivo",
-          paymentDate: initial.paymentDate || new Date().toISOString().slice(0, 10),
+          paymentDate: initial.paymentDate || toArgentinaCalendarDay(),
           dueDate: initial.dueDate || "",
           notes: initial.notes || "",
         }
@@ -597,7 +598,7 @@ export default function CajaPage() {
   const [commissions, setCommissions] = useState<any[]>([]);
   const [commForm, setCommForm] = useState({
     companyId: "",
-    date: new Date().toISOString().slice(0, 10),
+    date: toArgentinaCalendarDay(),
     amount: "",
     notes: "",
     paymentMethod: "transferencia",
@@ -608,7 +609,7 @@ export default function CajaPage() {
 
   // ── IVA
   const [ivaList, setIvaList] = useState<any[]>([]);
-  const [ivaForm, setIvaForm] = useState({ companyId: "", date: new Date().toISOString().slice(0, 10), amount: "", notes: "" });
+  const [ivaForm, setIvaForm] = useState({ companyId: "", date: toArgentinaCalendarDay(), amount: "", notes: "" });
   const [editingIva, setEditingIva] = useState<any>(null);
 
   // ── Companies
@@ -618,7 +619,7 @@ export default function CajaPage() {
   const [expenses, setExpenses] = useState<any[]>([]);
   const [expForm, setExpForm] = useState({
     type: "gasto_operativo",
-    date: new Date().toISOString().slice(0, 10),
+    date: toArgentinaCalendarDay(),
     description: "",
     category: "",
     amount: "",
@@ -635,7 +636,7 @@ export default function CajaPage() {
   const [ownMovements, setOwnMovements] = useState<any[]>([]);
   const [ownForm, setOwnForm] = useState({
     type: "aporte",
-    date: new Date().toISOString().slice(0, 10),
+    date: toArgentinaCalendarDay(),
     amount: "",
     paymentMethod: "efectivo",
     notes: "",
@@ -733,7 +734,7 @@ export default function CajaPage() {
     } else {
       await api.post("/api/cash/commissions", data);
     }
-    setCommForm({ companyId: "", date: new Date().toISOString().slice(0, 10), amount: "", notes: "", paymentMethod: "transferencia", periodMonth: "", status: "registrado" });
+    setCommForm({ companyId: "", date: toArgentinaCalendarDay(), amount: "", notes: "", paymentMethod: "transferencia", periodMonth: "", status: "registrado" });
     loadAll();
   }
   async function deleteComm(id: number) {
@@ -752,7 +753,7 @@ export default function CajaPage() {
     } else {
       await api.post("/api/cash/iva", data);
     }
-    setIvaForm({ companyId: "", date: new Date().toISOString().slice(0, 10), amount: "", notes: "" });
+    setIvaForm({ companyId: "", date: toArgentinaCalendarDay(), amount: "", notes: "" });
     loadAll();
   }
   async function deleteIvaEntry(id: number) {
@@ -785,7 +786,7 @@ export default function CajaPage() {
       } else {
         await api.post("/api/cash/expenses", data);
       }
-      setExpForm({ type: "gasto_operativo", date: new Date().toISOString().slice(0, 10), description: "", category: "", amount: "", paymentMethod: "efectivo", payeeName: "", salaryPeriod: "", notes: "", status: "registrado" });
+      setExpForm({ type: "gasto_operativo", date: toArgentinaCalendarDay(), description: "", category: "", amount: "", paymentMethod: "efectivo", payeeName: "", salaryPeriod: "", notes: "", status: "registrado" });
       loadAll();
     } catch (e: any) {
       setExpError(e.message || "Error al guardar");
@@ -821,7 +822,7 @@ export default function CajaPage() {
       } else {
         await api.post("/api/cash/own-movements", data);
       }
-      setOwnForm({ type: "aporte", date: new Date().toISOString().slice(0, 10), amount: "", paymentMethod: "efectivo", notes: "" });
+      setOwnForm({ type: "aporte", date: toArgentinaCalendarDay(), amount: "", paymentMethod: "efectivo", notes: "" });
       loadAll();
     } catch (e: any) {
       setOwnError(e.message || "Error al guardar movimiento");

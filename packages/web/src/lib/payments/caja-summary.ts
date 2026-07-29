@@ -19,6 +19,7 @@
 
 import { OWN_METHODS, DIRECT_COMPANY_METHODS } from "./splits";
 import { classifyRemittanceAllocationState } from "./remittance-allocations";
+import { toArgentinaCalendarDay } from "../dates/argentina-date";
 
 // ─── Métodos contables ──────────────────────────────────────────────────────
 
@@ -634,9 +635,22 @@ export interface CashDebtLegacyRowForDetalle {
 }
 
 function formatDebtLegacyDate(createdAt: Date | number | string | null): string {
-  if (createdAt instanceof Date) return createdAt.toISOString().slice(0, 10);
-  if (typeof createdAt === "number") return new Date(createdAt * 1000).toISOString().slice(0, 10);
-  if (typeof createdAt === "string" && createdAt.length > 0) return createdAt.slice(0, 10);
+  if (createdAt instanceof Date) return toArgentinaCalendarDay(createdAt);
+  // Drizzle guarda created_at como epoch en SEGUNDOS (mode: "timestamp") —
+  // acá llega en segundos cuando el driver no lo convirtió a Date.
+  if (typeof createdAt === "number") return toArgentinaCalendarDay(createdAt * 1000);
+  if (typeof createdAt === "string" && createdAt.length > 0) {
+    // Ya es un día calendario (YYYY-MM-DD), sin componente de hora — no hay
+    // instante UTC que convertir, se devuelve tal cual.
+    if (/^\d{4}-\d{2}-\d{2}$/.test(createdAt)) return createdAt;
+    // Timestamp completo en string (ISO u otro parseable): es un instante
+    // real, hay que convertirlo a día calendario Argentina, no cortar el
+    // string crudo (eso asumía UTC == Argentina, la misma causa raíz que
+    // #115).
+    const parsed = new Date(createdAt);
+    if (!isNaN(parsed.getTime())) return toArgentinaCalendarDay(parsed);
+    return createdAt.slice(0, 10);
+  }
   return "";
 }
 

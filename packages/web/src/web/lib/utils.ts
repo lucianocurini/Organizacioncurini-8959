@@ -1,5 +1,6 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { toArgentinaCalendarDay, diffCalendarDays } from "../../lib/dates/argentina-date";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -45,12 +46,12 @@ export function isSafeReturnTo(path: string | null | undefined): path is string 
   );
 }
 
-export function daysUntil(dateStr: string): number {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const end = new Date(dateStr);
-  end.setHours(0, 0, 0, 0);
-  return Math.ceil((end.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+// `now` es inyectable solo para tests — los consumidores actuales (que
+// llaman daysUntil(dateStr) con un solo argumento) no cambian de
+// comportamiento, siguen usando el instante real.
+export function daysUntil(dateStr: string, now: Date = new Date()): number {
+  const today = toArgentinaCalendarDay(now);
+  return diffCalendarDays(today, dateStr);
 }
 
 export const POLICY_TYPES: Record<string, { label: string; color: string }> = {

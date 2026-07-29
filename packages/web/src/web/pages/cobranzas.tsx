@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { PendingInstallmentsBatchTab } from "@/components/payments/PendingInstallmentsBatchTab";
 import { cn, formatCurrency as _fc, formatCurrencyCents } from "@/lib/utils";
+import { toArgentinaCalendarDay, shiftArgentinaMonth } from "../../lib/dates/argentina-date";
 import {
   splitsFromPayment, computeSplitTotals, groupSplitsByMethod,
   SINGLE_SPLIT_MISMATCH_MESSAGE, isImputarButtonDisabled,
@@ -139,7 +140,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
     manualCompany: "",
     amount: "",
     splits: [createBatchSplitRow("efectivo")] as BatchSplitFormRow[],
-    paymentDate: new Date().toISOString().split("T")[0],
+    paymentDate: toArgentinaCalendarDay(),
     dueDate: "",
     periodMonth: "",
     notes: "",
@@ -190,7 +191,7 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
       setForm({
         policyId: "", installmentId: "", manualPayer: "", manualPolicyNumber: "", manualCompany: "",
         amount: "", splits: [createBatchSplitRow("efectivo")],
-        paymentDate: new Date().toISOString().split("T")[0],
+        paymentDate: toArgentinaCalendarDay(),
         dueDate: "", periodMonth: "", notes: "", status: "confirmado",
       });
     }
@@ -815,13 +816,21 @@ function CobranzasTab() {
     return true;
   });
 
+  // Últimos 6 meses calendario de Argentina — antes usaba
+  // new Date().setMonth() (hora local del navegador) + toISOString() (mes
+  // UTC), que podía no coincidir con las claves "YYYY-MM" que arma
+  // GET /cash/stats (agrupa por mes de Argentina, ver
+  // resolveArgentinaMonthKey en lib/dates/argentina-date.ts) durante la
+  // ventana nocturna de fin de mes en Argentina. shiftArgentinaMonth calcula
+  // el mes por aritmética entera pura; new Date(year, month, 1) solo se usa
+  // al final para el nombre del mes (constructor local, no hay string ni
+  // UTC de por medio).
   const monthlyData = (() => {
     if (!stats) return [];
     return Array.from({ length: 6 }, (_, i) => {
-      const d = new Date();
-      d.setMonth(d.getMonth() - (5 - i));
-      const key = d.toISOString().substring(0, 7);
-      const label = d.toLocaleDateString("es-AR", { month: "short", year: "2-digit" });
+      const key = shiftArgentinaMonth(-(5 - i));
+      const [y, m] = key.split("-").map(Number);
+      const label = new Date(y!, m! - 1, 1).toLocaleDateString("es-AR", { month: "short", year: "2-digit" });
       return { key, label, amount: stats.byMonth[key] || 0 };
     });
   })();
@@ -1192,7 +1201,7 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState("");
   const [canal, setCanal] = useState("directo");
-  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
+  const [date, setDate] = useState(toArgentinaCalendarDay());
   const [notes, setNotes] = useState("");
   const [breakdown, setBreakdown] = useState({ efectivo: "", transferencia: "", cheque: "" });
   const [debtorItems, setDebtorItems] = useState<Set<string>>(new Set());
@@ -2093,7 +2102,7 @@ function AdeudadosTab() {
   const [items, setItems] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [collectingId, setCollectingId] = useState<number | null>(null);
-  const [collectForm, setCollectForm] = useState({ paymentMethod: "efectivo", paymentDate: new Date().toISOString().slice(0, 10) });
+  const [collectForm, setCollectForm] = useState({ paymentMethod: "efectivo", paymentDate: toArgentinaCalendarDay() });
   const [collecting, setCollecting] = useState(false);
 
   const fmt = (n: number) => n.toLocaleString("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 0 });
@@ -2117,7 +2126,7 @@ function AdeudadosTab() {
 
   function startCollect(id: number) {
     setCollectingId(id);
-    setCollectForm({ paymentMethod: "efectivo", paymentDate: new Date().toISOString().slice(0, 10) });
+    setCollectForm({ paymentMethod: "efectivo", paymentDate: toArgentinaCalendarDay() });
   }
 
   // Cuota real (source="installment"): el cobro registra un payment real —
@@ -2394,7 +2403,7 @@ function GastosTab() {
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
-  const [form, setForm] = useState({ date: new Date().toISOString().slice(0, 10), description: "", amount: "", category: "", notes: "" });
+  const [form, setForm] = useState({ date: toArgentinaCalendarDay(), description: "", amount: "", category: "", notes: "" });
   const [saving, setSaving] = useState(false);
 
   const fmt = (v: number) => formatCurrency(v);
@@ -2412,7 +2421,7 @@ function GastosTab() {
 
   function openNew() {
     setEditingId(null);
-    setForm({ date: new Date().toISOString().slice(0, 10), description: "", amount: "", category: "", notes: "" });
+    setForm({ date: toArgentinaCalendarDay(), description: "", amount: "", category: "", notes: "" });
     setShowForm(true);
   }
 

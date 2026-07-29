@@ -851,10 +851,13 @@ describe("buildAdeudadosDetalle", () => {
   });
 
   test("fecha de cash_debt legacy se formatea a YYYY-MM-DD desde distintos tipos de createdAt", () => {
+    // 10:00 UTC = 07:00 Argentina, mismo día en ambos husos.
     const [a] = buildAdeudadosDetalle([], [legacy({ createdAt: "2027-04-15T10:00:00.000Z" })]);
     expect(a!.fecha).toBe("2027-04-15");
+    // 00:00 UTC = 21:00 del día anterior en Argentina — el día calendario
+    // correcto es el 31/05, no el 01/06 (valor pre-fix, que asumía UTC).
     const [b] = buildAdeudadosDetalle([], [legacy({ createdAt: new Date("2027-06-01T00:00:00.000Z") })]);
-    expect(b!.fecha).toBe("2027-06-01");
+    expect(b!.fecha).toBe("2027-05-31");
   });
 });
 

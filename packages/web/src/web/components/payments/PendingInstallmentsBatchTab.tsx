@@ -6,6 +6,7 @@ import {
   Pencil, Ban, AlertTriangle,
 } from "lucide-react";
 import { cn, formatCurrency, formatCurrencyCents } from "@/lib/utils";
+import { toArgentinaCalendarDay } from "../../../lib/dates/argentina-date";
 import {
   type PendingInstallmentForPayment, type BatchSplitFormRow, type PaymentBatchSummary,
   type PaymentBatchDetail, type BatchCartItem, type ManualPaymentFormState,
@@ -663,7 +664,7 @@ function BatchPaymentModal({
   onClose: () => void;
   onCreated: (batchId: number) => void;
 }) {
-  const [paymentDate, setPaymentDate] = useState(new Date().toISOString().slice(0, 10));
+  const [paymentDate, setPaymentDate] = useState(toArgentinaCalendarDay());
   const [notes, setNotes] = useState("");
   const [splits, setSplits] = useState<BatchSplitFormRow[]>(() => {
     const target = calculateBatchTargetAmountCents(cart, [{ ...createBatchSplitRow("efectivo"), method: "efectivo" }]);

@@ -32,6 +32,7 @@
 
 import { eq, and } from "drizzle-orm";
 import { payments, policyInstallments } from "../../api/database/schema";
+import { toArgentinaCalendarDay } from "../dates/argentina-date";
 
 export async function recalculateInstallmentPaymentStatus(tx: any, installmentId: number): Promise<void> {
   const installment = await tx
@@ -57,7 +58,7 @@ export async function recalculateInstallmentPaymentStatus(tx: any, installmentId
 
   if (installment.status === "no_exigible") return; // conserva no_exigible — no hay pago válido que la reactive
 
-  const today = new Date().toISOString().split("T")[0];
+  const today = toArgentinaCalendarDay();
   const newStatus = installment.dueDate < today ? "vencida" : "pendiente";
   await tx.update(policyInstallments).set({ status: newStatus }).where(eq(policyInstallments.id, installmentId));
 }

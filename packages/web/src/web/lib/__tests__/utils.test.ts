@@ -4,7 +4,7 @@
 // (redondeo a peso entero, usado en dashboards/reportes) no se toca acá.
 // Ejecutar con: bun test packages/web/src/web/lib/__tests__/utils.test.ts
 import { describe, test, expect } from "bun:test";
-import { formatCurrencyCents } from "../utils";
+import { formatCurrencyCents, daysUntil } from "../utils";
 import { createSplitRow, computeSplitTotals } from "../payment-splits-form";
 
 describe("formatCurrencyCents", () => {
@@ -59,5 +59,54 @@ describe("Caso de regresión — diferencia de centavos visible con formatCurren
     const totals = computeSplitTotals("249911.94", splits);
     expect(totals.diferenciaCents).toBe(0);
     expect(formatCurrencyCents(totals.diferenciaCents)).toMatch(/^\$\s*0,00$/);
+  });
+});
+
+// ─── daysUntil — Bug B: antes parseaba la fecha con new Date(dateStr) (UTC)
+// y truncaba con setHours(0,0,0,0) (local), corriendo el resultado -1 día
+// siempre en Argentina, sin depender de la hora. Ahora compara ordinales de
+// calendario puros (ver lib/dates/argentina-date). El segundo argumento
+// `now` es solo para poder testear sin mockear el reloj global — los
+// consumidores reales (polizas.tsx, poliza-detail.tsx) siguen llamando
+// daysUntil(dateStr) con un solo argumento.
+describe("daysUntil", () => {
+  test("vencimiento hoy → 0", () => {
+    const now = new Date("2026-08-01T15:00:00.000Z"); // 12:00 Argentina
+    expect(daysUntil("2026-08-01", now)).toBe(0);
+  });
+
+  test("vencimiento mañana → 1", () => {
+    const now = new Date("2026-08-01T15:00:00.000Z");
+    expect(daysUntil("2026-08-02", now)).toBe(1);
+  });
+
+  test("vencimiento ayer → -1", () => {
+    const now = new Date("2026-08-01T15:00:00.000Z");
+    expect(daysUntil("2026-07-31", now)).toBe(-1);
+  });
+
+  test("caso que antes quedaba desplazado un día: endDate=2026-08-15, hoy=2026-08-01 Argentina → 14, no 13", () => {
+    // now = 2026-08-01T15:00:00Z = 12:00 Argentina, día calendario 2026-08-01.
+    // Con el bug viejo: new Date("2026-08-15").setHours(0,0,0,0) quedaba
+    // anclado en 2026-08-14 local → daysUntil devolvía 13.
+    const now = new Date("2026-08-01T15:00:00.000Z");
+    expect(daysUntil("2026-08-15", now)).toBe(14);
+  });
+
+  test("estable en la ventana 21:00–23:59 Argentina: today calculado en UTC daría un día de más", () => {
+    // 2026-07-28 22:16:56 Argentina = 2026-07-29T01:16:56Z (instante real de
+    // la rendición #115). El "hoy" correcto sigue siendo 28/07.
+    const now = new Date("2026-07-29T01:16:56.000Z");
+    expect(daysUntil("2026-07-28", now)).toBe(0);
+    expect(daysUntil("2026-07-29", now)).toBe(1); // con el bug viejo esto daba 0
+  });
+
+  test("formato de dateStr inválido → lanza (nunca compara silenciosamente mal)", () => {
+    expect(() => daysUntil("28/07/2026")).toThrow();
+    expect(() => daysUntil("2026-13-01")).toThrow();
+  });
+
+  test("sin segundo argumento usa el reloj real y no lanza", () => {
+    expect(typeof daysUntil("2030-01-01")).toBe("number");
   });
 });
