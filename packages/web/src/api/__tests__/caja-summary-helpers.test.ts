@@ -28,6 +28,7 @@ import {
   type RemittanceDebtRowForDetalle,
   type CashDebtLegacyRowForDetalle,
 } from "../../lib/payments/caja-summary";
+import { calculateExpectedCollectedCents } from "../../lib/payments/remittance-allocations";
 
 // ─── Métodos contables ──────────────────────────────────────────────────────
 
@@ -472,6 +473,142 @@ describe("collectDistinctExpectedSources", () => {
     ]);
     expect(result.standalonePaymentIds.sort()).toEqual([1, 2]);
     expect(result.cashEntryIds).toEqual([9]);
+  });
+});
+
+// ─── Hotfix — batch_child_payment (Migración 0029) nunca cuenta el batch
+// completo en expectedCollectedCents (ver caja-summary.ts, comentario sobre
+// collectDistinctExpectedSources) ─────────────────────────────────────────
+describe("collectDistinctExpectedSources — batch_child_payment (hijo de batch rendido por separado)", () => {
+  test("allocation solo con paymentId (sin paymentBatchId) → fuente individual", () => {
+    const result = collectDistinctExpectedSources([
+      { paymentId: 502, paymentBatchId: null, cashEntryId: null },
+    ]);
+    expect(result.standalonePaymentIds).toEqual([502]);
+    expect(result.batchIds).toEqual([]);
+  });
+
+  test("allocation solo con paymentBatchId (sin paymentId) → lote completo", () => {
+    const result = collectDistinctExpectedSources([
+      { paymentId: null, paymentBatchId: 3, cashEntryId: null },
+    ]);
+    expect(result.batchIds).toEqual([3]);
+    expect(result.standalonePaymentIds).toEqual([]);
+  });
+
+  test("allocation con paymentId Y paymentBatchId simultáneos → hijo individual, NUNCA el lote completo", () => {
+    const result = collectDistinctExpectedSources([
+      { paymentId: 493, paymentBatchId: 3, cashEntryId: null },
+    ]);
+    expect(result.standalonePaymentIds).toEqual([493]);
+    expect(result.batchIds).toEqual([]); // el batch 3 NO debe aparecer acá
+  });
+
+  test("varias allocations del mismo hijo (paymentId+paymentBatchId repetido) no duplican la fuente", () => {
+    const result = collectDistinctExpectedSources([
+      { paymentId: 493, paymentBatchId: 3, cashEntryId: null },
+      { paymentId: 493, paymentBatchId: 3, cashEntryId: null },
+      { paymentId: 493, paymentBatchId: 3, cashEntryId: null },
+    ]);
+    expect(result.standalonePaymentIds).toEqual([493]);
+    expect(result.batchIds).toEqual([]);
+  });
+
+  test("varias allocations del mismo lote completo (solo paymentBatchId) no duplican el lote", () => {
+    const result = collectDistinctExpectedSources([
+      { paymentId: null, paymentBatchId: 7, cashEntryId: null },
+      { paymentId: null, paymentBatchId: 7, cashEntryId: null },
+    ]);
+    expect(result.batchIds).toEqual([7]);
+    expect(result.standalonePaymentIds).toEqual([]);
+  });
+
+  test("combinación: hijo de batch + pago individual → ambos van a standalonePaymentIds, ningún batch completo", () => {
+    const result = collectDistinctExpectedSources([
+      { paymentId: 493, paymentBatchId: 3, cashEntryId: null }, // hijo de batch 3
+      { paymentId: 502, paymentBatchId: null, cashEntryId: null }, // pago standalone
+    ]);
+    expect(result.standalonePaymentIds.sort((a, b) => a - b)).toEqual([493, 502]);
+    expect(result.batchIds).toEqual([]);
+  });
+
+  test("combinación: lote completo + pago individual → el batch se cuenta aparte del pago", () => {
+    const result = collectDistinctExpectedSources([
+      { paymentId: null, paymentBatchId: 3, cashEntryId: null }, // instrumento del batch 3 completo
+      { paymentId: 502, paymentBatchId: null, cashEntryId: null }, // pago standalone, sin relación al batch
+    ]);
+    expect(result.batchIds).toEqual([3]);
+    expect(result.standalonePaymentIds).toEqual([502]);
+  });
+
+  test("rendición equivalente a #115: 3 hijos de batch 3 (rendidos por separado) + 1 pago standalone → expected $302.608, NO $760.122 (batch 3 completo)", () => {
+    // Datos reales verificados por SELECT-only contra Turso producción (ver
+    // diagnóstico de sesión anterior): batch 3 tiene 9 hijos, total_received_cents
+    // = $652.282; la rendición #115 solo rindió 3 de esos 9 hijos (493/494/498)
+    // + el pago standalone 502. El batch sigue con 6 hijos sin rendir (en cartera).
+    const allocations = [
+      { paymentId: 493, paymentBatchId: 3, cashEntryId: null }, // $42.270
+      { paymentId: 494, paymentBatchId: 3, cashEntryId: null }, // $35.088
+      { paymentId: 498, paymentBatchId: 3, cashEntryId: null }, // $117.410
+      { paymentId: 502, paymentBatchId: null, cashEntryId: null }, // $107.840, standalone
+    ];
+    const distinct = collectDistinctExpectedSources(allocations);
+    expect(distinct.batchIds).toEqual([]); // el batch 3 NUNCA debe aparecer como "completo" acá
+    expect(distinct.standalonePaymentIds.sort((a, b) => a - b)).toEqual([493, 494, 498, 502]);
+
+    const paymentAmountCentsById = new Map<number, number>([
+      [493, 4227000], [494, 3508800], [498, 11741000], [502, 10784000],
+    ]);
+    // total_received_cents real del batch 3 (9 hijos) — no debe usarse en este cálculo.
+    const batchTotalCentsById = new Map<number, number>([[3, 65228200]]);
+
+    const sources = [
+      ...distinct.standalonePaymentIds.map((id) => ({ kind: "standalone_payment" as const, amountCents: paymentAmountCentsById.get(id) ?? 0 })),
+      ...distinct.batchIds.map((id) => ({ kind: "batch" as const, amountCents: batchTotalCentsById.get(id) ?? 0 })),
+    ];
+    const expectedCollectedCents = calculateExpectedCollectedCents(sources);
+
+    expect(expectedCollectedCents).toBe(30260800); // $302.608 — la suma real de las 4 allocations
+    expect(expectedCollectedCents).not.toBe(76012200); // $760.122 — lo que daba el bug (batch completo + standalone)
+  });
+
+  test("regresión: un batch rendido COMPLETO de una sola vez (sin ningún paymentId) sigue sumando su total_received_cents entero, sin cambios", () => {
+    // Comportamiento previo a este fix, para un batch que SÍ se rinde entero
+    // con su propio instrumento de cobranza (batch_split/batch_split_check) —
+    // no debe verse afectado por distinguir el caso batch_child_payment.
+    const allocations = [
+      { paymentId: null, paymentBatchId: 9, cashEntryId: null },
+      { paymentId: null, paymentBatchId: 9, cashEntryId: null }, // ej. 2 cheques del mismo split
+    ];
+    const distinct = collectDistinctExpectedSources(allocations);
+    expect(distinct.batchIds).toEqual([9]);
+    expect(distinct.standalonePaymentIds).toEqual([]);
+
+    const batchTotalCentsById = new Map<number, number>([[9, 280000]]);
+    const sources = distinct.batchIds.map((id) => ({ kind: "batch" as const, amountCents: batchTotalCentsById.get(id) ?? 0 }));
+    expect(calculateExpectedCollectedCents(sources)).toBe(280000);
+  });
+
+  test("regresión: una rendición consistente con un batch completo real sigue clasificando 'complete', nunca pasa a 'inconsistent'", () => {
+    // allocationSumCents de la rendición = exactamente el total del batch (caso
+    // real: el batch se rindió entero, de una sola vez) — con el fix, este caso
+    // sigue sin ningún paymentId, así que sigue tratándose como batch completo
+    // y la comparación sigue cerrando exacto.
+    const allocations = [
+      { paymentId: null, paymentBatchId: 9, cashEntryId: null },
+    ];
+    const distinct = collectDistinctExpectedSources(allocations);
+    const batchTotalCentsById = new Map<number, number>([[9, 280000]]);
+    const sources = distinct.batchIds.map((id) => ({ kind: "batch" as const, amountCents: batchTotalCentsById.get(id) ?? 0 }));
+    const expectedCollectedCents = calculateExpectedCollectedCents(sources);
+
+    const c = classifyRemittanceForRendido({
+      remittanceId: 999, date: "2027-01-01",
+      allocations: [{ method: "transferencia_compania", amountCents: 280000, isProntoPagoSurcharge: false }],
+      expectedCollectedCents, hasRealMoneyItems: true, legacyPaymentBreakdownRaw: "{}",
+    });
+    expect(c.state).toBe("complete");
+    expect(c.inconsistency).toBeUndefined();
   });
 });
 

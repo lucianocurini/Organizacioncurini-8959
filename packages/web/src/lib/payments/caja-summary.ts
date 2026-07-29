@@ -285,6 +285,20 @@ export function applyManualCashEntryToCartera(
 // /remittances: payments.amount, payment_batches.totalReceivedCents,
 // cash_entries.amount — nunca resumando las mismas allocations). Un batch con
 // varios splits/cheques solo debe agruparse UNA vez acá.
+//
+// Migración 0029 (rendición por cuota): un payment HIJO de un batch rendido
+// de forma independiente (batch_child_payment, ver
+// resolveBatchChildPaymentInstrument en remittance-allocations.ts) genera una
+// allocation con paymentId Y paymentBatchId simultáneos — paymentBatchId ahí
+// es puramente denormalizado (trazabilidad de "de qué lote vino"), nunca
+// significa "este batch se rindió completo". Solo una allocation con
+// paymentBatchId SIN paymentId (batch_split/batch_split_check reales, ver
+// resolveBatchInstruments) representa de verdad el instrumento de cobranza
+// del batch entero, y debe sumar su totalReceivedCents completo. Antes de
+// este fix, cualquier paymentBatchId no nulo (con o sin paymentId) se trataba
+// como batch completo — eso hacía que una rendición con solo algunos hijos de
+// un batch (el resto siguen sin rendir, en cartera) comparara la suma real de
+// sus allocations contra el batch ENTERO y siempre diera "inconsistent".
 export interface AllocationRefForExpected {
   paymentId: number | null;
   paymentBatchId: number | null;
@@ -302,7 +316,8 @@ export function collectDistinctExpectedSources(
   const batchIds = new Set<number>();
   const cashEntryIds = new Set<number>();
   for (const a of allocations) {
-    if (a.paymentBatchId != null) batchIds.add(a.paymentBatchId);
+    if (a.paymentBatchId != null && a.paymentId != null) paymentIds.add(a.paymentId); // batch_child_payment: hijo individual, no el batch completo
+    else if (a.paymentBatchId != null) batchIds.add(a.paymentBatchId); // batch_split/batch_split_check: instrumento del batch completo real
     else if (a.paymentId != null) paymentIds.add(a.paymentId);
     if (a.cashEntryId != null) cashEntryIds.add(a.cashEntryId);
   }
