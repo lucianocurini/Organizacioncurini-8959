@@ -2,9 +2,13 @@ import { useEffect, useState, useRef } from "react";
 import { api } from "@/lib/api";
 import { X, Loader2, ListOrdered, Search, RefreshCw, ChevronRight, Plus, Trash2, UserCheck, Car } from "lucide-react";
 import { toast } from "sonner";
-import { buildInstallmentPlan, addCalendarMonths } from "../../../lib/installments/plan";
+import { addCalendarMonths } from "../../../lib/installments/plan";
 import { toArgentinaCalendarDay } from "../../../lib/dates/argentina-date";
 import { parseExpectedInstallmentsInput } from "@/lib/installments-rebuild";
+import {
+  planMonthlyInstallments, nextFirstDueDateOnStartDateChange, type InstRow,
+} from "@/lib/policy-installments-form";
+import { formatDate } from "@/lib/utils";
 
 // ─── Insured Person ───────────────────────────────────────────────────────────
 interface InsuredPerson {
@@ -68,22 +72,11 @@ const VIGENCY_DEFAULT_COUNT: Record<string, number> = { anual: 12, semestral: 6,
 // automáticamente vía calcEndDate si es semestral/cuatrimestral). Mientras
 // no esté completo no hay período real que previsualizar: no se inventa
 // uno, se devuelve una previsualización vacía.
-function planMonthlyInstallments(startDate: string, endDate: string, count: number, monthlyFee: number): InstRow[] {
-  if (!startDate || !endDate || count < 1) return [];
-  try {
-    const { installments } = buildInstallmentPlan({
-      periodStart: startDate,
-      periodEnd: endDate,
-      periodAmount: (monthlyFee || 0) * count,
-      installmentCount: count,
-    });
-    return installments.map((i) => ({ number: i.number, dueDate: i.dueDate, amount: i.amount, notes: "" }));
-  } catch {
-    // Fechas inconsistentes (fin < inicio) o la cantidad de cuotas pedida no
-    // entra en la vigencia cargada — no se previsualiza ningún plan parcial.
-    return [];
-  }
-}
+//
+// planMonthlyInstallments (con el "Vencimiento de la primera cuota" que
+// arma esta previsualización) vive en web/lib/policy-installments-form.ts
+// — extraída para poder testearla sin renderizar el componente, mismo
+// patrón que installments-rebuild.ts/rebilling-modal.ts.
 
 function renumber(rows: InstRow[]): InstRow[] {
   return rows.map((r, i) => ({ ...r, number: i + 1 }));
@@ -210,8 +203,6 @@ function calcEndDate(start: string, period: string): string {
   return d.toISOString().split("T")[0];
 }
 
-interface InstRow { number: number; dueDate: string; amount: number; notes: string; }
-
 export function PolicyModal({ initial, onClose, onSaved }: Props) {
   const isEdit = !!initial;
   const [companies, setCompanies] = useState<any[]>([]);
@@ -222,6 +213,16 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
   const [showInstallments, setShowInstallments] = useState(false);
   const [installmentCount, setInstallmentCount] = useState(!isEdit ? 12 : 0);
   const [installmentsDirty, setInstallmentsDirty] = useState(false);
+  // Vencimiento de la primera cuota — solo tiene sentido en alta (isEdit
+  // nunca la muestra ni la usa). Arranca igual a startDate (mismo valor
+  // inicial, toArgentinaCalendarDay()); se resetea solo porque el modal se
+  // desmonta y remonta entre aperturas (ver PolicyModal en polizas.tsx/
+  // poliza-detail.tsx: `{showX && <PolicyModal .../>}`) — no hace falta
+  // ningún reset manual al cerrar/guardar, useState ya vuelve a este valor.
+  const [firstDueDate, setFirstDueDate] = useState(!isEdit ? toArgentinaCalendarDay() : "");
+  // true en cuanto el usuario edita el campo directamente — a partir de ahí
+  // deja de seguir a startDate (ver nextFirstDueDateOnStartDateChange).
+  const [firstDueDateTouched, setFirstDueDateTouched] = useState(false);
 
   // Renewal search state
   const [renewalQ, setRenewalQ] = useState("");
@@ -414,6 +415,16 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
       return next;
     });
     if (!isEdit) {
+      // "Vencimiento de la primera cuota" sigue a startDate mientras el
+      // usuario no la haya tocado manualmente — se recalcula acá (no en un
+      // useEffect aparte) para poder usar el valor ya sincronizado en el
+      // mismo recompute de installmentRows de abajo, sin esperar un
+      // re-render.
+      let nextFirstDueDate = firstDueDate;
+      if (key === "startDate") {
+        nextFirstDueDate = nextFirstDueDateOnStartDateChange(firstDueDate, firstDueDateTouched, val);
+        if (nextFirstDueDate !== firstDueDate) setFirstDueDate(nextFirstDueDate);
+      }
       // endDate puede haber cambiado recién arriba (calcEndDate, para
       // semestral/cuatrimestral) — `form.endDate` todavía tiene el valor
       // viejo en este punto porque setForm es asíncrono. Se recalcula acá
@@ -424,15 +435,15 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
         if (suggested) {
           setInstallmentCount(suggested);
           const newEndDate = val !== "anual" && form.startDate ? calcEndDate(form.startDate, val) : form.endDate;
-          if (form.startDate) setInstallmentRows(planMonthlyInstallments(form.startDate, newEndDate, suggested, Number(form.monthlyFee) || 0));
+          if (form.startDate) setInstallmentRows(planMonthlyInstallments(form.startDate, newEndDate, suggested, Number(form.monthlyFee) || 0, nextFirstDueDate).installments);
         }
       } else if (key === "startDate" && !installmentsDirty && installmentCount > 0) {
         const newEndDate = form.vigencyPeriod !== "anual" ? calcEndDate(val, form.vigencyPeriod) : form.endDate;
-        setInstallmentRows(planMonthlyInstallments(val, newEndDate, installmentCount, Number(form.monthlyFee) || 0));
+        setInstallmentRows(planMonthlyInstallments(val, newEndDate, installmentCount, Number(form.monthlyFee) || 0, nextFirstDueDate).installments);
       } else if (key === "endDate" && !installmentsDirty && installmentCount > 0 && form.startDate) {
-        setInstallmentRows(planMonthlyInstallments(form.startDate, val, installmentCount, Number(form.monthlyFee) || 0));
+        setInstallmentRows(planMonthlyInstallments(form.startDate, val, installmentCount, Number(form.monthlyFee) || 0, nextFirstDueDate).installments);
       } else if (key === "monthlyFee" && !installmentsDirty && installmentCount > 0 && form.startDate) {
-        setInstallmentRows(planMonthlyInstallments(form.startDate, form.endDate, installmentCount, Number(val) || 0));
+        setInstallmentRows(planMonthlyInstallments(form.startDate, form.endDate, installmentCount, Number(val) || 0, nextFirstDueDate).installments);
       }
     }
   };
@@ -462,6 +473,23 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
       }
       expectedInstallments = parsed.value;
     }
+    // Alta: recalcula el plan con los valores actuales del formulario
+    // (incluido firstDueDate) antes de crear nada. Si el usuario ya editó
+    // la tabla a mano (installmentsDirty), esas filas son la autoridad —
+    // igual que hoy, no se revalida contra buildInstallmentPlan. Si no,
+    // cualquier combinación inválida (firstDueDate fuera del período,
+    // formato incorrecto, etc.) bloquea acá, con el mensaje de
+    // InstallmentPlanError — nunca se crea la póliza ni las cuotas con un
+    // plan inválido.
+    let finalInstallmentRows = installmentRows;
+    if (!isEdit && !installmentsDirty && installmentCount > 0 && form.startDate && form.endDate) {
+      const result = planMonthlyInstallments(form.startDate, form.endDate, installmentCount, Number(form.monthlyFee) || 0, firstDueDate);
+      if (result.error) {
+        toast.error(result.error);
+        return;
+      }
+      finalInstallmentRows = result.installments;
+    }
     setLoading(true);
     try {
       const payload: any = {
@@ -475,7 +503,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
         billingCycle: form.billingCycle || null,
         vigencyPeriod: form.vigencyPeriod || null,
         nextRebillingDate: form.nextRebillingDate || null,
-        installments: isEdit ? expectedInstallments : (installmentRows.length || null),
+        installments: isEdit ? expectedInstallments : (finalInstallmentRows.length || null),
         vehicleYear: form.vehicleYear ? Number(form.vehicleYear) : null,
         motoYear: form.motoYear ? Number(form.motoYear) : null,
         renewedFromId: renewedFrom ? renewedFrom.policy.id : null,
@@ -513,8 +541,8 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
       } else {
         const policy = await api.post("/api/policies", payload);
         // Save installments if any
-        if (installmentRows.length > 0 && policy.id) {
-          await api.post(`/api/policies/${policy.id}/installments/generate`, { installments: installmentRows });
+        if (finalInstallmentRows.length > 0 && policy.id) {
+          await api.post(`/api/policies/${policy.id}/installments/generate`, { installments: finalInstallmentRows });
         }
         // Save insured persons for accidentes/ART
         if ((form.type === "accidentes" || form.type === "art" || form.type === "vida") && policy.id) {
@@ -786,11 +814,32 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
                     const n = Math.max(1, Number(e.target.value) || 1);
                     setInstallmentCount(n);
                     if (form.startDate) {
-                      setInstallmentRows(planMonthlyInstallments(form.startDate, form.endDate, n, Number(form.monthlyFee) || 0));
+                      setInstallmentRows(planMonthlyInstallments(form.startDate, form.endDate, n, Number(form.monthlyFee) || 0, firstDueDate).installments);
                       setInstallmentsDirty(false);
                     }
                   }}
                 />
+              </div>
+            )}
+            {!isEdit && (
+              <div className="col-span-2">
+                <label className={labelClass}>Vencimiento de la primera cuota</label>
+                <input
+                  className={inputClass}
+                  type="date"
+                  value={firstDueDate}
+                  onChange={e => {
+                    const v = e.target.value;
+                    setFirstDueDate(v);
+                    setFirstDueDateTouched(true);
+                    if (!installmentsDirty && form.startDate && installmentCount > 0) {
+                      setInstallmentRows(planMonthlyInstallments(form.startDate, form.endDate, installmentCount, Number(form.monthlyFee) || 0, v).installments);
+                    }
+                  }}
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  Si se deja vacío, se usa el inicio de la vigencia{form.startDate ? ` (${formatDate(form.startDate)})` : ""}.
+                </p>
               </div>
             )}
             {isEdit && (() => {
