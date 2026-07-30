@@ -264,13 +264,23 @@ export const receivedChecks = sqliteTable("received_checks", {
 export const deliveries = sqliteTable("deliveries", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   policyId: integer("policy_id").references(() => policies.id), // nullable — envío manual sin póliza
+  // Migración 0031 — opcional; obligatorio A NIVEL APLICACIÓN cuando
+  // documentType="refacturacion" y policyId no es null (ver
+  // lib/deliveries/validation.ts). Siempre null en registros manuales.
+  rebillingId: integer("rebilling_id").references(() => rebillings.id),
   manualRecipient: text("manual_recipient"),
   manualPolicyNumber: text("manual_policy_number"),
   manualCompany: text("manual_company"),
   documentType: text("document_type").notNull(), // poliza | refacturacion
   channel: text("channel").notNull(), // whatsapp | email | copia_cliente | retiro_oficina
-  status: text("status").notNull().default("pendiente"), // pendiente | realizado
+  // pendiente | enviado | entregado (flujo vigente desde 0031) | realizado
+  // (valor histórico — solo vía PATCH /deliveries/:id/complete legacy, nunca
+  // se reinterpreta ni se reescribe en filas existentes).
+  status: text("status").notNull().default("pendiente"),
   scheduledDate: text("scheduled_date"),
+  // Migración 0031 — fecha en que el seguimiento pasó a "enviado". Distinta
+  // de scheduledDate (programada) y de completedDate (entregado/realizado).
+  sentDate: text("sent_date"),
   completedDate: text("completed_date"),
   notes: text("notes"),
   createdBy: integer("created_by").references(() => users.id),

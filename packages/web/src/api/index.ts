@@ -85,6 +85,12 @@ import {
   summarizeInsuredAccountBalances, calculateCreditActiveInCaja, calculateCreditRegularizedInCaja,
   calculateCobroSaldoDeudorInCaja, isSafeToCancelAccountMovementOrigin, type InsuredAccountMovementForCaja,
 } from "../lib/payments/insured-account";
+import {
+  isValidChannel, validateDeliveryLink, DeliveryValidationError,
+  hasActiveDuplicateDelivery, DeliveryDuplicateError,
+  validateSendTransition, validateDeliverTransition, DeliveryStatusTransitionError,
+  DELIVERY_CHANNELS,
+} from "../lib/deliveries/validation";
 
 const app = new Hono().basePath("/api");
 
@@ -643,6 +649,17 @@ app.delete("/rebillings/:id", requireAuth(async (c: any) => {
 
   const rebilling = await db.select({ id: rebillings.id, policyId: rebillings.policyId }).from(rebillings).where(eq(rebillings.id, id)).get();
   if (!rebilling) return c.json({ error: "La refacturación ya no existe" }, 404);
+
+  // Migración 0031 — un seguimiento de Envíos y Entregas vinculado a esta
+  // refacturación puntual (deliveries.rebillingId) bloquea el borrado, con
+  // el mismo criterio ya usado para pólizas (ver BLOCK_MSG en
+  // DELETE /policies/:id) — 409 claro en vez de dejar rebilling_id huérfano
+  // o depender de un fallo opaco de FK.
+  const linkedDelivery = await db.select({ id: deliveries.id }).from(deliveries)
+    .where(eq(deliveries.rebillingId, id)).get();
+  if (linkedDelivery) {
+    return c.json({ error: "No se puede eliminar la refacturación porque tiene un seguimiento de Envíos y Entregas vinculado." }, 409);
+  }
 
   const linkedInstallments = await loadRebillingGroup(db, id);
   const installmentIds = linkedInstallments.map((i: any) => i.id);
@@ -3781,62 +3798,238 @@ app.get("/payments/stats", requireAuth(async (c: any) => {
 }));
 
 // ─── DELIVERIES ───────────────────────────────────────────────────────────────
+//
+// Integración formal con Pólizas/Refacturaciones — Paso A (migración 0031):
+// deliveries.rebillingId + deliveries.sentDate, validación de vínculo real,
+// anti-duplicado transaccional (mismo patrón que RebillingDuplicateError/
+// checkDuplicateRebilling más abajo) y flujo de 3 estados nuevo. Reglas
+// completas en ../lib/deliveries/validation.ts.
+//
+// ── Coexistencia de PATCH /complete (legacy) con /send y /deliver (nuevos) ──
+// PATCH /deliveries/:id/complete NO CAMBIA — sigue moviendo cualquier estado
+// directo a "realizado" con completedDate=hoy, sin validar el estado previo,
+// exactamente como antes de esta migración (el frontend actual solo conoce
+// este endpoint; no se puede tocar su comportamiento sin frontend nuevo que
+// lo reemplace). Las creaciones nuevas siguen arrancando en "pendiente" —
+// desde ahí, un caller puede seguir usando el camino legacy de un solo paso
+// (PATCH /complete → "realizado") O el flujo nuevo de dos pasos explícitos
+// (PATCH /send → "enviado" → PATCH /deliver → "entregado"). Ambos caminos
+// son válidos y conviven: el anti-duplicado y el "permitir reenvío" tratan
+// "entregado" y "realizado" de forma idéntica (ambos fuera de
+// ACTIVE_DELIVERY_STATUSES). No hay plan de unificarlos en este Paso A —
+// eso requiere decidir con el frontend nuevo si el botón legacy desaparece.
+
+// Señal de control de flujo dentro de db.transaction — nunca se expone tal
+// cual al cliente (mismo patrón que RebillingDuplicateError).
+class DeliveryDuplicateHttpError extends DeliveryDuplicateError {}
+
 app.get("/deliveries", requireAuth(async (c: any) => {
-  const { policyId, channel, status, documentType } = c.req.query();
+  const { policyId, rebillingId, channel, status, documentType } = c.req.query();
   let results = await db
-    .select({ delivery: deliveries, policy: policies, insured: insureds, company: companies })
+    .select({ delivery: deliveries, policy: policies, insured: insureds, company: companies, rebilling: rebillings })
     .from(deliveries)
     .leftJoin(policies, eq(deliveries.policyId, policies.id))
     .leftJoin(insureds, eq(policies.insuredId, insureds.id))
     .leftJoin(companies, eq(policies.companyId, companies.id))
+    .leftJoin(rebillings, eq(deliveries.rebillingId, rebillings.id))
     .orderBy(desc(deliveries.createdAt))
     .all();
   if (policyId) results = results.filter((r) => r.delivery.policyId === Number(policyId));
+  if (rebillingId) results = results.filter((r) => r.delivery.rebillingId === Number(rebillingId));
   if (channel) results = results.filter((r) => r.delivery.channel === channel);
   if (status) results = results.filter((r) => r.delivery.status === status);
   if (documentType) results = results.filter((r) => r.delivery.documentType === documentType);
   return c.json(results, 200);
 }));
 
+// Resuelve y valida policyId/rebillingId contra la DB real, aplica las
+// reglas de vínculo puras (validateDeliveryLink) — compartido por POST y PUT.
+// Nunca toca `c` — devuelve un resultado tipado explícito; el caller decide
+// cómo responder.
+type DeliveryLinkResolution =
+  | { ok: true; policyId: number | null; rebillingId: number | null }
+  | { ok: false; status: 400 | 404; error: string };
+
+async function resolveAndValidateDeliveryLink(
+  policyIdRaw: any, rebillingIdRaw: any, documentType: any
+): Promise<DeliveryLinkResolution> {
+  const policyId = policyIdRaw != null && policyIdRaw !== "" ? Number(policyIdRaw) : null;
+  const rebillingId = rebillingIdRaw != null && rebillingIdRaw !== "" ? Number(rebillingIdRaw) : null;
+
+  if (policyId != null) {
+    const policy = await db.select({ id: policies.id }).from(policies).where(eq(policies.id, policyId)).get();
+    if (!policy) return { ok: false, status: 404, error: "La póliza indicada no existe." };
+  }
+
+  let rebilling: { id: number; policyId: number } | undefined;
+  if (rebillingId != null) {
+    rebilling = await db.select({ id: rebillings.id, policyId: rebillings.policyId })
+      .from(rebillings).where(eq(rebillings.id, rebillingId)).get();
+    if (!rebilling) return { ok: false, status: 404, error: "La refacturación indicada no existe." };
+  }
+
+  try {
+    validateDeliveryLink({ policyId, rebillingId, documentType }, rebilling ?? null);
+  } catch (e: any) {
+    if (e instanceof DeliveryValidationError) return { ok: false, status: 400, error: e.message };
+    throw e;
+  }
+
+  return { ok: true, policyId, rebillingId };
+}
+
+async function loadActiveDeliveriesForPolicy(dbClient: any, policyId: number) {
+  return dbClient.select({
+    id: deliveries.id, policyId: deliveries.policyId, rebillingId: deliveries.rebillingId,
+    documentType: deliveries.documentType, status: deliveries.status,
+  }).from(deliveries).where(eq(deliveries.policyId, policyId)).all();
+}
+
 app.post("/deliveries", requireAuth(async (c: any) => {
   const user = c.get("user");
   const body = await c.req.json();
-  const hasPolicyId = body.policyId != null && body.policyId !== "";
-  const [delivery] = await db
-    .insert(deliveries)
-    .values({
-      policyId: hasPolicyId ? Number(body.policyId) : null,
-      manualRecipient: body.manualRecipient || null,
-      manualPolicyNumber: body.manualPolicyNumber || null,
-      manualCompany: body.manualCompany || null,
-      documentType: body.documentType,
-      channel: body.channel,
-      status: body.status || "pendiente",
-      scheduledDate: body.scheduledDate || null,
-      notes: body.notes || null,
-      createdBy: user.id,
-    })
-    .returning();
-  return c.json(delivery, 201);
+
+  if (!isValidChannel(body.channel)) {
+    return c.json({ error: `channel inválido: "${body.channel}". Valores permitidos: ${DELIVERY_CHANNELS.join(", ")}.` }, 400);
+  }
+
+  const resolved = await resolveAndValidateDeliveryLink(body.policyId, body.rebillingId, body.documentType);
+  if (!resolved.ok) return c.json({ error: resolved.error }, resolved.status);
+  const { policyId, rebillingId } = resolved;
+
+  try {
+    const delivery = await db.transaction(async (tx) => {
+      if (policyId != null) {
+        const activeRows = await loadActiveDeliveriesForPolicy(tx, policyId);
+        if (hasActiveDuplicateDelivery({ policyId, rebillingId, documentType: body.documentType }, activeRows)) {
+          throw new DeliveryDuplicateHttpError(
+            "Ya existe un seguimiento activo (pendiente o enviado) para este documento."
+          );
+        }
+      }
+      const [row] = await tx.insert(deliveries).values({
+        policyId,
+        rebillingId,
+        manualRecipient: body.manualRecipient || null,
+        manualPolicyNumber: body.manualPolicyNumber || null,
+        manualCompany: body.manualCompany || null,
+        documentType: body.documentType,
+        channel: body.channel,
+        status: "pendiente", // toda creación nueva arranca acá — status del body se ignora a propósito
+        scheduledDate: body.scheduledDate || null,
+        notes: body.notes || null,
+        createdBy: user.id,
+      }).returning();
+      return row;
+    });
+    return c.json(delivery, 201);
+  } catch (e: any) {
+    if (e instanceof DeliveryDuplicateHttpError) return c.json({ error: e.message }, 409);
+    throw e;
+  }
 }));
 
+// Campos editables por PUT: vínculo (policyId/rebillingId), datos
+// descriptivos (documentType/channel/manual*/notes/scheduledDate). status,
+// sentDate y completedDate NUNCA se aceptan acá — solo se mueven a través de
+// las transiciones dedicadas (/send, /deliver, /complete legacy). Así una
+// edición de canal/observaciones nunca puede pisar un vínculo o una fecha ya
+// cargada por accidente.
+const DELIVERY_PUT_FIELDS = [
+  "policyId", "rebillingId", "manualRecipient", "manualPolicyNumber", "manualCompany",
+  "documentType", "channel", "scheduledDate", "notes",
+] as const;
+
 app.put("/deliveries/:id", requireAuth(async (c: any) => {
-  const body = await c.req.json();
   const id = Number(c.req.param("id"));
+  const body = await c.req.json();
+
+  const existing = await db.select().from(deliveries).where(eq(deliveries.id, id)).get();
+  if (!existing) return c.json({ error: "El seguimiento ya no existe." }, 404);
+
   const update: any = {};
-  const fields = ["policyId", "manualRecipient", "manualPolicyNumber", "manualCompany", "documentType", "channel", "status", "scheduledDate", "completedDate", "notes"];
-  for (const f of fields) {
+  for (const f of DELIVERY_PUT_FIELDS) {
     if (f in body) update[f] = body[f];
   }
-  if ("policyId" in update && (update.policyId === "" || update.policyId == null)) {
-    update.policyId = null;
-  } else if ("policyId" in update) {
-    update.policyId = Number(update.policyId);
+
+  const nextDocumentType = "documentType" in update ? update.documentType : existing.documentType;
+  const nextChannel = "channel" in update ? update.channel : existing.channel;
+  if ("channel" in update && !isValidChannel(nextChannel)) {
+    return c.json({ error: `channel inválido: "${nextChannel}". Valores permitidos: ${DELIVERY_CHANNELS.join(", ")}.` }, 400);
   }
-  const [delivery] = await db.update(deliveries).set(update).where(eq(deliveries.id, id)).returning();
+
+  const policyIdRaw = "policyId" in update ? update.policyId : existing.policyId;
+  const rebillingIdRaw = "rebillingId" in update ? update.rebillingId : existing.rebillingId;
+  const resolved = await resolveAndValidateDeliveryLink(policyIdRaw, rebillingIdRaw, nextDocumentType);
+  if (!resolved.ok) return c.json({ error: resolved.error }, resolved.status);
+  const { policyId, rebillingId } = resolved;
+
+  update.policyId = policyId;
+  update.rebillingId = rebillingId;
+
+  try {
+    const delivery = await db.transaction(async (tx) => {
+      if (policyId != null) {
+        const activeRows = await loadActiveDeliveriesForPolicy(tx, policyId);
+        if (hasActiveDuplicateDelivery({ policyId, rebillingId, documentType: nextDocumentType }, activeRows, id)) {
+          throw new DeliveryDuplicateHttpError(
+            "Ya existe un seguimiento activo (pendiente o enviado) para este documento."
+          );
+        }
+      }
+      const [row] = await tx.update(deliveries).set(update).where(eq(deliveries.id, id)).returning();
+      return row;
+    });
+    return c.json(delivery, 200);
+  } catch (e: any) {
+    if (e instanceof DeliveryDuplicateHttpError) return c.json({ error: e.message }, 409);
+    throw e;
+  }
+}));
+
+// ── Transiciones nuevas (flujo vigente) ─────────────────────────────────────
+
+app.patch("/deliveries/:id/send", requireAuth(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const existing = await db.select({ id: deliveries.id, status: deliveries.status }).from(deliveries).where(eq(deliveries.id, id)).get();
+  if (!existing) return c.json({ error: "El seguimiento ya no existe." }, 404);
+
+  try {
+    validateSendTransition(existing.status);
+  } catch (e: any) {
+    if (e instanceof DeliveryStatusTransitionError) return c.json({ error: e.message }, 409);
+    throw e;
+  }
+
+  const today = toArgentinaCalendarDay();
+  const [delivery] = await db.update(deliveries)
+    .set({ status: "enviado", sentDate: today })
+    .where(eq(deliveries.id, id))
+    .returning();
   return c.json(delivery, 200);
 }));
 
+app.patch("/deliveries/:id/deliver", requireAuth(async (c: any) => {
+  const id = Number(c.req.param("id"));
+  const existing = await db.select({ id: deliveries.id, status: deliveries.status }).from(deliveries).where(eq(deliveries.id, id)).get();
+  if (!existing) return c.json({ error: "El seguimiento ya no existe." }, 404);
+
+  try {
+    validateDeliverTransition(existing.status);
+  } catch (e: any) {
+    if (e instanceof DeliveryStatusTransitionError) return c.json({ error: e.message }, 409);
+    throw e;
+  }
+
+  const today = toArgentinaCalendarDay();
+  const [delivery] = await db.update(deliveries)
+    .set({ status: "entregado", completedDate: today })
+    .where(eq(deliveries.id, id))
+    .returning();
+  return c.json(delivery, 200);
+}));
+
+// ── LEGACY — sin cambios de comportamiento, ver comentario de coexistencia arriba ──
 app.patch("/deliveries/:id/complete", requireAuth(async (c: any) => {
   const today = toArgentinaCalendarDay();
   const [delivery] = await db
