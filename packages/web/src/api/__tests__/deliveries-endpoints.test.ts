@@ -14,6 +14,7 @@ import { database as db } from "../database/index";
 import { users, sessions, policies, rebillings, deliveries, companies, insureds } from "../database/schema";
 import { eq, inArray } from "drizzle-orm";
 import { toArgentinaCalendarDay } from "../../lib/dates/argentina-date";
+import { DELIVERY_CHANNEL_PENDING } from "../../lib/deliveries/validation";
 
 const SESSION_ID = "test-session-deliveries-endpoints-001";
 const USER_EMAIL = "test-deliveries-endpoints@test.local";
@@ -33,6 +34,12 @@ async function callGet(qs = "") {
 }
 async function callPost(body: Record<string, any>) {
   const res = await app.fetch(new Request("http://localhost/api/deliveries", {
+    method: "POST", headers: authHeaders(), body: JSON.stringify(body),
+  }));
+  return { status: res.status, body: await res.json() };
+}
+async function callQuickAdd(body: Record<string, any>) {
+  const res = await app.fetch(new Request("http://localhost/api/deliveries/quick-add", {
     method: "POST", headers: authHeaders(), body: JSON.stringify(body),
   }));
   return { status: res.status, body: await res.json() };
@@ -132,7 +139,7 @@ beforeAll(async () => {
     name: "Test Deliveries Endpoints", email: USER_EMAIL, password: "hashed-dummy", role: "admin", active: 1,
   }).returning({ id: users.id });
   userId = u!.id;
-  await db.insert(sessions).values({ id: SESSION_ID, userId, expiresAt: new Date(Date.now() + 86400000) });
+  await db.insert(sessions).values({ id: SESSION_ID, userId, expiresAt: new Date(Date.now() + 7 * 86400000) });
 
   const [ins] = await db.insert(insureds).values({ name: `${PREFIX} Asegurado`, createdBy: userId }).returning({ id: insureds.id });
   insuredId = ins!.id;
@@ -229,6 +236,79 @@ describe("POST /deliveries — vínculo con póliza/refacturación", () => {
     createdPolicyIds.push(policyId);
     const { status } = await callPost({ policyId, documentType: "poliza", channel: "carta_documento" });
     expect(status).toBe(400);
+  });
+});
+
+describe("POST /deliveries/quick-add — alta rápida desde póliza/refacturación", () => {
+  test("póliza general: crea pendiente con channel=DELIVERY_CHANNEL_PENDING, sin fechas", async () => {
+    const policyId = await mkPolicy("quick-poliza");
+    createdPolicyIds.push(policyId);
+    const { status, body } = await callQuickAdd({ policyId, documentType: "poliza" });
+    expect(status).toBe(201);
+    expect(body.policyId).toBe(policyId);
+    expect(body.rebillingId).toBeNull();
+    expect(body.status).toBe("pendiente");
+    expect(body.channel).toBe(DELIVERY_CHANNEL_PENDING);
+    expect(body.scheduledDate).toBeNull();
+    expect(body.sentDate).toBeNull();
+    expect(body.completedDate).toBeNull();
+    createdDeliveryIds.push(body.id);
+  });
+
+  test("refacturación puntual: crea pendiente vinculado al rebillingId real", async () => {
+    const policyId = await mkPolicy("quick-reb");
+    createdPolicyIds.push(policyId);
+    const rebillingId = await mkRebilling(policyId);
+    const { status, body } = await callQuickAdd({ policyId, rebillingId, documentType: "refacturacion" });
+    expect(status).toBe(201);
+    expect(body.rebillingId).toBe(rebillingId);
+    expect(body.channel).toBe(DELIVERY_CHANNEL_PENDING);
+    createdDeliveryIds.push(body.id);
+  });
+
+  test("segundo clic (mismo documento aún activo) → 409, no duplica", async () => {
+    const policyId = await mkPolicy("quick-dup");
+    createdPolicyIds.push(policyId);
+    const first = await callQuickAdd({ policyId, documentType: "poliza" });
+    expect(first.status).toBe(201);
+    createdDeliveryIds.push(first.body.id);
+
+    const second = await callQuickAdd({ policyId, documentType: "poliza" });
+    expect(second.status).toBe(409);
+    expect(second.body.error).toContain("Ya existe un seguimiento activo");
+
+    const rows = await db.select().from(deliveries).where(eq(deliveries.policyId, policyId));
+    expect(rows.length).toBe(1);
+  });
+
+  test("sin policyId → 400, nunca crea modo manual desde este endpoint", async () => {
+    const { status, body } = await callQuickAdd({ documentType: "poliza" });
+    expect(status).toBe(400);
+    expect(body.error).toContain("policyId");
+  });
+
+  test("policyId inexistente → 404 (misma resolución que POST /deliveries)", async () => {
+    const { status } = await callQuickAdd({ policyId: 999999, documentType: "poliza" });
+    expect(status).toBe(404);
+  });
+
+  test("rebilling perteneciente a OTRA póliza → 400 (misma validación de pertenencia)", async () => {
+    const policyId = await mkPolicy("quick-reb-otra-a");
+    const otherPolicyId = await mkPolicy("quick-reb-otra-b");
+    createdPolicyIds.push(policyId, otherPolicyId);
+    const rebillingId = await mkRebilling(otherPolicyId);
+    const { status, body } = await callQuickAdd({ policyId, rebillingId, documentType: "refacturacion" });
+    expect(status).toBe(400);
+    expect(body.error).toContain("no pertenece");
+  });
+
+  test("body.channel es ignorado — siempre arranca con DELIVERY_CHANNEL_PENDING", async () => {
+    const policyId = await mkPolicy("quick-channel-ignorado");
+    createdPolicyIds.push(policyId);
+    const { status, body } = await callQuickAdd({ policyId, documentType: "poliza", channel: "whatsapp" });
+    expect(status).toBe(201);
+    expect(body.channel).toBe(DELIVERY_CHANNEL_PENDING);
+    createdDeliveryIds.push(body.id);
   });
 });
 
@@ -453,6 +533,37 @@ describe("Transiciones de estado — pendiente → enviado → entregado", () =>
 
     const secondDeliver = await callPatch(`${created.body.id}/deliver`);
     expect(secondDeliver.status).toBe(409);
+  });
+
+  test("/send sobre un alta rápida sin completar (channel=sin_definir) → 409, no cambia de estado", async () => {
+    const policyId = await mkPolicy("send-sin-canal");
+    createdPolicyIds.push(policyId);
+    const created = await callQuickAdd({ policyId, documentType: "poliza" });
+    createdDeliveryIds.push(created.body.id);
+    expect(created.body.channel).toBe(DELIVERY_CHANNEL_PENDING);
+
+    const sent = await callPatch(`${created.body.id}/send`);
+    expect(sent.status).toBe(409);
+
+    const row = await db.select().from(deliveries).where(eq(deliveries.id, created.body.id)).get();
+    expect(row!.status).toBe("pendiente");
+    expect(row!.sentDate).toBeNull();
+  });
+
+  test("Completar datos (PUT con canal real) habilita /send después", async () => {
+    const policyId = await mkPolicy("completar-datos-habilita-send");
+    createdPolicyIds.push(policyId);
+    const created = await callQuickAdd({ policyId, documentType: "poliza" });
+    createdDeliveryIds.push(created.body.id);
+
+    const updated = await callPut(created.body.id, { channel: "whatsapp", scheduledDate: "2027-01-15", notes: "Completado en QA" });
+    expect(updated.status).toBe(200);
+    expect(updated.body.channel).toBe("whatsapp");
+
+    const sent = await callPatch(`${created.body.id}/send`);
+    expect(sent.status).toBe(200);
+    expect(sent.body.status).toBe("enviado");
+    expect(sent.body.sentDate).not.toBeNull();
   });
 
   test("PATCH /complete legacy sigue funcionando sin cambios: pendiente → realizado directo", async () => {

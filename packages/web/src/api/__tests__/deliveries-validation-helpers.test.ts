@@ -5,7 +5,7 @@ import { describe, test, expect } from "bun:test";
 import {
   isValidDocumentType, isValidChannel, validateDeliveryLink, hasActiveDuplicateDelivery,
   validateSendTransition, validateDeliverTransition,
-  DeliveryValidationError, DeliveryStatusTransitionError,
+  DeliveryValidationError, DeliveryStatusTransitionError, DELIVERY_CHANNEL_PENDING,
 } from "../../lib/deliveries/validation";
 
 describe("isValidDocumentType / isValidChannel", () => {
@@ -159,13 +159,21 @@ describe("hasActiveDuplicateDelivery — excludeId (edición)", () => {
 });
 
 describe("validateSendTransition", () => {
-  test("desde pendiente no lanza", () => {
-    expect(() => validateSendTransition("pendiente")).not.toThrow();
+  test("desde pendiente con canal real no lanza", () => {
+    expect(() => validateSendTransition("pendiente", "whatsapp")).not.toThrow();
+    expect(() => validateSendTransition("pendiente", "email")).not.toThrow();
   });
-  test("desde enviado/entregado/realizado lanza DeliveryStatusTransitionError", () => {
-    expect(() => validateSendTransition("enviado")).toThrow(DeliveryStatusTransitionError);
-    expect(() => validateSendTransition("entregado")).toThrow(DeliveryStatusTransitionError);
-    expect(() => validateSendTransition("realizado")).toThrow(DeliveryStatusTransitionError);
+  test("desde enviado/entregado/realizado lanza DeliveryStatusTransitionError (con canal real)", () => {
+    expect(() => validateSendTransition("enviado", "whatsapp")).toThrow(DeliveryStatusTransitionError);
+    expect(() => validateSendTransition("entregado", "whatsapp")).toThrow(DeliveryStatusTransitionError);
+    expect(() => validateSendTransition("realizado", "whatsapp")).toThrow(DeliveryStatusTransitionError);
+  });
+  test("desde pendiente con canal sin_definir (alta rápida sin completar) lanza", () => {
+    expect(() => validateSendTransition("pendiente", DELIVERY_CHANNEL_PENDING)).toThrow(DeliveryStatusTransitionError);
+  });
+  test("desde pendiente con canal vacío/inválido lanza", () => {
+    expect(() => validateSendTransition("pendiente", "")).toThrow(DeliveryStatusTransitionError);
+    expect(() => validateSendTransition("pendiente", "fax")).toThrow(DeliveryStatusTransitionError);
   });
 });
 

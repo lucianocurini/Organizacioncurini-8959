@@ -17,6 +17,10 @@ describe("isSafeReturnTo — Caso A / rutas internas válidas", () => {
   test("acepta /polizas con filtros, orden y página (listado general)", () => {
     expect(isSafeReturnTo("/polizas?q=perez&type=automotor&status=activa&sortBy=insured&sortOrder=asc&page=2")).toBe(true);
   });
+  test("acepta /envios con y sin filtros (Envíos y Entregas ↔ Póliza)", () => {
+    expect(isSafeReturnTo("/envios")).toBe(true);
+    expect(isSafeReturnTo("/envios?status=pendiente&channel=whatsapp")).toBe(true);
+  });
 });
 
 describe("isSafeReturnTo — Caso C (URL externa / maliciosa se rechaza)", () => {
@@ -35,6 +39,7 @@ describe("isSafeReturnTo — Caso C (URL externa / maliciosa se rechaza)", () =>
   test("rechaza rutas que solo empiezan igual pero no son el prefijo real", () => {
     expect(isSafeReturnTo("/polizasmalicioso")).toBe(false);
     expect(isSafeReturnTo("/reporte-mesevil")).toBe(false);
+    expect(isSafeReturnTo("/enviosmalicioso")).toBe(false);
   });
   test("rechaza vacío / null / undefined", () => {
     expect(isSafeReturnTo("")).toBe(false);

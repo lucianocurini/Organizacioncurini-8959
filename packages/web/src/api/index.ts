@@ -89,7 +89,7 @@ import {
   isValidChannel, validateDeliveryLink, DeliveryValidationError,
   hasActiveDuplicateDelivery, DeliveryDuplicateError,
   validateSendTransition, validateDeliverTransition, DeliveryStatusTransitionError,
-  DELIVERY_CHANNELS,
+  DELIVERY_CHANNELS, DELIVERY_CHANNEL_PENDING,
 } from "../lib/deliveries/validation";
 
 const app = new Hono().basePath("/api");
@@ -3929,6 +3929,56 @@ app.post("/deliveries", requireAuth(async (c: any) => {
   }
 }));
 
+// Alta rápida desde "Agregar a Envíos" (poliza-detail.tsx) — acotada a
+// propósito: SOLO policyId + documentType + rebillingId cuando corresponde.
+// A diferencia de POST /deliveries, acá no hay modo manual (policyId
+// siempre obligatorio) ni canal a elección — arranca con
+// DELIVERY_CHANNEL_PENDING y status="pendiente", sin fechas, para
+// completarse después desde /envios ("Completar datos"). Reutiliza sin
+// cambios la misma resolución de vínculo y el mismo anti-duplicado
+// transaccional que POST /deliveries — cero debilitamiento de esas reglas.
+app.post("/deliveries/quick-add", requireAuth(async (c: any) => {
+  const user = c.get("user");
+  const body = await c.req.json();
+
+  if (body.policyId == null || body.policyId === "") {
+    return c.json({ error: "policyId es obligatorio para el alta rápida." }, 400);
+  }
+
+  const resolved = await resolveAndValidateDeliveryLink(body.policyId, body.rebillingId, body.documentType);
+  if (!resolved.ok) return c.json({ error: resolved.error }, resolved.status);
+  const { policyId, rebillingId } = resolved;
+
+  try {
+    const delivery = await db.transaction(async (tx) => {
+      const activeRows = await loadActiveDeliveriesForPolicy(tx, policyId!);
+      if (hasActiveDuplicateDelivery({ policyId, rebillingId, documentType: body.documentType }, activeRows)) {
+        throw new DeliveryDuplicateHttpError(
+          "Ya existe un seguimiento activo (pendiente o enviado) para este documento."
+        );
+      }
+      const [row] = await tx.insert(deliveries).values({
+        policyId,
+        rebillingId,
+        manualRecipient: null,
+        manualPolicyNumber: null,
+        manualCompany: null,
+        documentType: body.documentType,
+        channel: DELIVERY_CHANNEL_PENDING,
+        status: "pendiente",
+        scheduledDate: null,
+        notes: null,
+        createdBy: user.id,
+      }).returning();
+      return row;
+    });
+    return c.json(delivery, 201);
+  } catch (e: any) {
+    if (e instanceof DeliveryDuplicateHttpError) return c.json({ error: e.message }, 409);
+    throw e;
+  }
+}));
+
 // Campos editables por PUT: vínculo (policyId/rebillingId), datos
 // descriptivos (documentType/channel/manual*/notes/scheduledDate). status,
 // sentDate y completedDate NUNCA se aceptan acá — solo se mueven a través de
@@ -3991,11 +4041,11 @@ app.put("/deliveries/:id", requireAuth(async (c: any) => {
 
 app.patch("/deliveries/:id/send", requireAuth(async (c: any) => {
   const id = Number(c.req.param("id"));
-  const existing = await db.select({ id: deliveries.id, status: deliveries.status }).from(deliveries).where(eq(deliveries.id, id)).get();
+  const existing = await db.select({ id: deliveries.id, status: deliveries.status, channel: deliveries.channel }).from(deliveries).where(eq(deliveries.id, id)).get();
   if (!existing) return c.json({ error: "El seguimiento ya no existe." }, 404);
 
   try {
-    validateSendTransition(existing.status);
+    validateSendTransition(existing.status, existing.channel);
   } catch (e: any) {
     if (e instanceof DeliveryStatusTransitionError) return c.json({ error: e.message }, 409);
     throw e;

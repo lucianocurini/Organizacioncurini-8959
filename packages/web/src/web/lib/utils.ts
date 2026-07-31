@@ -33,7 +33,7 @@ export function formatDate(dateStr: string | null | undefined): string {
 
 // Rutas internas a las que un botón "volver" puede redirigir. Cualquier otro
 // valor (URL externa, protocol-relative, esquema no-http) se considera inseguro.
-const SAFE_RETURN_PREFIXES = ["/reporte-mes", "/polizas"] as const;
+const SAFE_RETURN_PREFIXES = ["/reporte-mes", "/polizas", "/envios"] as const;
 
 export function isSafeReturnTo(path: string | null | undefined): path is string {
   if (!path) return false;

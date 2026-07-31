@@ -11,6 +11,16 @@ export type DeliveryDocumentType = typeof DELIVERY_DOCUMENT_TYPES[number];
 export const DELIVERY_CHANNELS = ["whatsapp", "email", "copia_cliente", "retiro_oficina"] as const;
 export type DeliveryChannel = typeof DELIVERY_CHANNELS[number];
 
+// Sentinel de "canal aún no definido" — usado exclusivamente por el alta
+// rápida desde póliza/refacturación (POST /deliveries/quick-add). Vive a
+// propósito FUERA de DELIVERY_CHANNELS: cualquier chequeo existente que use
+// isValidChannel() lo trata como canal inválido, que es justo lo que hace
+// falta para bloquear /send y el guardado normal de POST/PUT hasta que se
+// complete con un canal real ("Completar datos" en /envios). Nunca se
+// expone tal cual al usuario — la UI siempre lo traduce a un label
+// ("Datos por completar"), nunca lo imprime crudo.
+export const DELIVERY_CHANNEL_PENDING = "sin_definir";
+
 // "realizado" se conserva como valor histórico admitido (solo escrito hoy
 // por el PATCH /complete legacy, nunca por POST/PUT) — ver comentario de
 // coexistencia en index.ts, bloque DELIVERIES.
@@ -145,10 +155,23 @@ export function hasActiveDuplicateDelivery(
 // de entrada aparte, sin estas reglas — ver coexistencia documentada en
 // index.ts.
 
-export function validateSendTransition(currentStatus: string): void {
+/**
+ * channel es el valor ACTUAL de la fila (no el del body) — un seguimiento
+ * creado por el alta rápida (POST /deliveries/quick-add) arranca con
+ * DELIVERY_CHANNEL_PENDING y no puede avanzar a "enviado" hasta que
+ * "Completar datos" le asigne un canal real (isValidChannel). Mismo
+ * criterio que el resto de este archivo: la whitelist de canal vive acá,
+ * nunca en un CHECK de esquema.
+ */
+export function validateSendTransition(currentStatus: string, channel: string): void {
   if (currentStatus !== "pendiente") {
     throw new DeliveryStatusTransitionError(
       `No se puede marcar como enviado un seguimiento en estado "${currentStatus}" — solo se puede enviar desde "pendiente".`
+    );
+  }
+  if (!isValidChannel(channel)) {
+    throw new DeliveryStatusTransitionError(
+      "No se puede marcar como enviado sin un canal definido. Completá los datos del envío primero."
     );
   }
 }

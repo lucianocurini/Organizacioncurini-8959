@@ -3,7 +3,7 @@ import { api } from "@/lib/api";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { formatCurrency, formatDate, daysUntil, POLICY_TYPES, STATUS_TYPES, COVERAGE_LABELS, cn, isSafeReturnTo } from "@/lib/utils";
 import { Link, useParams } from "wouter";
-import { ArrowLeft, Edit, Car, Home, ShieldCheck, Briefcase, FileText, Calendar, Building2, User, Bike, HeartPulse, Zap, Scale, HardHat, Flame, RefreshCw, Plus, Pencil, Trash2, ListOrdered, CheckCircle2, Clock, AlertCircle, Loader2, X, Ban } from "lucide-react";
+import { ArrowLeft, Edit, Car, Home, ShieldCheck, Briefcase, FileText, Calendar, Building2, User, Bike, HeartPulse, Zap, Scale, HardHat, Flame, RefreshCw, Plus, Pencil, Trash2, ListOrdered, CheckCircle2, Clock, AlertCircle, Loader2, X, Ban, Send } from "lucide-react";
 import { PolicyModal } from "@/components/policies/PolicyModal";
 import { RebillingModal } from "@/components/policies/RebillingModal";
 import { toast } from "sonner";
@@ -22,6 +22,7 @@ import {
   type CancellationFormInput, type CancellationPreviewSummary,
 } from "@/lib/policy-cancellation";
 import { groupInstallmentsByRebilling, countLinkedInstallments } from "@/lib/rebilling-groups";
+import { buildQuickAddDeliveryPayload, normalizeDeliveryError } from "@/lib/deliveries-form";
 
 const typeIcons: Record<string, any> = {
   automotor: Car, motovehiculo: Bike, ecomovilidad: Zap, hogar: Home, accidentes: ShieldCheck, art: HeartPulse, comercial: Briefcase, responsabilidad_civil: Scale, cascos: HardHat, incendio: Flame,
@@ -95,6 +96,11 @@ export default function PolizaDetail() {
   const [cancelPreviewError, setCancelPreviewError] = useState<string | null>(null);
   const [cancelSubmitting, setCancelSubmitting] = useState(false);
 
+  // ─── "Agregar a Envíos" — alta rápida in-place, sin navegar ────────────────
+  // Clave del botón en curso ("general" | String(rebillingId)) para
+  // deshabilitar solo ese botón mientras el POST está en vuelo.
+  const [quickAddingKey, setQuickAddingKey] = useState<string | null>(null);
+
   // Destino del botón "volver": el origen (p.ej. Reporte mensual con sus filtros)
   // si vino con un returnTo interno válido, o el listado general como fallback seguro.
   const [backHref] = useState(() => {
@@ -154,6 +160,28 @@ export default function PolizaDetail() {
   const Icon = typeIcons[p.type] || FileText;
   const days = daysUntil(p.endDate);
   const hasRebilling = true; // todas las pólizas pueden tener refacturaciones
+
+  // Alta rápida: crea directamente un seguimiento "pendiente" (POST
+  // /deliveries/quick-add) SIN navegar — el usuario permanece en la póliza.
+  // El canal se completa después desde /envios ("Completar datos").
+  // rebillingId ausente → alta a nivel de la póliza general.
+  async function quickAddToEnvios(rebillingId?: number) {
+    const key = rebillingId != null ? String(rebillingId) : "general";
+    setQuickAddingKey(key);
+    try {
+      const payload = buildQuickAddDeliveryPayload({
+        policyId: p.id,
+        documentType: rebillingId != null ? "refacturacion" : "poliza",
+        rebillingId: rebillingId ?? null,
+      });
+      await api.post("/api/deliveries/quick-add", payload);
+      toast.success("Agregado a Envíos pendientes");
+    } catch (e: any) {
+      toast.error(normalizeDeliveryError(e).message);
+    } finally {
+      setQuickAddingKey(null);
+    }
+  }
 
   // Compute next billing start date
   let nextStart = p.startDate;
@@ -352,6 +380,14 @@ export default function PolizaDetail() {
                 <Ban className="w-4 h-4" /> <span className="hidden sm:inline">Anular póliza</span>
               </button>
             )}
+            <button
+              onClick={() => quickAddToEnvios()}
+              disabled={quickAddingKey === "general"}
+              className="flex items-center gap-2 px-3 sm:px-4 py-2 bg-[#1f2937] hover:bg-[#374151] text-gray-300 hover:text-white text-sm rounded-lg font-medium transition-all disabled:opacity-50"
+              title="Agregar a Envíos"
+            >
+              <Send className="w-4 h-4" /> <span className="hidden sm:inline">Agregar a Envíos</span>
+            </button>
             <button
               onClick={() => setShowEdit(true)}
               className="flex items-center gap-2 px-3 sm:px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg font-medium transition-all"
@@ -1228,6 +1264,14 @@ export default function PolizaDetail() {
                           {rebillingRebuildCheckLoading && rebillingRebuildTarget?.id === r.id
                             ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
                             : <ListOrdered className="w-3.5 h-3.5" />}
+                        </button>
+                        <button
+                          onClick={() => quickAddToEnvios(r.id)}
+                          disabled={quickAddingKey === String(r.id)}
+                          className="p-1.5 text-gray-500 hover:text-blue-400 hover:bg-blue-500/10 rounded-lg transition-all disabled:opacity-40"
+                          title="Agregar a Envíos"
+                        >
+                          <Send className="w-3.5 h-3.5" />
                         </button>
                         <button
                           onClick={() => deleteRebilling(r.id)}
