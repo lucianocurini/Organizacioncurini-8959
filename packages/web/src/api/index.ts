@@ -31,6 +31,7 @@ import {
   ivaEntries,
   ownMoneyMovements,
   insuredAccountMovements,
+  paymentAmountAdjustments,
 } from "./database/schema";
 import { buildFullBackup, validateFullBackup, EXPECTED_BUSINESS_TABLES } from "./backup/full-backup";
 import { nanoid } from "nanoid";
@@ -84,6 +85,8 @@ import {
   calculateBatchReceivedAppliedDifference, validateInsuredAccountMovement, InsuredAccountValidationError,
   summarizeInsuredAccountBalances, calculateCreditActiveInCaja, calculateCreditRegularizedInCaja,
   calculateCobroSaldoDeudorInCaja, isSafeToCancelAccountMovementOrigin, type InsuredAccountMovementForCaja,
+  MAX_ROUNDING_ADJUSTMENT_CENTS, ROUNDING_ADJUSTMENT_REASON, validateRoundingAdjustment,
+  calculatePaymentAmountAdjustmentCreditInCaja, type PaymentAmountAdjustmentForCaja,
 } from "../lib/payments/insured-account";
 import {
   isValidChannel, validateDeliveryLink, DeliveryValidationError,
@@ -2568,58 +2571,80 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
   const difference = calculateBatchReceivedAppliedDifference(receivedCents, appliedCents);
 
   let accountMovementToCreate: { type: "saldo_a_favor" | "saldo_deudor"; reason: string | null } | null = null;
+  // Tolerancia de redondeo (payment_amount_adjustments, sin insuredId —
+  // funciona igual con lote de un asegurado, multiasegurado o 100% manual,
+  // ver validateRoundingAdjustment/MAX_ROUNDING_ADJUSTMENT_CENTS en
+  // insured-account.ts). Nunca escribe en insured_account_movements.
+  let roundingAdjustmentToCreate: { amountCents: number; reason: string } | null = null;
 
   if (difference.kind !== "exacto") {
-    const expectedAction = difference.kind; // "saldo_a_favor" | "saldo_deudor" — únicas 2 acciones soportadas en esta fase
+    const expectedAction = difference.kind; // "saldo_a_favor" | "saldo_deudor" — sentido real de la diferencia (no aplica a ajuste_redondeo, que no tiene "sentido" fijo por asegurado)
     const resolution = body.accountDifferenceResolution;
 
     if (resolution == null || typeof resolution !== "object") {
       return c.json({
         error:
           `La suma de los medios ($${(receivedCents / 100).toFixed(2)}) no coincide con el total a aplicar a las cuotas ` +
-          `($${(appliedCents / 100).toFixed(2)}). Indicá accountDifferenceResolution.action ("saldo_a_favor" o ` +
-          `"saldo_deudor") para continuar.`,
+          `($${(appliedCents / 100).toFixed(2)}). Indicá accountDifferenceResolution.action ("saldo_a_favor", ` +
+          `"saldo_deudor" o "ajuste_redondeo") para continuar.`,
         code: "PAYMENT_BATCH_AMOUNT_DIFFERENCE",
         receivedCents, appliedCents, differenceCents: difference.differenceCents,
       }, 400);
     }
-    // Cualquier action fuera de las 2 soportadas hoy (incluido, a propósito,
-    // un futuro "ajuste_manual"/"devolucion_inmediata" — Caso D, no
-    // implementado todavía) se rechaza acá con un mensaje explícito, en vez
-    // de caer silenciosamente a ningún branch.
-    if (resolution.action !== "saldo_a_favor" && resolution.action !== "saldo_deudor") {
+
+    if (resolution.action === "ajuste_redondeo") {
+      // El backend nunca confía en que el frontend ya filtró el tope de $5 —
+      // se revalida acá siempre, incluso si llega forzado con una diferencia
+      // mayor. A diferencia de saldo_a_favor/saldo_deudor, no exige
+      // derivedInsuredId (payment_amount_adjustments no tiene insuredId).
+      try {
+        validateRoundingAdjustment({ differenceCents: difference.differenceCents });
+      } catch (e: any) {
+        if (e instanceof InsuredAccountValidationError) return c.json({ error: e.message }, 400);
+        throw e;
+      }
+      const reason = typeof resolution.reason === "string" && resolution.reason.trim()
+        ? resolution.reason.trim()
+        : ROUNDING_ADJUSTMENT_REASON;
+      roundingAdjustmentToCreate = { amountCents: difference.differenceCents, reason };
+    } else if (resolution.action === "saldo_a_favor" || resolution.action === "saldo_deudor") {
+      if (resolution.action !== expectedAction) {
+        return c.json({
+          error:
+            `accountDifferenceResolution.action ("${resolution.action}") no coincide con el sentido real de la diferencia ` +
+            `("${expectedAction}").`,
+        }, 400);
+      }
+      // Multiasegurado (Regla 5) y 100% manual_payment sin asegurado real
+      // (Caso B) comparten la misma señal: resolveBatchInsuredId ya devuelve
+      // null en ambos casos — ningún dueño único al que atribuir la diferencia.
+      if (derivedInsuredId == null) {
+        return c.json({
+          error:
+            "No se puede determinar un único asegurado real para asignar la diferencia de este cobro (el cobro mezcla más de " +
+            "un asegurado, o es una imputación 100% manual sin asegurado real). Separá este cobro para poder generar el saldo.",
+        }, 400);
+      }
+      const reason = typeof resolution.reason === "string" && resolution.reason.trim() ? resolution.reason.trim() : null;
+      try {
+        validateInsuredAccountMovement({
+          insuredId: derivedInsuredId,
+          type: resolution.action,
+          signedAmountCents: difference.differenceCents,
+          reason,
+        });
+      } catch (e: any) {
+        if (e instanceof InsuredAccountValidationError) return c.json({ error: e.message }, 400);
+        throw e;
+      }
+      accountMovementToCreate = { type: resolution.action, reason };
+    } else {
+      // Cualquier action fuera de las 3 soportadas hoy (incluido, a propósito,
+      // un futuro "ajuste_manual"/"devolucion_inmediata" — Caso D, no
+      // implementado todavía) se rechaza acá con un mensaje explícito, en vez
+      // de caer silenciosamente a ningún branch.
       return c.json({ error: `accountDifferenceResolution.action no soportada en esta etapa: "${resolution.action}".` }, 400);
     }
-    if (resolution.action !== expectedAction) {
-      return c.json({
-        error:
-          `accountDifferenceResolution.action ("${resolution.action}") no coincide con el sentido real de la diferencia ` +
-          `("${expectedAction}").`,
-      }, 400);
-    }
-    // Multiasegurado (Regla 5) y 100% manual_payment sin asegurado real
-    // (Caso B) comparten la misma señal: resolveBatchInsuredId ya devuelve
-    // null en ambos casos — ningún dueño único al que atribuir la diferencia.
-    if (derivedInsuredId == null) {
-      return c.json({
-        error:
-          "No se puede determinar un único asegurado real para asignar la diferencia de este cobro (el cobro mezcla más de " +
-          "un asegurado, o es una imputación 100% manual sin asegurado real). Separá este cobro para poder generar el saldo.",
-      }, 400);
-    }
-    const reason = typeof resolution.reason === "string" && resolution.reason.trim() ? resolution.reason.trim() : null;
-    try {
-      validateInsuredAccountMovement({
-        insuredId: derivedInsuredId,
-        type: resolution.action,
-        signedAmountCents: difference.differenceCents,
-        reason,
-      });
-    } catch (e: any) {
-      if (e instanceof InsuredAccountValidationError) return c.json({ error: e.message }, 400);
-      throw e;
-    }
-    accountMovementToCreate = { type: resolution.action, reason };
   }
 
   // Detección informativa de posibles cheques duplicados (banco+número contra
@@ -2795,6 +2820,21 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
             ? singleItem.installmentId
             : null,
         reason: accountMovementToCreate.reason,
+        createdBy: user.id,
+        createdAt: new Date(),
+      });
+    }
+
+    // Tolerancia de redondeo — ya validada por completo antes de abrir esta
+    // transacción (abs<=500 centavos, sin exigir ningún asegurado real).
+    // paymentBatchId es la única referencia (XOR de la migración 0030); nunca
+    // se escribe insuredId ni se toca insured_account_movements.
+    if (roundingAdjustmentToCreate) {
+      await tx.insert(paymentAmountAdjustments).values({
+        paymentBatchId: batch!.id,
+        amountCents: roundingAdjustmentToCreate.amountCents,
+        reason: roundingAdjustmentToCreate.reason,
+        authorizedBy: user.id,
         createdBy: user.id,
         createdAt: new Date(),
       });
@@ -3064,6 +3104,24 @@ app.get("/payment-batches/:id", requireAuth(async (c: any) => {
     reason: insuredAccountMovements.reason,
   }).from(insuredAccountMovements).where(or(...accountMovementConditions)).all();
 
+  // Tolerancia de redondeo (payment_amount_adjustments, Migración 0030) —
+  // deliberadamente en su propia propiedad (amountAdjustments), nunca
+  // mezclada dentro de accountMovements: son dos tablas distintas, con
+  // esquema y significado distintos (sin insuredId, sin status propio — ver
+  // insured-account.ts). Solo por paymentBatchId, igual que POST
+  // /payment-batches al crearla; ningún endpoint escribe todavía con
+  // paymentId para un batch. Se devuelve el array completo tal cual, sin
+  // asumir cardinalidad (en la práctica hoy es 0 o 1 por batch).
+  const amountAdjustments = await db.select({
+    id: paymentAmountAdjustments.id,
+    paymentBatchId: paymentAmountAdjustments.paymentBatchId,
+    amountCents: paymentAmountAdjustments.amountCents,
+    reason: paymentAmountAdjustments.reason,
+    authorizedBy: paymentAmountAdjustments.authorizedBy,
+    createdBy: paymentAmountAdjustments.createdBy,
+    createdAt: paymentAmountAdjustments.createdAt,
+  }).from(paymentAmountAdjustments).where(eq(paymentAmountAdjustments.paymentBatchId, id)).all();
+
   const baseFromChildren = childRows.reduce((s, r) => s + Math.round(r.payment.amount * 100), 0);
   const surchargeFromEntries = surcharges.reduce((s, e) => s + Math.round(e.amount * 100), 0);
   const splitsSum = splitsRows.reduce((s, sp) => s + sp.amountCents, 0);
@@ -3115,7 +3173,7 @@ app.get("/payment-batches/:id", requireAuth(async (c: any) => {
     possibleDuplicateChecks,
   };
 
-  return c.json({ batch, insuredSummary, items: childRows, splits: splitsWithChecksOut, surcharges, integrity, accountMovements }, 200);
+  return c.json({ batch, insuredSummary, items: childRows, splits: splitsWithChecksOut, surcharges, integrity, accountMovements, amountAdjustments }, 200);
 }));
 
 // ─── ANULACIÓN DE UN LOTE CONFIRMADO (corrección segura, con trazabilidad) ──
@@ -7716,6 +7774,38 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     byInsured: insuredBalances.byInsured.map((b) => ({ insuredId: b.insuredId, balance: centsToPesos(b.balanceCents) })),
   };
 
+  // ── Ajustes por redondeo (payment_amount_adjustments) ───────────────────
+  // Deliberadamente AJENA a cuentaCorriente de arriba — esta tabla no tiene
+  // insuredId, así que no hay ningún query que "olvidar filtrar" para que un
+  // ajuste de redondeo no aparezca como deuda/crédito de ningún asegurado
+  // (ver diagnóstico: la exclusión es por construcción del esquema, no por
+  // disciplina de filtrado). Solo soporta origen por lote hoy (paymentBatchId
+  // — ningún endpoint escribe todavía con paymentId, ver POST /payments
+  // standalone, sin cambios en esta etapa). "Activo" = el batch dueño de la
+  // fila sigue "confirmado" (no anulado) — se resuelve en el momento de leer,
+  // sin que la fila de payment_amount_adjustments necesite su propia columna
+  // de estado ni que POST /payment-batches/:id/cancel la toque nunca.
+  const roundingAdjustmentRows = await db.select({
+    id: paymentAmountAdjustments.id,
+    paymentBatchId: paymentAmountAdjustments.paymentBatchId,
+    amountCents: paymentAmountAdjustments.amountCents,
+  }).from(paymentAmountAdjustments).where(isNotNull(paymentAmountAdjustments.paymentBatchId)).all();
+
+  const roundingAdjustmentBatchIds = [...new Set(
+    roundingAdjustmentRows.map((r: any) => r.paymentBatchId as number)
+  )];
+  const roundingAdjustmentBatchStatusById = new Map<number, string>();
+  if (roundingAdjustmentBatchIds.length > 0) {
+    const rows = await db.select({ id: paymentBatches.id, status: paymentBatches.status })
+      .from(paymentBatches).where(inArray(paymentBatches.id, roundingAdjustmentBatchIds)).all();
+    for (const r of rows as any[]) roundingAdjustmentBatchStatusById.set(r.id, r.status);
+  }
+  const roundingAdjustmentsForCaja: PaymentAmountAdjustmentForCaja[] = roundingAdjustmentRows.map((r: any) => ({
+    amountCents: r.amountCents,
+    parentActive: roundingAdjustmentBatchStatusById.get(r.paymentBatchId!) === "confirmado",
+  }));
+  const roundingAdjustmentCreditCents = calculatePaymentAmountAdjustmentCreditInCaja(roundingAdjustmentsForCaja);
+
   // ── Caja propia — histórico ───────────────────────────────────────────────
   const cpComisiones  = allCommissions.filter((c: any) => c.status !== "anulado").reduce((s: number, c: any) => s + c.amount, 0);
   const cpAportes     = ownMovements.filter((m: any) => m.type === "aporte").reduce((s: number, m: any) => s + m.amount, 0);
@@ -7743,7 +7833,8 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     creditoActivoEnCajaCents,
     creditoRegularizadoCents,
     cobrosSaldoDeudorCents,
-  })); // Pendiente de rendir actual + cuenta corriente de asegurados
+    roundingAdjustmentCreditCents,
+  })); // Pendiente de rendir actual + cuenta corriente de asegurados + ajustes de redondeo
 
   // Diferencia de caja/cartera = pendiente total de rendir (cajaNeta) menos
   // adeudados. Los gastos NO se restan acá — son un movimiento de Caja

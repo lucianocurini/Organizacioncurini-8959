@@ -18,8 +18,13 @@ import {
   calculateCobroSaldoDeudorInCaja,
   isSafeToCancelAccountMovementOrigin,
   InsuredAccountValidationError,
+  MAX_ROUNDING_ADJUSTMENT_CENTS,
+  ROUNDING_ADJUSTMENT_REASON,
+  validateRoundingAdjustment,
+  calculatePaymentAmountAdjustmentCreditInCaja,
   type InsuredAccountMovementForBalance,
   type InsuredAccountMovementForCaja,
+  type PaymentAmountAdjustmentForCaja,
 } from "../../lib/payments/insured-account";
 
 // ─── calculateBatchReceivedAppliedDifference ───────────────────────────────
@@ -379,5 +384,93 @@ describe("isSafeToCancelAccountMovementOrigin", () => {
       thisOriginAmountCents: 10000, totalActivePoolCents: 15000, totalActiveConsumptionCents: 5000,
     });
     expect(safe).toBe(true);
+  });
+});
+
+// ─── validateRoundingAdjustment / MAX_ROUNDING_ADJUSTMENT_CENTS ────────────
+// Tolerancia de redondeo (payment_amount_adjustments) — reutiliza la tabla
+// del "caso sin asegurado real" para una diferencia CHICA y acotada,
+// independiente de insured_account_movements.
+
+describe("MAX_ROUNDING_ADJUSTMENT_CENTS", () => {
+  test("es exactamente 500 (tope de $5,00)", () => {
+    expect(MAX_ROUNDING_ADJUSTMENT_CENTS).toBe(500);
+  });
+});
+
+describe("validateRoundingAdjustment", () => {
+  test("caso real: faltante de -234 centavos ($2,34) → válido", () => {
+    expect(() => validateRoundingAdjustment({ differenceCents: -234 })).not.toThrow();
+  });
+
+  test("diferencia 0 → rechaza (sin ajuste no hay nada que registrar)", () => {
+    expect(() => validateRoundingAdjustment({ differenceCents: 0 })).toThrow(InsuredAccountValidationError);
+  });
+
+  test("-500 centavos ($5,00 faltante) → válido (límite inclusive)", () => {
+    expect(() => validateRoundingAdjustment({ differenceCents: -500 })).not.toThrow();
+  });
+
+  test("+500 centavos ($5,00 sobrante) → válido (límite inclusive)", () => {
+    expect(() => validateRoundingAdjustment({ differenceCents: 500 })).not.toThrow();
+  });
+
+  test("-501 centavos ($5,01 faltante) → rechaza", () => {
+    expect(() => validateRoundingAdjustment({ differenceCents: -501 })).toThrow(InsuredAccountValidationError);
+  });
+
+  test("+501 centavos ($5,01 sobrante) → rechaza", () => {
+    expect(() => validateRoundingAdjustment({ differenceCents: 501 })).toThrow(InsuredAccountValidationError);
+  });
+
+  test("diferencia grande (ej. $200.000) → rechaza, nunca se confía en que el frontend ya filtró", () => {
+    expect(() => validateRoundingAdjustment({ differenceCents: -20000000 })).toThrow(InsuredAccountValidationError);
+  });
+});
+
+describe("validatePaymentAmountAdjustment — reutilizado por el ajuste de redondeo", () => {
+  test("acepta un ajuste de redondeo típico (paymentBatchId, amountCents negativo, reason estándar)", () => {
+    expect(() => validatePaymentAmountAdjustment({
+      paymentBatchId: 1, amountCents: -234, reason: ROUNDING_ADJUSTMENT_REASON, authorizedBy: 7,
+    })).not.toThrow();
+  });
+
+  test("acepta amountCents positivo (sobrante) sin restricción de signo — a diferencia de insured_account_movements", () => {
+    expect(() => validatePaymentAmountAdjustment({
+      paymentBatchId: 1, amountCents: 300, reason: ROUNDING_ADJUSTMENT_REASON, authorizedBy: 7,
+    })).not.toThrow();
+  });
+});
+
+// ─── calculatePaymentAmountAdjustmentCreditInCaja ──────────────────────────
+
+describe("calculatePaymentAmountAdjustmentCreditInCaja", () => {
+  test("faltante (amountCents negativo) nunca suma Caja — ya excluido vía Math.min de applyBatchToCartera", () => {
+    const adjustments: PaymentAmountAdjustmentForCaja[] = [{ amountCents: -234, parentActive: true }];
+    expect(calculatePaymentAmountAdjustmentCreditInCaja(adjustments)).toBe(0);
+  });
+
+  test("sobrante (amountCents positivo) con lote activo → suma Caja", () => {
+    const adjustments: PaymentAmountAdjustmentForCaja[] = [{ amountCents: 300, parentActive: true }];
+    expect(calculatePaymentAmountAdjustmentCreditInCaja(adjustments)).toBe(300);
+  });
+
+  test("sobrante de un lote anulado → 0 (no contribuye, aunque la fila histórica siga existiendo)", () => {
+    const adjustments: PaymentAmountAdjustmentForCaja[] = [{ amountCents: 300, parentActive: false }];
+    expect(calculatePaymentAmountAdjustmentCreditInCaja(adjustments)).toBe(0);
+  });
+
+  test("varios ajustes mezclados — solo suma los sobrantes de lotes activos", () => {
+    const adjustments: PaymentAmountAdjustmentForCaja[] = [
+      { amountCents: 300, parentActive: true },   // suma
+      { amountCents: -234, parentActive: true },  // no suma (faltante)
+      { amountCents: 450, parentActive: false },  // no suma (lote anulado)
+      { amountCents: 100, parentActive: true },   // suma
+    ];
+    expect(calculatePaymentAmountAdjustmentCreditInCaja(adjustments)).toBe(400);
+  });
+
+  test("lista vacía → 0", () => {
+    expect(calculatePaymentAmountAdjustmentCreditInCaja([])).toBe(0);
   });
 });

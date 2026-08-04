@@ -11,7 +11,7 @@ import { database as db } from "../database/index";
 import {
   users, sessions, policies, companies, insureds, policyInstallments,
   payments, paymentSplits, paymentBatches, paymentBatchSplits, cashEntries, receivedChecks, cashDebts,
-  insuredAccountMovements,
+  insuredAccountMovements, paymentAmountAdjustments,
 } from "../database/schema";
 import { eq, inArray, and } from "drizzle-orm";
 
@@ -104,6 +104,11 @@ async function getMovementsForBatch(batchId: number) {
   return db.select().from(insuredAccountMovements).where(eq(insuredAccountMovements.originBatchId, batchId)).all();
 }
 
+/** Tolerancia de redondeo (payment_amount_adjustments) — solo por paymentBatchId, ver POST /payment-batches. */
+async function getAdjustmentsForBatch(batchId: number) {
+  return db.select().from(paymentAmountAdjustments).where(eq(paymentAmountAdjustments.paymentBatchId, batchId)).all();
+}
+
 let checkCounter = 0;
 function mkCheckPayload(overrides: Record<string, any> = {}) {
   checkCounter++;
@@ -144,6 +149,11 @@ beforeAll(async () => {
       // por un solo id todavía referenciado (bug real detectado y corregido
       // en Fase 2B — ver mismo comentario en afterAll).
       if (batchIds.length) await db.delete(insuredAccountMovements).where(inArray(insuredAccountMovements.originBatchId, batchIds)).catch(() => {});
+      // payment_amount_adjustments.payment_batch_id referencia payment_batches
+      // — mismo bug de orden que insured_account_movements arriba (Fase 2B):
+      // debe limpiarse ANTES de borrar payment_batches, o el DELETE bulk falla
+      // entero por FK bajo @libsql/client (foreign_keys=ON).
+      if (batchIds.length) await db.delete(paymentAmountAdjustments).where(inArray(paymentAmountAdjustments.paymentBatchId, batchIds)).catch(() => {});
       if (payIds.length) await db.delete(cashEntries).where(inArray(cashEntries.paymentId, payIds)).catch(() => {});
       // received_checks.payment_split_id referencia payment_splits — debe
       // limpiarse ANTES de borrar los splits (mismo bug de orden que el de
@@ -199,6 +209,9 @@ afterAll(async () => {
   // de este archivo (bug real detectado y corregido en Fase 2B).
   if (batchIdsToClean.length) {
     await db.delete(insuredAccountMovements).where(inArray(insuredAccountMovements.originBatchId, batchIdsToClean)).catch(() => {});
+    // Mismo bug de orden que insured_account_movements (Fase 2B) — ver
+    // comentario de arriba: debe limpiarse ANTES de payment_batches.
+    await db.delete(paymentAmountAdjustments).where(inArray(paymentAmountAdjustments.paymentBatchId, batchIdsToClean)).catch(() => {});
   }
   if (paymentIdsToClean.length) {
     await db.delete(cashEntries).where(inArray(cashEntries.paymentId, paymentIdsToClean)).catch(() => {});
@@ -2649,5 +2662,403 @@ describe("78. GET /payment-batches/:id — datos para el comprobante (Fase 2F)",
     const { body } = await callGetBatch(created.id);
     expect(body.accountMovements.length).toBe(1);
     expect(body.accountMovements[0].status).toBe("anulado");
+  });
+});
+
+// ─── 79+: Tolerancia de redondeo (payment_amount_adjustments) ─────────────
+// Reutiliza payment_amount_adjustments (Migración 0030, Fase 2A — sin
+// insuredId) para una diferencia CHICA y acotada (≤$5,00) entre dinero real
+// recibido y lo aplicado a las cuotas — nunca escribe insured_account_
+// movements, nunca exige un asegurado único (funciona igual con lote de un
+// asegurado, multiasegurado o 100% manual).
+
+async function mk13InstallmentsElNorte(insured: number, company: number): Promise<number[]> {
+  // 12 × $134.774,00 + 1 × $134.773,00 = $1.752.061,00 exacto.
+  const policyId = await mkPolicy(insured, company);
+  const ids: number[] = [];
+  for (let n = 1; n <= 12; n++) ids.push(await mkInstallment(policyId, n, "2027-01-01", 134774));
+  ids.push(await mkInstallment(policyId, 13, "2027-01-01", 134773));
+  return ids;
+}
+
+const EL_NORTE_CHECKS = [
+  { checkNumber: "14572565", amount: 770499.67 },
+  { checkNumber: "14572566", amount: 580462.77 },
+  { checkNumber: "14572567", amount: 401096.22 },
+];
+
+describe("79. Tolerancia de redondeo — caso real (13 cuotas El Norte, 3 cheques)", () => {
+  test("sin accountDifferenceResolution → 400 bloqueado, nada se crea, las 13 cuotas siguen pendientes", async () => {
+    const instIds = await mk13InstallmentsElNorte(insuredId, companyId);
+    const before = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: instIds.map((id) => ({ installmentId: id })),
+      splits: [{
+        method: "cheque", amount: 1752058.66,
+        checks: EL_NORTE_CHECKS.map((c) => ({ checkNumber: `${PREFIX}-79-${c.checkNumber}`, bankName: `${PREFIX} Banco`, dueDate: "2027-06-01", amount: c.amount })),
+      }],
+    });
+    expect(status).toBe(400);
+    expect(body.code).toBe("PAYMENT_BATCH_AMOUNT_DIFFERENCE");
+
+    const after = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    expect(after.length).toBe(before.length);
+    for (const id of instIds) expect((await getInstallment(id))!.status).toBe("pendiente");
+  });
+
+  test("con aceptación explícita (ajuste_redondeo) → 201, fila -234 en payment_amount_adjustments, sin insured_account_movements", async () => {
+    const instIds = await mk13InstallmentsElNorte(insuredId, companyId);
+
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: instIds.map((id) => ({ installmentId: id })),
+      splits: [{
+        method: "cheque", amount: 1752058.66,
+        checks: EL_NORTE_CHECKS.map((c) => ({ checkNumber: `${PREFIX}-79b-${c.checkNumber}`, bankName: `${PREFIX} Banco`, dueDate: "2027-06-01", amount: c.amount })),
+      }],
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+    expect(status).toBe(201);
+
+    const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
+    expect(batch!.totalReceivedCents).toBe(175206100); // aplicado (nominal), sin cambios
+    expect(batch!.receivedAmountCents).toBe(175205866); // real (3 cheques)
+
+    // Los 3 cheques quedan por su importe físico real, sin achicarse.
+    const checks = await getChecksForBatch(body.id);
+    expect(checks.length).toBe(3);
+    expect(checks.reduce((s, c) => s + c.amountCents, 0)).toBe(175205866);
+
+    // payment_amount_adjustments: exactamente 1 fila, -234 centavos.
+    const adjustments = await getAdjustmentsForBatch(body.id);
+    expect(adjustments.length).toBe(1);
+    expect(adjustments[0]!.amountCents).toBe(-234);
+    expect(adjustments[0]!.paymentBatchId).toBe(body.id);
+    expect(adjustments[0]!.paymentId).toBeNull();
+    expect(adjustments[0]!.reason).toBe("Ajuste por redondeo autorizado en cobro en lote");
+    expect(adjustments[0]!.authorizedBy).toBe(userId);
+    expect(adjustments[0]!.createdBy).toBe(userId);
+    expect(adjustments[0]!.createdAt).toBeTruthy();
+
+    // Nunca se toca insured_account_movements — la tolerancia de redondeo es
+    // deliberadamente ajena a la cuenta corriente del asegurado.
+    const movements = await getMovementsForBatch(body.id);
+    expect(movements.length).toBe(0);
+
+    // Las 13 cuotas quedan pagadas por su importe NOMINAL, sin relación con
+    // el faltante de $2,34.
+    const children = await getChildren(body.id);
+    expect(children.length).toBe(13);
+    const sumChildrenAmount = children.reduce((s, c) => s + c.amount, 0);
+    expect(sumChildrenAmount).toBeCloseTo(1752061.00, 2);
+    for (const id of instIds) expect((await getInstallment(id))!.status).toBe("pagada");
+  });
+});
+
+describe("80. Tolerancia de redondeo — límite exacto de $5,00 (500 centavos)", () => {
+  test("-500 centavos ($5,00 faltante) → 201, aceptado (límite inclusive)", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 995 }], // aplicado=1000, real=995 → -500
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+    expect(status).toBe(201);
+    const adjustments = await getAdjustmentsForBatch(body.id);
+    expect(adjustments[0]!.amountCents).toBe(-500);
+  });
+
+  test("+500 centavos ($5,00 sobrante) → 201, aceptado (límite inclusive)", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1005 }], // aplicado=1000, real=1005 → +500
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+    expect(status).toBe(201);
+    const adjustments = await getAdjustmentsForBatch(body.id);
+    expect(adjustments[0]!.amountCents).toBe(500);
+  });
+
+  test("-501 centavos ($5,01 faltante) → 400, rechazado, nada se escribe", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const before = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 994.99 }], // aplicado=1000, real=994.99 → -501
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain("$5.00"); // mensajes de error del backend usan toFixed(2) (punto), no coma
+    const after = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    expect(after.length).toBe(before.length);
+  });
+
+  test("+501 centavos ($5,01 sobrante) → 400, rechazado", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1005.01 }], // aplicado=1000, real=1005.01 → +501
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain("$5.00"); // mensajes de error del backend usan toFixed(2) (punto), no coma
+  });
+
+  test("el backend rechaza ajuste_redondeo forzado con una diferencia grande, aunque el frontend lo mande igual", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1500 }], // sobrante de $500 — muy por encima del tope
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+    expect(status).toBe(400);
+    expect(body.error).toContain("$5.00"); // mensajes de error del backend usan toFixed(2) (punto), no coma
+    const movements = await db.select().from(insuredAccountMovements).all();
+    // No quedó ningún efecto secundario — ni siquiera se evaluó la rama de saldo_a_favor/saldo_deudor.
+    expect(movements.every((m) => m.originBatchId !== body.id)).toBe(true);
+  });
+});
+
+describe("81. Tolerancia de redondeo — multiasegurado y 100% manual (sin exigir asegurado único)", () => {
+  test("multiasegurado (2 insuredId reales distintos) con diferencia de $2 y ajuste_redondeo → 201, ya no bloquea", async () => {
+    const policyA = await mkPolicy(insuredId, companyId);
+    const instA = await mkInstallment(policyA, 1, "2027-01-01", 1000);
+    const policyB = await mkPolicy(otherInsuredId, companyId);
+    const instB = await mkInstallment(policyB, 1, "2027-01-01", 500);
+
+    const { status, body } = await callPost({
+      paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instA }, { installmentId: instB }],
+      splits: [{ method: "efectivo", amount: 1498 }], // aplicado=1500, real=1498 → faltante $2
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+    expect(status).toBe(201);
+    const adjustments = await getAdjustmentsForBatch(body.id);
+    expect(adjustments.length).toBe(1);
+    expect(adjustments[0]!.amountCents).toBe(-200);
+    // Ningún insured_account_movement — ni para insuredId ni para otherInsuredId.
+    const movements = await getMovementsForBatch(body.id);
+    expect(movements.length).toBe(0);
+  });
+
+  test("100% manual_payment (sin ningún insuredId real) con diferencia de $2 y ajuste_redondeo → 201", async () => {
+    const { status, body } = await callPost({
+      paymentDate: "2027-01-01", notes: null,
+      items: [{ source: "manual_payment", manualPayer: "Cliente sin póliza (81)", amount: 1000 }],
+      splits: [{ method: "efectivo", amount: 1002 }], // aplicado=1000, real=1002 → sobrante $2
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+    expect(status).toBe(201);
+    const adjustments = await getAdjustmentsForBatch(body.id);
+    expect(adjustments.length).toBe(1);
+    expect(adjustments[0]!.amountCents).toBe(200);
+    const movements = await getMovementsForBatch(body.id);
+    expect(movements.length).toBe(0);
+  });
+});
+
+describe("82. Tolerancia de redondeo — Caja (sobrante suma, faltante no, cuenta corriente nunca se mueve)", () => {
+  test("sobrante de redondeo suma exactamente a Caja (cartera aplicado + roundingAdjustmentCreditCents = dinero real)", async () => {
+    const before = await getCashSummary();
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+
+    const { status, body } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1003 }], // aplicado=1000, real=1003 → sobrante $3
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+    expect(status).toBe(201);
+
+    const after = await getCashSummary();
+    // cajaNeta sube EXACTAMENTE el dinero real recibido ($10,03) — no el
+    // aplicado solo, y no el aplicado + sobrante duplicado.
+    expect(after.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(1003, 2);
+    expect(after.cartera.total - before.cartera.total).toBeCloseTo(1000, 2); // solo lo aplicado
+  });
+
+  test("faltante de redondeo NUNCA agrega dinero inexistente — Caja sube solo el real recibido", async () => {
+    const before = await getCashSummary();
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+
+    const { status } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 997 }], // aplicado=1000, real=997 → faltante $3
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+    expect(status).toBe(201);
+
+    const after = await getCashSummary();
+    expect(after.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(997, 2); // nunca 1000
+    expect(after.cartera.total - before.cartera.total).toBeCloseTo(997, 2);
+  });
+
+  test("caso real (faltante $2,34): El Norte no aparece debiendo nada en cuenta corriente", async () => {
+    const before = await getCashSummary();
+    const beforeBalance = before.cuentaCorriente.byInsured.find((b: any) => b.insuredId === insuredId)?.balance ?? 0;
+
+    const instIds = await mk13InstallmentsElNorte(insuredId, companyId);
+    await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: instIds.map((id) => ({ installmentId: id })),
+      splits: [{
+        method: "cheque", amount: 1752058.66,
+        checks: EL_NORTE_CHECKS.map((c) => ({ checkNumber: `${PREFIX}-82-${c.checkNumber}`, bankName: `${PREFIX} Banco`, dueDate: "2027-06-01", amount: c.amount })),
+      }],
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+
+    const after = await getCashSummary();
+    const afterBalance = after.cuentaCorriente.byInsured.find((b: any) => b.insuredId === insuredId)?.balance ?? 0;
+    expect(afterBalance).toBe(beforeBalance); // sin cambios — nunca aparece debiendo $2,34
+  });
+});
+
+describe("83. Tolerancia de redondeo — anulación del lote", () => {
+  test("al anular, la fila de payment_amount_adjustments permanece intacta pero deja de contribuir a Caja", async () => {
+    const baseline = await getCashSummary();
+
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1004 }], // sobrante $4
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+
+    const withAdjustment = await getCashSummary();
+    expect(withAdjustment.cajaNeta.total - baseline.cajaNeta.total).toBeCloseTo(1004, 2);
+
+    const cancel = await callCancelBatch(created.id);
+    expect(cancel.status).toBe(200);
+
+    // La fila histórica sigue existiendo — nunca se borra ni se anula.
+    const adjustments = await getAdjustmentsForBatch(created.id);
+    expect(adjustments.length).toBe(1);
+    expect(adjustments[0]!.amountCents).toBe(400);
+
+    const afterCancel = await getCashSummary();
+    // Cancelado, Caja vuelve exactamente a la línea de base — el ajuste ya
+    // no contribuye (batch.status !== "confirmado").
+    expect(afterCancel.cajaNeta.total - baseline.cajaNeta.total).toBeCloseTo(0, 2);
+    const installment = await getInstallment(instId);
+    expect(installment!.status).toBe("pendiente"); // vuelve a estar disponible para cobrar
+  });
+});
+
+// ─── 84. GET /payment-batches/:id — amountAdjustments (gap del detalle/comprobante) ──
+// El detalle de un batch resuelto por ajuste_redondeo nunca escribe en
+// insured_account_movements (ver describes 79-83), así que el comprobante
+// necesita su propia propiedad para no mostrar "sin resolución registrada"
+// en un batch que sí tiene una resolución real (ver payment-batch-form.ts,
+// summarizeBatchResolution).
+
+describe("84. GET /payment-batches/:id — amountAdjustments (tolerancia de redondeo)", () => {
+  test("caso real (faltante -234): amountAdjustments trae exactamente 1 fila con todos los metadatos, accountMovements vacío", async () => {
+    const instIds = await mk13InstallmentsElNorte(insuredId, companyId);
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: instIds.map((id) => ({ installmentId: id })),
+      splits: [{
+        method: "cheque", amount: 1752058.66,
+        checks: EL_NORTE_CHECKS.map((c) => ({ checkNumber: `${PREFIX}-84a-${c.checkNumber}`, bankName: `${PREFIX} Banco`, dueDate: "2027-06-01", amount: c.amount })),
+      }],
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+
+    const { status, body } = await callGetBatch(created.id);
+    expect(status).toBe(200);
+    expect(body.accountMovements).toEqual([]);
+    expect(body.amountAdjustments.length).toBe(1);
+    const adj = body.amountAdjustments[0];
+    expect(adj.paymentBatchId).toBe(created.id);
+    expect(adj.amountCents).toBe(-234);
+    expect(adj.reason).toBe("Ajuste por redondeo autorizado en cobro en lote");
+    expect(adj.authorizedBy).toBe(userId);
+    expect(adj.createdBy).toBe(userId);
+    expect(adj.createdAt).toBeTruthy();
+  });
+
+  test("sobrante (+300): amountAdjustments trae el signo positivo intacto", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1003 }], // aplicado=1000, real=1003 → sobrante $3
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+
+    const { body } = await callGetBatch(created.id);
+    expect(body.amountAdjustments.length).toBe(1);
+    expect(body.amountAdjustments[0].amountCents).toBe(300);
+  });
+
+  test("lote sin ninguna diferencia (kind exacto): amountAdjustments = [], compatible con batches previos a esta etapa", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1000 }],
+    });
+
+    const { body } = await callGetBatch(created.id);
+    expect(body.amountAdjustments).toEqual([]);
+    expect(body.accountMovements).toEqual([]);
+  });
+
+  test("flujo existente saldo_a_favor sin regresión: amountAdjustments = [], accountMovements sigue igual", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const checkNumber = `CHK-84D-${Date.now()}`;
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "cheque", amount: 1100, checks: [{ checkNumber, bankName: `${PREFIX} Banco`, dueDate: "2027-06-01", amount: 1100 }] }],
+      accountDifferenceResolution: { action: "saldo_a_favor", reason: "cheque redondeado por el asegurado" },
+    });
+
+    const { body } = await callGetBatch(created.id);
+    expect(body.amountAdjustments).toEqual([]);
+    expect(body.accountMovements.length).toBe(1);
+    expect(body.accountMovements[0].type).toBe("saldo_a_favor");
+    expect(body.accountMovements[0].reason).toBe("cheque redondeado por el asegurado");
+  });
+
+  test("lote anulado: el ajuste sigue visible como registro histórico en amountAdjustments (misma fila, sin cambios)", async () => {
+    const policyId = await mkPolicy(insuredId, companyId);
+    const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const { body: created } = await callPost({
+      insuredId, paymentDate: "2027-01-01", notes: null,
+      items: [{ installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1004 }], // sobrante $4
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+
+    const cancel = await callCancelBatch(created.id);
+    expect(cancel.status).toBe(200);
+
+    const { body } = await callGetBatch(created.id);
+    expect(body.batch.status).toBe("anulado");
+    expect(body.amountAdjustments.length).toBe(1);
+    expect(body.amountAdjustments[0].amountCents).toBe(400);
   });
 });

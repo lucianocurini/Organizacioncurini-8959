@@ -3,6 +3,7 @@ import {
   type PendingInstallmentForPayment, type BatchSplitFormRow, type BatchCartItem,
   type ManualPaymentFormState, type PaymentBatchDetailItem, type PaymentBatchCancelCheckResponse,
   type BatchDifferenceResolutionFormState, type BatchDetailAccountMovement, type PaymentBatchDetail,
+  type BatchDetailAmountAdjustment,
   summarizeCartInsureds, calculateCartTotal, getInstallmentRowState, addInstallmentToCart, removeFromCart, cartItemKey,
   emptyManualPaymentForm, validateManualPaymentForm, buildManualCartItemFromForm, addManualPaymentToCart,
   estimateProntoPagoSurchargeCents, calculateBatchTargetAmountCents,
@@ -17,8 +18,11 @@ import {
   MIXED_GROUP_ERROR, SURCHARGE_AMOUNT_CENTS,
   updateSplitMethodPreservingChecks, splitsToPaymentSplitsPayload,
   calculateBatchReceivedAppliedDifference, emptyBatchDifferenceResolutionForm, validateBatchDifferenceResolution,
-  buildAccountDifferenceResolutionPayload, receivedCentsOf, findBatchDifferenceResolution,
+  buildAccountDifferenceResolutionPayload, receivedCentsOf, findBatchDifferenceResolution, summarizeBatchResolution,
+  syncChequeSplitAmounts, isRoundingAdjustmentEligible, buildRoundingAdjustmentPayload,
+  validateBatchDifferenceResolutionWithRounding, MAX_ROUNDING_ADJUSTMENT_CENTS,
 } from "../payment-batch-form";
+import { formatCurrencyCents } from "../utils";
 
 function pendingItem(overrides: Partial<PendingInstallmentForPayment> = {}): PendingInstallmentForPayment {
   return {
@@ -927,6 +931,75 @@ describe("findBatchDifferenceResolution", () => {
   });
 });
 
+// ─── summarizeBatchResolution — gap del detalle/comprobante (amountAdjustments) ──
+
+describe("summarizeBatchResolution", () => {
+  function movement(overrides: Partial<BatchDetailAccountMovement> = {}): BatchDetailAccountMovement {
+    return { id: 1, insuredId: 100, type: "saldo_a_favor", signedAmountCents: 10000, status: "activo", reason: null, ...overrides };
+  }
+  function adjustment(overrides: Partial<BatchDetailAmountAdjustment> = {}): BatchDetailAmountAdjustment {
+    return {
+      id: 1, paymentBatchId: 55, amountCents: -234,
+      reason: "Ajuste por redondeo autorizado en cobro en lote",
+      authorizedBy: 7, createdBy: 7, createdAt: "2027-01-01T00:00:00.000Z",
+      ...overrides,
+    };
+  }
+
+  test("sin movimientos y sin ajustes → kind='none', nunca se confunde con una resolución real", () => {
+    const result = summarizeBatchResolution([], [], "confirmado");
+    expect(result).toEqual({ kind: "none", accountMovement: null, roundingAdjustment: null });
+  });
+
+  test("caso real (faltante -234, batch confirmado) → kind='rounding_adjustment', label exacto 'Faltante por ajuste de redondeo: $2,34'", () => {
+    const result = summarizeBatchResolution([], [adjustment({ amountCents: -234 })], "confirmado");
+    expect(result.kind).toBe("rounding_adjustment");
+    expect(result.accountMovement).toBeNull();
+    expect(result.roundingAdjustment).not.toBeNull();
+    expect(result.roundingAdjustment!.amountCents).toBe(-234);
+    expect(result.roundingAdjustment!.label).toBe(`Faltante por ajuste de redondeo: ${formatCurrencyCents(234)}`);
+    expect(result.roundingAdjustment!.reason).toBe("Ajuste por redondeo autorizado en cobro en lote");
+    expect(result.roundingAdjustment!.contributesToCaja).toBe(true);
+  });
+
+  test("sobrante (+500, batch confirmado) → label 'Sobrante por ajuste de redondeo: $5,00'", () => {
+    const result = summarizeBatchResolution([], [adjustment({ amountCents: 500 })], "confirmado");
+    expect(result.roundingAdjustment!.label).toBe(`Sobrante por ajuste de redondeo: ${formatCurrencyCents(500)}`);
+    expect(result.roundingAdjustment!.contributesToCaja).toBe(true);
+  });
+
+  test("batch anulado → contributesToCaja=false, pero el ajuste sigue presente (histórico, kind sin cambios)", () => {
+    const result = summarizeBatchResolution([], [adjustment({ amountCents: 400 })], "anulado");
+    expect(result.kind).toBe("rounding_adjustment");
+    expect(result.roundingAdjustment!.amountCents).toBe(400);
+    expect(result.roundingAdjustment!.contributesToCaja).toBe(false);
+  });
+
+  test("flujo existente saldo_a_favor/saldo_deudor sin regresión: mismo resultado que findBatchDifferenceResolution, kind='account_movement'", () => {
+    const movements = [movement({ type: "saldo_deudor", reason: "acordado con el asegurado" })];
+    const result = summarizeBatchResolution(movements, [], "confirmado");
+    expect(result.kind).toBe("account_movement");
+    expect(result.roundingAdjustment).toBeNull();
+    expect(result.accountMovement).toEqual(findBatchDifferenceResolution(movements));
+  });
+
+  test("ambos presentes a la vez (dato anómalo) → kind='inconsistent_both', ninguno de los dos se oculta", () => {
+    const movements = [movement({ type: "saldo_a_favor", reason: "movimiento real" })];
+    const adjustments = [adjustment({ amountCents: -234 })];
+    const result = summarizeBatchResolution(movements, adjustments, "confirmado");
+    expect(result.kind).toBe("inconsistent_both");
+    expect(result.accountMovement).not.toBeNull();
+    expect(result.accountMovement!.reason).toBe("movimiento real");
+    expect(result.roundingAdjustment).not.toBeNull();
+    expect(result.roundingAdjustment!.amountCents).toBe(-234);
+  });
+
+  test("nunca devuelve kind='none' cuando existe un ajuste válido, incluso con reason vacío en accountMovements", () => {
+    const result = summarizeBatchResolution([], [adjustment()], "confirmado");
+    expect(result.kind).not.toBe("none");
+  });
+});
+
 describe("comprobante — descripción de ítems (cuota / cobro manual con póliza / imputación libre)", () => {
   function detailItem(overrides: Partial<PaymentBatchDetailItem> = {}): PaymentBatchDetailItem {
     return {
@@ -1322,5 +1395,223 @@ describe("splitsToPaymentSplitsPayload", () => {
       { method: "efectivo", amount: 600 },
       { method: "transferencia", amount: 400 },
     ]);
+  });
+});
+
+// ─── syncChequeSplitAmounts — el usuario ya no escribe el importe a mano ───
+
+describe("syncChequeSplitAmounts", () => {
+  test("caso real: 3 cheques ($770.499,67 + $580.462,77 + $401.096,22) → split.amount = $1.752.058,66 exacto", () => {
+    let splits: BatchSplitFormRow[] = [createBatchSplitRow("cheque", "1752061")]; // arranca en el nominal (target), como antes
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    const [c1, c2, c3] = splits[0]!.checks;
+    splits = updateCheckInSplit(splits, splits[0]!.uid, c1!.uid, { checkNumber: "14572565", bankName: "Banco A", dueDate: "2027-06-01", amount: "770499.67" });
+    splits = updateCheckInSplit(splits, splits[0]!.uid, c2!.uid, { checkNumber: "14572566", bankName: "Banco A", dueDate: "2027-06-01", amount: "580462.77" });
+    splits = updateCheckInSplit(splits, splits[0]!.uid, c3!.uid, { checkNumber: "14572567", bankName: "Banco A", dueDate: "2027-06-01", amount: "401096.22" });
+
+    const synced = syncChequeSplitAmounts(splits);
+    expect(synced[0]!.amount).toBe("1752058.66");
+    expect(amountStringToCentsStrict(synced[0]!.amount)).toBe(175205866);
+  });
+
+  test("no-op para splits que no son cheque — nunca toca su amount", () => {
+    const splits: BatchSplitFormRow[] = [createBatchSplitRow("efectivo", "1000")];
+    const synced = syncChequeSplitAmounts(splits);
+    expect(synced[0]!.amount).toBe("1000");
+  });
+
+  test("split cheque sin ningún cheque cargado → amount se recalcula a 0.00, nunca queda con un valor stale", () => {
+    let splits: BatchSplitFormRow[] = [createBatchSplitRow("cheque", "1752061")];
+    const synced = syncChequeSplitAmounts(splits);
+    expect(synced[0]!.amount).toBe("0.00");
+  });
+
+  test("funciona con varios medios de pago a la vez — cada split cheque se sincroniza independiente, los demás no se tocan", () => {
+    let splits: BatchSplitFormRow[] = [
+      createBatchSplitRow("efectivo", "500"),
+      createBatchSplitRow("cheque", "1000"),
+    ];
+    splits = addCheckToSplit(splits, splits[1]!.uid);
+    splits = updateCheckInSplit(splits, splits[1]!.uid, splits[1]!.checks[0]!.uid, {
+      checkNumber: "1", bankName: "Nación", dueDate: "2027-06-01", amount: "999.99",
+    });
+    const synced = syncChequeSplitAmounts(splits);
+    expect(synced[0]!.amount).toBe("500"); // efectivo, sin cambios
+    expect(synced[1]!.amount).toBe("999.99"); // cheque, recalculado
+  });
+
+  test("recalcula al agregar un segundo cheque (simula 'agregar')", () => {
+    let splits: BatchSplitFormRow[] = [createBatchSplitRow("cheque", "1000")];
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    splits = updateCheckInSplit(splits, splits[0]!.uid, splits[0]!.checks[0]!.uid, { checkNumber: "1", bankName: "Nación", dueDate: "2027-06-01", amount: "600" });
+    splits = syncChequeSplitAmounts(splits);
+    expect(splits[0]!.amount).toBe("600.00");
+
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    splits = updateCheckInSplit(splits, splits[0]!.uid, splits[0]!.checks[1]!.uid, { checkNumber: "2", bankName: "Galicia", dueDate: "2027-06-01", amount: "400" });
+    splits = syncChequeSplitAmounts(splits);
+    expect(splits[0]!.amount).toBe("1000.00"); // recalculado, sin intervención manual
+  });
+
+  test("recalcula al editar el importe de un cheque existente", () => {
+    let splits: BatchSplitFormRow[] = [createBatchSplitRow("cheque", "1000")];
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    splits = updateCheckInSplit(splits, splits[0]!.uid, splits[0]!.checks[0]!.uid, { checkNumber: "1", bankName: "Nación", dueDate: "2027-06-01", amount: "600" });
+    splits = syncChequeSplitAmounts(splits);
+    expect(splits[0]!.amount).toBe("600.00");
+
+    splits = updateCheckInSplit(splits, splits[0]!.uid, splits[0]!.checks[0]!.uid, { amount: "650.50" });
+    splits = syncChequeSplitAmounts(splits);
+    expect(splits[0]!.amount).toBe("650.50");
+  });
+
+  test("recalcula al quitar un cheque", () => {
+    let splits: BatchSplitFormRow[] = [createBatchSplitRow("cheque", "1000")];
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    const [c1, c2] = splits[0]!.checks;
+    splits = updateCheckInSplit(splits, splits[0]!.uid, c1!.uid, { checkNumber: "1", bankName: "Nación", dueDate: "2027-06-01", amount: "600" });
+    splits = updateCheckInSplit(splits, splits[0]!.uid, c2!.uid, { checkNumber: "2", bankName: "Galicia", dueDate: "2027-06-01", amount: "400" });
+    splits = syncChequeSplitAmounts(splits);
+    expect(splits[0]!.amount).toBe("1000.00");
+
+    splits = removeCheckFromSplit(splits, splits[0]!.uid, c2!.uid);
+    splits = syncChequeSplitAmounts(splits);
+    expect(splits[0]!.amount).toBe("600.00");
+  });
+
+  test("idempotente — aplicarlo dos veces seguidas da el mismo resultado", () => {
+    let splits: BatchSplitFormRow[] = [createBatchSplitRow("cheque", "1000")];
+    splits = addCheckToSplit(splits, splits[0]!.uid);
+    splits = updateCheckInSplit(splits, splits[0]!.uid, splits[0]!.checks[0]!.uid, { checkNumber: "1", bankName: "Nación", dueDate: "2027-06-01", amount: "999.99" });
+    const once = syncChequeSplitAmounts(splits);
+    const twice = syncChequeSplitAmounts(once);
+    expect(twice).toEqual(once);
+  });
+});
+
+// ─── Tolerancia de redondeo — isRoundingAdjustmentEligible / buildRoundingAdjustmentPayload ──
+
+describe("MAX_ROUNDING_ADJUSTMENT_CENTS", () => {
+  test("re-exportado de insured-account.ts, vale 500", () => {
+    expect(MAX_ROUNDING_ADJUSTMENT_CENTS).toBe(500);
+  });
+});
+
+describe("isRoundingAdjustmentEligible", () => {
+  test("diferencia 0 → no elegible (no hay nada que aceptar)", () => {
+    expect(isRoundingAdjustmentEligible(0)).toBe(false);
+  });
+  test("caso real: -234 centavos ($2,34 faltante) → elegible", () => {
+    expect(isRoundingAdjustmentEligible(-234)).toBe(true);
+  });
+  test("+234 centavos (sobrante) → elegible", () => {
+    expect(isRoundingAdjustmentEligible(234)).toBe(true);
+  });
+  test("-500 / +500 (límite exacto de $5,00) → elegible", () => {
+    expect(isRoundingAdjustmentEligible(-500)).toBe(true);
+    expect(isRoundingAdjustmentEligible(500)).toBe(true);
+  });
+  test("-501 / +501 ($5,01) → NO elegible, sigue el flujo general", () => {
+    expect(isRoundingAdjustmentEligible(-501)).toBe(false);
+    expect(isRoundingAdjustmentEligible(501)).toBe(false);
+  });
+});
+
+describe("buildRoundingAdjustmentPayload", () => {
+  test("siempre { action: 'ajuste_redondeo' }, sin reason (el backend autogenera el motivo estándar)", () => {
+    expect(buildRoundingAdjustmentPayload()).toEqual({ action: "ajuste_redondeo" });
+  });
+});
+
+describe("validateBatchDifferenceResolutionWithRounding", () => {
+  function resolution(overrides: Partial<BatchDifferenceResolutionFormState> = {}): BatchDifferenceResolutionFormState {
+    return { ...emptyBatchDifferenceResolutionForm(), ...overrides };
+  }
+
+  test("sin diferencia ('exacto') → siempre válido, sin importar nada más", () => {
+    const exact = calculateBatchReceivedAppliedDifference(100000, 100000);
+    expect(validateBatchDifferenceResolutionWithRounding(exact, resolution(), false, "manual-only").valid).toBe(true);
+  });
+
+  test("caso real (faltante $2,34, elegible) con checkbox tildado → válido para asegurado único, SIN elegir saldo_deudor ni cargar motivo", () => {
+    const faltante = calculateBatchReceivedAppliedDifference(175205866, 175206100);
+    const result = validateBatchDifferenceResolutionWithRounding(faltante, resolution(), true, "single");
+    expect(result.valid).toBe(true);
+  });
+
+  test("faltante elegible con checkbox tildado → válido en MULTIASEGURADO, sin exigir ningún insuredId (payment_amount_adjustments no lo necesita)", () => {
+    const faltante = calculateBatchReceivedAppliedDifference(175205866, 175206100);
+    const result = validateBatchDifferenceResolutionWithRounding(faltante, resolution(), true, "multiple");
+    expect(result.valid).toBe(true);
+  });
+
+  test("faltante elegible con checkbox tildado → válido en 100% MANUAL, sin exigir ningún insuredId", () => {
+    const faltante = calculateBatchReceivedAppliedDifference(175205866, 175206100);
+    const result = validateBatchDifferenceResolutionWithRounding(faltante, resolution(), true, "manual-only");
+    expect(result.valid).toBe(true);
+  });
+
+  test("faltante elegible pero checkbox SIN tildar, asegurado único → delega en el flujo existente (pide elegir saldo deudor)", () => {
+    const faltante = calculateBatchReceivedAppliedDifference(80000, 100000); // faltante $200, elegible? |diff|=20000 > 500 → NO elegible
+    const result = validateBatchDifferenceResolutionWithRounding(faltante, resolution(), false, "single");
+    expect(result.valid).toBe(false);
+    expect(result.errorMessage).toContain("Saldo deudor");
+  });
+
+  test("faltante elegible ($2,34) pero checkbox SIN tildar, asegurado único → delega en validateBatchDifferenceResolution (pide elegir una resolución)", () => {
+    const faltante = calculateBatchReceivedAppliedDifference(175205866, 175206100);
+    const result = validateBatchDifferenceResolutionWithRounding(faltante, resolution(), false, "single");
+    expect(result.valid).toBe(false); // ninguna de las dos vías fue elegida todavía
+  });
+
+  test("faltante elegible ($2,34), asegurado único, SIN checkbox y SIN resolución elegida → mensaje combinado exacto (redondeo o saldo deudor)", () => {
+    const faltante = calculateBatchReceivedAppliedDifference(175205866, 175206100);
+    const result = validateBatchDifferenceResolutionWithRounding(faltante, resolution(), false, "single");
+    expect(result.errorMessage).toBe(
+      "Elegí aceptar el ajuste por redondeo o registrar la diferencia como saldo deudor para confirmar el cobro.",
+    );
+  });
+
+  test("sobrante elegible ($5,00), asegurado único, SIN checkbox y SIN resolución elegida → mensaje combinado exacto (redondeo o saldo a favor)", () => {
+    const sobrante = calculateBatchReceivedAppliedDifference(175206600, 175206100); // +$5,00, elegible (tope inclusive)
+    const result = validateBatchDifferenceResolutionWithRounding(sobrante, resolution(), false, "single");
+    expect(result.valid).toBe(false);
+    expect(result.errorMessage).toBe(
+      "Elegí aceptar el ajuste por redondeo o registrar la diferencia como saldo a favor para confirmar el cobro.",
+    );
+  });
+
+  test("faltante elegible pero YA con saldo_deudor elegido sin motivo → vuelve al mensaje específico de motivo obligatorio, no al combinado", () => {
+    const faltante = calculateBatchReceivedAppliedDifference(175205866, 175206100);
+    const result = validateBatchDifferenceResolutionWithRounding(
+      faltante, resolution({ action: "saldo_deudor", reason: "" }), false, "single",
+    );
+    expect(result.valid).toBe(false);
+    expect(result.errorMessage).toBe("El motivo es obligatorio para registrar un saldo deudor.");
+  });
+
+  test("asegurado único, faltante elegible, checkbox SIN tildar pero SÍ eligió saldo_deudor con motivo → válido (flujo existente intacto, sin regresión)", () => {
+    const faltante = calculateBatchReceivedAppliedDifference(175205866, 175206100);
+    const result = validateBatchDifferenceResolutionWithRounding(
+      faltante, resolution({ action: "saldo_deudor", reason: "acordado con el asegurado" }), false, "single",
+    );
+    expect(result.valid).toBe(true);
+  });
+
+  test("diferencia >$5,00 en multiasegurado → sigue bloqueada aunque roundingAccepted sea true (no elegible, no hay checkbox real)", () => {
+    const faltante = calculateBatchReceivedAppliedDifference(80000, 100000); // |diff|=20000 > 500
+    const result = validateBatchDifferenceResolutionWithRounding(faltante, resolution(), true, "multiple");
+    expect(result.valid).toBe(false);
+    expect(result.errorMessage).toContain("único asegurado real");
+  });
+
+  test("diferencia >$5,00 en asegurado único → EXACTAMENTE el flujo general existente, sin cambios", () => {
+    const sobrante = calculateBatchReceivedAppliedDifference(150000, 100000); // |diff|=50000 > 500
+    const withoutRounding = validateBatchDifferenceResolution(sobrante, resolution({ action: "saldo_a_favor" }), "single");
+    const withRoundingWrapper = validateBatchDifferenceResolutionWithRounding(sobrante, resolution({ action: "saldo_a_favor" }), false, "single");
+    expect(withRoundingWrapper).toEqual(withoutRounding);
   });
 });

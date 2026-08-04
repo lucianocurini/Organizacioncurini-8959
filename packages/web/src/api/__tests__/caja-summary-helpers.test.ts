@@ -421,6 +421,31 @@ describe("calculateCajaNetaTotalCents", () => {
     });
     expect(total).toBe(50000);
   });
+
+  // ─── roundingAdjustmentCreditCents (payment_amount_adjustments) ──────────
+
+  test("roundingAdjustmentCreditCents omitido → equivale a 0 (compatibilidad con callers existentes)", () => {
+    const total = calculateCajaNetaTotalCents({
+      carteraTotalCents: 50000, creditoActivoEnCajaCents: 0, creditoRegularizadoCents: 0, cobrosSaldoDeudorCents: 0,
+    });
+    expect(total).toBe(50000);
+  });
+
+  test("sobrante de redondeo suma Caja, junto con el resto de los términos", () => {
+    const total = calculateCajaNetaTotalCents({
+      carteraTotalCents: 100000, creditoActivoEnCajaCents: 10000, creditoRegularizadoCents: 0,
+      cobrosSaldoDeudorCents: 0, roundingAdjustmentCreditCents: 300,
+    });
+    expect(total).toBe(110300);
+  });
+
+  test("caso real: faltante de redondeo (-234) nunca se pasa acá con signo negativo — el caller ya lo excluyó (calculatePaymentAmountAdjustmentCreditInCaja)", () => {
+    const total = calculateCajaNetaTotalCents({
+      carteraTotalCents: 175205866, creditoActivoEnCajaCents: 0, creditoRegularizadoCents: 0,
+      cobrosSaldoDeudorCents: 0, roundingAdjustmentCreditCents: 0,
+    });
+    expect(total).toBe(175205866); // exactamente los 3 cheques reales, sin el faltante de $2,34
+  });
 });
 
 // ─── Cartera pendiente — recargo Pronto Pago standalone / manuales ─────────

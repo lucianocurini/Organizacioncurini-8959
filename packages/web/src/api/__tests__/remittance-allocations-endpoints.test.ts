@@ -11,7 +11,7 @@ import { database as db } from "../database/index";
 import {
   users, sessions, policies, companies, insureds, policyInstallments,
   payments, paymentSplits, paymentBatches, paymentBatchSplits, receivedChecks,
-  cashEntries, remittances, remittanceItems, remittanceAllocations,
+  cashEntries, remittances, remittanceItems, remittanceAllocations, paymentAmountAdjustments,
 } from "../database/schema";
 import { eq, inArray } from "drizzle-orm";
 
@@ -158,6 +158,10 @@ beforeAll(async () => {
       const splitIds = splitRows.map((s) => s.id);
       if (splitIds.length) await db.delete(receivedChecks).where(inArray(receivedChecks.batchSplitId, splitIds)).catch(() => {});
     }
+    // payment_amount_adjustments.payment_batch_id referencia payment_batches
+    // — debe limpiarse ANTES de borrar payment_batches (mismo bug de orden
+    // documentado en payment-batches.test.ts, Fase 2B).
+    if (batchIds.length) await db.delete(paymentAmountAdjustments).where(inArray(paymentAmountAdjustments.paymentBatchId, batchIds)).catch(() => {});
     if (batchIds.length) await db.delete(paymentBatchSplits).where(inArray(paymentBatchSplits.batchId, batchIds)).catch(() => {});
     if (batchIds.length) await db.delete(paymentBatches).where(inArray(paymentBatches.id, batchIds)).catch(() => {});
     if (polIds.length) await db.delete(policyInstallments).where(inArray(policyInstallments.policyId, polIds)).catch(() => {});
@@ -204,6 +208,7 @@ afterAll(async () => {
     const splitRows = await db.select({ id: paymentBatchSplits.id }).from(paymentBatchSplits).where(inArray(paymentBatchSplits.batchId, batchIdsToClean)).all();
     const splitIds = splitRows.map((s) => s.id);
     if (splitIds.length) await db.delete(receivedChecks).where(inArray(receivedChecks.batchSplitId, splitIds)).catch(() => {});
+    await db.delete(paymentAmountAdjustments).where(inArray(paymentAmountAdjustments.paymentBatchId, batchIdsToClean)).catch(() => {});
     await db.delete(paymentBatchSplits).where(inArray(paymentBatchSplits.batchId, batchIdsToClean)).catch(() => {});
     await db.delete(paymentBatches).where(inArray(paymentBatches.id, batchIdsToClean)).catch(() => {});
   }
@@ -548,6 +553,128 @@ describe("POST /api/remittances — cobro múltiple (payment_batches), rendició
     expect(items.some((it: any) => it.source === "cash_entry" && it.sourceId === surchargeRows[0]!.id)).toBe(true);
     expect((await getCashEntry(surchargeRows[0]!.id))!.rendered).toBe(1);
     expect(batchId).toBeGreaterThan(0);
+  });
+});
+
+describe("POST /api/remittances — lote con tolerancia de redondeo (payment_amount_adjustments), rendición total y parcial", () => {
+  // La tolerancia de redondeo (ver payment-batches.test.ts, describes 79-83)
+  // nunca toca payments.amount (nominal) ni payment_batch_splits/
+  // received_checks (dinero real) — un batch resuelto con ajuste_redondeo
+  // tiene EXACTAMENTE la misma forma que cualquier batch sin diferencia para
+  // todo lo que Rendiciones lee. Estos tests confirman que no reintroduce el
+  // bug de "batch_child_payment" (ver caja-summary-helpers.test.ts) ni ningún
+  // aviso falso de inconsistencia.
+
+  test("rendición TOTAL de un batch con ajuste de redondeo (faltante $2,34, caso real) — sin inconsistencias", async () => {
+    const p1 = await mkPolicy(companyId);
+    const i1 = await mkInstallment(p1, 1, 1000);
+    const p2 = await mkPolicy(companyId);
+    const i2 = await mkInstallment(p2, 1, 752.66); // 1000 + 752.66 = 1752.66 (mismo patrón a menor escala que el caso real)
+
+    const created = await callPostBatch({
+      paymentDate: "2027-06-01", insuredId,
+      items: [{ installmentId: i1 }, { installmentId: i2 }],
+      splits: [{ method: "efectivo", amount: 1750.32 }], // aplicado=1752.66, real=1750.32 → faltante $2,34
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+      applyProntoPagoSurcharge: false,
+    });
+    expect(created.status).toBe(201);
+    const batchId = created.body.id as number;
+    const children = await mkChildIds(batchId);
+    expect(children.length).toBe(2);
+
+    // Cada hijo se rinde por su propio importe NOMINAL real (payments.amount,
+    // el instrumento de SALIDA elegido en la rendición — Migración 0029,
+    // independiente del dinero real que entró en el cobro original) — nunca
+    // se asume el orden de inserción de items[] al armar el body. El
+    // paymentBreakdown debe sumar el NOMINAL rendido (1752.66), nunca el
+    // real recibido en el cobro (1750.32, que es del cobro, no de esta rendición).
+    const childPayments = await Promise.all(children.map((cid) => getPayment(cid)));
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { efectivo: 1752.66 },
+      items: children.map((cid, idx) => ({ source: "payment", sourceId: cid, amount: childPayments[idx]!.amount, paymentMethod: "efectivo" })),
+    });
+    expect(res.status).toBe(200);
+    const allocs = await getAllocations(res.body.id);
+    expect(allocs.length).toBe(2);
+    // Los hijos se rinden por su importe NOMINAL — el ajuste de redondeo
+    // nunca se propaga a la rendición (no es un instrumento ni una cuota).
+    expect(allocs.reduce((s, a) => s + a.amountCents, 0)).toBe(175266);
+    for (const cid of children) expect((await getPayment(cid))!.rendered).toBe(1);
+  });
+
+  test("rendición PARCIAL: se rinde solo un hijo del batch con ajuste de redondeo, el resto queda pendiente sin inconsistencia", async () => {
+    const p1 = await mkPolicy(companyId);
+    const i1 = await mkInstallment(p1, 1, 1000);
+    const p2 = await mkPolicy(companyId);
+    const i2 = await mkInstallment(p2, 1, 752.66);
+
+    const created = await callPostBatch({
+      paymentDate: "2027-06-01", insuredId,
+      items: [{ installmentId: i1 }, { installmentId: i2 }],
+      splits: [{ method: "efectivo", amount: 1750.32 }],
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+      applyProntoPagoSurcharge: false,
+    });
+    expect(created.status).toBe(201);
+    const batchId = created.body.id as number;
+    const children = await mkChildIds(batchId);
+    const firstChildPayment = (await getPayment(children[0]!))!;
+
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { efectivo: firstChildPayment.amount },
+      items: [{ source: "payment", sourceId: children[0], amount: firstChildPayment.amount, paymentMethod: "efectivo" }],
+    });
+    expect(res.status).toBe(200);
+    const allocs = await getAllocations(res.body.id);
+    expect(allocs.length).toBe(1);
+    expect((await getPayment(children[0]!))!.rendered).toBe(1);
+    expect((await getPayment(children[1]!))!.rendered).toBe(0); // sigue pendiente, sin tocar
+
+    // El batch_child_payment del hijo rendido no debe marcarse como
+    // "inconsistente" en la reconstrucción de Caja (mismo fix ya en
+    // producción — ver caja-summary-helpers.test.ts, collectDistinctExpectedSources).
+    const allocRow = allocs[0]!;
+    expect(allocRow.paymentId).toBe(children[0]);
+    expect(allocRow.paymentBatchId).toBe(batchId); // denormalizado, trazabilidad — nunca "batch completo"
+
+    // Segunda rendición, del hijo restante — también limpia.
+    const secondChildPayment = (await getPayment(children[1]!))!;
+    const res2 = await callPostRemittance({
+      date: "2027-06-02", canal: "directo", paymentBreakdown: { efectivo: secondChildPayment.amount },
+      items: [{ source: "payment", sourceId: children[1], amount: secondChildPayment.amount, paymentMethod: "efectivo" }],
+    });
+    expect(res2.status).toBe(200);
+    expect((await getPayment(children[1]!))!.rendered).toBe(1);
+  });
+
+  test("el ajuste de redondeo nunca aparece como item/allocation propio — solo los hijos reales", async () => {
+    const p1 = await mkPolicy(companyId);
+    const i1 = await mkInstallment(p1, 1, 1000);
+
+    const created = await callPostBatch({
+      paymentDate: "2027-06-01", insuredId,
+      items: [{ installmentId: i1 }],
+      splits: [{ method: "efectivo", amount: 1003 }], // sobrante $3
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+      applyProntoPagoSurcharge: false,
+    });
+    const batchId = created.body.id as number;
+    const children = await mkChildIds(batchId);
+
+    const res = await callPostRemittance({
+      date: "2027-06-01", canal: "directo", paymentBreakdown: { efectivo: 1000 },
+      items: [{ source: "payment", sourceId: children[0], amount: 1000, paymentMethod: "efectivo" }],
+    });
+    expect(res.status).toBe(200);
+    const allocs = await getAllocations(res.body.id);
+    // Exactamente 1 allocation (el hijo) — el ajuste de $3 nunca genera una
+    // segunda allocation ni un remittance_item propio.
+    expect(allocs.length).toBe(1);
+    expect(allocs[0]!.amountCents).toBe(100000);
+
+    const adjustments = await db.select().from(paymentAmountAdjustments).where(eq(paymentAmountAdjustments.paymentBatchId, batchId)).all();
+    expect(adjustments.length).toBe(1); // sigue existiendo, pero fuera de remittance_allocations por completo
   });
 });
 

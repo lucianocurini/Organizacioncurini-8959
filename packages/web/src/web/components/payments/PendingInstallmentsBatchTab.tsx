@@ -22,8 +22,10 @@ import {
   canShowCancelButton, canShowEditButton, describeBatchCancelImpact, isCancelConfirmationValid,
   isBatchTrulyCancellable, combinedCancelBlockingReasons,
   buildBatchCancelPayload, emptyBatchEditForm, validateBatchEditForm, buildBatchPatchPayload, BATCH_CORRECTION_HINT,
-  calculateBatchReceivedAppliedDifference, emptyBatchDifferenceResolutionForm, validateBatchDifferenceResolution,
-  buildAccountDifferenceResolutionPayload, receivedCentsOf, findBatchDifferenceResolution,
+  calculateBatchReceivedAppliedDifference, emptyBatchDifferenceResolutionForm,
+  buildAccountDifferenceResolutionPayload, receivedCentsOf, summarizeBatchResolution,
+  syncChequeSplitAmounts, isRoundingAdjustmentEligible, buildRoundingAdjustmentPayload,
+  validateBatchDifferenceResolutionWithRounding,
 } from "@/lib/payment-batch-form";
 import { CheckSubForm } from "./CheckSubForm";
 
@@ -676,6 +678,9 @@ function BatchPaymentModal({
   // Fase 2E: sobrantes/faltantes — cómo resolver la diferencia entre el
   // dinero real recibido (SUM(splits)) y lo aplicado a las cuotas (target).
   const [differenceResolution, setDifferenceResolution] = useState<BatchDifferenceResolutionFormState>(emptyBatchDifferenceResolutionForm());
+  // Tolerancia de redondeo (ver 7C de payment-batch-form.ts) — checkbox
+  // independiente del radio saldo_a_favor/saldo_deudor, nunca preseleccionado.
+  const [roundingAccepted, setRoundingAccepted] = useState(false);
 
   const subtotal = calculateCartTotal(cart);
   const targetCents = calculateBatchTargetAmountCents(cart, splits);
@@ -688,11 +693,27 @@ function BatchPaymentModal({
   const totals = computeSplitTotals(String(targetCents / 100), splits);
   const cartInsuredSummary = summarizeCartInsureds(cart);
   const difference = calculateBatchReceivedAppliedDifference(totals.distributedCents, targetCents);
-  const differenceValidation = validateBatchDifferenceResolution(difference, differenceResolution, cartInsuredSummary.kind);
+  const differenceValidation = validateBatchDifferenceResolutionWithRounding(
+    difference, differenceResolution, roundingAccepted, cartInsuredSummary.kind
+  );
+
+  // Cambiar cualquier importe (cuota agregada/quitada, medio editado, cheque
+  // cargado) puede cambiar `difference.differenceCents` — cuando eso pasa, la
+  // aceptación previa (checkbox de redondeo O radio saldo a favor/deudor) ya
+  // no corresponde a la diferencia real y se resetea, nunca se arrastra.
+  useEffect(() => {
+    setDifferenceResolution(emptyBatchDifferenceResolutionForm());
+    setRoundingAccepted(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [difference.differenceCents]);
 
   function setSplitsAndSync(next: BatchSplitFormRow[]) {
     const target = calculateBatchTargetAmountCents(cart, next);
-    setSplits(next.length === 1 ? syncSingleBatchSplitAmount(next, String(target / 100)) : next);
+    const synced = next.length === 1 ? syncSingleBatchSplitAmount(next, String(target / 100)) : next;
+    // syncChequeSplitAmounts SIEMPRE corre al final — un split "cheque" nunca
+    // se queda con el importe sincronizado al target: su importe real es la
+    // suma de sus propios cheques (0 si todavía no cargó ninguno).
+    setSplits(syncChequeSplitAmounts(synced));
   }
 
   function handleAddSplit() {
@@ -706,13 +727,19 @@ function BatchPaymentModal({
     // pisar con el target (a diferencia de un cambio de MÉTODO, que sigue
     // autocompletando como antes) — así el usuario puede declarar un cheque
     // real mayor o menor a lo aplicado, sin que la UI se lo "achique" solo
-    // porque hay un único medio de pago (Regla 5 del pedido).
+    // porque hay un único medio de pago (Regla 5 del pedido). Nunca aplica a
+    // un split "cheque": ese importe ya no es editable a mano (ver el input
+    // deshabilitado más abajo) — su valor real lo fija syncChequeSplitAmounts.
     const next = updateBatchSplitRow(splits, uid, patch);
     if (next.length === 1 && patch.amount === undefined) {
       setSplitsAndSync(next);
     } else {
-      setSplits(next);
+      setSplits(syncChequeSplitAmounts(next));
     }
+  }
+
+  function updateChecksAndSync(mutate: (prev: BatchSplitFormRow[]) => BatchSplitFormRow[]) {
+    setSplits((prev) => syncChequeSplitAmounts(mutate(prev)));
   }
 
   async function handleSubmit() {
@@ -737,7 +764,10 @@ function BatchPaymentModal({
     try {
       const payload = buildPaymentBatchPayload({
         paymentDate, cart, splits, notes: notes || null,
-        accountDifferenceResolution: difference.kind !== "exacto" ? buildAccountDifferenceResolutionPayload(differenceResolution) : null,
+        accountDifferenceResolution:
+          difference.kind === "exacto" ? null :
+          (roundingAccepted && isRoundingAdjustmentEligible(difference.differenceCents)) ? buildRoundingAdjustmentPayload() :
+          buildAccountDifferenceResolutionPayload(differenceResolution),
       });
       const result = await api.post("/api/payment-batches", payload);
       onCreated(result.id);
@@ -839,9 +869,12 @@ function BatchPaymentModal({
                       className="payment-method-select flex-1 px-2 py-1.5 bg-white/5 border border-white/10 rounded text-white text-xs outline-none focus:border-blue-500">
                       {PAYMENT_METHODS.map((m) => <option key={m} value={m}>{METHOD_LABELS[m]}</option>)}
                     </select>
-                    <input type="number" value={split.amount} onChange={(e) => handleUpdateSplit(split.uid, { amount: e.target.value })}
+                    <input type="number" value={split.amount}
+                      onChange={(e) => handleUpdateSplit(split.uid, { amount: e.target.value })}
                       placeholder="0.00"
-                      className="w-32 px-2 py-1.5 bg-white/5 border border-white/10 rounded text-white text-xs outline-none focus:border-blue-500 disabled:opacity-60" />
+                      disabled={split.method === "cheque"}
+                      title={split.method === "cheque" ? "Se calcula automáticamente como la suma de los cheques cargados abajo." : undefined}
+                      className="w-32 px-2 py-1.5 bg-white/5 border border-white/10 rounded text-white text-xs outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed" />
                     {splits.length > 1 && (
                       <button onClick={() => handleRemoveSplit(split.uid)} className="text-white/40 hover:text-red-400">
                         <Trash2 className="w-3.5 h-3.5" />
@@ -852,9 +885,9 @@ function BatchPaymentModal({
                   {split.method === "cheque" && (
                     <CheckSubForm
                       split={split}
-                      onAdd={() => setSplits(addCheckToSplit(splits, split.uid))}
-                      onRemove={(checkUid) => setSplits(removeCheckFromSplit(splits, split.uid, checkUid))}
-                      onUpdate={(checkUid, patch) => setSplits(updateCheckInSplit(splits, split.uid, checkUid, patch))}
+                      onAdd={() => updateChecksAndSync((prev) => addCheckToSplit(prev, split.uid))}
+                      onRemove={(checkUid) => updateChecksAndSync((prev) => removeCheckFromSplit(prev, split.uid, checkUid))}
+                      onUpdate={(checkUid, patch) => updateChecksAndSync((prev) => updateCheckInSplit(prev, split.uid, checkUid, patch))}
                     />
                   )}
                 </div>
@@ -893,11 +926,34 @@ function BatchPaymentModal({
                     : "Se recibió menos dinero real del que se aplica a las cuotas seleccionadas."}
                 </p>
 
-                {cartInsuredSummary.kind !== "single" ? (
-                  <p className="text-xs text-amber-300">
-                    No se puede resolver esta diferencia: el cobro {cartInsuredSummary.kind === "multiple" ? "mezcla varios asegurados" : "es 100% manual, sin asegurado real"}.
-                    Separá este cobro en uno por asegurado para poder continuar.
-                  </p>
+                {/* Tolerancia de redondeo: única vía disponible en un lote
+                    multiasegurado/manual (no exige asegurado real); para un
+                    asegurado único convive con saldo a favor/deudor de abajo
+                    — tildarla excluye esa otra resolución (nunca se mandan
+                    las dos). No preseleccionada nunca. */}
+                {isRoundingAdjustmentEligible(difference.differenceCents) && (
+                  <label className="flex items-start gap-2 text-xs text-white/70">
+                    <input
+                      type="checkbox"
+                      checked={roundingAccepted}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setRoundingAccepted(checked);
+                        if (checked) setDifferenceResolution(emptyBatchDifferenceResolutionForm());
+                      }}
+                      className="mt-0.5 accent-blue-600"
+                    />
+                    Aceptar ajuste por redondeo de {formatCurrencyCents(Math.abs(difference.differenceCents))}
+                  </label>
+                )}
+
+                {!roundingAccepted && (cartInsuredSummary.kind !== "single" ? (
+                  !isRoundingAdjustmentEligible(difference.differenceCents) && (
+                    <p className="text-xs text-amber-300">
+                      No se puede resolver esta diferencia: el cobro {cartInsuredSummary.kind === "multiple" ? "mezcla varios asegurados" : "es 100% manual, sin asegurado real"}.
+                      Separá este cobro en uno por asegurado para poder continuar.
+                    </p>
+                  )
                 ) : (
                   <>
                     <label className="flex items-start gap-2 text-xs text-white/70">
@@ -928,7 +984,7 @@ function BatchPaymentModal({
                       <p className="text-xs text-red-400">{differenceValidation.errorMessage}</p>
                     )}
                   </>
-                )}
+                ))}
               </div>
             )}
           </div>
@@ -1019,7 +1075,7 @@ function BatchReceiptModal({
             {groupedSplits.map((s) => (
               <div key={s.method} className="flex justify-between text-xs py-0.5">
                 <span className="text-white/70">{METHOD_LABELS[s.method] ?? s.method}</span>
-                <span className="text-white font-mono">{formatCurrency(s.amountCents / 100)}</span>
+                <span className="text-white font-mono">{formatCurrencyCents(s.amountCents)}</span>
               </div>
             ))}
           </div>
@@ -1030,7 +1086,7 @@ function BatchReceiptModal({
               {detail.splits.flatMap((s) => s.checks).map((c) => (
                 <div key={c.id} className="flex justify-between text-xs py-0.5">
                   <span className="text-white/70">{c.bankName} #{c.checkNumber} — vence {fmtDate(c.dueDate)}</span>
-                  <span className="text-white font-mono">{formatCurrency(c.amountCents / 100)}</span>
+                  <span className="text-white font-mono">{formatCurrencyCents(c.amountCents)}</span>
                 </div>
               ))}
             </div>
@@ -1054,7 +1110,7 @@ function BatchReceiptModal({
               );
             }
             const isSobrante = difference.kind === "saldo_a_favor";
-            const resolution = findBatchDifferenceResolution(detail.accountMovements);
+            const resolutionSummary = summarizeBatchResolution(detail.accountMovements, detail.amountAdjustments, detail.batch.status);
             return (
               <div className={cn(
                 "rounded-xl border p-3 space-y-1.5",
@@ -1075,15 +1131,49 @@ function BatchReceiptModal({
                   <span>{isSobrante ? "Sobrante" : "Faltante"}</span>
                   <span className="font-mono">{formatCurrencyCents(Math.abs(difference.differenceCents))}</span>
                 </div>
-                <div className="text-xs text-white/70">
-                  <span className="text-white/40">Resolución: </span>
-                  {resolution
-                    ? (resolution.action === "saldo_a_favor" ? "Saldo a favor del asegurado" : "Saldo deudor del asegurado")
-                    : "sin resolución registrada"}
-                  {resolution?.status === "anulado" && <span className="text-red-400"> (anulada junto con el cobro)</span>}
-                </div>
-                {resolution?.reason && (
-                  <p className="text-xs text-white/50 italic">"{resolution.reason}"</p>
+
+                {/* Caso anómalo (nunca debería pasar por diseño del backend):
+                    el batch tiene registrada a la vez una resolución de
+                    cuenta corriente Y un ajuste de redondeo. Se muestran los
+                    DOS bloques de abajo en vez de ocultar cualquiera. */}
+                {resolutionSummary.kind === "inconsistent_both" && (
+                  <div className="flex items-start gap-2 px-2 py-1.5 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs text-amber-300">
+                    <Info className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                    <span>Se registraron dos resoluciones distintas para este cobro (inconsistencia de datos) — revisar con un administrador.</span>
+                  </div>
+                )}
+
+                {resolutionSummary.accountMovement && (
+                  <>
+                    <div className="text-xs text-white/70">
+                      <span className="text-white/40">Resolución: </span>
+                      {resolutionSummary.accountMovement.action === "saldo_a_favor" ? "Saldo a favor del asegurado" : "Saldo deudor del asegurado"}
+                      {resolutionSummary.accountMovement.status === "anulado" && <span className="text-red-400"> (anulada junto con el cobro)</span>}
+                    </div>
+                    {resolutionSummary.accountMovement.reason && (
+                      <p className="text-xs text-white/50 italic">"{resolutionSummary.accountMovement.reason}"</p>
+                    )}
+                  </>
+                )}
+
+                {resolutionSummary.roundingAdjustment && (
+                  <>
+                    <div className="text-xs text-white/70">
+                      <span className="text-white/40">Resolución: </span>
+                      {resolutionSummary.roundingAdjustment.label}
+                      {!resolutionSummary.roundingAdjustment.contributesToCaja && (
+                        <span className="text-red-400"> (cobro anulado — ya no contribuye a Caja)</span>
+                      )}
+                    </div>
+                    <p className="text-xs text-white/50 italic">"{resolutionSummary.roundingAdjustment.reason}"</p>
+                  </>
+                )}
+
+                {resolutionSummary.kind === "none" && (
+                  <div className="text-xs text-white/70">
+                    <span className="text-white/40">Resolución: </span>
+                    sin resolución registrada
+                  </div>
                 )}
               </div>
             );

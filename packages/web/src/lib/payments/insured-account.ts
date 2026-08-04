@@ -242,6 +242,68 @@ export function validatePaymentAmountAdjustment(input: PaymentAmountAdjustmentIn
   }
 }
 
+// ─── Ajuste por redondeo (payment_amount_adjustments, sin asegurado) ───────
+//
+// Caso de uso distinto del resto de esta tabla (ajuste administrativo
+// discrecional): una diferencia CHICA y acotada entre dinero real recibido
+// (SUM(splits)) y lo aplicado a las cuotas de un cobro por lote, aceptada
+// explícitamente por el usuario en el momento de cobrar — nunca una decisión
+// de negocio de cuenta corriente (por eso usa payment_amount_adjustments,
+// nunca insured_account_movements: no tiene insuredId, funciona igual con
+// lote de un asegurado, multiasegurado o 100% manual_payment).
+//
+// Convención de signo (sin CHECK de DB, igual criterio que
+// calculateBatchReceivedAppliedDifference): amountCents = receivedCents -
+// appliedCents. Positivo = sobrante real (dinero real de más). Negativo =
+// faltante (dinero real de menos, nunca llegó).
+export const MAX_ROUNDING_ADJUSTMENT_CENTS = 500;
+
+export const ROUNDING_ADJUSTMENT_REASON = "Ajuste por redondeo autorizado en cobro en lote";
+
+/**
+ * Único chequeo propio de este caso de uso (además de
+ * validatePaymentAmountAdjustment, que sigue aplicando para XOR/reason/
+ * authorizedBy): la diferencia debe ser distinta de 0 (sin ajuste no hay nada
+ * que registrar) y su valor absoluto no puede superar el tope — el backend
+ * nunca confía en que el frontend ya filtró esto, aunque lo envíe forzado.
+ */
+export function validateRoundingAdjustment(input: { differenceCents: number }): void {
+  if (!Number.isFinite(input.differenceCents) || input.differenceCents === 0) {
+    throw new InsuredAccountValidationError("La diferencia debe ser distinta de 0 para registrar un ajuste por redondeo.");
+  }
+  if (Math.abs(input.differenceCents) > MAX_ROUNDING_ADJUSTMENT_CENTS) {
+    throw new InsuredAccountValidationError(
+      `El ajuste por redondeo solo admite diferencias de hasta $${(MAX_ROUNDING_ADJUSTMENT_CENTS / 100).toFixed(2)} ` +
+      `(recibida: $${(Math.abs(input.differenceCents) / 100).toFixed(2)}).`
+    );
+  }
+}
+
+export interface PaymentAmountAdjustmentForCaja {
+  amountCents: number;
+  /** true si el payment/payment_batch al que pertenece este ajuste sigue "confirmado" (no anulado). */
+  parentActive: boolean;
+}
+
+/**
+ * roundingAdjustmentCreditCents — SUMA Caja (dinero real recibido de más),
+ * mismo criterio que saldo_a_favor en calculateCreditActiveInCaja. Un
+ * faltante (amountCents<0) nunca resta acá: esa porción de dinero que no
+ * llegó ya quedó excluida de cartera.totalCents por el Math.min de
+ * applyBatchToCartera (caja-summary.ts) — sumarla de nuevo en negativo la
+ * duplicaría. Un ajuste cuyo batch/pago padre ya fue anulado (parentActive
+ * false) no contribuye nada — se excluye entero, sin escribir ni anular la
+ * fila histórica de payment_amount_adjustments (ver POST
+ * /payment-batches/:id/cancel: no la toca, la exclusión es 100% de lectura).
+ */
+export function calculatePaymentAmountAdjustmentCreditInCaja(
+  adjustments: ReadonlyArray<PaymentAmountAdjustmentForCaja>
+): number {
+  return adjustments
+    .filter((a) => a.parentActive && a.amountCents > 0)
+    .reduce((sum, a) => sum + a.amountCents, 0);
+}
+
 // ─── Contribución a Caja ─────────────────────────────────────────────────────
 
 export interface InsuredAccountMovementForCaja {

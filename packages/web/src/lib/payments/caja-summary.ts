@@ -560,6 +560,18 @@ export function accumulateRemittanceContribution(contribution: RemittanceContrib
 // + cobrosSaldoDeudorCents       — dinero real que entra a saldar una deuda
 //                                   de cuenta corriente previa (insured-
 //                                   account.ts, calculateCobroSaldoDeudorInCaja)
+// + roundingAdjustmentCreditCents — sobrante real de un ajuste por redondeo
+//                                   (payment_amount_adjustments, ver
+//                                   insured-account.ts,
+//                                   calculatePaymentAmountAdjustmentCreditInCaja)
+//                                   — un faltante de redondeo nunca resta acá
+//                                   (esa porción ya quedó fuera de
+//                                   cartera.totalCents vía el Math.min de
+//                                   applyBatchToCartera, sin relación con esta
+//                                   tabla): sumarlo de nuevo en negativo lo
+//                                   duplicaría. Tabla ajena a cuenta corriente
+//                                   del asegurado (sin insuredId) — nunca se
+//                                   mezcla con los 3 términos de arriba.
 //
 // Nunca se resta saldosAFavorPendientesCents/saldosDeudoresPendientesCents
 // acá — son puramente informativos de cuenta corriente (Regla 2/3 del pedido:
@@ -570,12 +582,14 @@ export function calculateCajaNetaTotalCents(params: {
   creditoActivoEnCajaCents: number;
   creditoRegularizadoCents: number;
   cobrosSaldoDeudorCents: number;
+  roundingAdjustmentCreditCents?: number;
 }): number {
   return (
     params.carteraTotalCents +
     params.creditoActivoEnCajaCents +
     params.creditoRegularizadoCents +
-    params.cobrosSaldoDeudorCents
+    params.cobrosSaldoDeudorCents +
+    (params.roundingAdjustmentCreditCents ?? 0)
   );
 }
 

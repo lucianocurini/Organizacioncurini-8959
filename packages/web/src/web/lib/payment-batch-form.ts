@@ -33,6 +33,7 @@
 //     compañía en texto, sin ninguna fila real detrás) — insuredId SIEMPRE
 //     null, nunca inferido de ningún otro ítem del carrito.
 
+import { formatCurrencyCents } from "./utils";
 import {
   type PaymentSplitFormRow, type SplitGroup,
   createSplitRow, computeSplitTotals, validateSplitsForm,
@@ -43,14 +44,14 @@ import { classifySplitGroup } from "../../lib/payments/splits";
 import { SURCHARGE_AMOUNT_CENTS } from "../../lib/payments/batches";
 import { isSurchargeAbsorbedByGroup } from "../../lib/payments/policy-economic-group";
 import {
-  calculateBatchReceivedAppliedDifference,
+  calculateBatchReceivedAppliedDifference, MAX_ROUNDING_ADJUSTMENT_CENTS,
   type BatchReceivedAppliedDifference, type BatchReceivedAppliedKind,
 } from "../../lib/payments/insured-account";
 
 export type { SplitGroup, BatchReceivedAppliedDifference, BatchReceivedAppliedKind };
 export {
   computeSplitTotals, groupSplitsByMethod, amountStringToCentsStrict, MIXED_GROUP_ERROR, SURCHARGE_AMOUNT_CENTS,
-  calculateBatchReceivedAppliedDifference,
+  calculateBatchReceivedAppliedDifference, MAX_ROUNDING_ADJUSTMENT_CENTS,
 };
 
 // ─── 1. Cuota pendiente (fila de resultado de búsqueda, GET /installments/pending-for-payment) ──
@@ -473,6 +474,21 @@ export function sumCheckRowsCents(checks: ReadonlyArray<CheckFormRow>): number {
   return checks.reduce((sum, c) => sum + (amountStringToCentsStrict(c.amount) ?? 0), 0);
 }
 
+/**
+ * Recalcula split.amount de cada split "cheque" como la suma EXACTA (en
+ * centavos) de sus propios cheques — nunca al revés. El usuario ya no
+ * escribe el importe de un split cheque a mano: se deriva solo, cada vez que
+ * agrega/edita/quita un cheque, sin importar cuántos medios de pago haya en
+ * total (a diferencia de syncSingleBatchSplitAmount, que solo actúa con un
+ * único split). No-op para cualquier split que no sea "cheque" — no toca su
+ * `amount`. Idempotente y puro: aplicarlo dos veces seguidas da el mismo
+ * resultado. `.toFixed(2)` (no `String(cents/100)`) para no arrastrar ruido
+ * de punto flotante al campo que ahora se muestra como "calculado" en la UI.
+ */
+export function syncChequeSplitAmounts(splits: BatchSplitFormRow[]): BatchSplitFormRow[] {
+  return splits.map((s) => (s.method === "cheque" ? { ...s, amount: (sumCheckRowsCents(s.checks) / 100).toFixed(2) } : s));
+}
+
 // Migración 0028 — cheques en cobranzas INDIVIDUALES: cambiar el método de
 // un split debe conservar sus cheques solo si sigue siendo "cheque". Al
 // entrar a "cheque" arranca con una fila vacía (nunca 0, para no mostrar el
@@ -700,7 +716,7 @@ export function validateBatchDifferenceResolution(
 }
 
 export interface AccountDifferenceResolutionPayload {
-  action: "saldo_a_favor" | "saldo_deudor";
+  action: "saldo_a_favor" | "saldo_deudor" | "ajuste_redondeo";
   reason?: string | null;
 }
 
@@ -711,6 +727,71 @@ export function buildAccountDifferenceResolutionPayload(
   if (resolution.action == null) return null;
   const reason = resolution.reason.trim();
   return { action: resolution.action, reason: reason || null };
+}
+
+// ─── 7C. Tolerancia de redondeo (payment_amount_adjustments, sin cuenta corriente) ──
+// Alternativa MÁS SIMPLE a saldo_a_favor/saldo_deudor para una diferencia
+// chica (≤$5,00): un checkbox único, sin motivo obligatorio, que NUNCA exige
+// un asegurado real único — funciona igual con lote de un asegurado,
+// multiasegurado o 100% manual (ver payment_amount_adjustments, que no tiene
+// insuredId). El backend vuelve a exigir el mismo tope, nunca confía en que
+// el checkbox ya lo filtró (ver POST /payment-batches, index.ts).
+
+/** true si la diferencia es distinta de 0 y su valor absoluto no supera el tope — mismo criterio que validateRoundingAdjustment (backend). */
+export function isRoundingAdjustmentEligible(differenceCents: number): boolean {
+  return differenceCents !== 0 && Math.abs(differenceCents) <= MAX_ROUNDING_ADJUSTMENT_CENTS;
+}
+
+export function buildRoundingAdjustmentPayload(): AccountDifferenceResolutionPayload {
+  return { action: "ajuste_redondeo" };
+}
+
+/**
+ * Validación completa de la resolución de diferencia, incluyendo la
+ * tolerancia de redondeo:
+ *  - "exacto": siempre válido, sin resolución (comportamiento sin cambios).
+ *  - diferencia elegible para redondeo (ver isRoundingAdjustmentEligible) Y
+ *    el usuario tildó el checkbox: válido siempre, sin importar
+ *    cartInsuredKind — a diferencia de saldo_a_favor/saldo_deudor, esta vía
+ *    no exige ningún asegurado real.
+ *  - asegurado único, diferencia elegible para redondeo, checkbox SIN tildar
+ *    y todavía no eligió ninguna resolución (resolution.action == null):
+ *    mensaje que menciona LAS DOS vías disponibles (redondeo o saldo a
+ *    favor/deudor) — el genérico de validateBatchDifferenceResolution solo
+ *    menciona saldo a favor/deudor, que ya no es la única opción cuando el
+ *    checkbox de redondeo está disponible. Una vez que el usuario ya eligió
+ *    algo (radio tildado, con o sin motivo cargado), se vuelve al mensaje
+ *    específico de esa vía (ver validateBatchDifferenceResolution).
+ *  - cualquier otro caso (diferencia >$5,00, o ≤$5,00 sin tildar el
+ *    checkbox y ya con una resolución elegida): EXACTAMENTE el criterio
+ *    existente de validateBatchDifferenceResolution, sin ningún cambio — el
+ *    flujo de saldo a favor/deudor para un asegurado único sigue disponible
+ *    tal cual estaba, tildar el checkbox de redondeo es lo único que lo
+ *    excluye.
+ */
+export function validateBatchDifferenceResolutionWithRounding(
+  difference: BatchReceivedAppliedDifference,
+  resolution: BatchDifferenceResolutionFormState,
+  roundingAccepted: boolean,
+  cartInsuredKind: CartInsuredSummary["kind"],
+): BatchDifferenceValidationResult {
+  if (difference.kind === "exacto") return { valid: true, errorMessage: null };
+  if (roundingAccepted && isRoundingAdjustmentEligible(difference.differenceCents)) {
+    return { valid: true, errorMessage: null };
+  }
+  if (
+    cartInsuredKind === "single" &&
+    resolution.action == null &&
+    isRoundingAdjustmentEligible(difference.differenceCents)
+  ) {
+    return {
+      valid: false,
+      errorMessage: difference.kind === "saldo_a_favor"
+        ? "Elegí aceptar el ajuste por redondeo o registrar la diferencia como saldo a favor para confirmar el cobro."
+        : "Elegí aceptar el ajuste por redondeo o registrar la diferencia como saldo deudor para confirmar el cobro.",
+    };
+  }
+  return validateBatchDifferenceResolution(difference, resolution, cartInsuredKind);
 }
 
 // ─── 8. Payload final — POST /api/payment-batches ───────────────────────────
@@ -898,6 +979,27 @@ export interface BatchDetailAccountMovement {
   reason: string | null;
 }
 
+/**
+ * Fila de payment_amount_adjustments vinculada a este batch (GET
+ * /payment-batches/:id, por paymentBatchId) — hoy exclusivamente la
+ * tolerancia de redondeo (ver insured-account.ts,
+ * MAX_ROUNDING_ADJUSTMENT_CENTS), pero el shape es el de la tabla completa,
+ * sin asumir que todo registro futuro sea necesariamente un ajuste de
+ * redondeo. A diferencia de BatchDetailAccountMovement, no tiene insuredId
+ * ni status propio — "vigente" se resuelve leyendo batch.status (ver
+ * summarizeBatchResolution/contributesToCaja más abajo), nunca con una
+ * columna propia.
+ */
+export interface BatchDetailAmountAdjustment {
+  id: number;
+  paymentBatchId: number | null;
+  amountCents: number;
+  reason: string;
+  authorizedBy: number;
+  createdBy: number;
+  createdAt: string;
+}
+
 export interface PaymentBatchDetail {
   batch: {
     id: number; insuredId: number | null; baseAmountCents: number; surchargeAmountCents: number;
@@ -917,6 +1019,7 @@ export interface PaymentBatchDetail {
   surcharges: Array<{ id: number; amount: number }>;
   integrity: Record<string, unknown>;
   accountMovements: BatchDetailAccountMovement[];
+  amountAdjustments: BatchDetailAmountAdjustment[];
 }
 
 // ─── Fase 2F — comprobante consistente con sobrantes/faltantes ─────────────
@@ -964,6 +1067,70 @@ export function findBatchDifferenceResolution(
   const movement = accountMovements.find((m) => m.type === "saldo_a_favor" || m.type === "saldo_deudor");
   if (!movement) return null;
   return { action: movement.type as "saldo_a_favor" | "saldo_deudor", reason: movement.reason, status: movement.status };
+}
+
+/**
+ * Ajuste de redondeo (payment_amount_adjustments) ya listo para mostrar en
+ * el detalle/comprobante — label trae el texto final ("Faltante por ajuste
+ * de redondeo: $2,34" / "Sobrante por ajuste de redondeo: $5,00"), sin que
+ * el componente tenga que reconstruir el signo. contributesToCaja refleja
+ * batch.status en el momento de leer (=== "confirmado") — la fila histórica
+ * de payment_amount_adjustments no tiene columna de estado propia, así que
+ * "vigente" siempre se resuelve contra el batch dueño (mismo criterio que
+ * calculatePaymentAmountAdjustmentCreditInCaja en insured-account.ts).
+ */
+export interface BatchRoundingAdjustmentDisplay {
+  amountCents: number;
+  reason: string;
+  label: string;
+  contributesToCaja: boolean;
+}
+
+export type BatchResolutionKind = "none" | "account_movement" | "rounding_adjustment" | "inconsistent_both";
+
+/**
+ * kind="inconsistent_both" es el único caso donde accountMovement Y
+ * roundingAdjustment vienen los dos no-null a la vez — nunca debería ocurrir
+ * por diseño (POST /payment-batches crea como máximo uno de los dos por
+ * batch), pero si datos anómalos lo produjeran, este shape obliga al
+ * componente a mostrar (o señalizar) ambos en vez de quedarse en silencio
+ * con uno solo.
+ */
+export interface BatchResolutionSummary {
+  kind: BatchResolutionKind;
+  accountMovement: BatchDifferenceResolutionDisplay | null;
+  roundingAdjustment: BatchRoundingAdjustmentDisplay | null;
+}
+
+/**
+ * Combina accountMovements (saldo_a_favor/saldo_deudor, insured_account_
+ * movements) y amountAdjustments (ajuste_redondeo, payment_amount_
+ * adjustments) en una sola descripción de cómo se resolvió la diferencia de
+ * ESTE batch. "sin resolución registrada" (kind="none") queda reservado
+ * exclusivamente al caso en que NINGUNA de las dos tablas tiene una fila —
+ * nunca se devuelve ese kind cuando amountAdjustments trae un ajuste válido.
+ * Toma como máximo la primera fila de amountAdjustments (cardinalidad 0 o 1
+ * en la práctica, ver POST /payment-batches) — un batch con más de una fila
+ * sería en sí mismo un caso anómalo fuera del alcance de este helper.
+ */
+export function summarizeBatchResolution(
+  accountMovements: ReadonlyArray<BatchDetailAccountMovement>,
+  amountAdjustments: ReadonlyArray<BatchDetailAmountAdjustment>,
+  batchStatus: string,
+): BatchResolutionSummary {
+  const accountMovement = findBatchDifferenceResolution(accountMovements);
+  const adjustmentRow = amountAdjustments[0] ?? null;
+  const roundingAdjustment: BatchRoundingAdjustmentDisplay | null = adjustmentRow ? {
+    amountCents: adjustmentRow.amountCents,
+    reason: adjustmentRow.reason,
+    label: `${adjustmentRow.amountCents < 0 ? "Faltante" : "Sobrante"} por ajuste de redondeo: ${formatCurrencyCents(Math.abs(adjustmentRow.amountCents))}`,
+    contributesToCaja: batchStatus === "confirmado",
+  } : null;
+
+  if (accountMovement && roundingAdjustment) return { kind: "inconsistent_both", accountMovement, roundingAdjustment };
+  if (roundingAdjustment) return { kind: "rounding_adjustment", accountMovement: null, roundingAdjustment };
+  if (accountMovement) return { kind: "account_movement", accountMovement, roundingAdjustment: null };
+  return { kind: "none", accountMovement: null, roundingAdjustment: null };
 }
 
 /** true si el ítem del detalle es un cobro manual de cualquier tipo (sin cuota — installment viene null del backend). */
