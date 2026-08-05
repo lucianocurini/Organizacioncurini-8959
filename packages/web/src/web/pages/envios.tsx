@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
 import { Link, useLocation } from "wouter";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { api } from "@/lib/api";
@@ -21,6 +21,15 @@ import {
   DELIVERY_CHANNELS, DELIVERY_DOCUMENT_TYPES,
   type DeliveryTransitionKind, type PolicyDetailForLinkedForm,
 } from "@/lib/deliveries-form";
+import {
+  createDeliveriesTableScrollControl,
+  DELIVERIES_TABLE_MIN_WIDTH_CLASS,
+  DELIVERIES_TABLE_SCROLL_CONTAINER_CLASS,
+  DELIVERIES_STICKY_ACTIONS_HEADER_CLASS, DELIVERIES_STICKY_ACTIONS_CELL_CLASS,
+  DELIVERIES_SCROLL_CONTROL_LABEL,
+  DELIVERIES_SCROLL_CONTROL_WRAPPER_VISIBLE_CLASS, DELIVERIES_SCROLL_CONTROL_WRAPPER_HIDDEN_CLASS,
+  DELIVERIES_SCROLL_RANGE_CLASS,
+} from "@/lib/table-scroll-sync";
 
 const CHANNEL_LABELS: Record<string, string> = {
   whatsapp: "WhatsApp",
@@ -522,8 +531,44 @@ function TransitionConfirmDialog({ kind, onConfirm, onCancel, submitting }: {
   );
 }
 
+// Control de scroll horizontal persistente (input[type=range]) arriba de la
+// tabla de escritorio, sincronizado en ambos sentidos con el scroll real de
+// la tabla, con su rango máximo recalculado vía ResizeObserver. La mecánica
+// de sincronización/observación vive en table-scroll-sync.ts (testeable sin
+// montar React); acá solo se conectan los nodos.
+//
+// Los tres elementos (contenedor de scroll, <table>, <input range>) se
+// guardan en estado en vez de useRef porque el <table> recién existe en el
+// DOM después de que termina el loading async — con useRef + useEffect([])
+// el efecto corría una sola vez con refs todavía null y nunca se
+// reintentaba (bug real detectado en QA 2026-08-05: el control quedaba sin
+// overflow real, scrollWidth pegado a 0). Con callback refs → estado, el
+// efecto se re-dispara automáticamente en cuanto los tres nodos existen,
+// sin importar cuándo se monta cada uno.
+function useDeliveriesTableScrollControl() {
+  const [tableScrollEl, setTableScrollEl] = useState<HTMLDivElement | null>(null);
+  const [tableEl, setTableEl] = useState<HTMLTableElement | null>(null);
+  const [rangeEl, setRangeEl] = useState<HTMLInputElement | null>(null);
+  const [maxScrollLeft, setMaxScrollLeft] = useState(0);
+
+  const tableScrollRef = useCallback((node: HTMLDivElement | null) => setTableScrollEl(node), []);
+  const tableRef = useCallback((node: HTMLTableElement | null) => setTableEl(node), []);
+  const rangeRef = useCallback((node: HTMLInputElement | null) => setRangeEl(node), []);
+
+  // useLayoutEffect (no useEffect): mide/aplica el ancho ANTES del paint
+  // para que el control no parpadee oculto→visible en el primer render.
+  useLayoutEffect(() => {
+    if (!tableScrollEl || !tableEl || !rangeEl || typeof ResizeObserver === "undefined") return;
+    const handle = createDeliveriesTableScrollControl(rangeEl, tableScrollEl, tableEl, setMaxScrollLeft, ResizeObserver);
+    return () => handle.destroy();
+  }, [tableScrollEl, tableEl, rangeEl]);
+
+  return { tableScrollRef, tableRef, rangeRef, maxScrollLeft };
+}
+
 export default function Envios() {
   const [, navigate] = useLocation();
+  const { tableScrollRef, tableRef, rangeRef, maxScrollLeft } = useDeliveriesTableScrollControl();
 
   // Se lee UNA sola vez al montar (mismo patrón que initialFiltersRef en
   // reporte-mes.tsx). El alta rápida desde la póliza ya no navega acá con
@@ -796,105 +841,129 @@ export default function Envios() {
                 );
               })}
             </div>
-            {/* Desktop table */}
-            <div className="hidden lg:block overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-xs text-gray-500 border-b border-[#1f2937]">
-                    <th className="text-left px-5 py-3 font-medium">Destinatario / Asegurado</th>
-                    <th className="text-left px-3 py-3 font-medium">Compañía</th>
-                    <th className="text-left px-3 py-3 font-medium">N° Póliza</th>
-                    <th className="text-left px-3 py-3 font-medium">Documento</th>
-                    <th className="text-left px-3 py-3 font-medium">Canal</th>
-                    <th className="text-left px-3 py-3 font-medium">Programado</th>
-                    <th className="text-left px-3 py-3 font-medium">Enviado</th>
-                    <th className="text-left px-3 py-3 font-medium">Entregado</th>
-                    <th className="text-left px-3 py-3 font-medium">Estado</th>
-                    <th className="px-5 py-3" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {filtered.map(r => {
-                    const display = getDeliveryRowDisplay(r);
-                    const pending = isChannelPending(r.delivery.channel);
-                    const transitionKind = getAvailableDeliveryTransition(r.delivery.status, r.delivery.channel);
-                    const transitionCopy = transitionKind ? DELIVERY_TRANSITION_COPY[transitionKind] : null;
-                    return (
-                      <tr key={r.delivery.id} className="border-b border-[#1f2937] hover:bg-[#1a2540]/30 transition-colors">
-                        <td className="px-5 py-3">
-                          <div className="flex items-center gap-2">
-                            <p className="text-white font-medium">{display.recipientName}</p>
-                            {display.isManual && (
-                              <span className="px-1.5 py-0.5 rounded text-[10px] border border-orange-500/30 bg-orange-500/10 text-orange-400">manual</span>
+            {/* Desktop table — el scroll horizontal vive únicamente en este
+                bloque (control de scroll + tableScrollRef), nunca en la
+                página. El control es un <input type="range"> estilizado a
+                mano (no un scrollbar nativo) para que sea siempre visible en
+                Chrome/Windows — ver table-scroll-sync.ts. Solo se muestra
+                cuando hay overflow real (maxScrollLeft > 0). */}
+            <div className="hidden lg:block">
+              <div
+                className={maxScrollLeft > 0 ? DELIVERIES_SCROLL_CONTROL_WRAPPER_VISIBLE_CLASS : DELIVERIES_SCROLL_CONTROL_WRAPPER_HIDDEN_CLASS}
+                data-testid="deliveries-table-scroll-control"
+              >
+                <span className="text-xs text-gray-500 whitespace-nowrap flex-shrink-0">{DELIVERIES_SCROLL_CONTROL_LABEL}</span>
+                <input
+                  ref={rangeRef}
+                  type="range"
+                  min={0}
+                  max={maxScrollLeft}
+                  defaultValue={0}
+                  aria-label={DELIVERIES_SCROLL_CONTROL_LABEL}
+                  title={DELIVERIES_SCROLL_CONTROL_LABEL}
+                  data-testid="deliveries-table-scroll-range"
+                  className={DELIVERIES_SCROLL_RANGE_CLASS}
+                />
+              </div>
+              <div ref={tableScrollRef} data-testid="deliveries-table-scroll" className={DELIVERIES_TABLE_SCROLL_CONTAINER_CLASS}>
+                <table ref={tableRef} className={DELIVERIES_TABLE_MIN_WIDTH_CLASS}>
+                  <thead>
+                    <tr className="text-xs text-gray-500 border-b border-[#1f2937]">
+                      <th className="text-left px-5 py-3 font-medium min-w-[200px]">Destinatario / Asegurado</th>
+                      <th className="text-left px-3 py-3 font-medium min-w-[130px]">Compañía</th>
+                      <th className="text-left px-3 py-3 font-medium min-w-[110px]">N° Póliza</th>
+                      <th className="text-left px-3 py-3 font-medium min-w-[150px]">Documento</th>
+                      <th className="text-left px-3 py-3 font-medium min-w-[150px]">Canal</th>
+                      <th className="text-left px-3 py-3 font-medium min-w-[100px]">Programado</th>
+                      <th className="text-left px-3 py-3 font-medium min-w-[100px]">Enviado</th>
+                      <th className="text-left px-3 py-3 font-medium min-w-[100px]">Entregado</th>
+                      <th className="text-left px-3 py-3 font-medium min-w-[130px]">Estado</th>
+                      <th className={DELIVERIES_STICKY_ACTIONS_HEADER_CLASS} />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filtered.map(r => {
+                      const display = getDeliveryRowDisplay(r);
+                      const pending = isChannelPending(r.delivery.channel);
+                      const transitionKind = getAvailableDeliveryTransition(r.delivery.status, r.delivery.channel);
+                      const transitionCopy = transitionKind ? DELIVERY_TRANSITION_COPY[transitionKind] : null;
+                      return (
+                        <tr key={r.delivery.id} className="group border-b border-[#1f2937] hover:bg-[#1a2540]/30 transition-colors">
+                          <td className="px-5 py-3">
+                            <div className="flex items-center gap-2">
+                              <p className="text-white font-medium">{display.recipientName}</p>
+                              {display.isManual && (
+                                <span className="px-1.5 py-0.5 rounded text-[10px] border border-orange-500/30 bg-orange-500/10 text-orange-400">manual</span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-3 py-3 text-gray-300 text-xs">{display.companyName}</td>
+                          <td className="px-3 py-3 text-gray-300 text-xs">{display.policyNumber}</td>
+                          <td className="px-3 py-3">
+                            <span className="px-2 py-0.5 rounded text-xs border border-[#2d3748] text-gray-300">
+                              {DOC_LABELS[r.delivery.documentType] || r.delivery.documentType}
+                            </span>
+                            {display.period && (
+                              <p className="text-[11px] text-violet-300 mt-1">
+                                {formatDate(display.period.billingStart)} → {formatDate(display.period.billingEnd)}
+                              </p>
                             )}
-                          </div>
-                        </td>
-                        <td className="px-3 py-3 text-gray-300 text-xs">{display.companyName}</td>
-                        <td className="px-3 py-3 text-gray-300 text-xs">{display.policyNumber}</td>
-                        <td className="px-3 py-3">
-                          <span className="px-2 py-0.5 rounded text-xs border border-[#2d3748] text-gray-300">
-                            {DOC_LABELS[r.delivery.documentType] || r.delivery.documentType}
-                          </span>
-                          {display.period && (
-                            <p className="text-[11px] text-violet-300 mt-1">
-                              {formatDate(display.period.billingStart)} → {formatDate(display.period.billingEnd)}
-                            </p>
-                          )}
-                        </td>
-                        <td className="px-3 py-3">
-                          <ChannelBadge channel={r.delivery.channel} className="w-fit" />
-                        </td>
-                        <td className="px-3 py-3 text-gray-300 text-xs">
-                          {r.delivery.scheduledDate ? formatDate(r.delivery.scheduledDate) : "—"}
-                        </td>
-                        <td className="px-3 py-3 text-gray-300 text-xs">
-                          {r.delivery.sentDate ? formatDate(r.delivery.sentDate) : "—"}
-                        </td>
-                        <td className="px-3 py-3 text-gray-300 text-xs">
-                          {r.delivery.completedDate ? formatDate(r.delivery.completedDate) : "—"}
-                        </td>
-                        <td className="px-3 py-3">
-                          <span className={cn("px-2 py-0.5 rounded text-xs border", STATUS_COLORS[r.delivery.status])}>
-                            {STATUS_LABELS[r.delivery.status] || r.delivery.status}
-                          </span>
-                        </td>
-                        <td className="px-5 py-3">
-                          <div className="flex items-center gap-2 justify-end flex-wrap">
-                            {transitionKind && transitionCopy && (
-                              <button onClick={() => openTransition(r)} title={transitionCopy.actionLabel}
-                                className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-blue-600/20 text-blue-400 border border-blue-500/30 hover:bg-blue-600/40 transition-colors whitespace-nowrap">
-                                <Send className="w-3 h-3" /> {transitionCopy.actionLabel}
+                          </td>
+                          <td className="px-3 py-3">
+                            <ChannelBadge channel={r.delivery.channel} className="w-fit" />
+                          </td>
+                          <td className="px-3 py-3 text-gray-300 text-xs">
+                            {r.delivery.scheduledDate ? formatDate(r.delivery.scheduledDate) : "—"}
+                          </td>
+                          <td className="px-3 py-3 text-gray-300 text-xs">
+                            {r.delivery.sentDate ? formatDate(r.delivery.sentDate) : "—"}
+                          </td>
+                          <td className="px-3 py-3 text-gray-300 text-xs">
+                            {r.delivery.completedDate ? formatDate(r.delivery.completedDate) : "—"}
+                          </td>
+                          <td className="px-3 py-3">
+                            <span className={cn("px-2 py-0.5 rounded text-xs border", STATUS_COLORS[r.delivery.status])}>
+                              {STATUS_LABELS[r.delivery.status] || r.delivery.status}
+                            </span>
+                          </td>
+                          <td className={DELIVERIES_STICKY_ACTIONS_CELL_CLASS}>
+                            <div className="flex items-center gap-2 justify-end flex-nowrap">
+                              {transitionKind && transitionCopy && (
+                                <button onClick={() => openTransition(r)} title={transitionCopy.actionLabel}
+                                  className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-blue-600/20 text-blue-400 border border-blue-500/30 hover:bg-blue-600/40 transition-colors whitespace-nowrap">
+                                  <Send className="w-3 h-3" /> {transitionCopy.actionLabel}
+                                </button>
+                              )}
+                              {!display.isManual && r.policy && (
+                                <Link href={`/polizas/${r.policy.id}?returnTo=${encodeURIComponent(currentPath)}`}>
+                                  <a className="text-gray-400 hover:text-blue-400 transition-colors flex-shrink-0" title="Ver póliza">
+                                    <ExternalLink className="w-4 h-4" />
+                                  </a>
+                                </Link>
+                              )}
+                              {pending ? (
+                                <button onClick={() => { setEditing(r); setModalOpen(true); }}
+                                  className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 transition-colors whitespace-nowrap">
+                                  <Edit2 className="w-3 h-3" /> Completar datos
+                                </button>
+                              ) : (
+                                <button onClick={() => { setEditing(r); setModalOpen(true); }}
+                                  className="text-gray-400 hover:text-blue-400 transition-colors flex-shrink-0" title="Editar">
+                                  <Edit2 className="w-4 h-4" />
+                                </button>
+                              )}
+                              <button onClick={() => handleDelete(r.delivery.id)}
+                                className="text-gray-400 hover:text-red-400 transition-colors flex-shrink-0" title="Eliminar">
+                                <Trash2 className="w-4 h-4" />
                               </button>
-                            )}
-                            {!display.isManual && r.policy && (
-                              <Link href={`/polizas/${r.policy.id}?returnTo=${encodeURIComponent(currentPath)}`}>
-                                <a className="text-gray-400 hover:text-blue-400 transition-colors" title="Ver póliza">
-                                  <ExternalLink className="w-4 h-4" />
-                                </a>
-                              </Link>
-                            )}
-                            {pending ? (
-                              <button onClick={() => { setEditing(r); setModalOpen(true); }}
-                                className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 transition-colors whitespace-nowrap">
-                                <Edit2 className="w-3 h-3" /> Completar datos
-                              </button>
-                            ) : (
-                              <button onClick={() => { setEditing(r); setModalOpen(true); }}
-                                className="text-gray-400 hover:text-blue-400 transition-colors" title="Editar">
-                                <Edit2 className="w-4 h-4" />
-                              </button>
-                            )}
-                            <button onClick={() => handleDelete(r.delivery.id)}
-                              className="text-gray-400 hover:text-red-400 transition-colors" title="Eliminar">
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             </div>
             </>
           )}
