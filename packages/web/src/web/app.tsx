@@ -1,7 +1,7 @@
 import { Route, Switch, Redirect } from "wouter";
 import { Provider } from "./components/provider";
 import { AuthProvider, useAuth } from "./lib/auth";
-import { AgentFeedback, RunableBadge } from "@runablehq/website-runtime";
+import { AgentFeedback } from "@runablehq/website-runtime";
 import { Toaster } from "./components/ui/sonner";
 import { useEffect } from "react";
 
@@ -83,7 +83,6 @@ function App() {
         <ProtectedRoutes />
         <Toaster theme="dark" position="bottom-right" />
         {import.meta.env.DEV && <AgentFeedback />}
-        {<RunableBadge />}
       </AuthProvider>
     </Provider>
   );

@@ -48,7 +48,7 @@ import { parseRebillingPayload, RebillingPayloadError, buildRebillingInstallment
 import { classifyRebillingGroupForRebuild, runRebillingRebuildTransaction, RebillingRebuildConflictError, RebillingNotFoundError } from "../lib/installments/rebilling-rebuild";
 import { validateAndNormalizeSplits, SplitValidationError, classifySplitGroup, isDirectCompanyPaymentMethod, type SplitGroup } from "../lib/payments/splits";
 import { recalculateInstallmentPaymentStatus } from "../lib/payments/installment-status";
-import { toArgentinaCalendarDay, resolveArgentinaMonthKey } from "../lib/dates/argentina-date";
+import { toArgentinaCalendarDay, resolveArgentinaMonthKey, shiftArgentinaMonth } from "../lib/dates/argentina-date";
 import {
   validateCancellationEffectiveDate, validatePolicyCancellationState, classifyInstallmentsForCancellation,
   appendCancellationNote, isInstallmentNonCollectible, PolicyCancellationValidationError, PolicyAlreadyCancelledError,
@@ -6626,6 +6626,14 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
       billingEnd: rebillings.billingEnd,
       premium: rebillings.premium,
       monthlyFee: rebillings.monthlyFee,
+      // Suma asegurada HISTÓRICA de esta refacturación puntual — no la de la
+      // póliza (que puede haber cambiado desde entonces). Sin fallback: si es
+      // null, el reporte debe mostrarlo vacío, nunca inventar el valor actual.
+      sumInsured: rebillings.sumInsured,
+      // Cobertura NO tiene versión histórica por refacturación en el modelo —
+      // única fuente posible es la póliza (puede no ser exacta al período si
+      // la cobertura cambió sin una refacturación de por medio).
+      coverageType: policies.coverageType,
       notes: rebillings.notes,
       duplicateCount: sql<number>`COUNT(*)`,
       policyNumber: policies.policyNumber,
@@ -6662,6 +6670,40 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     .orderBy(asc(rebillings.billingStart), sql`MIN(${rebillings.id})`)
     .all();
 
+  // Columnas compartidas por toda consulta que arme filas "de póliza" —
+  // reales (altas/renovaciones del mes) o proyectadas (vigentes cuya
+  // renovación/refacturación se espera en un mes futuro, ver más abajo).
+  const POLICY_REPORT_COLUMNS = {
+    policyId: policies.id,
+    policyNumber: policies.policyNumber,
+    type: policies.type,
+    startDate: policies.startDate,
+    endDate: policies.endDate,
+    premium: policies.premium,
+    monthlyFee: policies.monthlyFee,
+    sumInsured: policies.sumInsured,
+    coverageType: policies.coverageType,
+    nextRebillingDate: policies.nextRebillingDate,
+    billingCycle: policies.billingCycle,
+    notes: policies.notes,
+    renewedFromId: policies.renewedFromId,
+    companyId: policies.companyId,
+    insuredName: insureds.name,
+    companyName: companies.name,
+    isFleet: policies.isFleet,
+    vehicleBrand: policies.vehicleBrand,
+    vehicleModel: policies.vehicleModel,
+    vehicleYear: policies.vehicleYear,
+    vehiclePlate: policies.vehiclePlate,
+    motoBrand: policies.motoBrand,
+    motoModel: policies.motoModel,
+    motoYear: policies.motoYear,
+    motoPlate: policies.motoPlate,
+    propertyAddress: policies.propertyAddress,
+    businessName: policies.businessName,
+    businessActivity: policies.businessActivity,
+  };
+
   // ── 2. Policies starting in month ──
   const polConditions: any[] = [
     gte(policies.startDate, startDate),
@@ -6671,32 +6713,7 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
   if (validType) polConditions.push(eq(policies.type, validType));
 
   const polRaw = await db
-    .select({
-      policyId: policies.id,
-      policyNumber: policies.policyNumber,
-      type: policies.type,
-      startDate: policies.startDate,
-      endDate: policies.endDate,
-      premium: policies.premium,
-      monthlyFee: policies.monthlyFee,
-      notes: policies.notes,
-      renewedFromId: policies.renewedFromId,
-      companyId: policies.companyId,
-      insuredName: insureds.name,
-      companyName: companies.name,
-      isFleet: policies.isFleet,
-      vehicleBrand: policies.vehicleBrand,
-      vehicleModel: policies.vehicleModel,
-      vehicleYear: policies.vehicleYear,
-      vehiclePlate: policies.vehiclePlate,
-      motoBrand: policies.motoBrand,
-      motoModel: policies.motoModel,
-      motoYear: policies.motoYear,
-      motoPlate: policies.motoPlate,
-      propertyAddress: policies.propertyAddress,
-      businessName: policies.businessName,
-      businessActivity: policies.businessActivity,
-    })
+    .select(POLICY_REPORT_COLUMNS)
     .from(policies)
     .innerJoin(insureds, eq(policies.insuredId, insureds.id))
     .innerJoin(companies, eq(policies.companyId, companies.id))
@@ -6731,6 +6748,8 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
       amount: policyInstallments.amount,
       status: policyInstallments.status,
       type: policies.type,
+      sumInsured: policies.sumInsured,
+      coverageType: policies.coverageType,
       companyId: policies.companyId,
       insuredName: insureds.name,
       companyName: companies.name,
@@ -6755,9 +6774,91 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     .orderBy(asc(policyInstallments.dueDate))
     .all();
 
+  // ── 4. Proyección de renovaciones/refacturaciones futuras ──────────────────
+  // Solo para meses POSTERIORES al mes actual de Argentina (mes actual y
+  // pasados preservan el comportamiento de siempre: nada se proyecta, solo se
+  // muestran eventos reales ya registrados). "Vigente" usa la MISMA
+  // definición que ya usa el resto del sistema (ver GET /stats más arriba):
+  // policies.status IN ('activa', 'por_vencer') — es el status ya
+  // mantenido por el propio flujo de alta/edición/renovación, no un
+  // recálculo propio por endDate que podría desalinearse del resto de la app.
+  const VIGENTE_STATUSES = ["activa", "por_vencer"];
+  const currentArgentinaMonth = shiftArgentinaMonth(0);
+  const isFutureMonth = month > currentArgentinaMonth;
+
+  let projRenewalRaw: typeof polRaw = [];
+  let projRebillingRaw: typeof polRaw = [];
+
+  if (isFutureMonth) {
+    // Renovación proyectada: pólizas vigentes cuyo endDate cae en el mes
+    // seleccionado — esa fecha ES la "fecha prevista de renovación" pedida.
+    const projRenewalConditions: any[] = [
+      inArray(policies.status, VIGENTE_STATUSES),
+      gte(policies.endDate, startDate),
+      lt(policies.endDate, endDateExclusive),
+    ];
+    if (companyId) projRenewalConditions.push(eq(policies.companyId, companyId));
+    if (validType) projRenewalConditions.push(eq(policies.type, validType));
+
+    const renewalCandidates = await db
+      .select(POLICY_REPORT_COLUMNS)
+      .from(policies)
+      .innerJoin(insureds, eq(policies.insuredId, insureds.id))
+      .innerJoin(companies, eq(policies.companyId, companies.id))
+      .where(and(...projRenewalConditions))
+      .all();
+
+    // Dedupe con dato real: si otra póliza YA la renovó (relación real
+    // policies.renewedFromId), el evento ya ocurrió — no proyectar encima.
+    // (Defensa en profundidad: el propio flujo de renovación ya pasa la
+    // póliza vieja a status "renovada" al crear la nueva — ver POST
+    // /policies — por lo que en el camino normal el filtro de vigencia de
+    // arriba ya la excluye solo. Esta consulta cubre el caso de datos
+    // importados/editados donde ese status no se haya actualizado.)
+    let alreadyRenewedIds = new Set<number>();
+    if (renewalCandidates.length > 0) {
+      const childRows = await db
+        .select({ renewedFromId: policies.renewedFromId })
+        .from(policies)
+        .where(inArray(policies.renewedFromId, renewalCandidates.map((r) => r.policyId)))
+        .all();
+      alreadyRenewedIds = new Set(
+        childRows.map((r) => r.renewedFromId).filter((x): x is number => x != null)
+      );
+    }
+    projRenewalRaw = renewalCandidates.filter((r) => !alreadyRenewedIds.has(r.policyId));
+
+    // Refacturación proyectada: pólizas vigentes con nextRebillingDate
+    // informado (nunca inferido) dentro del mes seleccionado.
+    const projRebillingConditions: any[] = [
+      inArray(policies.status, VIGENTE_STATUSES),
+      isNotNull(policies.nextRebillingDate),
+      gte(policies.nextRebillingDate, startDate),
+      lt(policies.nextRebillingDate, endDateExclusive),
+    ];
+    if (companyId) projRebillingConditions.push(eq(policies.companyId, companyId));
+    if (validType) projRebillingConditions.push(eq(policies.type, validType));
+
+    const rebillingCandidates = await db
+      .select(POLICY_REPORT_COLUMNS)
+      .from(policies)
+      .innerJoin(insureds, eq(policies.insuredId, insureds.id))
+      .innerJoin(companies, eq(policies.companyId, companies.id))
+      .where(and(...projRebillingConditions))
+      .all();
+
+    // Dedupe con dato real: si ya existe una refacturación real de esta
+    // póliza en este mismo mes (rebRaw, ya consultado arriba), el dato real
+    // manda — no duplicar con una proyección.
+    const realRebillingPolicyIds = new Set(rebRaw.map((r) => Number(r.policyId)));
+    projRebillingRaw = rebillingCandidates.filter((r) => !realRebillingPolicyIds.has(r.policyId));
+  }
+
   // ── Bien asegurado: conteo de flota en un solo query batched (sin N+1) ──
   const fleetPolicyIds = [
     ...rebRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
+    ...projRenewalRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
+    ...projRebillingRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
     ...polRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
     ...instRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
   ];
@@ -6772,7 +6873,7 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     for (const fr of fleetRows) fleetCounts.set(Number(fr.policyId), Number(fr.count));
   }
 
-  let rebillingRows = rebRaw.map((r) => ({
+  let rebillingRows: any[] = rebRaw.map((r) => ({
     rebillingId: Number(r.rebillingId),
     policyId: Number(r.policyId),
     policyNumber: String(r.policyNumber),
@@ -6793,7 +6894,41 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
       Number(r.policyId),
       fleetCounts,
     ),
+    // Suma asegurada: histórica de ESTA refacturación (rebillings.sumInsured),
+    // sin fallback a la de la póliza — ver comentario en el SELECT de rebRaw.
+    coverageType: r.coverageType ? String(r.coverageType) : null,
+    sumInsured: r.sumInsured != null ? Number(r.sumInsured) : null,
+    projected: false as const,
   }));
+
+  // Refacturaciones proyectadas: misma póliza vigente, sin refacturación real
+  // todavía — usamos sus valores ACTUALES de referencia (premio, cuota,
+  // cobertura, suma asegurada), nunca inventados. rebillingId negativo:
+  // nunca colisiona con un id real (autoincrement, siempre positivo).
+  const projectedRebillingRows = projRebillingRaw.map((p) => ({
+    rebillingId: -Number(p.policyId),
+    policyId: Number(p.policyId),
+    policyNumber: String(p.policyNumber),
+    insuredName: String(p.insuredName),
+    companyName: String(p.companyName),
+    type: String(p.type),
+    billingStart: String(p.nextRebillingDate),
+    // Fin de período todavía no existe (no hay refacturación real) — no se inventa.
+    billingEnd: null,
+    premium: p.premium != null ? Number(p.premium) : null,
+    monthlyFee: p.monthlyFee != null ? Number(p.monthlyFee) : null,
+    policyOriginalStart: String(p.startDate),
+    billingCycle: p.billingCycle ? String(p.billingCycle) : null,
+    // Todavía no hay refacturación real que clasificar (prórroga/endoso/...).
+    rebillingType: null,
+    duplicateCount: 1,
+    extraDuplicateRows: 0,
+    insuredAsset: reportInsuredAsset(p as ReportAssetFields, Number(p.policyId), fleetCounts),
+    coverageType: p.coverageType ? String(p.coverageType) : null,
+    sumInsured: p.sumInsured != null ? Number(p.sumInsured) : null,
+    projected: true as const,
+  }));
+  rebillingRows = [...rebillingRows, ...projectedRebillingRows];
 
   let pendingInstallmentRows = instRaw.map((r) => ({
     installmentId: Number(r.installmentId),
@@ -6811,6 +6946,8 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
       Number(r.policyId),
       fleetCounts,
     ),
+    coverageType: r.coverageType ? String(r.coverageType) : null,
+    sumInsured: r.sumInsured != null ? Number(r.sumInsured) : null,
   }));
 
   // Lookup old policies for renewedFromId
@@ -6852,6 +6989,9 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
         renewedFromPolicyNumber: old?.policyNumber ?? null,
         renewedFromEndDate: old?.endDate ?? null,
         insuredAsset: reportInsuredAsset(p as ReportAssetFields, Number(p.policyId), fleetCounts),
+        coverageType: p.coverageType ? String(p.coverageType) : null,
+        sumInsured: p.sumInsured != null ? Number(p.sumInsured) : null,
+        projected: false as const,
       });
     } else if (reportIsRenovationImported(notes)) {
       renovationsImported.push({
@@ -6866,6 +7006,8 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
         monthlyFee: p.monthlyFee != null ? Number(p.monthlyFee) : null,
         sourceImporter: reportSourceImporter(notes),
         insuredAsset: reportInsuredAsset(p as ReportAssetFields, Number(p.policyId), fleetCounts),
+        coverageType: p.coverageType ? String(p.coverageType) : null,
+        sumInsured: p.sumInsured != null ? Number(p.sumInsured) : null,
       });
     } else {
       const importer = reportSourceImporter(notes);
@@ -6883,8 +7025,36 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
         sourceImporter: importer,
         classificationReason: reportClassificationReason(notes, importer),
         insuredAsset: reportInsuredAsset(p as ReportAssetFields, Number(p.policyId), fleetCounts),
+        coverageType: p.coverageType ? String(p.coverageType) : null,
+        sumInsured: p.sumInsured != null ? Number(p.sumInsured) : null,
       });
     }
+  }
+
+  // Renovaciones proyectadas: la póliza vigente TODAVÍA no tiene sucesora
+  // real (ver dedupe al construir projRenewalRaw) — se muestra ella misma
+  // como referencia, con su propia fecha de fin de vigencia como "fecha
+  // prevista de renovación". startDate/renewedFrom* quedan null a propósito:
+  // la póliza nueva (real) todavía no existe, no hay fecha de inicio ni
+  // predecesor que inventar.
+  for (const p of projRenewalRaw) {
+    renovationsConfirmed.push({
+      policyId: p.policyId,
+      policyNumber: p.policyNumber,
+      insuredName: p.insuredName,
+      companyName: p.companyName,
+      type: p.type,
+      startDate: null,
+      endDate: p.endDate,
+      premium: p.premium != null ? Number(p.premium) : null,
+      monthlyFee: p.monthlyFee != null ? Number(p.monthlyFee) : null,
+      renewedFromPolicyNumber: null,
+      renewedFromEndDate: null,
+      insuredAsset: reportInsuredAsset(p as ReportAssetFields, Number(p.policyId), fleetCounts),
+      coverageType: p.coverageType ? String(p.coverageType) : null,
+      sumInsured: p.sumInsured != null ? Number(p.sumInsured) : null,
+      projected: true as const,
+    });
   }
 
   // ── 3. Apply filters ──
@@ -6953,6 +7123,9 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
 
   return c.json({
     month,
+    // El frontend usa esto para el aviso de proyección y no tiene que
+    // recalcular "mes actual de Argentina" por su cuenta con otra lógica.
+    isFutureMonth,
     rebillings:            filteredRebillings,
     renovationsConfirmed:  filteredConfirmed,
     renovationsImported:   filteredImported,

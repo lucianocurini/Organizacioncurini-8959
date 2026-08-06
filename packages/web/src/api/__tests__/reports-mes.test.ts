@@ -10,6 +10,7 @@ import {
   users, sessions, policies, rebillings, companies, insureds, policyFleetVehicles, policyInstallments,
 } from "../database/schema";
 import { eq, inArray } from "drizzle-orm";
+import { shiftArgentinaMonth, toArgentinaCalendarDay } from "../../lib/dates/argentina-date";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -20,6 +21,19 @@ const USER_EMAIL = "test-reports-mes@test.local";
 // Far-future months → no real-data collisions
 const M = "2027-06";
 const M_ADJ = "2027-07";
+
+// Meses para los tests de proyección (renovaciones/refacturaciones futuras).
+// Se calculan relativos al mes actual REAL de Argentina (no hardcodeados)
+// para que "F es futuro" y "PAST_MONTH es pasado" sigan siendo ciertos sin
+// importar cuándo corra la suite — y bien separados de M/M_ADJ para no
+// colisionar con esos fixtures.
+const NOW_YEAR = Number(toArgentinaCalendarDay().slice(0, 4));
+const FUTURE_YEAR = NOW_YEAR + 6;
+const F = `${FUTURE_YEAR}-03`;
+const F_ADJ = `${FUTURE_YEAR}-04`;
+const DEC = `${FUTURE_YEAR}-12`;
+const JAN = `${FUTURE_YEAR + 1}-01`;
+const PAST_MONTH = "2020-05";
 
 let userId: number;
 let insuredId: number;
@@ -61,11 +75,15 @@ async function mkPolicy(opts: {
   propertyAddress?: string | null;
   businessName?: string | null;
   businessActivity?: string | null;
+  status?: string;
+  sumInsured?: number | null;
+  coverageType?: string | null;
+  nextRebillingDate?: string | null;
 }): Promise<number> {
   const [p] = await db.insert(policies).values({
     policyNumber: opts.num,
     type: opts.type ?? "automotor",
-    status: "activa",
+    status: opts.status ?? "activa",
     companyId: opts.companyId,
     insuredId,
     startDate: opts.startDate,
@@ -86,6 +104,9 @@ async function mkPolicy(opts: {
     propertyAddress: opts.propertyAddress ?? null,
     businessName: opts.businessName ?? null,
     businessActivity: opts.businessActivity ?? null,
+    sumInsured: opts.sumInsured !== undefined ? opts.sumInsured : null,
+    coverageType: opts.coverageType !== undefined ? opts.coverageType : null,
+    nextRebillingDate: opts.nextRebillingDate !== undefined ? opts.nextRebillingDate : null,
   }).returning({ id: policies.id });
   policyIdsToClean.push(p!.id);
   return p!.id;
@@ -98,6 +119,7 @@ async function mkReb(opts: {
   premium?: number | null;
   monthlyFee?: number | null;
   notes?: string | null;
+  sumInsured?: number | null;
 }): Promise<number> {
   const [r] = await db.insert(rebillings).values({
     policyId: opts.policyId,
@@ -106,6 +128,7 @@ async function mkReb(opts: {
     premium: opts.premium !== undefined ? opts.premium : 10000,
     monthlyFee: opts.monthlyFee ?? null,
     notes: opts.notes ?? null,
+    sumInsured: opts.sumInsured !== undefined ? opts.sumInsured : null,
   }).returning({ id: rebillings.id });
   rebillingIdsToClean.push(r!.id);
   return r!.id;
@@ -952,5 +975,359 @@ describe("Caso O — Cuotas pendientes del mes (installments por dueDate)", () =
     const body = await (await callReport(M)).json();
     expect(body.rebillings.some((r: any) => r.policyId === polReb)).toBe(true);
     expect(body.pendingInstallments.some((r: any) => r.policyId === polInst)).toBe(true);
+  });
+});
+
+// ── Caso P — Renovaciones proyectadas (mes futuro, pólizas vigentes) ─────────
+// Regla de negocio: para meses POSTERIORES al mes actual de Argentina, una
+// póliza vigente cuyo endDate cae en el mes seleccionado se muestra como
+// renovación proyectada (projected=true), usando esa fecha como "fecha
+// prevista de renovación" — nunca se inventa una póliza nueva.
+
+describe("Caso P — Renovaciones proyectadas", () => {
+  test("póliza vigente con endDate en el mes futuro → aparece como renovación proyectada", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-P001",
+      companyId: coElNorteId,
+      startDate: "2026-01-01",
+      endDate: `${F}-15`,
+      status: "activa",
+      sumInsured: 5000000,
+      coverageType: "todo_riesgo",
+    });
+
+    const body = await (await callReport(F)).json();
+    expect(body.isFutureMonth).toBe(true);
+    const row = body.renovationsConfirmed.find((r: any) => r.policyId === polId);
+    expect(row).toBeDefined();
+    expect(row.projected).toBe(true);
+    expect(row.endDate).toBe(`${F}-15`);
+    expect(row.startDate).toBeNull();
+    expect(row.renewedFromPolicyNumber).toBeNull();
+    expect(row.renewedFromEndDate).toBeNull();
+    expect(row.coverageType).toBe("todo_riesgo");
+    expect(row.sumInsured).toBe(5000000);
+  });
+
+  test("la misma póliza NO aparece al consultar otro mes futuro", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-P002",
+      companyId: coElNorteId,
+      startDate: "2026-01-01",
+      endDate: `${F}-20`,
+      status: "por_vencer",
+    });
+
+    const bodyOther = await (await callReport(F_ADJ)).json();
+    expect(bodyOther.renovationsConfirmed.some((r: any) => r.policyId === polId)).toBe(false);
+
+    const bodySame = await (await callReport(F)).json();
+    expect(bodySame.renovationsConfirmed.some((r: any) => r.policyId === polId)).toBe(true);
+  });
+
+  test("póliza 'vencida' con endDate en el mes → NO se proyecta (no está vigente)", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-P003",
+      companyId: coElNorteId,
+      startDate: "2026-01-01",
+      endDate: `${F}-10`,
+      status: "vencida",
+    });
+    const body = await (await callReport(F)).json();
+    expect(body.renovationsConfirmed.some((r: any) => r.policyId === polId)).toBe(false);
+  });
+
+  test("póliza 'cancelada' con endDate en el mes → NO se proyecta", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-P004",
+      companyId: coElNorteId,
+      startDate: "2026-01-01",
+      endDate: `${F}-10`,
+      status: "cancelada",
+    });
+    const body = await (await callReport(F)).json();
+    expect(body.renovationsConfirmed.some((r: any) => r.policyId === polId)).toBe(false);
+  });
+
+  test("póliza ya renovada realmente (existe hija con renewedFromId) → no se duplica con una proyección", async () => {
+    const oldId = await mkPolicy({
+      num: "TEST-RM-P005-OLD",
+      companyId: coElNorteId,
+      startDate: "2026-01-01",
+      endDate: `${F}-12`,
+      // A propósito status="activa" (no "renovada"): prueba el dedupe
+      // relacional real (policies.renewedFromId), no solo el filtro de status.
+      status: "activa",
+    });
+    const newId = await mkPolicy({
+      num: "TEST-RM-P005-NEW",
+      companyId: coElNorteId,
+      startDate: `${F}-12`,
+      renewedFromId: oldId,
+    });
+
+    const body = await (await callReport(F)).json();
+    expect(body.renovationsConfirmed.filter((r: any) => r.policyId === oldId).length).toBe(0);
+    const realRow = body.renovationsConfirmed.find((r: any) => r.policyId === newId);
+    expect(realRow).toBeDefined();
+    expect(realRow.projected).toBe(false);
+  });
+
+  test("mes actual/pasado: preserva comportamiento anterior — endDate en ese mes NO proyecta", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-P006",
+      companyId: coElNorteId,
+      startDate: "2020-01-01",
+      endDate: `${PAST_MONTH}-15`,
+      status: "activa",
+    });
+    const body = await (await callReport(PAST_MONTH)).json();
+    expect(body.isFutureMonth).toBe(false);
+    expect(body.renovationsConfirmed.some((r: any) => r.policyId === polId)).toBe(false);
+  });
+
+  test("mes actual de Argentina tampoco proyecta (solo estrictamente posteriores)", async () => {
+    const currentMonth = shiftArgentinaMonth(0);
+    const body = await (await callReport(currentMonth)).json();
+    expect(body.isFutureMonth).toBe(false);
+  });
+
+  test("cambio de año diciembre→enero: respeta el límite exacto del mes", async () => {
+    const polDec = await mkPolicy({
+      num: "TEST-RM-P007-DEC",
+      companyId: coElNorteId,
+      startDate: "2026-01-01",
+      endDate: `${DEC}-31`,
+      status: "activa",
+    });
+    const polJan = await mkPolicy({
+      num: "TEST-RM-P007-JAN",
+      companyId: coElNorteId,
+      startDate: "2026-01-01",
+      endDate: `${JAN}-01`,
+      status: "activa",
+    });
+
+    const bodyJan = await (await callReport(JAN)).json();
+    expect(bodyJan.renovationsConfirmed.some((r: any) => r.policyId === polDec)).toBe(false);
+    expect(bodyJan.renovationsConfirmed.some((r: any) => r.policyId === polJan)).toBe(true);
+
+    const bodyDec = await (await callReport(DEC)).json();
+    expect(bodyDec.renovationsConfirmed.some((r: any) => r.policyId === polDec)).toBe(true);
+    expect(bodyDec.renovationsConfirmed.some((r: any) => r.policyId === polJan)).toBe(false);
+  });
+});
+
+// ── Caso Q — independencia de huso horario ───────────────────────────────────
+// isFutureMonth se calcula con shiftArgentinaMonth (Intl con timeZone fijo
+// "America/Argentina/Buenos_Aires"), nunca con Date/getMonth()/toISOString()
+// del proceso — el mismo patrón ya validado para el bug UTC de rendición
+// #115. Se prueba comparando contra el propio helper en vez de contra una
+// fecha hardcodeada, así el test es válido corra cuando corra.
+
+describe("Caso Q — el límite de mes futuro usa el calendario de Argentina, no UTC/local", () => {
+  test("mes anterior al actual (Argentina) → isFutureMonth=false", async () => {
+    const body = await (await callReport(shiftArgentinaMonth(-1))).json();
+    expect(body.isFutureMonth).toBe(false);
+  });
+
+  test("mes actual (Argentina) → isFutureMonth=false", async () => {
+    const body = await (await callReport(shiftArgentinaMonth(0))).json();
+    expect(body.isFutureMonth).toBe(false);
+  });
+
+  test("mes siguiente (Argentina) → isFutureMonth=true", async () => {
+    const body = await (await callReport(shiftArgentinaMonth(1))).json();
+    expect(body.isFutureMonth).toBe(true);
+  });
+});
+
+// ── Caso R — Refacturaciones proyectadas (mes futuro, nextRebillingDate) ─────
+
+describe("Caso R — Refacturaciones proyectadas", () => {
+  test("póliza vigente con nextRebillingDate en el mes → aparece como refacturación proyectada", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-R001",
+      companyId: coRivadaviaId,
+      startDate: "2026-01-01",
+      endDate: `${FUTURE_YEAR + 2}-12-31`,
+      status: "activa",
+      nextRebillingDate: `${F}-08`,
+      sumInsured: 3000000,
+      coverageType: "terceros_completo",
+    });
+
+    const body = await (await callReport(F)).json();
+    const row = body.rebillings.find((r: any) => r.policyId === polId);
+    expect(row).toBeDefined();
+    expect(row.projected).toBe(true);
+    expect(row.billingStart).toBe(`${F}-08`);
+    expect(row.billingEnd).toBeNull();
+    expect(row.rebillingId).toBeLessThan(0);
+    expect(row.rebillingType).toBeNull();
+    expect(row.duplicateCount).toBe(1);
+    expect(row.coverageType).toBe("terceros_completo");
+    expect(row.sumInsured).toBe(3000000);
+  });
+
+  test("nextRebillingDate=null → NO se infiere ninguna proyección", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-R002",
+      companyId: coRivadaviaId,
+      startDate: "2026-01-01",
+      endDate: `${FUTURE_YEAR + 2}-12-31`,
+      status: "activa",
+      nextRebillingDate: null,
+    });
+    const body = await (await callReport(F)).json();
+    expect(body.rebillings.some((r: any) => r.policyId === polId)).toBe(false);
+  });
+
+  test("póliza no vigente ('vencida') con nextRebillingDate en el mes → no se proyecta", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-R003",
+      companyId: coRivadaviaId,
+      startDate: "2026-01-01",
+      endDate: `${FUTURE_YEAR + 2}-12-31`,
+      status: "vencida",
+      nextRebillingDate: `${F}-08`,
+    });
+    const body = await (await callReport(F)).json();
+    expect(body.rebillings.some((r: any) => r.policyId === polId)).toBe(false);
+  });
+
+  test("ya existe una refacturación real ese mes → no se duplica con una proyectada", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-R004",
+      companyId: coRivadaviaId,
+      startDate: "2026-01-01",
+      endDate: `${FUTURE_YEAR + 2}-12-31`,
+      status: "activa",
+      nextRebillingDate: `${F}-08`,
+    });
+    await mkReb({ policyId: polId, billingStart: `${F}-05`, notes: "Importado de Rivadavia | Prórroga" });
+
+    const body = await (await callReport(F)).json();
+    const matching = body.rebillings.filter((r: any) => r.policyId === polId);
+    expect(matching.length).toBe(1);
+    expect(matching[0].projected).toBe(false);
+  });
+
+  test("mes actual/pasado: nextRebillingDate en ese mes no genera fila (preserva comportamiento previo)", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-R005",
+      companyId: coRivadaviaId,
+      startDate: "2020-01-01",
+      endDate: `${FUTURE_YEAR + 2}-12-31`,
+      status: "activa",
+      nextRebillingDate: `${PAST_MONTH}-08`,
+    });
+    const body = await (await callReport(PAST_MONTH)).json();
+    expect(body.rebillings.some((r: any) => r.policyId === polId)).toBe(false);
+  });
+});
+
+// ── Caso S — Cobertura y Suma asegurada ───────────────────────────────────────
+
+describe("Caso S — Cobertura y Suma asegurada", () => {
+  test("Alta: coverageType/sumInsured de la póliza aparecen tal cual", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-S001",
+      companyId: coElNorteId,
+      startDate: `${M}-01`,
+      notes: null,
+      sumInsured: 1234567,
+      coverageType: "incendio",
+    });
+    const body = await (await callReport(M)).json();
+    const row = body.newPolicies.find((p: any) => p.policyId === polId);
+    expect(row.coverageType).toBe("incendio");
+    expect(row.sumInsured).toBe(1234567);
+  });
+
+  test("Renovación confirmada real: coverageType/sumInsured de la póliza nueva", async () => {
+    const oldId = await mkPolicy({
+      num: "TEST-RM-S002-OLD", companyId: coCoopId, startDate: "2025-01-01", endDate: `${M}-01`,
+    });
+    const newId = await mkPolicy({
+      num: "TEST-RM-S002-NEW",
+      companyId: coCoopId,
+      startDate: `${M}-01`,
+      renewedFromId: oldId,
+      sumInsured: 999,
+      coverageType: "todo_riesgo",
+    });
+    const body = await (await callReport(M)).json();
+    const row = body.renovationsConfirmed.find((r: any) => r.policyId === newId);
+    expect(row.coverageType).toBe("todo_riesgo");
+    expect(row.sumInsured).toBe(999);
+  });
+
+  test("Cuota pendiente: coverageType/sumInsured provienen de la póliza dueña", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-S003",
+      companyId: coMercantilId,
+      startDate: "2026-01-01",
+      sumInsured: 55555,
+      coverageType: "basica",
+    });
+    await mkInstallment({ policyId: polId, number: 1, dueDate: `${M}-01` });
+    const body = await (await callReport(M)).json();
+    const row = body.pendingInstallments.find((r: any) => r.policyId === polId);
+    expect(row.coverageType).toBe("basica");
+    expect(row.sumInsured).toBe(55555);
+  });
+
+  test("Refacturación real: sumInsured sale de rebillings (histórico), NO de policies, cuando difieren", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-S004",
+      companyId: coElNorteId,
+      startDate: "2026-01-01",
+      sumInsured: 100000,
+      coverageType: "todo_riesgo",
+    });
+    await mkReb({
+      policyId: polId,
+      billingStart: `${M}-01`,
+      sumInsured: 77777,
+      notes: "Importado de El Norte v2 | Prórroga",
+    });
+    const body = await (await callReport(M)).json();
+    const row = body.rebillings.find((r: any) => r.policyId === polId);
+    expect(row.sumInsured).toBe(77777);
+    expect(row.coverageType).toBe("todo_riesgo");
+  });
+
+  test("Refacturación real con sumInsured null → null en la fila, SIN fallback al de la póliza", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-S005",
+      companyId: coElNorteId,
+      startDate: "2026-01-01",
+      sumInsured: 500000,
+    });
+    await mkReb({
+      policyId: polId,
+      billingStart: `${M}-01`,
+      sumInsured: null,
+      notes: "Importado de El Norte v2 | Prórroga",
+    });
+    const body = await (await callReport(M)).json();
+    const row = body.rebillings.find((r: any) => r.policyId === polId);
+    expect(row.sumInsured).toBeNull();
+  });
+
+  test("coverageType null en la póliza → null en la fila (backend no inventa 'Sin informar')", async () => {
+    const polId = await mkPolicy({
+      num: "TEST-RM-S006",
+      companyId: coElNorteId,
+      startDate: `${M}-01`,
+      notes: null,
+      coverageType: null,
+      sumInsured: null,
+    });
+    const body = await (await callReport(M)).json();
+    const row = body.newPolicies.find((p: any) => p.policyId === polId);
+    expect(row.coverageType).toBeNull();
+    expect(row.sumInsured).toBeNull();
   });
 });

@@ -2,11 +2,11 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { useLocation } from "wouter";
 import { api } from "@/lib/api";
 import { AppLayout } from "@/components/layout/AppLayout";
-import { formatCurrency, formatDate, POLICY_TYPES, cn } from "@/lib/utils";
+import { formatCurrency, formatDate, POLICY_TYPES, COVERAGE_LABELS, cn } from "@/lib/utils";
 import { buildReportQuery, buildReportPath, parseReportFilters } from "@/lib/report-filters";
 import {
   ChevronLeft, ChevronRight, Download, Printer, Search, X, RefreshCw,
-  FileText, TrendingUp, Plus, Copy, BarChart3,
+  FileText, TrendingUp, Plus, Copy, BarChart3, Info,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { PolicyActions } from "@/components/policies/PolicyActions";
@@ -21,15 +21,22 @@ interface RebillingRow {
   companyName: string;
   type: string;
   billingStart: string;
-  billingEnd: string;
+  // null en refacturaciones proyectadas: todavía no existe un período real.
+  billingEnd: string | null;
   premium: number | null;
   monthlyFee: number | null;
   policyOriginalStart: string;
   billingCycle: string | null;
-  rebillingType: string;
+  // null en proyectadas: no hay refacturación real que clasificar todavía.
+  rebillingType: string | null;
   duplicateCount: number;
   extraDuplicateRows: number;
   insuredAsset: string | null;
+  coverageType: string | null;
+  sumInsured: number | null;
+  // true = proyección (póliza vigente sin refacturación real todavía),
+  // no un evento ya registrado.
+  projected: boolean;
 }
 
 interface RenovationConfirmedRow {
@@ -38,13 +45,17 @@ interface RenovationConfirmedRow {
   insuredName: string;
   companyName: string;
   type: string;
-  startDate: string;
+  // null en renovaciones proyectadas: la póliza nueva todavía no existe.
+  startDate: string | null;
   endDate: string;
   premium: number | null;
   monthlyFee: number | null;
   renewedFromPolicyNumber: string | null;
   renewedFromEndDate: string | null;
   insuredAsset: string | null;
+  coverageType: string | null;
+  sumInsured: number | null;
+  projected: boolean;
 }
 
 interface RenovationImportedRow {
@@ -59,6 +70,8 @@ interface RenovationImportedRow {
   monthlyFee: number | null;
   sourceImporter: string;
   insuredAsset: string | null;
+  coverageType: string | null;
+  sumInsured: number | null;
 }
 
 interface NewPolicyRow {
@@ -75,6 +88,8 @@ interface NewPolicyRow {
   sourceImporter: string;
   classificationReason: string;
   insuredAsset: string | null;
+  coverageType: string | null;
+  sumInsured: number | null;
 }
 
 interface PendingInstallmentRow {
@@ -89,6 +104,8 @@ interface PendingInstallmentRow {
   amount: number;
   status: string;
   insuredAsset: string | null;
+  coverageType: string | null;
+  sumInsured: number | null;
 }
 
 interface ReportTotals {
@@ -108,6 +125,9 @@ interface ReportTotals {
 
 interface ReportData {
   month: string;
+  // true si el mes consultado es posterior al mes actual de Argentina —
+  // controla el aviso de proyección (ver banner en el header).
+  isFutureMonth: boolean;
   rebillings: RebillingRow[];
   renovationsConfirmed: RenovationConfirmedRow[];
   renovationsImported: RenovationImportedRow[];
@@ -173,13 +193,36 @@ const REBILLING_TYPE_COLORS: Record<string, string> = {
   otro: "bg-gray-500/15 text-gray-400 border-gray-500/20",
 };
 
-function RebillingTypeBadge({ type }: { type: string }) {
+function RebillingTypeBadge({ type }: { type: string | null }) {
+  // null = refacturación proyectada: todavía no hay nada real que clasificar.
+  if (!type) return <span className="text-gray-600 text-xs">—</span>;
   return (
     <span className={cn("inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium border",
       REBILLING_TYPE_COLORS[type] ?? REBILLING_TYPE_COLORS.otro)}>
       {REBILLING_TYPE_LABELS[type] ?? type}
     </span>
   );
+}
+
+// Distingue una fila PROYECTADA (renovación/refacturación esperada a partir
+// de la póliza vigente) de un evento ya registrado — nunca se inventa una
+// póliza o refacturación real, solo se anticipa lo esperable.
+function ProjectedBadge() {
+  return (
+    <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-violet-500/15 text-violet-400 border border-violet-500/20">
+      Proyectada
+    </span>
+  );
+}
+
+function CoverageCell({ value }: { value: string | null }) {
+  if (!value) return <span className="text-gray-600 text-xs">—</span>;
+  return <span className="text-sm text-gray-300 whitespace-normal break-words">{COVERAGE_LABELS[value] ?? value}</span>;
+}
+
+function SumInsuredCell({ value }: { value: number | null }) {
+  if (value == null) return <span className="text-gray-600 text-xs">—</span>;
+  return <span className="text-sm text-gray-300">{formatCurrency(value)}</span>;
 }
 
 function DuplicateBadge({ count }: { count: number }) {
@@ -324,6 +367,19 @@ function buildCSV(rows: Record<string, unknown>[]): string {
 
 // ── Excel export ──────────────────────────────────────────────────────────────
 
+// Ancho de columna a partir del contenido real (encabezado + valores), no una
+// lista fija por hoja — así una hoja nueva o una columna reordenada quedan
+// bien dimensionadas automáticamente, sin mantenimiento manual. `wch` es la
+// unidad de ancho de columna de Excel (~cantidad de caracteres "0").
+function autoSizeColumns(rows: Record<string, unknown>[]): { wch: number }[] {
+  if (!rows.length) return [];
+  const headers = Object.keys(rows[0]);
+  return headers.map((h) => {
+    const maxLen = rows.reduce((max, r) => Math.max(max, String(r[h] ?? "").length), h.length);
+    return { wch: Math.min(Math.max(maxLen + 2, 10), 45) };
+  });
+}
+
 function exportExcel(data: ReportData, activeFilters: string) {
   const wb = XLSX.utils.book_new();
 
@@ -346,7 +402,9 @@ function exportExcel(data: ReportData, activeFilters: string) {
     { Sección: "  · Vencidas", Valor: data.totals.pendingInstallmentsOverdueCount },
     { Sección: "  · Importe total", Valor: data.totals.totalPendingInstallmentsAmount },
   ];
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), "Resumen");
+  const summarySheet = XLSX.utils.json_to_sheet(summaryRows);
+  summarySheet["!cols"] = autoSizeColumns(summaryRows);
+  XLSX.utils.book_append_sheet(wb, summarySheet, "Resumen");
 
   // Refacturaciones sheet
   const rebRows = data.rebillings.map((r) => ({
@@ -355,15 +413,19 @@ function exportExcel(data: ReportData, activeFilters: string) {
     "Bien asegurado": r.insuredAsset ?? "",
     "Compañía": r.companyName,
     "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
+    "Cobertura": r.coverageType ? (COVERAGE_LABELS[r.coverageType] ?? r.coverageType) : "",
+    "Suma asegurada": r.sumInsured ?? "",
     "Inicio refact.": r.billingStart,
-    "Fin refact.": r.billingEnd,
+    "Fin refact.": r.billingEnd ?? "",
     "Premio": r.premium,
     "Cuota mensual": r.monthlyFee,
     "Inicio póliza": r.policyOriginalStart,
-    "Tipo": REBILLING_TYPE_LABELS[r.rebillingType] ?? r.rebillingType,
+    "Tipo": r.rebillingType ? (REBILLING_TYPE_LABELS[r.rebillingType] ?? r.rebillingType) : "",
     "Duplicados detectados": r.duplicateCount > 1 ? r.duplicateCount : "",
+    "Proyectada": r.projected ? "Sí" : "",
   }));
   const rebSheet = XLSX.utils.json_to_sheet(rebRows);
+  rebSheet["!cols"] = autoSizeColumns(rebRows);
   XLSX.utils.book_append_sheet(wb, rebSheet, "Refacturaciones");
 
   // Renovaciones sheet (confirmed + imported merged)
@@ -375,12 +437,15 @@ function exportExcel(data: ReportData, activeFilters: string) {
       "Bien asegurado": r.insuredAsset ?? "",
       "Compañía": r.companyName,
       "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
-      "Inicio vigencia": r.startDate,
+      "Cobertura": r.coverageType ? (COVERAGE_LABELS[r.coverageType] ?? r.coverageType) : "",
+      "Suma asegurada": r.sumInsured ?? "",
+      "Inicio vigencia": r.startDate ?? "",
       "Fin vigencia": r.endDate,
       "Premio": r.premium,
       "Póliza anterior": r.renewedFromPolicyNumber ?? "",
       "Vto. anterior": r.renewedFromEndDate ?? "",
       "Importador": "",
+      "Proyectada": r.projected ? "Sí" : "",
     })),
     ...data.renovationsImported.map((r) => ({
       "Tipo renovación": "Importada",
@@ -389,15 +454,20 @@ function exportExcel(data: ReportData, activeFilters: string) {
       "Bien asegurado": r.insuredAsset ?? "",
       "Compañía": r.companyName,
       "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
+      "Cobertura": r.coverageType ? (COVERAGE_LABELS[r.coverageType] ?? r.coverageType) : "",
+      "Suma asegurada": r.sumInsured ?? "",
       "Inicio vigencia": r.startDate,
       "Fin vigencia": r.endDate,
       "Premio": r.premium,
       "Póliza anterior": "",
       "Vto. anterior": "",
       "Importador": importerLabel(r.sourceImporter),
+      "Proyectada": "",
     })),
   ];
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(renRows), "Renovaciones");
+  const renSheet = XLSX.utils.json_to_sheet(renRows);
+  renSheet["!cols"] = autoSizeColumns(renRows);
+  XLSX.utils.book_append_sheet(wb, renSheet, "Renovaciones");
 
   // Altas sheet
   const altasRows = data.newPolicies.map((r) => ({
@@ -406,6 +476,8 @@ function exportExcel(data: ReportData, activeFilters: string) {
     "Bien asegurado": r.insuredAsset ?? "",
     "Compañía": r.companyName,
     "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
+    "Cobertura": r.coverageType ? (COVERAGE_LABELS[r.coverageType] ?? r.coverageType) : "",
+    "Suma asegurada": r.sumInsured ?? "",
     "Inicio vigencia": r.startDate,
     "Fin vigencia": r.endDate,
     "Premio": r.premium,
@@ -416,7 +488,9 @@ function exportExcel(data: ReportData, activeFilters: string) {
         ? "Refact. sin base"
         : "Alta directa",
   }));
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(altasRows), "Altas");
+  const altasSheet = XLSX.utils.json_to_sheet(altasRows);
+  altasSheet["!cols"] = autoSizeColumns(altasRows);
+  XLSX.utils.book_append_sheet(wb, altasSheet, "Altas");
 
   // Cuotas pendientes sheet (proyección — no depende de pagos)
   const pendingRows = data.pendingInstallments.map((r) => ({
@@ -425,12 +499,16 @@ function exportExcel(data: ReportData, activeFilters: string) {
     "Bien asegurado": r.insuredAsset ?? "",
     "Compañía": r.companyName,
     "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
+    "Cobertura": r.coverageType ? (COVERAGE_LABELS[r.coverageType] ?? r.coverageType) : "",
+    "Suma asegurada": r.sumInsured ?? "",
     "Vencimiento": r.dueDate,
     "Cuota N°": r.installmentNumber,
     "Importe": r.amount,
     "Estado": INSTALLMENT_STATUS_LABELS[r.status] ?? r.status,
   }));
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(pendingRows), "Cuotas pendientes");
+  const pendingSheet = XLSX.utils.json_to_sheet(pendingRows);
+  pendingSheet["!cols"] = autoSizeColumns(pendingRows);
+  XLSX.utils.book_append_sheet(wb, pendingSheet, "Cuotas pendientes");
 
   XLSX.writeFile(wb, `renovaciones_refacturaciones_${data.month}.xlsx`);
 }
@@ -441,14 +519,16 @@ function exportCSV(data: ReportData) {
   const all: Record<string, unknown>[] = [
     ...data.rebillings.map((r) => ({
       "Tipo de movimiento": "Refacturación",
-      "Subtipo": REBILLING_TYPE_LABELS[r.rebillingType] ?? r.rebillingType,
+      "Subtipo": r.rebillingType ? (REBILLING_TYPE_LABELS[r.rebillingType] ?? r.rebillingType) : "",
       "N° Póliza": r.policyNumber,
       "Asegurado": r.insuredName,
       "Bien asegurado": r.insuredAsset ?? "",
       "Compañía": r.companyName,
       "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
+      "Cobertura": r.coverageType ? (COVERAGE_LABELS[r.coverageType] ?? r.coverageType) : "",
+      "Suma asegurada": r.sumInsured ?? "",
       "Fecha inicio": r.billingStart,
-      "Fecha fin": r.billingEnd,
+      "Fecha fin": r.billingEnd ?? "",
       "Premio": r.premium ?? "",
       "Cuota mensual": r.monthlyFee ?? "",
       "Inicio póliza original": r.policyOriginalStart,
@@ -456,6 +536,7 @@ function exportCSV(data: ReportData) {
       "Póliza anterior": "",
       "Importador": "",
       "Clasificación alta": "",
+      "Proyectada": r.projected ? "Sí" : "",
     })),
     ...data.renovationsConfirmed.map((r) => ({
       "Tipo de movimiento": "Renovación confirmada",
@@ -465,7 +546,9 @@ function exportCSV(data: ReportData) {
       "Bien asegurado": r.insuredAsset ?? "",
       "Compañía": r.companyName,
       "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
-      "Fecha inicio": r.startDate,
+      "Cobertura": r.coverageType ? (COVERAGE_LABELS[r.coverageType] ?? r.coverageType) : "",
+      "Suma asegurada": r.sumInsured ?? "",
+      "Fecha inicio": r.startDate ?? "",
       "Fecha fin": r.endDate,
       "Premio": r.premium ?? "",
       "Cuota mensual": "",
@@ -474,6 +557,7 @@ function exportCSV(data: ReportData) {
       "Póliza anterior": r.renewedFromPolicyNumber ?? "",
       "Importador": "",
       "Clasificación alta": "",
+      "Proyectada": r.projected ? "Sí" : "",
     })),
     ...data.renovationsImported.map((r) => ({
       "Tipo de movimiento": "Renovación importada",
@@ -483,6 +567,8 @@ function exportCSV(data: ReportData) {
       "Bien asegurado": r.insuredAsset ?? "",
       "Compañía": r.companyName,
       "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
+      "Cobertura": r.coverageType ? (COVERAGE_LABELS[r.coverageType] ?? r.coverageType) : "",
+      "Suma asegurada": r.sumInsured ?? "",
       "Fecha inicio": r.startDate,
       "Fecha fin": r.endDate,
       "Premio": r.premium ?? "",
@@ -492,6 +578,7 @@ function exportCSV(data: ReportData) {
       "Póliza anterior": "",
       "Importador": importerLabel(r.sourceImporter),
       "Clasificación alta": "",
+      "Proyectada": "",
     })),
     ...data.newPolicies.map((r) => ({
       "Tipo de movimiento": "Alta",
@@ -501,6 +588,8 @@ function exportCSV(data: ReportData) {
       "Bien asegurado": r.insuredAsset ?? "",
       "Compañía": r.companyName,
       "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
+      "Cobertura": r.coverageType ? (COVERAGE_LABELS[r.coverageType] ?? r.coverageType) : "",
+      "Suma asegurada": r.sumInsured ?? "",
       "Fecha inicio": r.startDate,
       "Fecha fin": r.endDate,
       "Premio": r.premium ?? "",
@@ -514,6 +603,7 @@ function exportCSV(data: ReportData) {
         : r.classificationReason === "refacturacion_sin_base"
           ? "Refact. sin base"
           : "Alta directa",
+      "Proyectada": "",
     })),
     ...data.pendingInstallments.map((r) => ({
       "Tipo de movimiento": "Cuota pendiente",
@@ -523,6 +613,8 @@ function exportCSV(data: ReportData) {
       "Bien asegurado": r.insuredAsset ?? "",
       "Compañía": r.companyName,
       "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
+      "Cobertura": r.coverageType ? (COVERAGE_LABELS[r.coverageType] ?? r.coverageType) : "",
+      "Suma asegurada": r.sumInsured ?? "",
       "Fecha inicio": r.dueDate,
       "Fecha fin": "",
       "Premio": r.amount ?? "",
@@ -532,6 +624,7 @@ function exportCSV(data: ReportData) {
       "Póliza anterior": "",
       "Importador": "",
       "Clasificación alta": "",
+      "Proyectada": "",
     })),
   ];
 
@@ -549,14 +642,33 @@ function exportCSV(data: ReportData) {
 
 const PRINT_STYLES = `
 @media print {
-  @page { size: A4 landscape; margin: 1cm; }
+  @page { size: A4 landscape; margin: 0.6cm; }
   body { background: white !important; color: black !important; font-size: 10px; }
   .no-print { display: none !important; }
   .col-actions { display: none !important; }
+  /* Defensa adicional: <RunableBadge /> (@runablehq/website-runtime) ya no
+     se monta en App.tsx, pero si algún día vuelve a aparecer (u otra página
+     lo agrega), esto evita que un elemento position:fixed se repita en cada
+     página impresa y se superponga con una fila de la tabla. Selector según
+     el data-attribute que el propio paquete expone, no una clase interna. */
+  [data-runable-badge] { display: none !important; }
   .print-card { border: 1px solid #ccc !important; background: white !important; break-inside: avoid; }
   .print-section { border: 1px solid #ccc !important; background: white !important; break-inside: auto; margin-bottom: 0.6cm; }
-  .print-section table { page-break-inside: auto; font-size: 9px; }
-  .print-section th, .print-section td { padding: 4px 6px !important; }
+  /* El wrapper overflow-x-auto (scroll horizontal en pantalla) no debe
+     recortar nada al imprimir: no hay scrollbar usable en el PDF. */
+  .print-section .overflow-x-auto { overflow: visible !important; }
+  /* Los anchos fijos de <col> (pensados para pantalla, con espacio de sobra
+     para mouse/zoom) suman más que el ancho físico imprimible de A4
+     horizontal — Chrome NO aplica "shrink to fit" solo porque el contenido
+     no entre (eso es una opción manual del diálogo de impresión, no el
+     comportamiento por defecto de imprimir/guardar como PDF). Por eso en
+     impresión se abandona table-layout:fixed con anchos en px y se deja que
+     cada columna se ajuste a su contenido real, que es sensiblemente más
+     angosto que el ancho pensado para pantalla — así todas las columnas,
+     incluidas Cobertura y Suma asegurada, entran sin cortarse. */
+  .print-section table { page-break-inside: auto; font-size: 8px; table-layout: auto !important; width: auto !important; min-width: 0 !important; }
+  .print-section col { width: auto !important; }
+  .print-section th, .print-section td { padding: 2px 3px !important; }
   .print-section tr { page-break-inside: avoid; }
   thead { display: table-header-group; }
   a { color: inherit !important; text-decoration: none !important; }
@@ -689,6 +801,12 @@ export default function ReporteMes() {
           <p className="text-lg capitalize mt-1">{monthLabel(month)}</p>
           {activeFiltersLabel && <p className="text-sm mt-1">Filtros: {activeFiltersLabel}</p>}
           <p className="text-sm mt-1">Emitido: {new Date().toLocaleString("es-AR")}</p>
+          {data?.isFutureMonth && (
+            <p className="text-sm mt-1">
+              Mes futuro: Renovaciones y Refacturaciones son una proyección a partir de las
+              pólizas vigentes (filas "Proyectada"), no eventos ya registrados.
+            </p>
+          )}
         </div>
 
         {/* Month navigation */}
@@ -719,6 +837,19 @@ export default function ReporteMes() {
           </button>
           {loading && <RefreshCw className="w-4 h-4 text-blue-400 animate-spin ml-1" />}
         </div>
+
+        {/* Aviso de proyección — solo meses posteriores al actual de Argentina */}
+        {data?.isFutureMonth && (
+          <div className="flex items-start gap-2 mb-5 px-3 py-2.5 rounded-lg bg-violet-500/10 border border-violet-500/20 text-violet-300 text-sm no-print">
+            <Info className="w-4 h-4 mt-0.5 shrink-0" />
+            <p>
+              Mes futuro: las secciones de Renovaciones y Refacturaciones muestran una{" "}
+              <strong>proyección</strong> a partir de las pólizas actualmente vigentes (marcadas
+              con la etiqueta "Proyectada"), no eventos ya registrados. Las Altas y las Cuotas
+              pendientes siguen mostrando únicamente datos reales.
+            </p>
+          </div>
+        )}
 
         {/* Filters */}
         <div className="flex flex-wrap gap-3 mb-5 no-print">
@@ -846,14 +977,16 @@ export default function ReporteMes() {
               count={data.rebillings.length}
               empty="Sin refacturaciones para este período."
             >
-              <table className="w-full table-fixed" style={{ minWidth: 1420 }}>
+              <table className="w-full table-fixed" style={{ minWidth: 1660 }}>
                 <colgroup>
                   <col style={{ width: 90 }} />
                   <col style={{ width: 110 }} />
-                  <col style={{ width: 130 }} />
+                  <col style={{ width: 150 }} />
                   <col style={{ width: 140 }} />
                   <col style={{ width: 220 }} />
                   <col style={{ width: 90 }} />
+                  <col style={{ width: 130 }} />
+                  <col style={{ width: 110 }} />
                   <col style={{ width: 90 }} />
                   <col style={{ width: 100 }} />
                   <col style={{ width: 100 }} />
@@ -869,6 +1002,8 @@ export default function ReporteMes() {
                     <Th>Asegurado</Th>
                     <Th>Bien asegurado</Th>
                     <Th>Tipo</Th>
+                    <Th>Cobertura</Th>
+                    <Th>Suma asegurada</Th>
                     <Th>Fin refact.</Th>
                     <Th>Premio</Th>
                     <Th>Cuota mensual</Th>
@@ -882,11 +1017,18 @@ export default function ReporteMes() {
                     <tr key={`${r.rebillingId}`} className="hover:bg-[#0d1424]/50 transition-colors">
                       <Td className="font-mono text-xs">{formatDate(r.billingStart)}</Td>
                       <Td className="text-gray-400">{r.companyName}</Td>
-                      <Td><span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span></Td>
+                      <Td>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span>
+                          {r.projected && <ProjectedBadge />}
+                        </div>
+                      </Td>
                       <Td>{r.insuredName}</Td>
                       <Td className="whitespace-normal break-words"><AssetCell value={r.insuredAsset} /></Td>
                       <Td><TypeBadge type={r.type} /></Td>
-                      <Td className="font-mono text-xs">{formatDate(r.billingEnd)}</Td>
+                      <Td><CoverageCell value={r.coverageType} /></Td>
+                      <Td><SumInsuredCell value={r.sumInsured} /></Td>
+                      <Td className="font-mono text-xs">{r.billingEnd ? formatDate(r.billingEnd) : <span className="text-gray-600 text-xs">—</span>}</Td>
                       <Td className="font-medium text-white">{formatCurrency(r.premium)}</Td>
                       <Td className="text-gray-300">{r.monthlyFee != null ? formatCurrency(r.monthlyFee) : <span className="text-gray-600 text-xs">—</span>}</Td>
                       <Td><RebillingTypeBadge type={r.rebillingType} /></Td>
@@ -906,14 +1048,16 @@ export default function ReporteMes() {
               count={data.renovationsConfirmed.length}
               empty="Sin renovaciones confirmadas este mes."
             >
-              <table className="w-full table-fixed" style={{ minWidth: 1370 }}>
+              <table className="w-full table-fixed" style={{ minWidth: 1630 }}>
                 <colgroup>
                   <col style={{ width: 90 }} />
                   <col style={{ width: 110 }} />
-                  <col style={{ width: 130 }} />
+                  <col style={{ width: 150 }} />
                   <col style={{ width: 140 }} />
                   <col style={{ width: 220 }} />
                   <col style={{ width: 90 }} />
+                  <col style={{ width: 130 }} />
+                  <col style={{ width: 110 }} />
                   <col style={{ width: 90 }} />
                   <col style={{ width: 100 }} />
                   <col style={{ width: 100 }} />
@@ -928,6 +1072,8 @@ export default function ReporteMes() {
                     <Th>Asegurado</Th>
                     <Th>Bien asegurado</Th>
                     <Th>Tipo</Th>
+                    <Th>Cobertura</Th>
+                    <Th>Suma asegurada</Th>
                     <Th>Fin vigencia</Th>
                     <Th>Premio</Th>
                     <Th>Cuota mensual</Th>
@@ -938,13 +1084,23 @@ export default function ReporteMes() {
                 <tbody className="divide-y divide-[#1f2937]">
                   {data.renovationsConfirmed.map((r) => (
                     <tr key={r.policyId} className="hover:bg-[#0d1424]/50 transition-colors">
-                      <Td className="font-mono text-xs">{formatDate(r.startDate)}</Td>
+                      <Td className="font-mono text-xs">{r.startDate ? formatDate(r.startDate) : <span className="text-gray-600 text-xs">—</span>}</Td>
                       <Td className="text-gray-400">{r.companyName}</Td>
-                      <Td><span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span></Td>
+                      <Td>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span>
+                          {r.projected && <ProjectedBadge />}
+                        </div>
+                      </Td>
                       <Td>{r.insuredName}</Td>
                       <Td className="whitespace-normal break-words"><AssetCell value={r.insuredAsset} /></Td>
                       <Td><TypeBadge type={r.type} /></Td>
-                      <Td className="font-mono text-xs">{formatDate(r.endDate)}</Td>
+                      <Td><CoverageCell value={r.coverageType} /></Td>
+                      <Td><SumInsuredCell value={r.sumInsured} /></Td>
+                      <Td className="font-mono text-xs">
+                        {formatDate(r.endDate)}
+                        {r.projected && <span className="block text-[10px] text-violet-400 font-sans">fecha prevista</span>}
+                      </Td>
                       <Td className="font-medium text-white">{formatCurrency(r.premium)}</Td>
                       <Td className="text-gray-300">{r.monthlyFee != null ? formatCurrency(r.monthlyFee) : <span className="text-gray-600 text-xs">—</span>}</Td>
                       <Td>
@@ -967,7 +1123,7 @@ export default function ReporteMes() {
               count={data.renovationsImported.length}
               empty="Sin renovaciones importadas este mes."
             >
-              <table className="w-full table-fixed" style={{ minWidth: 1370 }}>
+              <table className="w-full table-fixed" style={{ minWidth: 1610 }}>
                 <colgroup>
                   <col style={{ width: 90 }} />
                   <col style={{ width: 110 }} />
@@ -975,6 +1131,8 @@ export default function ReporteMes() {
                   <col style={{ width: 140 }} />
                   <col style={{ width: 220 }} />
                   <col style={{ width: 90 }} />
+                  <col style={{ width: 130 }} />
+                  <col style={{ width: 110 }} />
                   <col style={{ width: 90 }} />
                   <col style={{ width: 100 }} />
                   <col style={{ width: 100 }} />
@@ -989,6 +1147,8 @@ export default function ReporteMes() {
                     <Th>Asegurado</Th>
                     <Th>Bien asegurado</Th>
                     <Th>Tipo</Th>
+                    <Th>Cobertura</Th>
+                    <Th>Suma asegurada</Th>
                     <Th>Fin vigencia</Th>
                     <Th>Premio</Th>
                     <Th>Cuota mensual</Th>
@@ -1005,6 +1165,8 @@ export default function ReporteMes() {
                       <Td>{r.insuredName}</Td>
                       <Td className="whitespace-normal break-words"><AssetCell value={r.insuredAsset} /></Td>
                       <Td><TypeBadge type={r.type} /></Td>
+                      <Td><CoverageCell value={r.coverageType} /></Td>
+                      <Td><SumInsuredCell value={r.sumInsured} /></Td>
                       <Td className="font-mono text-xs">{formatDate(r.endDate)}</Td>
                       <Td className="font-medium text-white">{formatCurrency(r.premium)}</Td>
                       <Td className="text-gray-300">{r.monthlyFee != null ? formatCurrency(r.monthlyFee) : <span className="text-gray-600 text-xs">—</span>}</Td>
@@ -1024,7 +1186,7 @@ export default function ReporteMes() {
               count={data.newPolicies.length}
               empty="Sin altas este mes."
             >
-              <table className="w-full table-fixed" style={{ minWidth: 1370 }}>
+              <table className="w-full table-fixed" style={{ minWidth: 1610 }}>
                 <colgroup>
                   <col style={{ width: 90 }} />
                   <col style={{ width: 110 }} />
@@ -1032,6 +1194,8 @@ export default function ReporteMes() {
                   <col style={{ width: 140 }} />
                   <col style={{ width: 220 }} />
                   <col style={{ width: 90 }} />
+                  <col style={{ width: 130 }} />
+                  <col style={{ width: 110 }} />
                   <col style={{ width: 90 }} />
                   <col style={{ width: 100 }} />
                   <col style={{ width: 100 }} />
@@ -1046,6 +1210,8 @@ export default function ReporteMes() {
                     <Th>Asegurado</Th>
                     <Th>Bien asegurado</Th>
                     <Th>Tipo</Th>
+                    <Th>Cobertura</Th>
+                    <Th>Suma asegurada</Th>
                     <Th>Fin vigencia</Th>
                     <Th>Premio</Th>
                     <Th>Cuota mensual</Th>
@@ -1062,6 +1228,8 @@ export default function ReporteMes() {
                       <Td>{r.insuredName}</Td>
                       <Td className="whitespace-normal break-words"><AssetCell value={r.insuredAsset} /></Td>
                       <Td><TypeBadge type={r.type} /></Td>
+                      <Td><CoverageCell value={r.coverageType} /></Td>
+                      <Td><SumInsuredCell value={r.sumInsured} /></Td>
                       <Td className="font-mono text-xs">{formatDate(r.endDate)}</Td>
                       <Td className="font-medium text-white">{formatCurrency(r.premium)}</Td>
                       <Td className="text-gray-300">{r.monthlyFee != null ? formatCurrency(r.monthlyFee) : <span className="text-gray-600 text-xs">—</span>}</Td>
@@ -1086,7 +1254,7 @@ export default function ReporteMes() {
               count={data.pendingInstallments.length}
               empty="Sin cuotas pendientes con vencimiento en este período."
             >
-              <table className="w-full table-fixed" style={{ minWidth: 1150 }}>
+              <table className="w-full table-fixed" style={{ minWidth: 1400 }}>
                 <colgroup>
                   <col style={{ width: 90 }} />
                   <col style={{ width: 110 }} />
@@ -1094,6 +1262,8 @@ export default function ReporteMes() {
                   <col style={{ width: 140 }} />
                   <col style={{ width: 220 }} />
                   <col style={{ width: 90 }} />
+                  <col style={{ width: 130 }} />
+                  <col style={{ width: 110 }} />
                   <col style={{ width: 70 }} />
                   <col style={{ width: 100 }} />
                   <col style={{ width: 100 }} />
@@ -1107,6 +1277,8 @@ export default function ReporteMes() {
                     <Th>Asegurado</Th>
                     <Th>Bien asegurado</Th>
                     <Th>Tipo</Th>
+                    <Th>Cobertura</Th>
+                    <Th>Suma asegurada</Th>
                     <Th>Cuota N°</Th>
                     <Th>Importe</Th>
                     <Th>Estado</Th>
@@ -1122,6 +1294,8 @@ export default function ReporteMes() {
                       <Td>{r.insuredName}</Td>
                       <Td className="whitespace-normal break-words"><AssetCell value={r.insuredAsset} /></Td>
                       <Td><TypeBadge type={r.type} /></Td>
+                      <Td><CoverageCell value={r.coverageType} /></Td>
+                      <Td><SumInsuredCell value={r.sumInsured} /></Td>
                       <Td className="text-gray-400 text-xs">{r.installmentNumber}</Td>
                       <Td className="font-medium text-white">{formatCurrency(r.amount)}</Td>
                       <Td><InstallmentStatusBadge status={r.status} /></Td>
