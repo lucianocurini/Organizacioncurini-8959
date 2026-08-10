@@ -4396,7 +4396,26 @@ app.get("/tasks", requireAuth(async (c: any) => {
   // Argentina del último día del mes (ver diagnóstico de fechas locales).
   const monthYear = c.req.query("month") || toArgentinaCalendarDay().slice(0, 7);
 
-  // Auto-generate recurring tasks from active templates if not yet created for this month
+  // Auto-generate recurring tasks from active templates if not yet created for
+  // this month. "existing" incluye filas dismissed=1 a propósito: una tarea
+  // recurrente que el usuario borró (dismissed=1, ver DELETE /tasks/:id más
+  // abajo) sigue contando como "ya existe para este template/mes" — así deja
+  // de regenerarse con un id nuevo en cada carga (bug corregido, migración
+  // 0032). onConflictDoNothing() SIN target a propósito: en SQLite, un
+  // target explícito (template_id, month_year) exige que exista una UNIQUE
+  // constraint/índice que calce esas columnas exactamente — si 0033
+  // todavía no corrió (p.ej. bloqueada en producción por duplicados
+  // preexistentes, ver scripts/preflight-0033-prod.ts), el INSERT revienta
+  // con "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+  // constraint" en cada carga de GET /tasks que necesite generar una tarea
+  // — un 500 nuevo, peor que el bug que 0032 vino a arreglar (confirmado
+  // por reproducción directa contra @libsql/client). Sin target, SQLite
+  // aprovecha automáticamente cualquier UNIQUE constraint aplicable si
+  // existe (la de 0033, apenas se cree) y no falla si todavía no existe
+  // ninguna — sin protección ante la carrera todavía en ese caso, pero sin
+  // romper nada. Ver
+  // __tests__/tasks-migration-0032-0033-sequence.test.ts para los tres
+  // estados (solo 0032, 0032+0033, concurrencia).
   const allTemplates = await db.select().from(taskTemplates).where(eq(taskTemplates.active, 1)).all();
   // Only generate from templates visible to this user
   const visibleTemplates = allTemplates.filter(t => isAdmin || !t.isAdminOnly);
@@ -4425,14 +4444,14 @@ app.get("/tasks", requireAuth(async (c: any) => {
         isRecurring: 1,
         isAdminOnly: tpl.isAdminOnly,
         createdBy: user.id,
-      });
+      }).onConflictDoNothing();
     }
   }
 
   const allTasks = await db
     .select()
     .from(tasks)
-    .where(eq(tasks.monthYear, monthYear))
+    .where(and(eq(tasks.monthYear, monthYear), eq(tasks.dismissed, 0)))
     .orderBy(desc(tasks.isRecurring), asc(tasks.createdAt));
 
   // Filter out admin-only tasks for non-admin users
@@ -4476,8 +4495,37 @@ app.put("/tasks/:id", requireAuth(async (c: any) => {
   return c.json(row, 200);
 }));
 
+// DELETE /tasks/:id — borrar una tarea recurrente (isRecurring=1) corta la
+// recurrencia desde ese mes en adelante, no solo omite el mes actual: (a)
+// desactiva el template (active=0), lo que además impide que el
+// auto-generador de GET /tasks (más arriba) vuelva a crear instancias en
+// cualquier mes futuro no consultado todavía, y (b) marca dismissed=1 en
+// la instancia borrada Y en cualquier instancia del mismo template con
+// monthYear >= al mes borrado — esto oculta instancias futuras que ya
+// existían porque esos meses habían sido consultados (y por lo tanto
+// generados) antes de este borrado, algo que desactivar el template por sí
+// solo no alcanza a cubrir. Las instancias con monthYear anterior al mes
+// borrado quedan intactas como historial (nunca se tocan, nunca se borran
+// físicamente). Ambos pasos van en una única transacción para que el
+// template nunca quede desactivado sin ocultar las instancias futuras, ni
+// viceversa (ver tasks.test.ts, "borrar recurrente corta la recurrencia").
+// Las tareas únicas (isRecurring=0) siguen con DELETE físico sin cambios —
+// no tienen template ni auto-generación que las pueda "resucitar".
 app.delete("/tasks/:id", requireAuth(async (c: any) => {
-  await db.delete(tasks).where(eq(tasks.id, Number(c.req.param("id"))));
+  const id = Number(c.req.param("id"));
+  const row = await db.select().from(tasks).where(eq(tasks.id, id)).get();
+  if (!row) return c.json({ ok: true }, 200);
+  if (row.isRecurring === 1 && row.templateId != null) {
+    const templateId = row.templateId;
+    await db.transaction(async (tx) => {
+      await tx.update(taskTemplates).set({ active: 0 }).where(eq(taskTemplates.id, templateId));
+      await tx.update(tasks).set({ dismissed: 1 }).where(
+        and(eq(tasks.templateId, templateId), gte(tasks.monthYear, row.monthYear))
+      );
+    });
+  } else {
+    await db.delete(tasks).where(eq(tasks.id, id));
+  }
   return c.json({ ok: true }, 200);
 }));
 

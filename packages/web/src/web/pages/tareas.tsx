@@ -3,6 +3,7 @@ import { AppLayout } from "@/components/layout/AppLayout";
 import { CheckCircle2, Circle, Plus, Trash2, Settings, X, ChevronLeft, ChevronRight, Pencil, RefreshCw, ListChecks, Lock } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/lib/auth";
+import { optimisticallyRemoveTask, reconcileTaskRemoval, taskDeleteConfirmMessage } from "@/lib/task-removal";
 
 interface TaskTemplate {
   id: number;
@@ -136,8 +137,20 @@ export default function Tareas() {
   }
 
   async function removeTask(id: number) {
-    setTasks(prev => prev.filter(t => t.id !== id));
-    await fetch("/api/tasks/" + id, { method: "DELETE", headers: headers() });
+    const removed = tasks.find(t => t.id === id);
+    if (removed && !confirm(taskDeleteConfirmMessage(removed.isRecurring))) return;
+    setTasks(prev => optimisticallyRemoveTask(prev, id));
+    let ok = false;
+    try {
+      const r = await fetch("/api/tasks/" + id, { method: "DELETE", headers: headers() });
+      ok = r.ok;
+    } catch {
+      ok = false;
+    }
+    if (!ok) {
+      setTasks(prev => reconcileTaskRemoval(prev, removed, false));
+      toast.error("Error al eliminar la tarea");
+    }
   }
 
   async function addTask() {

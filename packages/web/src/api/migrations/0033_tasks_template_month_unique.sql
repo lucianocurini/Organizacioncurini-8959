@@ -1,0 +1,34 @@
+-- Migration 0033: índice único (template_id, month_year) en tasks —
+-- impide que el auto-generador de GET /tasks (index.ts) cree más de una
+-- tarea recurrente por template/mes bajo condiciones de carrera (dos GET
+-- concurrentes pasando ambos el chequeo "no existe" antes de que
+-- cualquiera de los dos inserte — confirmado por reproducción local).
+--
+-- NULL se excluye de la unicidad por semántica estándar de SQL/SQLite (dos
+-- NULL nunca son "iguales" a efectos de UNIQUE), así que las tareas únicas
+-- (template_id IS NULL) siguen pudiendo repetirse libremente entre sí sin
+-- verse afectadas por este índice — no necesitan estarlo, no tienen
+-- auto-generación.
+--
+-- ⚠ RIESGO — NO APLICAR A CIEGAS CONTRA TURSO/PRODUCCIÓN. Si ya existen
+-- filas duplicadas para el mismo (template_id, month_year) — el propio bug
+-- que motivó esta migración pudo haberlas generado — este CREATE UNIQUE
+-- INDEX falla (SQLite: "UNIQUE constraint failed"). Por eso el aplicador
+-- TS (src/lib/migrations/apply-0033-tasks-template-month-unique.ts) NUNCA
+-- ejecuta este statement a ciegas: primero corre un preflight de SOLO
+-- LECTURA que agrupa (template_id, month_year) con COUNT(*) > 1 y, si
+-- encuentra alguno, aborta ANTES de intentar crear el índice — sin borrar
+-- ni modificar ninguna fila. Ver también el preflight dedicado propuesto
+-- para Turso (scripts/preflight-0033-prod.ts, aún no creado/ejecutado).
+--
+-- Requiere que la migración 0032 (tasks.dismissed) ya esté aplicada — no
+-- por dependencia técnica de este statement, sino porque sin dismissed
+-- cualquier DELETE de una tarea recurrente sigue siendo físico y el bug
+-- original (regeneración fantasma) seguiría produciendo colisiones nuevas
+-- después de creado el índice.
+--
+-- Aplicada localmente (dev.db) por el aplicador idempotente TS — NO se
+-- corrió contra Turso/producción. Pendiente de autorización explícita tras
+-- confirmar por preflight que producción no tiene duplicados.
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_template_month_unique ON tasks(template_id, month_year);

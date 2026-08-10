@@ -417,6 +417,22 @@ export const taskTemplates = sqliteTable("task_templates", {
 });
 
 // Tasks: instancias (fijas o únicas)
+//
+// dismissed (migración 0032) — descarte explícito del usuario, DISTINTO de
+// status. Una tarea recurrente (isRecurring=1) borrada por el usuario NUNCA
+// se elimina físicamente: se marca dismissed=1 para que GET /tasks deje de
+// devolverla Y para que el auto-generador (index.ts) la reconozca como "ya
+// existe para este template/mes" y no la vuelva a crear. Borrar una
+// instancia recurrente además desactiva su task_template y propaga
+// dismissed=1 a toda instancia del mismo template con monthYear >= al mes
+// borrado (corta la recurrencia desde ese mes en adelante, no solo omite
+// el mes actual — ver DELETE /tasks/:id en index.ts). Las instancias con
+// monthYear anterior quedan con dismissed=0 como historial. Las tareas
+// únicas (templateId null) no usan este campo — su DELETE sigue siendo
+// físico.
+// Índice único (template_id, month_year) declarado en migración 0033, no
+// acá — este proyecto no declara índices/constraints en Drizzle (ver
+// comentario de paymentSplits más arriba).
 export const tasks = sqliteTable("tasks", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   templateId: integer("template_id").references(() => taskTemplates.id), // null = tarea única
@@ -427,6 +443,7 @@ export const tasks = sqliteTable("tasks", {
   status: text("status").notNull().default("pendiente"), // pendiente | realizada
   isRecurring: integer("is_recurring").notNull().default(0), // 1 = generada desde template
   isAdminOnly: integer("is_admin_only").notNull().default(0), // 1 = solo visible para admin
+  dismissed: integer("dismissed").notNull().default(0), // 1 = descartada por el usuario (solo recurrentes)
   createdBy: integer("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
   completedAt: integer("completed_at", { mode: "timestamp" }),

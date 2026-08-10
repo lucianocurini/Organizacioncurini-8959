@@ -1,0 +1,28 @@
+-- Migration 0032: tasks.dismissed — descarte explícito de una tarea
+-- recurrente por parte del usuario, separado de status.
+--
+-- Bug corregido: GET /tasks regenera automáticamente cualquier tarea
+-- recurrente (isRecurring=1) que no tenga una fila para el template/mes
+-- actual. El DELETE físico (comportamiento previo a esta migración) hacía
+-- indistinguible "nunca se generó" de "el usuario la borró a propósito" —
+-- la siguiente carga de la página la recreaba con un id nuevo. Con
+-- dismissed=1 la fila sigue existiendo (el auto-generador ya no la
+-- recrea) pero GET /tasks deja de devolverla.
+--
+-- Una columna nueva, aditiva y con DEFAULT 0 — la tabla no se recrea, no
+-- hay backfill real (todo lo histórico queda en 0, su valor por defecto,
+-- que es exactamente el comportamiento correcto: ninguna tarea existente
+-- fue descartada).
+--
+-- Alcance: SOLO tareas recurrentes usan este campo. Las tareas únicas
+-- (template_id IS NULL) siguen con DELETE físico sin cambios — no hay
+-- auto-generación que las pueda "resucitar", así que no necesitan este
+-- mecanismo (ver diagnóstico previo, confirmado por reproducción local).
+--
+-- Aplicada localmente (dev.db) por el aplicador idempotente TS
+-- (src/lib/migrations/apply-0032-tasks-dismissed.ts) — NO se corrió
+-- contra Turso/producción. Es aditiva y de bajo riesgo por sí sola (no
+-- depende de que existan o no duplicados), a diferencia de la migración
+-- 0033 (índice único), que sí requiere preflight previo contra Turso.
+
+ALTER TABLE tasks ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0;
