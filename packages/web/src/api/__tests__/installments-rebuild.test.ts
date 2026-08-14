@@ -480,6 +480,52 @@ describe("POST /policies/:id/installments/rebuild", () => {
     expect(status).toBe(409);
     expect(body.blockingInstallments[0].reasons.some((r: string) => r.includes("refacturación"))).toBe(true);
   });
+
+  // ─── Migración 0034 — seguridad de reconstrucción del plan de emisión ─────
+  describe("importe contado vs. nuevo nominal", () => {
+    test("contado ya cargado mayor al NUEVO nominal: rechaza, plan anterior y contado quedan intactos", async () => {
+      const policyId = await mkPolicy();
+      const initial = await callRebuild(policyId, VALID_REBUILD_BODY); // nominal $3000
+      expect(initial.status).toBe(200);
+      await db.update(policies).set({ cashPaymentAmountCents: 300000 }).where(eq(policies.id, policyId)); // $3000, == nominal actual
+
+      // Reconstruir a un plan más chico ($2000) — el contado ya cargado
+      // ($3000) quedaría mayor al nuevo nominal.
+      const rebuilt = await callRebuild(policyId, { periodStart: "2027-01-01", periodEnd: "2027-06-01", periodAmount: 2000, installmentCount: 2 });
+      expect(rebuilt.status).toBe(409);
+      expect(rebuilt.body.error).toContain("no puede ser mayor a la suma nominal");
+
+      // El plan anterior (3 cuotas, $3000) sigue exactamente igual — nunca se
+      // llegó a borrar nada.
+      const rows = await getInstallments(policyId);
+      expect(rows.length).toBe(3);
+      const pol = await db.select({ cashPaymentAmountCents: policies.cashPaymentAmountCents, installments: policies.installments })
+        .from(policies).where(eq(policies.id, policyId)).get();
+      expect(pol?.cashPaymentAmountCents).toBe(300000); // intacto, nunca se tocó
+      expect(pol?.installments).toBe(3); // tampoco se tocó
+    });
+
+    test("contado ya cargado igual o menor al nuevo nominal: el rebuild funciona igual que antes", async () => {
+      const policyId = await mkPolicy();
+      await callRebuild(policyId, VALID_REBUILD_BODY); // nominal $3000
+      await db.update(policies).set({ cashPaymentAmountCents: 150000 }).where(eq(policies.id, policyId)); // $1500 < $3000
+
+      // Reconstruir a un plan más grande ($4000) — el contado ($1500) sigue
+      // siendo válido contra el nuevo nominal, mayor.
+      const rebuilt = await callRebuild(policyId, { periodStart: "2027-01-01", periodEnd: "2027-06-01", periodAmount: 4000, installmentCount: 4 });
+      expect(rebuilt.status).toBe(200);
+      const pol = await db.select({ cashPaymentAmountCents: policies.cashPaymentAmountCents })
+        .from(policies).where(eq(policies.id, policyId)).get();
+      expect(pol?.cashPaymentAmountCents).toBe(150000); // el rebuild no lo toca, sigue siendo válido
+    });
+
+    test("sin contado cargado (null): el rebuild funciona sin cambios de comportamiento", async () => {
+      const policyId = await mkPolicy();
+      await callRebuild(policyId, VALID_REBUILD_BODY);
+      const rebuilt = await callRebuild(policyId, { periodStart: "2027-01-01", periodEnd: "2027-06-01", periodAmount: 2000, installmentCount: 2 });
+      expect(rebuilt.status).toBe(200);
+    });
+  });
 });
 
 // ─── 21, 24: pruebas directas de la transacción (tx real, sin pasar por HTTP) ──

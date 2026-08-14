@@ -74,6 +74,25 @@ export function diffCalendarDays(a: string, b: string): number {
 }
 
 /**
+ * Suma (o resta, con `days` negativo) días calendario completos a un día
+ * "YYYY-MM-DD" — aritmética pura sobre el ordinal (mismo `parseCalendarDayToUtcOrdinal`
+ * de arriba), nunca `Date.setDate()` sobre un `Date` local: eso mezclaría la
+ * hora del proceso que ejecuta el cálculo con un día que ya es puro
+ * calendario. El resultado se re-arma con los getters UTC del ordinal
+ * resultante — sigue sin haber ningún huso horario real de por medio, el
+ * ordinal en sí ya es calendario puro (ver comentario de
+ * parseCalendarDayToUtcOrdinal).
+ */
+export function addCalendarDays(value: string, days: number): string {
+  const ordinal = parseCalendarDayToUtcOrdinal(value) + days;
+  const d = new Date(ordinal * 86400000);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+
+/**
  * Mes calendario Argentina (YYYY-MM) resultante de sumar `monthsOffset`
  * meses al mes de `value` (instante real, default ahora). Aritmética entera
  * pura sobre año/mes a partir del día ya resuelto en Argentina — nunca

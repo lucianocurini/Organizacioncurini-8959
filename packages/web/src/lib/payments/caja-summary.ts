@@ -186,23 +186,32 @@ function apportionCents(totalCents: number, weights: ReadonlyArray<number>): num
   return result;
 }
 
+export interface BatchCarteraResult {
+  // Porción del total REAL capeado (min(real, aplicado)) que corresponde a
+  // los hijos YA rendidos de este batch — complemento exacto de lo que este
+  // mismo cálculo dejó en cartera (nunca se recalcula por separado, evita
+  // drift de redondeo: rendido = capeado - pendiente). 0 si el batch está
+  // anulado o no tiene ningún hijo confirmado. Usado por totalCobrado —
+  // nunca por cartera/cajaNeta, que no lo necesitan (ver caller en index.ts).
+  renderedRealCents: number;
+}
+
 export function applyBatchToCartera(
   batch: BatchForCartera,
   cartera: MoneyBucketCents,
   directoCompania: DirectCompanyBucketCents,
   inconsistencias: CarteraInconsistency[]
-): void {
-  if (batch.status !== "confirmado") return; // batches anulados no aportan cartera pendiente
+): BatchCarteraResult {
+  if (batch.status !== "confirmado") return { renderedRealCents: 0 }; // batches anulados no aportan cartera pendiente ni cobrado histórico
 
   const confirmedChildren = batch.children.filter((c) => c.status === "confirmado");
-  if (confirmedChildren.length === 0) return; // sin hijos confirmados, nada que contar
+  if (confirmedChildren.length === 0) return { renderedRealCents: 0 }; // sin hijos confirmados, nada que contar
 
   // Etapa "rendición por cuota": cobrar por lote no obliga a rendir el lote
   // completo — un batch puede quedar con algunos hijos ya rendidos y otros
   // no, sin que eso sea una inconsistencia. Los hijos ya rendidos salen de
   // cartera pendiente; los que faltan rendir, siguen.
   const pendingChildren = confirmedChildren.filter((c) => c.rendered === 0);
-  if (pendingChildren.length === 0) return; // todos los hijos confirmados ya fueron rendidos
 
   const totalChildrenAmountCents = confirmedChildren.reduce((s, c) => s + c.amountCents, 0);
   const pendingChildrenAmountCents = pendingChildren.reduce((s, c) => s + c.amountCents, 0);
@@ -230,6 +239,17 @@ export function applyBatchToCartera(
   const pendingTargetCents = totalChildrenAmountCents > 0
     ? Math.round((cappedTotalCents * pendingChildrenAmountCents) / totalChildrenAmountCents)
     : 0;
+  // Complemento exacto (nunca se prorratea por separado — mismo cappedTotalCents
+  // de arriba menos lo pendiente ya calculado): esto es lo que "sale" de
+  // cartera hacia rendido a medida que se rinden hijos, sin que el TOTAL
+  // capeado del batch cambie nunca por el solo hecho de rendir — evita el
+  // salto artificial que tenía totalCobrado antes de esta corrección (un
+  // lote con diferencia mostraba un total distinto según cuántos hijos
+  // estuvieran rendidos, cuando la plata real capeada del lote es la misma).
+  const renderedRealCents = cappedTotalCents - pendingTargetCents;
+
+  if (pendingChildren.length === 0) return { renderedRealCents }; // todos los hijos confirmados ya fueron rendidos — nada queda en cartera
+
   const splitCentsToApply = apportionCents(pendingTargetCents, batch.splits.map((s) => s.amountCents));
 
   batch.splits.forEach((split, i) => {
@@ -254,6 +274,8 @@ export function applyBatchToCartera(
       addDirectCompanyCents(directoCompania, split.method, cents);
     }
   });
+
+  return { renderedRealCents };
 }
 
 // D. Pronto Pago standalone — cash_entry pronto_pago_surcharge rendered=0
@@ -597,6 +619,43 @@ export function calculateCajaNetaTotalCents(params: {
 
 export function centsToPesos(cents: number): number {
   return cents / 100;
+}
+
+// ─── Cobrado del período (Sección "Totales del período") ──────────────────
+//
+// cobradoPeriodo debe reflejar DINERO REAL recibido en el período, nunca lo
+// NOMINAL/aplicado a cuotas. Un pago standalone no tiene este problema (su
+// payments.amount siempre coincide con la suma de sus splits reales,
+// validado en POST /payments) — el problema es específico de los hijos de un
+// payment_batches: cada payment hijo guarda el importe NOMINAL de su cuota
+// (trazabilidad hacia la compañía, ver POST /payment-batches y POST
+// /policies/:id/cash-period-payment), nunca la porción real de dinero que le
+// corresponde del batch. Eso diverge del dinero real recibido en 3 casos: un
+// pago de contado por período (descuento comercial, Migración 0034), una
+// diferencia recibido/aplicado resuelta como sobrante o faltante (Fase 2B,
+// Migración 0030), o un ajuste por redondeo. Agrupar por batch UNA sola vez y
+// usar receivedAmountCents (dinero real — Migración 0030; fallback a
+// totalReceivedCents solo para el backfill histórico donde ambos son
+// siempre iguales) es la única forma de no contar de más ni de menos. Un
+// batch anulado nunca llega acá (sus payments hijos ya no están
+// status='confirmado', ver POST /payment-batches/:id/cancel) — no hace falta
+// ningún chequeo extra de estado.
+export interface PeriodBatchForCobrado {
+  batchId: number;
+  receivedCents: number;
+  splitGroup: "own" | "direct_company" | "mixed";
+}
+
+/**
+ * Suma el dinero real de los batches propios (nunca directo compañía) que
+ * aportan al período — mismo criterio de exclusión que ya usaba cobradoPeriodo
+ * para pagos standalone (paymentGroupById.get(p.id) !== "direct_company").
+ * "mixed" no debería ocurrir nunca en un batch real (resolveBatchSplitGroup
+ * lo rechaza al crear cualquier payment_batches) — se excluye igual que
+ * "direct_company" por seguridad, nunca se asume "own" por defecto.
+ */
+export function sumOwnBatchReceivedCentsForPeriod(batches: ReadonlyArray<PeriodBatchForCobrado>): number {
+  return batches.reduce((s, b) => s + (b.splitGroup === "own" ? b.receivedCents : 0), 0);
 }
 
 // ─── Detalle de adeudados (Caja) ────────────────────────────────────────────

@@ -15,6 +15,7 @@ import { sql, eq, inArray, and } from "drizzle-orm";
 import { policies, rebillings, policyInstallments, payments, remittanceItems } from "../../api/database/schema";
 import type { InstallmentPlanResult } from "./plan";
 import type { RebillingPayload } from "./rebilling-plan";
+import { validateCashPaymentAmountAgainstNominal } from "../payments/cash-period-payments";
 
 export type RebillingRebuildClassification = "NO_INSTALLMENTS" | "SAFE_TO_REBUILD" | "REQUIRES_MANUAL_REVIEW";
 
@@ -185,6 +186,20 @@ export async function runRebillingRebuildTransaction(
   }
   const previousCount = recheck.currentCount;
   const policyId = recheck.policyId;
+
+  // Migración 0034 — Etapa "seguridad de reconstrucción de plan": el importe
+  // contado de ESTA refacturación (rebillings.cashPaymentAmountCents) no lo
+  // toca esta reconstrucción, pero el NUEVO nominal del plan puede ser menor
+  // al que había cuando se cargó ese importe — si queda mayor al nuevo
+  // nominal, se rechaza ANTES de borrar ninguna cuota (con `tx`, valor real
+  // vigente). Lanzar acá aborta toda la transacción — el plan anterior y el
+  // importe contado quedan exactamente como estaban.
+  const currentRebilling = await tx.select({ cashPaymentAmountCents: rebillings.cashPaymentAmountCents })
+    .from(rebillings).where(eq(rebillings.id, rebillingId)).get();
+  if (currentRebilling?.cashPaymentAmountCents != null) {
+    const newNominalCents = plan.installments.reduce((s, r) => s + Math.round(r.amount * 100), 0);
+    validateCashPaymentAmountAgainstNominal(currentRebilling.cashPaymentAmountCents, newNominalCents);
+  }
 
   if (previousCount > 0) {
     await tx.delete(policyInstallments).where(eq(policyInstallments.rebillingId, rebillingId));

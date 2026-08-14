@@ -7,7 +7,7 @@
 import { describe, test, expect } from "bun:test";
 import {
   toArgentinaCalendarDay, parseCalendarDayToUtcOrdinal, diffCalendarDays,
-  shiftArgentinaMonth, resolveArgentinaMonthKey,
+  shiftArgentinaMonth, resolveArgentinaMonthKey, addCalendarDays,
 } from "../argentina-date";
 
 describe("toArgentinaCalendarDay", () => {
@@ -100,6 +100,53 @@ describe("diffCalendarDays", () => {
 
   test("cruza fin de año correctamente", () => {
     expect(diffCalendarDays("2026-12-31", "2027-01-01")).toBe(1);
+  });
+});
+
+describe("addCalendarDays", () => {
+  test("suma 30 días corridos dentro del mismo mes", () => {
+    expect(addCalendarDays("2026-07-01", 30)).toBe("2026-07-31");
+  });
+
+  test("suma 30 días corridos cruzando de mes", () => {
+    expect(addCalendarDays("2026-07-15", 30)).toBe("2026-08-14");
+  });
+
+  test("cruza fin de año", () => {
+    expect(addCalendarDays("2026-12-15", 30)).toBe("2027-01-14");
+  });
+
+  test("29 de febrero en año bisiesto se respeta al sumar días", () => {
+    expect(addCalendarDays("2028-02-01", 28)).toBe("2028-02-29");
+  });
+
+  test("days = 0 devuelve el mismo día", () => {
+    expect(addCalendarDays("2026-07-29", 0)).toBe("2026-07-29");
+  });
+
+  test("days negativo resta días calendario", () => {
+    expect(addCalendarDays("2026-07-31", -30)).toBe("2026-07-01");
+  });
+
+  test("formato de entrada inválido → lanza (delega en parseCalendarDayToUtcOrdinal)", () => {
+    expect(() => addCalendarDays("29-07-2026", 30)).toThrow(/formato inválido/);
+  });
+
+  test("es aritmética de calendario puro: no depende de process.env.TZ", () => {
+    const original = process.env.TZ;
+    try {
+      process.env.TZ = "UTC";
+      const inUtc = addCalendarDays("2026-07-15", 30);
+      process.env.TZ = "America/Argentina/Buenos_Aires";
+      const inArgentina = addCalendarDays("2026-07-15", 30);
+      process.env.TZ = "Pacific/Kiritimati"; // UTC+14
+      const inOpuesto = addCalendarDays("2026-07-15", 30);
+      expect(inUtc).toBe("2026-08-14");
+      expect(inArgentina).toBe("2026-08-14");
+      expect(inOpuesto).toBe("2026-08-14");
+    } finally {
+      process.env.TZ = original;
+    }
   });
 });
 

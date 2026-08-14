@@ -13,7 +13,7 @@
 import { describe, test, expect } from "bun:test";
 import { readFileSync } from "fs";
 import { resolve } from "path";
-import { planMonthlyInstallments, nextFirstDueDateOnStartDateChange } from "../policy-installments-form";
+import { planMonthlyInstallments, nextFirstDueDateOnStartDateChange, computeCashPaymentPreview } from "../policy-installments-form";
 
 describe("planMonthlyInstallments — firstDueDate igual a startDate", () => {
   test("sin firstDueDate explícito, la primera cuota vence en startDate (comportamiento de siempre)", () => {
@@ -187,5 +187,48 @@ describe("PolicyModal.tsx — invariantes del campo firstDueDate", () => {
     const editBranch = SRC.match(/if \(isEdit\) \{([\s\S]*?)\n {6}\} else \{/);
     expect(editBranch).not.toBeNull();
     expect(editBranch![1]).not.toContain("installments/generate");
+  });
+});
+
+describe("computeCashPaymentPreview", () => {
+  test("sin cuotas, nominal 0 y sin previsualización de contado", () => {
+    const preview = computeCashPaymentPreview([], "");
+    expect(preview).toEqual({ nominalAmountCents: 0, cashAmountCents: null, discountAmountCents: null });
+  });
+
+  test("con cuotas pero sin importe contado cargado: solo el nominal", () => {
+    const preview = computeCashPaymentPreview([{ amount: 100000 }, { amount: 100000 }], "");
+    expect(preview.nominalAmountCents).toBe(20000000);
+    expect(preview.cashAmountCents).toBeNull();
+  });
+
+  test("contado menor al nominal: descuento positivo", () => {
+    const preview = computeCashPaymentPreview(
+      [{ amount: 100000 }, { amount: 100000 }, { amount: 100000 }, { amount: 100000 }],
+      "380000",
+    );
+    expect(preview.nominalAmountCents).toBe(40000000);
+    expect(preview.cashAmountCents).toBe(38000000);
+    expect(preview.discountAmountCents).toBe(2000000);
+  });
+
+  test("contado igual al nominal: descuento $0", () => {
+    const preview = computeCashPaymentPreview([{ amount: 100000 }, { amount: 100000 }], "200000");
+    expect(preview.discountAmountCents).toBe(0);
+  });
+
+  test("contado mayor al nominal: descuento negativo (la UI lo muestra como error, no lo oculta)", () => {
+    const preview = computeCashPaymentPreview([{ amount: 100000 }], "150000");
+    expect(preview.discountAmountCents).toBe(-5000000);
+  });
+
+  test("contado inválido (no numérico) se trata como vacío", () => {
+    const preview = computeCashPaymentPreview([{ amount: 100000 }], "abc");
+    expect(preview.cashAmountCents).toBeNull();
+  });
+
+  test("contado cero o negativo se trata como vacío", () => {
+    expect(computeCashPaymentPreview([{ amount: 100000 }], "0").cashAmountCents).toBeNull();
+    expect(computeCashPaymentPreview([{ amount: 100000 }], "-50").cashAmountCents).toBeNull();
   });
 });

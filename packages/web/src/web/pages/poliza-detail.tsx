@@ -23,6 +23,7 @@ import {
 } from "@/lib/policy-cancellation";
 import { groupInstallmentsByRebilling, countLinkedInstallments } from "@/lib/rebilling-groups";
 import { buildQuickAddDeliveryPayload, normalizeDeliveryError } from "@/lib/deliveries-form";
+import { calculateCashPeriodDeadline, getCashPeriodDeadlineStatus } from "@/lib/cash-period-payment-form";
 
 const typeIcons: Record<string, any> = {
   automotor: Car, motovehiculo: Bike, ecomovilidad: Zap, hogar: Home, accidentes: ShieldCheck, art: HeartPulse, comercial: Briefcase, responsabilidad_civil: Scale, cascos: HardHat, incendio: Flame,
@@ -902,6 +903,41 @@ export default function PolizaDetail() {
                             Franquicia: {formatCurrency(group.deductible)}
                           </span>
                         )}
+                        {(() => {
+                          // Pago de contado por período (Migración 0034,
+                          // rediseño): SOLO lectura acá — ningún cobro se
+                          // genera desde Pólizas, la imputación es exclusiva
+                          // de Cobranzas (ver PendingInstallmentsBatchTab). El
+                          // importe vive en policies (emisión/renovación) o en
+                          // la refacturación puntual de este grupo, nunca
+                          // inventado acá, y se muestra siempre que esté
+                          // informado — incluso si el período ya no admite
+                          // cobrarlo de contado, se preserva como dato
+                          // histórico (Regla: "el importe configurado se
+                          // preserva aunque ya no pueda cobrarse").
+                          const cashPaymentAmountCents = group.rebillingId == null
+                            ? p.cashPaymentAmountCents
+                            : (rebillingsList.find((r: any) => r.id === group.rebillingId)?.cashPaymentAmountCents ?? null);
+                          if (cashPaymentAmountCents == null) return null;
+                          const periodStartDate = group.rebillingId == null
+                            ? p.startDate
+                            : (rebillingsList.find((r: any) => r.id === group.rebillingId)?.billingStart ?? p.startDate);
+                          const deadline = calculateCashPeriodDeadline(periodStartDate);
+                          const deadlineStatus = getCashPeriodDeadlineStatus(deadline, today);
+                          return (
+                            <span
+                              className={`text-xs px-2.5 py-1 rounded-lg border whitespace-nowrap inline-flex items-center gap-1.5 ${
+                                deadlineStatus === "vigente"
+                                  ? "bg-emerald-500/10 text-emerald-300 border-emerald-500/20"
+                                  : "bg-amber-500/10 text-amber-300 border-amber-500/20"
+                              }`}
+                              title="Configurado en la póliza/refacturación — el cobro de contado se hace exclusivamente desde Cobranzas."
+                            >
+                              Contado: {formatCurrency(cashPaymentAmountCents / 100)} · Vence {formatDate(deadline)}
+                              {" "}({deadlineStatus === "vigente" ? "Vigente" : "Vencido"})
+                            </span>
+                          );
+                        })()}
                       </div>
                       {group.installments.length === 0 ? (
                         <div className="bg-[#111827] border border-amber-500/20 rounded-xl px-4 py-3 text-xs text-amber-300 flex items-center justify-between gap-3 flex-wrap">

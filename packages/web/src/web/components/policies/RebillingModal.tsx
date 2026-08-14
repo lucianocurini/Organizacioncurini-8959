@@ -56,6 +56,7 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
     sumInsured: initial?.sumInsured != null ? String(initial.sumInsured) : (policy.sumInsured != null ? String(policy.sumInsured) : ""),
     deductible: initial?.deductible != null ? String(initial.deductible) : (policy.deductible != null ? String(policy.deductible) : ""),
     notes: initial?.notes ?? "",
+    cashPaymentAmount: initial?.cashPaymentAmountCents != null ? String(initial.cashPaymentAmountCents / 100) : "",
   });
   const [loading, setLoading] = useState(false);
 
@@ -72,6 +73,17 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
   const planAmountMismatchWarning = isEditMode
     ? computePlanAmountMismatchWarning(form.monthlyFee, form.premium, initial?.installmentCount)
     : null;
+
+  // Ahorro contado estimado — solo previsualización (nominal = cuota × cantidad
+  // de cuotas del grupo), la validación real (>0, <= nominal) siempre la hace
+  // el backend contra las cuotas reales. null = sin datos suficientes para estimar.
+  const cashPaymentPreview = (() => {
+    const count = isEditMode ? initial?.installmentCount : Number(form.installmentCount);
+    const fee = Number(form.monthlyFee);
+    const cash = Number(form.cashPaymentAmount);
+    if (!count || !Number.isFinite(fee) || fee <= 0 || !form.cashPaymentAmount || !Number.isFinite(cash) || cash <= 0) return null;
+    return Math.round((fee * count - cash) * 100) / 100;
+  })();
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -207,6 +219,19 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
               <input type="number" min="0" className={inp} value={form.deductible}
                 onChange={e => set("deductible", e.target.value)} placeholder="0" />
               <p className="text-[11px] text-gray-600 mt-1">Si se informa, también actualiza la franquicia vigente de la póliza.</p>
+            </div>
+            <div>
+              <label className={lbl}>Importe contado (opcional)</label>
+              <input type="number" className={inp} value={form.cashPaymentAmount}
+                onChange={e => set("cashPaymentAmount", e.target.value)} placeholder="Ej: 50000 — si la compañía ofrece contado" />
+              <p className="text-[11px] text-gray-600 mt-1">
+                Importe para cancelar TODAS las cuotas de ESTA refacturación de una sola vez. No es un medio de pago.
+              </p>
+              {cashPaymentPreview != null && (
+                cashPaymentPreview >= 0
+                  ? <p className="text-[11px] text-emerald-400 mt-1">Ahorro contado estimado: ${cashPaymentPreview.toLocaleString("es-AR")}</p>
+                  : <p className="text-[11px] text-red-400 mt-1">El importe contado no puede ser mayor al total del plan.</p>
+              )}
             </div>
           </div>
 

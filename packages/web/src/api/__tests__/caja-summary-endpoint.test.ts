@@ -23,6 +23,7 @@ import {
   payments, paymentSplits, paymentBatches, paymentBatchSplits, receivedChecks,
   cashEntries, cashExpenses, commissionEntries, ownMoneyMovements, cashDebts,
   remittances, remittanceItems, remittanceAllocations, insuredAccountMovements,
+  paymentAmountAdjustments,
 } from "../database/schema";
 import { eq, inArray } from "drizzle-orm";
 
@@ -175,6 +176,10 @@ async function cleanupBatch(batchId: number) {
   // (@libsql/client) el DELETE de payment_batches revienta si esto no se
   // borra primero (no-op para batches sin diferencia, que es la mayoría).
   await deleteWithRetry(() => db.delete(insuredAccountMovements).where(eq(insuredAccountMovements.originBatchId, batchId)));
+  // Idem para accountDifferenceResolution.action="ajuste_redondeo" — deja una
+  // fila en payment_amount_adjustments con paymentBatchId=batchId (no-op para
+  // el resto de los batches).
+  await deleteWithRetry(() => db.delete(paymentAmountAdjustments).where(eq(paymentAmountAdjustments.paymentBatchId, batchId)));
   const splitRows = await db.select({ id: paymentBatchSplits.id }).from(paymentBatchSplits).where(eq(paymentBatchSplits.batchId, batchId)).all();
   const splitIds = splitRows.map((s) => s.id);
   if (splitIds.length) await deleteWithRetry(() => db.delete(receivedChecks).where(inArray(receivedChecks.batchSplitId, splitIds)));
@@ -1088,6 +1093,7 @@ describe("GET /api/cash/summary — Fase 2C: cuenta corriente de asegurados", ()
   test("2-5. sobrante $10.000 (cheque $110.000/cuota $100.000): ciclo completo hasta aplicar y rendir la cuota futura", async () => {
     const { policyId, instId } = await mkRealInstallment(1000);
     const before = (await getSummary()).body;
+    const beforePeriod = (await getSummary(`?from=${FIXTURE_DATE}&to=${FIXTURE_DATE}`)).body;
 
     // 2. Cheque $1100 recibido / $1000 aplicado a la cuota → sobrante $100.
     const created = await callPostBatch({
@@ -1112,6 +1118,17 @@ describe("GET /api/cash/summary — Fase 2C: cuenta corriente de asegurados", ()
       expect(afterBatch.cuentaCorriente.saldosAFavorPendientes - before.cuentaCorriente.saldosAFavorPendientes).toBeCloseTo(100, 2);
       expect(afterBatch.cuentaCorriente.creditoActivoEnCaja - before.cuentaCorriente.creditoActivoEnCaja).toBeCloseTo(100, 2);
 
+      // Regresión subtotal período: debe sumar el dinero REAL recibido
+      // ($1100), nunca el nominal aplicado a la cuota ($1000) — antes de este
+      // fix, periodo.cobrado sumaba payments.amount del hijo (nominal).
+      const afterBatchPeriod = (await getSummary(`?from=${FIXTURE_DATE}&to=${FIXTURE_DATE}`)).body;
+      expect(afterBatchPeriod.periodo.cobrado - beforePeriod.periodo.cobrado).toBeCloseTo(1100, 2);
+      expect(afterBatchPeriod.periodo.cobrado - beforePeriod.periodo.cobrado).not.toBeCloseTo(1000, 2);
+
+      // Regresión totalCobrado: mientras está pendiente, capea a lo real
+      // aplicado ($1000 — el sobrante de $100 vive aparte en cuentaCorriente).
+      expect(afterBatch.totalCobrado - before.totalCobrado).toBeCloseTo(1000, 2);
+
       // 3. Se rinde la cuota original (simulado directo, aislado del flujo de
       // POST /remittances — mismo criterio que el resto de este archivo).
       await db.update(payments).set({ rendered: 1, renderedAt: new Date() }).where(eq(payments.id, childPaymentId));
@@ -1121,6 +1138,9 @@ describe("GET /api/cash/summary — Fase 2C: cuenta corriente de asegurados", ()
       // La cuenta corriente sigue exactamente igual — rendir la cuota
       // original no consume el crédito.
       expect(afterRender.cuentaCorriente.saldosAFavorPendientes - before.cuentaCorriente.saldosAFavorPendientes).toBeCloseTo(100, 2);
+      // Regresión totalCobrado: rendir NO lo mueve — sigue en $1000 (nunca
+      // salta a $1100 sumando el nominal completo de la cuota + surplus).
+      expect(afterRender.totalCobrado - before.totalCobrado).toBeCloseTo(1000, 2);
 
       // 4. Se aplica el saldo a favor a una cuota futura — "anchor" payment
       // sin splits/importe real (relatedPaymentId solo necesita existir para
@@ -1215,6 +1235,7 @@ describe("GET /api/cash/summary — Fase 2C: cuenta corriente de asegurados", ()
   test("8-9. saldo deudor (faltante $100) no suma Caja; el cobro posterior sí suma como dinero real y cierra la deuda", async () => {
     const { policyId, instId } = await mkRealInstallment(1000);
     const before = (await getSummary()).body;
+    const beforePeriod = (await getSummary(`?from=${FIXTURE_DATE}&to=${FIXTURE_DATE}`)).body;
 
     // 8. Cheque $900 recibido / $1000 aplicado a la cuota → faltante $100.
     const created = await callPostBatch({
@@ -1233,6 +1254,27 @@ describe("GET /api/cash/summary — Fase 2C: cuenta corriente de asegurados", ()
       // Caja sube solo lo realmente recibido ($900) — nunca los $1000 aplicados.
       expect(afterBatch.cajaNeta.total - before.cajaNeta.total).toBeCloseTo(900, 2);
       expect(afterBatch.cuentaCorriente.saldosDeudoresPendientes - before.cuentaCorriente.saldosDeudoresPendientes).toBeCloseTo(100, 2);
+
+      // Regresión subtotal período: debe sumar el dinero REAL recibido
+      // ($900), nunca el nominal aplicado a la cuota ($1000).
+      const afterBatchPeriod = (await getSummary(`?from=${FIXTURE_DATE}&to=${FIXTURE_DATE}`)).body;
+      expect(afterBatchPeriod.periodo.cobrado - beforePeriod.periodo.cobrado).toBeCloseTo(900, 2);
+      expect(afterBatchPeriod.periodo.cobrado - beforePeriod.periodo.cobrado).not.toBeCloseTo(1000, 2);
+
+      // Regresión totalCobrado: capea a lo real recibido ($900), nunca al
+      // nominal aplicado ($1000).
+      expect(afterBatch.totalCobrado - before.totalCobrado).toBeCloseTo(900, 2);
+
+      // Rendir la cuota (lote normal con faltante) NO debe mover totalCobrado
+      // — la rendición por cuota usa el nominal de la cuota ($1000, lo que
+      // Curini le paga a la compañía), pero eso NUNCA debe traducirse en un
+      // salto de $900 a $1000 en lo históricamente cobrado (dinero real).
+      const childRow = await db.select({ id: payments.id }).from(payments).where(eq(payments.batchId, batchId)).get();
+      await db.update(payments).set({ rendered: 1, renderedAt: new Date() }).where(eq(payments.id, childRow!.id));
+      const afterRender = (await getSummary()).body;
+      expect(afterRender.totalCobrado - before.totalCobrado).toBeCloseTo(900, 2);
+      expect(afterRender.totalCobrado - before.totalCobrado).not.toBeCloseTo(1000, 2);
+      await db.update(payments).set({ rendered: 0, renderedAt: null }).where(eq(payments.id, childRow!.id)); // revierte para el resto del test
 
       // 9. Cobro del saldo deudor — dinero real nuevo que entra a saldar la deuda
       // (sin endpoint propio todavía, ver comentario de cabecera del describe).
@@ -1255,4 +1297,168 @@ describe("GET /api/cash/summary — Fase 2C: cuenta corriente de asegurados", ()
   // 10. No mezclar con cash_debts/Adeudados — cubierto por los describe
   // "adeudadosDetalle"/"adelantos y recuperos" de este mismo archivo, que
   // no se tocaron en esta fase y siguen pasando (ver corrida completa).
+});
+
+// ─── Regresión: subtotal período (periodo.cobrado) de un lote ──────────────
+//
+// periodo.cobrado debía sumar el importe NOMINAL de cada payment hijo de un
+// batch (payments.amount, la cuota aplicada) en vez del dinero REAL recibido
+// del batch (receivedAmountCents) — capea/refleja mal en cualquier lote con
+// diferencia recibido/aplicado. Los casos de sobrante/faltante ya quedaron
+// cubiertos arriba (tests 2-5 y 8-9, extendidos con la misma aserción); acá
+// se cubren los 3 casos restantes pedidos explícitamente: lote normal
+// exacto (sin cambio de comportamiento esperado), ajuste por redondeo, y
+// anulación + filtro por fecha.
+describe("GET /api/cash/summary — periodo.cobrado de un payment_batches", () => {
+  async function mkRealInstallment(amountPesos: number) {
+    const [policyReal] = await db.insert(policies).values({
+      policyNumber: `${PREFIX}-PER-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      type: "automotor", status: "activa", companyId, insuredId,
+      startDate: "2027-01-01", endDate: "2027-12-31", createdBy: userId,
+    }).returning({ id: policies.id });
+    const policyId = policyReal!.id;
+    const [instRow] = await db.insert(policyInstallments).values({
+      policyId, number: 1, dueDate: FIXTURE_DATE, amount: amountPesos, status: "pendiente", rendered: 0,
+    }).returning({ id: policyInstallments.id });
+    return { policyId, instId: instRow!.id };
+  }
+  async function cleanupRealInstallment(policyId: number, instId: number) {
+    await deleteWithRetry(() => db.delete(policyInstallments).where(eq(policyInstallments.id, instId)));
+    await deleteWithRetry(() => db.delete(policies).where(eq(policies.id, policyId)));
+  }
+
+  test("lote normal exacto: periodo.cobrado suma el importe real (== nominal, sin diferencia)", async () => {
+    const { policyId, instId } = await mkRealInstallment(1000);
+    const before = (await getSummary(`?from=${FIXTURE_DATE}&to=${FIXTURE_DATE}`)).body;
+    const beforeTotal = (await getSummary()).body;
+
+    const created = await callPostBatch({
+      paymentDate: FIXTURE_DATE, insuredId,
+      items: [{ source: "installment", installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1000 }],
+      applyProntoPagoSurcharge: false,
+    });
+    expect(created.status).toBe(201);
+    const batchId = created.body.id as number;
+
+    try {
+      const after = (await getSummary(`?from=${FIXTURE_DATE}&to=${FIXTURE_DATE}`)).body;
+      expect(after.periodo.cobrado - before.periodo.cobrado).toBeCloseTo(1000, 2);
+
+      // totalCobrado: sin diferencia, exacto igual antes/después de rendir
+      // (regresión: confirma que el caso "normal" no cambió con el fix).
+      const afterBatchTotal = (await getSummary()).body;
+      expect(afterBatchTotal.totalCobrado - beforeTotal.totalCobrado).toBeCloseTo(1000, 2);
+      const childRow = await db.select({ id: payments.id }).from(payments).where(eq(payments.batchId, batchId)).get();
+      await db.update(payments).set({ rendered: 1, renderedAt: new Date() }).where(eq(payments.id, childRow!.id));
+      const afterRenderTotal = (await getSummary()).body;
+      expect(afterRenderTotal.totalCobrado - beforeTotal.totalCobrado).toBeCloseTo(1000, 2);
+    } finally {
+      await cleanupBatch(batchId);
+      await cleanupRealInstallment(policyId, instId);
+    }
+  });
+
+  test("ajuste por redondeo (+3 centavos): periodo.cobrado suma el dinero real recibido, nunca el nominal aplicado", async () => {
+    const { policyId, instId } = await mkRealInstallment(1000);
+    const before = (await getSummary(`?from=${FIXTURE_DATE}&to=${FIXTURE_DATE}`)).body;
+
+    // $1000,03 recibido / $1000,00 aplicado a la cuota → diferencia de 3
+    // centavos, dentro de MAX_ROUNDING_ADJUSTMENT_CENTS ($5,00).
+    const created = await callPostBatch({
+      paymentDate: FIXTURE_DATE, insuredId,
+      items: [{ source: "installment", installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1000.03 }],
+      applyProntoPagoSurcharge: false,
+      accountDifferenceResolution: { action: "ajuste_redondeo" },
+    });
+    expect(created.status).toBe(201);
+    const batchId = created.body.id as number;
+
+    try {
+      const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, batchId)).get();
+      expect(batch!.totalReceivedCents).toBe(100000); // aplicado (nominal), sin cambios
+      expect(batch!.receivedAmountCents).toBe(100003); // real
+
+      const after = (await getSummary(`?from=${FIXTURE_DATE}&to=${FIXTURE_DATE}`)).body;
+      expect(after.periodo.cobrado - before.periodo.cobrado).toBeCloseTo(1000.03, 2);
+      expect(after.periodo.cobrado - before.periodo.cobrado).not.toBeCloseTo(1000, 2);
+    } finally {
+      await cleanupBatch(batchId);
+      await cleanupRealInstallment(policyId, instId);
+    }
+  });
+
+  test("anulación: un batch anulado no aporta nada a periodo.cobrado", async () => {
+    const { policyId, instId } = await mkRealInstallment(1000);
+    const before = (await getSummary(`?from=${FIXTURE_DATE}&to=${FIXTURE_DATE}`)).body;
+
+    const created = await callPostBatch({
+      paymentDate: FIXTURE_DATE, insuredId,
+      items: [{ source: "installment", installmentId: instId }],
+      splits: [{ method: "efectivo", amount: 1000 }],
+      applyProntoPagoSurcharge: false,
+    });
+    expect(created.status).toBe(201);
+    const batchId = created.body.id as number;
+
+    try {
+      const afterBatch = (await getSummary(`?from=${FIXTURE_DATE}&to=${FIXTURE_DATE}`)).body;
+      expect(afterBatch.periodo.cobrado - before.periodo.cobrado).toBeCloseTo(1000, 2);
+
+      const cancelled = await app.fetch(new Request(`http://localhost/api/payment-batches/${batchId}/cancel`, {
+        method: "POST", headers: authHeaders(), body: JSON.stringify({ confirm: true }),
+      }));
+      expect(cancelled.status).toBe(200);
+
+      const afterCancel = (await getSummary(`?from=${FIXTURE_DATE}&to=${FIXTURE_DATE}`)).body;
+      expect(afterCancel.periodo.cobrado - before.periodo.cobrado).toBeCloseTo(0, 2);
+    } finally {
+      await cleanupBatch(batchId);
+      await cleanupRealInstallment(policyId, instId);
+    }
+  });
+
+  test("filtro por fecha: un lote fuera del rango no aporta a periodo.cobrado del rango consultado, uno dentro sí", async () => {
+    const { policyId: policyIn, instId: instIn } = await mkRealInstallment(1000);
+    const { policyId: policyOut, instId: instOut } = await mkRealInstallment(2000);
+    const OUT_OF_RANGE_DATE = "2027-09-20";
+
+    const beforeInRange = (await getSummary(`?from=${FIXTURE_DATE}&to=${FIXTURE_DATE}`)).body;
+    const beforeOutRange = (await getSummary(`?from=${OUT_OF_RANGE_DATE}&to=${OUT_OF_RANGE_DATE}`)).body;
+
+    const createdIn = await callPostBatch({
+      paymentDate: FIXTURE_DATE, insuredId,
+      items: [{ source: "installment", installmentId: instIn }],
+      splits: [{ method: "efectivo", amount: 1000 }],
+      applyProntoPagoSurcharge: false,
+    });
+    expect(createdIn.status).toBe(201);
+    const batchInId = createdIn.body.id as number;
+
+    const createdOut = await callPostBatch({
+      paymentDate: OUT_OF_RANGE_DATE, insuredId,
+      items: [{ source: "installment", installmentId: instOut }],
+      splits: [{ method: "efectivo", amount: 2000 }],
+      applyProntoPagoSurcharge: false,
+    });
+    expect(createdOut.status).toBe(201);
+    const batchOutId = createdOut.body.id as number;
+
+    try {
+      // El rango de FIXTURE_DATE solo debe subir por el lote "in" ($1000) —
+      // el lote "out" (fecha 2027-09-20) no aporta nada a esta consulta.
+      const afterInRange = (await getSummary(`?from=${FIXTURE_DATE}&to=${FIXTURE_DATE}`)).body;
+      expect(afterInRange.periodo.cobrado - beforeInRange.periodo.cobrado).toBeCloseTo(1000, 2);
+
+      // El rango de OUT_OF_RANGE_DATE solo debe subir por el lote "out" ($2000).
+      const afterOutRange = (await getSummary(`?from=${OUT_OF_RANGE_DATE}&to=${OUT_OF_RANGE_DATE}`)).body;
+      expect(afterOutRange.periodo.cobrado - beforeOutRange.periodo.cobrado).toBeCloseTo(2000, 2);
+    } finally {
+      await cleanupBatch(batchInId);
+      await cleanupBatch(batchOutId);
+      await cleanupRealInstallment(policyIn, instIn);
+      await cleanupRealInstallment(policyOut, instOut);
+    }
+  });
 });

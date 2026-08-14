@@ -32,6 +32,7 @@ import {
   ownMoneyMovements,
   insuredAccountMovements,
   paymentAmountAdjustments,
+  cashPeriodPayments,
 } from "./database/schema";
 import { buildFullBackup, validateFullBackup, EXPECTED_BUSINESS_TABLES } from "./backup/full-backup";
 import { nanoid } from "nanoid";
@@ -70,7 +71,7 @@ import {
 } from "../lib/payments/received-checks";
 import {
   resolveStandalonePaymentInstruments, resolveCashEntryInstrument, resolveBatchChildPaymentInstrument,
-  buildRemittanceAllocations, validateAllocationOwnership, validateAllocationTotals,
+  resolveBatchInstruments, buildRemittanceAllocations, validateAllocationOwnership, validateAllocationTotals,
   calculateExpectedCollectedCents, classifyRemittanceAllocationState,
   RemittanceAllocationValidationError, type ResolvedInstrument, type CollectedAmountSource,
 } from "../lib/payments/remittance-allocations";
@@ -80,6 +81,7 @@ import {
   accumulateRemittanceContribution, emptyMoneyBucket, emptyDirectCompanyBucket, emptyRendidoAccumulator,
   centsToPesos, buildAdeudadosDetalle, assertAdeudadosDetalleMatchesTotal, AdeudadosSumMismatchError,
   isContableMethod, calculateCajaNetaTotalCents, type CarteraInconsistency, type BatchForCartera,
+  sumOwnBatchReceivedCentsForPeriod, type PeriodBatchForCobrado,
 } from "../lib/payments/caja-summary";
 import {
   calculateBatchReceivedAppliedDifference, validateInsuredAccountMovement, InsuredAccountValidationError,
@@ -94,6 +96,12 @@ import {
   validateSendTransition, validateDeliverTransition, DeliveryStatusTransitionError,
   DELIVERY_CHANNELS, DELIVERY_CHANNEL_PENDING,
 } from "../lib/deliveries/validation";
+import {
+  validateCashPaymentAmountInput, validateCashPaymentAmountAgainstNominal,
+  assertAllInstallmentsEligibleForCashPeriod, checkCashPeriodEligibility, buildCashPeriodPaymentSnapshot,
+  getCommissionBaseAmountCents, calculateCashPeriodDeadline, getCashPeriodDeadlineStatus,
+  CashPeriodPaymentValidationError, type CashPeriodInstallmentForEligibility,
+} from "../lib/payments/cash-period-payments";
 
 const app = new Hono().basePath("/api");
 
@@ -260,6 +268,135 @@ app.get("/policies", requireAuth(async (c: any) => {
   return c.json(results, 200);
 }));
 
+// ─── Búsqueda de períodos con contado disponible (rediseño Pago de contado) ────
+//
+// Único punto de entrada para que Cobranzas ofrezca la alternativa "Pagar de
+// contado el período completo" — ya NO existe ningún cobro de contado
+// generable desde Pólizas (ver poliza-detail.tsx: solo lectura). Devuelve,
+// por cada período (policyId + rebillingId, mismo criterio que en todo este
+// archivo) con un importe contado cargado, si sigue siendo elegible
+// (checkCashPeriodEligibility — misma regla exacta, todo o nada, que valida
+// el POST real) y su vencimiento informativo Vigente/Vencido. Un período
+// vencido SIGUE apareciendo con eligible=true si no tiene actividad — el
+// vencimiento nunca es un gate, solo display (ver
+// calculateCashPeriodDeadline/getCashPeriodDeadlineStatus). Un período no
+// eligible se devuelve igual (con eligible=false + ineligibleReasons) para
+// que el frontend pueda mostrar por qué desapareció la alternativa, en vez
+// de simplemente omitirlo silenciosamente.
+// Registrado ANTES de "/policies/:id" a propósito: Hono matchea rutas en
+// orden de registro, y "/policies/:id" capturaría "cash-period-search" como
+// id (NaN) si esta ruta quedara después.
+app.get("/policies/cash-period-search", requireAuth(async (c: any) => {
+  const { insuredId, search, companyId, policyId } = c.req.query();
+  const today = toArgentinaCalendarDay();
+
+  const baseConditions = [eq(policies.status, "activa")];
+  if (insuredId) baseConditions.push(eq(policies.insuredId, Number(insuredId)));
+  if (companyId) baseConditions.push(eq(policies.companyId, Number(companyId)));
+  if (policyId) baseConditions.push(eq(policies.id, Number(policyId)));
+
+  // Candidatos de emisión/renovación (rebillingId = null): policies con
+  // cashPaymentAmountCents cargado.
+  const policyCandidates = await db.select({
+    policyId: policies.id, policyNumber: policies.policyNumber,
+    insuredId: policies.insuredId, insuredName: insureds.name,
+    companyId: companies.id, companyName: companies.name,
+    cashPaymentAmountCents: policies.cashPaymentAmountCents,
+    periodStartDate: policies.startDate,
+  }).from(policies)
+    .innerJoin(insureds, eq(policies.insuredId, insureds.id))
+    .innerJoin(companies, eq(policies.companyId, companies.id))
+    .where(and(...baseConditions, isNotNull(policies.cashPaymentAmountCents)))
+    .all();
+
+  // Candidatos de refacturación: rebillings con cashPaymentAmountCents
+  // cargado, de pólizas que cumplen los mismos filtros.
+  const rebillingCandidates = await db.select({
+    policyId: policies.id, policyNumber: policies.policyNumber,
+    insuredId: policies.insuredId, insuredName: insureds.name,
+    companyId: companies.id, companyName: companies.name,
+    cashPaymentAmountCents: rebillings.cashPaymentAmountCents,
+    periodStartDate: rebillings.billingStart,
+    rebillingId: rebillings.id,
+  }).from(rebillings)
+    .innerJoin(policies, eq(rebillings.policyId, policies.id))
+    .innerJoin(insureds, eq(policies.insuredId, insureds.id))
+    .innerJoin(companies, eq(policies.companyId, companies.id))
+    .where(and(...baseConditions, isNotNull(rebillings.cashPaymentAmountCents)))
+    .all();
+
+  type Candidate = {
+    policyId: number; policyNumber: string; insuredId: number; insuredName: string;
+    companyId: number; companyName: string; cashPaymentAmountCents: number | null;
+    periodStartDate: string; rebillingId: number | null;
+  };
+  let candidates: Candidate[] = [
+    ...policyCandidates.map((r) => ({ ...r, rebillingId: null as number | null })),
+    ...rebillingCandidates,
+  ];
+
+  if (search) {
+    const needle = String(search).toLowerCase();
+    candidates = candidates.filter((r) =>
+      (r.insuredName ?? "").toLowerCase().includes(needle) ||
+      (r.policyNumber ?? "").toLowerCase().includes(needle)
+    );
+  }
+
+  // Elegibilidad + nominal reales por período — SIEMPRE re-derivados de las
+  // cuotas actuales (nunca confiar en un valor cacheado), mismo criterio que
+  // POST /payment-batches/cash-period-payment.
+  const result = await Promise.all(candidates.map(async (cand) => {
+    const periodInstallmentRows = await db.select({
+      id: policyInstallments.id, amount: policyInstallments.amount,
+      status: policyInstallments.status, rendered: policyInstallments.rendered,
+    }).from(policyInstallments)
+      .where(and(
+        eq(policyInstallments.policyId, cand.policyId),
+        cand.rebillingId !== null ? eq(policyInstallments.rebillingId, cand.rebillingId) : isNull(policyInstallments.rebillingId),
+      )).all();
+
+    const periodInstallmentIds = periodInstallmentRows.map((r) => r.id);
+    const confirmedPaymentRows = periodInstallmentIds.length > 0
+      ? await db.select({ installmentId: payments.installmentId }).from(payments)
+        .where(and(inArray(payments.installmentId, periodInstallmentIds), eq(payments.status, "confirmado")))
+        .all()
+      : [];
+    const confirmedInstallmentIds = new Set(confirmedPaymentRows.map((p) => p.installmentId));
+
+    const eligibilityRows: CashPeriodInstallmentForEligibility[] = periodInstallmentRows.map((r) => ({
+      id: r.id, status: r.status, rendered: r.rendered, hasConfirmedPayment: confirmedInstallmentIds.has(r.id),
+    }));
+    const { eligible, reasons } = checkCashPeriodEligibility(eligibilityRows);
+    const nominalAmountCents = periodInstallmentRows.reduce((s, r) => s + Math.round(r.amount * 100), 0);
+    const deadline = calculateCashPeriodDeadline(cand.periodStartDate);
+
+    return {
+      policyId: cand.policyId, policyNumber: cand.policyNumber,
+      insuredId: cand.insuredId, insuredName: cand.insuredName,
+      companyId: cand.companyId, companyName: cand.companyName,
+      rebillingId: cand.rebillingId,
+      cashPaymentAmountCents: cand.cashPaymentAmountCents,
+      nominalAmountCents,
+      discountAmountCents: cand.cashPaymentAmountCents !== null ? Math.max(0, nominalAmountCents - cand.cashPaymentAmountCents) : null,
+      installmentCount: periodInstallmentRows.length,
+      periodStartDate: cand.periodStartDate,
+      deadline,
+      deadlineStatus: getCashPeriodDeadlineStatus(deadline, today),
+      eligible,
+      ineligibleReasons: reasons,
+    };
+  }));
+
+  result.sort((a, b) =>
+    (a.insuredName ?? "").localeCompare(b.insuredName ?? "") ||
+    (a.policyNumber ?? "").localeCompare(b.policyNumber ?? "") ||
+    (a.rebillingId ?? 0) - (b.rebillingId ?? 0)
+  );
+
+  return c.json(result, 200);
+}));
+
 app.get("/policies/:id", requireAuth(async (c: any) => {
   const id = Number(c.req.param("id"));
   const result = await db
@@ -359,6 +496,29 @@ async function rebillingGroupActivitySets(dbClient: any, installmentIds: number[
 const REB_DELETE_BLOCK_MSG = "No se puede eliminar la refacturación porque tiene cuotas pagadas, rendidas o con movimientos asociados.";
 const REB_EDIT_BLOCK_MSG = "No se puede editar la refacturación porque tiene cuotas pagadas, rendidas o con movimientos asociados.";
 
+// ─── Pago de contado por período de facturación (Migración 0034) ──────────
+//
+// "Período de emisión/renovación" de una póliza = policy_installments con
+// policyId=X AND rebillingId IS NULL — mismo criterio de "período" que
+// loadRebillingGroup usa para una refacturación puntual (rebillingId=Y), y
+// que src/web/lib/rebilling-groups.ts ya usa en el frontend. Se reutilizan
+// TAL CUAL rebillingGroupActivitySets/hasRebillingGroupActivity (genéricas,
+// no dependen de rebillingId) para decidir si el período de emisión/
+// renovación tiene actividad — mismo criterio que ya bloquea la edición del
+// plan de una refacturación, sin duplicar esa lógica.
+async function loadPolicyBaseInstallmentGroup(dbClient: any, policyId: number) {
+  return dbClient
+    .select({ id: policyInstallments.id, status: policyInstallments.status, rendered: policyInstallments.rendered })
+    .from(policyInstallments)
+    .where(and(eq(policyInstallments.policyId, policyId), isNull(policyInstallments.rebillingId)))
+    .all();
+}
+
+const POLICY_CASH_PAYMENT_EDIT_BLOCK_MSG =
+  "No se puede modificar el importe contado del período de emisión/renovación porque tiene cuotas pagadas, rendidas o con pagos asociados.";
+const REB_CASH_PAYMENT_EDIT_BLOCK_MSG =
+  "No se puede modificar el importe contado de esta refacturación porque tiene cuotas pagadas, rendidas o con pagos asociados.";
+
 app.post("/policies/:id/rebillings", requireAuth(async (c: any) => {
   const user = c.get("user");
   const policyId = Number(c.req.param("id"));
@@ -386,6 +546,21 @@ app.post("/policies/:id/rebillings", requireAuth(async (c: any) => {
     throw e;
   }
 
+  // Importe contado (opcional) de ESTA refacturación — Migración 0034. El
+  // plan ya está armado acá, así que a diferencia del alta de póliza sí se
+  // puede validar contra el nominal real desde el primer momento (Regla 3).
+  let cashPaymentAmountCents: number | null;
+  try {
+    cashPaymentAmountCents = validateCashPaymentAmountInput(body.cashPaymentAmountCents);
+    if (cashPaymentAmountCents !== null) {
+      const nominalAmountCents = plan.installments.reduce((s, i) => s + Math.round(i.amount * 100), 0);
+      validateCashPaymentAmountAgainstNominal(cashPaymentAmountCents, nominalAmountCents);
+    }
+  } catch (e: any) {
+    if (e instanceof CashPeriodPaymentValidationError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
   try {
     const result = await db.transaction(async (tx) => {
       // 3. comprobar duplicado (dentro de la transacción — check-then-insert atómico)
@@ -408,6 +583,7 @@ app.post("/policies/:id/rebillings", requireAuth(async (c: any) => {
         firstDueDate: payload.firstDueDate,
         deductible: payload.deductible,
         notes: payload.notes,
+        cashPaymentAmountCents,
         createdBy: user.id,
       }).returning();
 
@@ -461,12 +637,27 @@ app.put("/rebillings/:id", requireAuth(async (c: any) => {
 
   // CASO C — hay actividad: bloquear cualquier cambio que afecte fechas,
   // importe o cantidad de cuotas. Solo notes puede cambiar sin riesgo.
+  // cashPaymentAmountCents (Migración 0034, Regla 4) sigue el mismo criterio:
+  // con actividad, ni siquiera se puede "retirar" — se bloquea cualquier
+  // intento de cambiarlo (incluido a null) con su propio mensaje.
   if (groupHasActivity) {
     const touchesPlan =
       body.billingStart !== undefined || body.billingEnd !== undefined ||
       body.monthlyFee !== undefined || body.installmentCount !== undefined ||
       body.firstDueDate !== undefined || body.premium !== undefined || body.deductible !== undefined;
     if (touchesPlan) return c.json({ error: REB_EDIT_BLOCK_MSG }, 409);
+    if ("cashPaymentAmountCents" in body) {
+      let requestedValue: number | null;
+      try {
+        requestedValue = validateCashPaymentAmountInput(body.cashPaymentAmountCents);
+      } catch (e: any) {
+        if (e instanceof CashPeriodPaymentValidationError) return c.json({ error: e.message }, 400);
+        throw e;
+      }
+      if (requestedValue !== existing.cashPaymentAmountCents) {
+        return c.json({ error: REB_CASH_PAYMENT_EDIT_BLOCK_MSG }, 409);
+      }
+    }
 
     const [row] = await db.update(rebillings)
       .set({ notes: body.notes !== undefined ? (body.notes || null) : existing.notes })
@@ -484,6 +675,29 @@ app.put("/rebillings/:id", requireAuth(async (c: any) => {
   // existe la acción separada POST /rebillings/:id/installments/rebuild.
   const wantsPlan = body.installmentCount !== undefined || body.firstDueDate !== undefined;
   if (!wantsPlan) {
+    // Importe contado (opcional) de esta refacturación — Migración 0034,
+    // Regla 3: sin actividad todavía se puede validar contra el nominal REAL
+    // ya generado (currentGroup son las cuotas existentes de este grupo).
+    let cashPaymentAmountCents: number | null | undefined = undefined;
+    if ("cashPaymentAmountCents" in body) {
+      try {
+        cashPaymentAmountCents = validateCashPaymentAmountInput(body.cashPaymentAmountCents);
+      } catch (e: any) {
+        if (e instanceof CashPeriodPaymentValidationError) return c.json({ error: e.message }, 400);
+        throw e;
+      }
+      if (cashPaymentAmountCents !== null && currentGroup.length > 0) {
+        const nominalRows = await db.select({ amount: policyInstallments.amount }).from(policyInstallments)
+          .where(eq(policyInstallments.rebillingId, id)).all();
+        const nominalAmountCents = nominalRows.reduce((s: number, r: any) => s + Math.round(r.amount * 100), 0);
+        try {
+          validateCashPaymentAmountAgainstNominal(cashPaymentAmountCents, nominalAmountCents);
+        } catch (e: any) {
+          if (e instanceof CashPeriodPaymentValidationError) return c.json({ error: e.message }, 400);
+          throw e;
+        }
+      }
+    }
     const [row] = await db.update(rebillings).set({
       billingStart: body.billingStart ?? existing.billingStart,
       billingEnd: body.billingEnd ?? existing.billingEnd,
@@ -492,6 +706,7 @@ app.put("/rebillings/:id", requireAuth(async (c: any) => {
       sumInsured: body.sumInsured !== undefined ? (body.sumInsured ? Number(body.sumInsured) : null) : existing.sumInsured,
       deductible: body.deductible !== undefined ? (body.deductible ? Number(body.deductible) : null) : existing.deductible,
       notes: body.notes !== undefined ? (body.notes || null) : existing.notes,
+      cashPaymentAmountCents: cashPaymentAmountCents !== undefined ? cashPaymentAmountCents : existing.cashPaymentAmountCents,
     }).where(eq(rebillings.id, id)).returning();
 
     // Igual que en el alta y en la corrección de plan: si se informó
@@ -537,13 +752,17 @@ app.put("/rebillings/:id", requireAuth(async (c: any) => {
     throw e;
   }
 
-  const result = await db.transaction(async (tx) => runRebillingRebuildTransaction(tx, id, plan, payload))
-    .catch((e: any) => {
-      if (e instanceof RebillingRebuildConflictError) return null;
-      throw e;
-    });
-
-  if (result === null) return c.json({ error: REB_EDIT_BLOCK_MSG }, 409);
+  let result;
+  try {
+    result = await db.transaction(async (tx) => runRebillingRebuildTransaction(tx, id, plan, payload));
+  } catch (e: any) {
+    if (e instanceof RebillingRebuildConflictError) return c.json({ error: REB_EDIT_BLOCK_MSG }, 409);
+    // Migración 0034: el importe contado de esta refacturación quedó mayor
+    // al nuevo nominal del plan reconstruido — mismo camino de fondo que
+    // POST /rebillings/:id/installments/rebuild (runRebillingRebuildTransaction).
+    if (e instanceof CashPeriodPaymentValidationError) return c.json({ error: e.message }, 409);
+    throw e;
+  }
   return c.json({ ...result.rebilling, installments: result.insertedRows }, 200);
 }));
 
@@ -638,6 +857,10 @@ app.post("/rebillings/:id/installments/rebuild", requireAuth(async (c: any) => {
     if (e instanceof RebillingRebuildConflictError) {
       return c.json({ error: e.message, blockingInstallments: e.blockingInstallments }, 409);
     }
+    // Migración 0034: el importe contado de esta refacturación quedó mayor
+    // al nuevo nominal del plan reconstruido — la transacción abortó antes
+    // de tocar ninguna cuota (ver runRebillingRebuildTransaction).
+    if (e instanceof CashPeriodPaymentValidationError) return c.json({ error: e.message }, 409);
     if (e instanceof RebillingNotFoundError) return c.json({ error: "La refacturación ya no existe" }, 404);
     console.error("[POST /rebillings/:id/installments/rebuild]", e?.message, e);
     return c.json({ error: "No se pudo corregir el plan de cuotas." }, 500);
@@ -711,6 +934,11 @@ app.get("/policies/:id/installments", requireAuth(async (c: any) => {
 app.post("/policies/:id/installments/generate", requireAuth(async (c: any) => {
   const policyId = Number(c.req.param("id"));
   const body = await c.req.json();
+
+  const policyRow = await db.select({ id: policies.id })
+    .from(policies).where(eq(policies.id, policyId)).get();
+  if (!policyRow) return c.json({ error: "La póliza no existe." }, 404);
+
   // 409 if installments already exist — prevents accidental destruction of historical data
   const existing = await db
     .select({ id: policyInstallments.id })
@@ -724,6 +952,33 @@ app.post("/policies/:id/installments/generate", requireAuth(async (c: any) => {
     }, 409);
   }
   if (!body.installments?.length) return c.json([], 200);
+
+  // Importe contado (opcional) del período de emisión/renovación —
+  // Migración 0034, Etapa "seguridad alta de póliza": POST /policies NUNCA
+  // lo persiste (no conoce el nominal todavía) — llega EN ESTE request,
+  // junto con el plan recién armado por el frontend (que sí lo conservó
+  // temporalmente en el formulario), y acá se valida y persiste ATÓMICO con
+  // las cuotas, dentro de la MISMA transacción: si el contado es inválido
+  // (o falla cualquier otra parte de la escritura), no se inserta ninguna
+  // cuota NI se guarda el contado — la póliza queda exactamente como estaba
+  // (cashPaymentAmountCents sigue NULL, nunca un valor sin validar).
+  let cashPaymentAmountCents: number | null;
+  try {
+    cashPaymentAmountCents = validateCashPaymentAmountInput(body.cashPaymentAmountCents);
+  } catch (e: any) {
+    if (e instanceof CashPeriodPaymentValidationError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+  if (cashPaymentAmountCents !== null) {
+    const nominalAmountCents = body.installments.reduce((s: number, inst: any) => s + Math.round(Number(inst.amount) * 100), 0);
+    try {
+      validateCashPaymentAmountAgainstNominal(cashPaymentAmountCents, nominalAmountCents);
+    } catch (e: any) {
+      if (e instanceof CashPeriodPaymentValidationError) return c.json({ error: e.message }, 409);
+      throw e;
+    }
+  }
+
   const rows = await db.transaction(async (tx) => {
     const inserted = await tx
       .insert(policyInstallments)
@@ -736,7 +991,10 @@ app.post("/policies/:id/installments/generate", requireAuth(async (c: any) => {
         notes: inst.notes || null,
       })))
       .returning();
-    await tx.update(policies).set({ installments: body.installments.length }).where(eq(policies.id, policyId));
+    await tx.update(policies).set({
+      installments: body.installments.length,
+      cashPaymentAmountCents,
+    }).where(eq(policies.id, policyId));
     return inserted;
   });
   return c.json(rows, 201);
@@ -852,6 +1110,10 @@ app.post("/policies/:id/installments/rebuild", requireAuth(async (c: any) => {
         blockingInstallments: e.blockingInstallments,
       }, 409);
     }
+    // Migración 0034: el importe contado ya cargado quedó mayor al nuevo
+    // nominal del plan reconstruido — la transacción abortó antes de tocar
+    // ninguna cuota (ver runInstallmentRebuildTransaction).
+    if (e instanceof CashPeriodPaymentValidationError) return c.json({ error: e.message }, 409);
     if (e instanceof PolicyNotFoundError) return c.json({ error: "La póliza no existe." }, 404);
     console.error("[POST /policies/:id/installments/rebuild]", e?.message, e);
     return c.json({ error: "No se pudo reconstruir el plan de cuotas." }, 500);
@@ -883,6 +1145,19 @@ app.post("/policies", requireAuth(async (c: any) => {
   if (!body.nextRebillingDate) body.nextRebillingDate = null;
   else if (!isValidCalendarDate(body.nextRebillingDate))
     return c.json({ error: `Próxima fecha de refacturación inválida: "${body.nextRebillingDate}"` }, 400);
+  // Importe contado (opcional) del período de emisión/renovación —
+  // Migración 0034, Etapa "seguridad alta de póliza": al alta NUNCA hay
+  // cuotas todavía, así que este endpoint NO PUEDE validarlo contra el
+  // nominal (Regla 3) — y por eso NUNCA lo persiste, sin importar qué venga
+  // en el body. Antes se guardaba con solo la validación de forma (entero
+  // positivo), lo que dejaba una ventana real: una póliza podía quedar para
+  // siempre con un importe contado mayor a su nominal si nadie volvía a
+  // tocar el campo. El único punto que SÍ conoce el nominal real es POST
+  // /policies/:id/installments/generate (recibe el plan recién armado) —
+  // ahí se valida y persiste de forma atómica junto con las cuotas (ver ese
+  // endpoint). El frontend es responsable de conservar el valor tipeado en
+  // el formulario y reenviarlo en esa segunda llamada — nunca acá.
+  body.cashPaymentAmountCents = null;
   const today = toArgentinaCalendarDay();
   const daysToEnd = Math.ceil(
     (new Date(body.endDate).getTime() - new Date(today).getTime()) / (1000 * 60 * 60 * 24)
@@ -910,10 +1185,60 @@ app.put("/policies/:id", requireAuth(async (c: any) => {
   // (intento de "rehabilitar" por esta vía), se rechaza — la única forma de
   // anular es POST /policies/:id/cancel, y no hay rehabilitación manual en
   // esta versión (ver src/lib/policies/cancellation.ts).
-  const current = await db.select({ status: policies.status }).from(policies).where(eq(policies.id, id)).get();
+  const current = await db.select({ status: policies.status, cashPaymentAmountCents: policies.cashPaymentAmountCents })
+    .from(policies).where(eq(policies.id, id)).get();
   if (!current) return c.json({ error: "La póliza no existe." }, 404);
   if ("status" in body && (body.status === "cancelada" || current.status === "cancelada")) {
     return c.json({ error: "Las anulaciones deben gestionarse mediante la acción específica \"Anular póliza\"." }, 400);
+  }
+
+  // Importe contado (opcional) del período de emisión/renovación —
+  // Migración 0034, Regla 4: editable libremente hasta que exista actividad
+  // real (pago/imputación/rendición) sobre alguna cuota del período; nunca
+  // se puede "retirar" (volver a null) ni cambiar después de usado. Regla 3:
+  // si el período ya tiene cuotas reales, se revalida acá que el nuevo
+  // importe no supere su suma nominal (igual está permitido).
+  if ("cashPaymentAmountCents" in body) {
+    let newValue: number | null;
+    try {
+      newValue = validateCashPaymentAmountInput(body.cashPaymentAmountCents);
+    } catch (e: any) {
+      if (e instanceof CashPeriodPaymentValidationError) return c.json({ error: e.message }, 400);
+      throw e;
+    }
+    if (newValue !== current.cashPaymentAmountCents) {
+      const baseGroup = await loadPolicyBaseInstallmentGroup(db, id);
+      const baseInstallmentIds = baseGroup.map((i: any) => i.id);
+      const { paidInstallmentIds, remittedInstallmentIds } = await rebillingGroupActivitySets(db, baseInstallmentIds);
+      if (hasRebillingGroupActivity(baseGroup, paidInstallmentIds, remittedInstallmentIds)) {
+        return c.json({ error: POLICY_CASH_PAYMENT_EDIT_BLOCK_MSG }, 409);
+      }
+      // Etapa "seguridad alta de póliza": sin cuotas todavía, un valor no
+      // nulo acá es SIEMPRE no-validable (no hay nominal real contra el
+      // cual compararlo) — nunca se acepta por esta vía, aunque el llamador
+      // sea directo a la API. La única forma de cargar el importe contado
+      // del período de emisión/renovación es POST
+      // /policies/:id/installments/generate, atómico junto con el plan
+      // real. Retirarlo (volver a null) sigue permitido sin cuotas: no hay
+      // nada que validar para vaciar el campo.
+      if (newValue !== null && baseGroup.length === 0) {
+        return c.json({
+          error: "Todavía no existen cuotas para este período — el importe contado se carga junto con el plan, vía POST /policies/:id/installments/generate.",
+        }, 409);
+      }
+      if (newValue !== null && baseGroup.length > 0) {
+        const nominalRows = await db.select({ amount: policyInstallments.amount }).from(policyInstallments)
+          .where(and(eq(policyInstallments.policyId, id), isNull(policyInstallments.rebillingId))).all();
+        const nominalAmountCents = nominalRows.reduce((s: number, r: any) => s + Math.round(r.amount * 100), 0);
+        try {
+          validateCashPaymentAmountAgainstNominal(newValue, nominalAmountCents);
+        } catch (e: any) {
+          if (e instanceof CashPeriodPaymentValidationError) return c.json({ error: e.message }, 400);
+          throw e;
+        }
+      }
+    }
+    body.cashPaymentAmountCents = newValue;
   }
 
   // Normalize and validate billingCycle
@@ -1442,6 +1767,160 @@ app.get("/payments", requireAuth(async (c: any) => {
   if (status) results = results.filter((r) => r.payment.status === status);
   if (from) results = results.filter((r) => r.payment.paymentDate >= from);
   if (to) results = results.filter((r) => r.payment.paymentDate <= to);
+
+  // Migración 0034 (rediseño Pago de contado): los hijos de un cobro de
+  // período de contado (payments.batchId de una fila en cash_period_payments)
+  // NUNCA se muestran como filas propias — cada hijo guarda el importe
+  // NOMINAL COMPLETO de su cuota (trazabilidad hacia la cuota real), así que
+  // listarlos tal cual los mostraría 4 veces (una por cuota) en vez de UNA
+  // sola vez por el importe contado real. Se colapsan acá en una única fila
+  // sintética por batch — importe = cashAmountCents (el contractual real,
+  // nunca la suma nominal) y método = el/los medio(s) REAL(es) de
+  // payment_batch_splits, nunca el literal "contado" que guardan los hijos
+  // (esa es la modalidad comercial, no un instrumento — misma distinción que
+  // ya hace este archivo para "lote"/"combinado").
+  const batchIdsPresent = [...new Set(results.map((r) => r.payment.batchId).filter((id): id is number => id != null))];
+  const cashPeriodRows = batchIdsPresent.length > 0
+    ? await db.select().from(cashPeriodPayments).where(inArray(cashPeriodPayments.paymentBatchId, batchIdsPresent)).all()
+    : [];
+  const cashPeriodByBatchId = new Map(cashPeriodRows.map((r) => [r.paymentBatchId, r]));
+
+  // Tipo propio (no typeof results): una fila sintética de contado nunca
+  // tiene un payments.id ni installmentId real (colapsa varias cuotas — ver
+  // comentario más abajo), así que payment.id/installmentId son SIEMPRE
+  // null acá, nunca `number` como en una fila real — este tipo lo refleja
+  // con precisión en vez de forzar la forma de una fila real.
+  type CashPeriodSyntheticRow = Omit<(typeof results)[number], "payment"> & {
+    payment: Omit<(typeof results)[number]["payment"], "id" | "installmentId"> & {
+      id: null;
+      installmentId: null;
+      hasSurcharge: boolean;
+      hasChecks: boolean;
+      splits: { method: string; amountCents: number; notes: string | null }[];
+      isCashPeriodPayment: true;
+      concept: string;
+      cashPeriodPayment: {
+        rebillingId: number | null;
+        nominalAmountCents: number;
+        cashAmountCents: number;
+        discountAmountCents: number;
+      };
+    };
+  };
+  let cashPeriodSyntheticRows: CashPeriodSyntheticRow[] = [];
+  if (cashPeriodByBatchId.size > 0) {
+    const cashPeriodBatchIds = [...cashPeriodByBatchId.keys()];
+    const batchRows = await db.select().from(paymentBatches).where(inArray(paymentBatches.id, cashPeriodBatchIds)).all();
+    const batchById = new Map(batchRows.map((b) => [b.id, b]));
+
+    const batchSplitRows = await db.select().from(paymentBatchSplits).where(inArray(paymentBatchSplits.batchId, cashPeriodBatchIds)).all();
+    const splitsByBatchId = new Map<number, { method: string; amountCents: number; notes: string | null }[]>();
+    for (const s of batchSplitRows) {
+      const arr = splitsByBatchId.get(s.batchId) ?? [];
+      arr.push({ method: s.method, amountCents: s.amountCents, notes: s.notes });
+      splitsByBatchId.set(s.batchId, arr);
+    }
+
+    const batchSplitIds = batchSplitRows.map((s) => s.id);
+    const batchChecksSet = new Set<number>();
+    if (batchSplitIds.length > 0) {
+      const splitIdToBatchId = new Map(batchSplitRows.map((s) => [s.id, s.batchId]));
+      const checkRows = await db.select({ batchSplitId: receivedChecks.batchSplitId })
+        .from(receivedChecks).where(inArray(receivedChecks.batchSplitId, batchSplitIds)).all();
+      for (const chk of checkRows) {
+        if (chk.batchSplitId == null) continue;
+        const bId = splitIdToBatchId.get(chk.batchSplitId);
+        if (bId != null) batchChecksSet.add(bId);
+      }
+    }
+
+    // Representante (policy/insured/company) de cada batch — cualquiera de
+    // sus hijos sirve, todos comparten policyId (ver POST
+    // /payment-batches/cash-period-payment: un único policyId por período).
+    const representativeByBatchId = new Map<number, (typeof results)[number]>();
+    for (const r of results) {
+      if (r.payment.batchId != null && cashPeriodByBatchId.has(r.payment.batchId) && !representativeByBatchId.has(r.payment.batchId)) {
+        representativeByBatchId.set(r.payment.batchId, r);
+      }
+    }
+
+    cashPeriodSyntheticRows = [...cashPeriodByBatchId.entries()].flatMap(([batchId, cashPeriodPayment]) => {
+      const rep = representativeByBatchId.get(batchId);
+      const batch = batchById.get(batchId);
+      if (!rep || !batch) return []; // defensivo — no debería pasar (integridad referencial)
+      const splits = splitsByBatchId.get(batchId) ?? [];
+      // Un cobro de contado confirmado SIEMPRE se crea con al menos un medio
+      // real en payment_batch_splits (ver POST /payment-batches/cash-period-payment)
+      // — 0 splits acá es la misma categoría de "no debería pasar" que
+      // !rep || !batch de arriba, nunca un caso legítimo de "sin método".
+      if (splits.length === 0) return [];
+      const resolvedMethod = splits.length === 1 ? splits[0]!.method : "combinado";
+      return [{
+        policy: rep.policy, insured: rep.insured, company: rep.company, installment: null,
+        payment: {
+          // Fila sintética: NO es un payments.id real — nunca editable ni
+          // eliminable como pago individual (backend ya rechaza tocar un
+          // hijo de batch por separado en PUT/DELETE /payments/:id; acá
+          // además se le quita el id real para que el frontend nunca lo
+          // ofrezca como si fuera un pago suelto).
+          id: null,
+          batchId,
+          policyId: rep.payment.policyId,
+          // manualPayer/manualPolicyNumber/manualCompany: exclusivos de la
+          // imputación manual sin póliza — un cobro de contado SIEMPRE está
+          // vinculado a una póliza real (rep.policy), nunca aplica.
+          manualPayer: null,
+          manualPolicyNumber: null,
+          manualCompany: null,
+          amount: cashPeriodPayment.cashAmountCents / 100,
+          paymentMethod: resolvedMethod,
+          paymentDate: batch.paymentDate,
+          // periodMonth: es un dato de imputación de payments STANDALONE
+          // (mes contable de una cuota puntual) — un cobro de contado cubre
+          // TODO el período de una vez por menos que la suma de cuotas;
+          // no hay un único mes al que asignarlo, así que no aplica.
+          periodMonth: null,
+          status: cashPeriodPayment.status,
+          // El período se rinde como UN SOLO instrumento (ver comentario de
+          // cash_period_payments en schema.ts) — nunca por cuota individual
+          // como un payment standalone. Se expone acá con el mismo nombre de
+          // campo que cualquier otro payment (rendered/renderedAt) para que
+          // los filtros existentes de Cobranzas ("pendiente de
+          // rendir"/"rendidos") sigan funcionando sin lógica nueva — valores
+          // reales de cash_period_payments, nunca null (si el período está
+          // rendido, esta fila también debe reflejarlo).
+          rendered: cashPeriodPayment.rendered,
+          renderedAt: cashPeriodPayment.renderedAt,
+          // installmentId: el período colapsa VARIAS cuotas en una sola fila
+          // (ver comentario de arriba) — no hay una cuota individual a la que
+          // apunte esta fila sintética, a diferencia de cada payment hijo
+          // real (que sí guarda su installmentId propio, nunca perdido).
+          installmentId: null,
+          dueDate: null,
+          // createdBy: quién confirmó el cobro de contado — valor real de
+          // cash_period_payments (mismo criterio que createdAt/rendered de
+          // arriba), nunca null.
+          createdBy: cashPeriodPayment.createdBy,
+          createdAt: cashPeriodPayment.createdAt,
+          notes: batch.notes,
+          hasSurcharge: false,
+          hasChecks: batchChecksSet.has(batchId),
+          splits,
+          isCashPeriodPayment: true,
+          concept: "Pago de contado",
+          cashPeriodPayment: {
+            rebillingId: cashPeriodPayment.rebillingId,
+            nominalAmountCents: cashPeriodPayment.nominalAmountCents,
+            cashAmountCents: cashPeriodPayment.cashAmountCents,
+            discountAmountCents: cashPeriodPayment.discountAmountCents,
+          },
+        },
+      }];
+    });
+
+    results = results.filter((r) => r.payment.batchId == null || !cashPeriodByBatchId.has(r.payment.batchId));
+  }
+
   const paymentIds = results.map(r => r.payment.id);
   const surchargeSet = new Set<number>();
   const splitsByPayment = new Map<number, { method: string; amountCents: number; notes: string | null }[]>();
@@ -1487,17 +1966,37 @@ app.get("/payments", requireAuth(async (c: any) => {
   // splits ya cargados en el query de arriba) para no hacer N+1 consultas.
   if (method) {
     results = results.filter((r) => (splitsByPayment.get(r.payment.id) ?? []).some((s) => s.method === method));
+    // Los hijos de contado nunca tienen payment_splits propios (sus medios
+    // reales viven en payment_batch_splits, ya resueltos en `splits` de la
+    // fila sintética) — se filtra por ahí, nunca por r.payment.paymentMethod.
+    cashPeriodSyntheticRows = cashPeriodSyntheticRows.filter((r: any) =>
+      (r.payment.splits as { method: string }[]).some((s) => s.method === method)
+    );
   }
-  return c.json(results.map(r => ({
-    ...r,
-    payment: {
-      ...r.payment,
-      hasSurcharge: surchargeSet.has(r.payment.id),
-      hasChecks: paymentIdsWithChecks.has(r.payment.id),
-      dueDate: (r.installment?.dueDate ?? r.payment.dueDate ?? null) as string | null,
-      splits: splitsByPayment.get(r.payment.id) ?? [],
-    },
-  })), 200);
+  const combined = [
+    ...results.map(r => ({
+      ...r,
+      payment: {
+        ...r.payment,
+        hasSurcharge: surchargeSet.has(r.payment.id),
+        hasChecks: paymentIdsWithChecks.has(r.payment.id),
+        dueDate: (r.installment?.dueDate ?? r.payment.dueDate ?? null) as string | null,
+        splits: splitsByPayment.get(r.payment.id) ?? [],
+      },
+    })),
+    ...cashPeriodSyntheticRows,
+  ];
+  // orderBy(desc(createdAt)) del query original se pierde al mezclar las
+  // filas sintéticas (createdAt de cash_period_payments, no de payments) —
+  // se reordena acá con el mismo criterio para que el listado siga viniendo
+  // más nuevo primero sin importar si la fila es un pago suelto o un
+  // período de contado colapsado.
+  combined.sort((a: any, b: any) => {
+    const bTime = b.payment.createdAt ? new Date(b.payment.createdAt).getTime() : 0;
+    const aTime = a.payment.createdAt ? new Date(a.payment.createdAt).getTime() : 0;
+    return bTime - aTime;
+  });
+  return c.json(combined, 200);
 }));
 
 app.post("/payments", requireAuth(async (c: any) => {
@@ -2861,6 +3360,381 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
   return c.json({ id: batchId }, 201);
 }));
 
+// ─── PAGO DE CONTADO POR PERÍODO DE FACTURACIÓN (Migración 0034) ──────────
+//
+// Endpoint DEDICADO — no un modo más de POST /payment-batches de arriba, a
+// propósito: ese endpoint calcula baseAmountCents/totalReceivedCents SIEMPRE
+// como la suma nominal de las cuotas elegidas (calculateBaseAmountCents), y
+// cualquier diferencia contra el dinero real dispara accountDifferenceResolution
+// (sobrante/faltante, Fase 2B) — exactamente lo que este flujo NUNCA debe
+// hacer con el descuento comercial. Aislar la lógica acá evita tener que
+// abrir un "modo contado" condicional en 700 líneas de la ruta general, con
+// el riesgo de que un descuento termine filtrándose por ese camino.
+//
+// Todo o nada (Regla 5): se resuelven TODAS las cuotas del período server-side
+// (nunca se aceptan installmentIds del body — a diferencia del batch general,
+// acá no hay "carrito", el período completo es la única unidad posible). El
+// importe contado tampoco viene del body: es SIEMPRE el ya cargado en
+// policies/rebillings.cashPaymentAmountCents (Regla 2 — "debe cargarse antes
+// del cobro"), nunca inventado en el momento del cobro.
+app.post("/payment-batches/cash-period-payment", requireAuth(async (c: any) => {
+  const user = c.get("user");
+  const body = await c.req.json();
+
+  if (!body.paymentDate || !/^\d{4}-\d{2}-\d{2}$/.test(body.paymentDate)) {
+    return c.json({ error: "Falta o es inválida la fecha de pago (YYYY-MM-DD)." }, 400);
+  }
+  const policyId = Number(body.policyId);
+  if (!Number.isFinite(policyId) || policyId <= 0) {
+    return c.json({ error: "policyId inválido." }, 400);
+  }
+  const rebillingId = body.rebillingId == null ? null : Number(body.rebillingId);
+  if (rebillingId !== null && (!Number.isFinite(rebillingId) || rebillingId <= 0)) {
+    return c.json({ error: "rebillingId inválido." }, 400);
+  }
+
+  let normalizedSplits;
+  try {
+    normalizedSplits = normalizeBatchSplits(body.splits);
+  } catch (e: any) {
+    if (e instanceof PaymentBatchValidationError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
+  interface SplitWithChecks { split: NormalizedPaymentBatchSplit; checks: NormalizedReceivedCheck[] }
+  let splitsWithChecks: SplitWithChecks[];
+  try {
+    splitsWithChecks = normalizedSplits.map((split, i) => {
+      const rawChecks = body.splits[i]?.checks;
+      if (split.method === "cheque") {
+        if (!Array.isArray(rawChecks) || rawChecks.length === 0) {
+          throw new PaymentBatchValidationError(`El split cheque (medio ${i + 1}) debe incluir al menos un cheque.`);
+        }
+        const checks = rawChecks.map((raw: any, j: number) => normalizeReceivedCheck(raw, `cheque ${j + 1} del medio ${i + 1}`));
+        const totalsCheck = validateChecksMatchSplit(checks, split.amountCents);
+        if (!totalsCheck.valid) throw new PaymentBatchValidationError(totalsCheck.errorMessage!);
+        return { split, checks };
+      }
+      if (Array.isArray(rawChecks) && rawChecks.length > 0) {
+        throw new PaymentBatchValidationError(`El medio ${i + 1} (${split.method}) no puede incluir cheques.`);
+      }
+      return { split, checks: [] };
+    });
+  } catch (e: any) {
+    if (e instanceof PaymentBatchValidationError || e instanceof ReceivedCheckValidationError) {
+      return c.json({ error: e.message }, 400);
+    }
+    throw e;
+  }
+
+  let splitGroup: SplitGroup;
+  try {
+    splitGroup = resolveBatchSplitGroup(normalizedSplits);
+  } catch (e: any) {
+    if (e instanceof PaymentBatchValidationError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+  void splitGroup; // sin recargos Pronto Pago en este flujo — ver comentario más abajo.
+
+  // 1. Póliza real — asegurado/compañía SIEMPRE se derivan de ella, nunca del body.
+  const policy = await db.select({
+    id: policies.id, status: policies.status, insuredId: policies.insuredId,
+    cashPaymentAmountCents: policies.cashPaymentAmountCents,
+  }).from(policies).where(eq(policies.id, policyId)).get();
+  if (!policy) return c.json({ error: "La póliza no existe." }, 404);
+  if (policy.status === "cancelada") return c.json({ error: "La póliza está cancelada." }, 409);
+
+  // 2. Importe contado del período — SIEMPRE el ya cargado (Regla 2), nunca
+  // el del body. rebillingId debe pertenecer de verdad a esta póliza.
+  let cashAmountCents: number | null;
+  if (rebillingId !== null) {
+    const rebilling = await db.select({
+      id: rebillings.id, policyId: rebillings.policyId, cashPaymentAmountCents: rebillings.cashPaymentAmountCents,
+    }).from(rebillings).where(eq(rebillings.id, rebillingId)).get();
+    if (!rebilling) return c.json({ error: "La refacturación no existe." }, 404);
+    if (rebilling.policyId !== policyId) return c.json({ error: "La refacturación no pertenece a esta póliza." }, 400);
+    cashAmountCents = rebilling.cashPaymentAmountCents;
+  } else {
+    cashAmountCents = policy.cashPaymentAmountCents;
+  }
+  if (cashAmountCents === null) {
+    return c.json({
+      error: "Este período no tiene un importe contado cargado. Cargalo primero en los datos de la póliza/refacturación para poder pagarlo de contado.",
+    }, 400);
+  }
+
+  // 3. Todas las cuotas del período (Regla 5 — todo o nada, server-side,
+  // nunca desde el body) + elegibilidad.
+  const periodInstallmentRows = await db.select({
+    id: policyInstallments.id, amount: policyInstallments.amount,
+    status: policyInstallments.status, rendered: policyInstallments.rendered,
+  }).from(policyInstallments)
+    .where(and(
+      eq(policyInstallments.policyId, policyId),
+      rebillingId !== null ? eq(policyInstallments.rebillingId, rebillingId) : isNull(policyInstallments.rebillingId),
+    )).all();
+
+  const periodInstallmentIds = periodInstallmentRows.map((r) => r.id);
+  const confirmedPaymentRows = periodInstallmentIds.length > 0
+    ? await db.select({ installmentId: payments.installmentId }).from(payments)
+      .where(and(inArray(payments.installmentId, periodInstallmentIds), eq(payments.status, "confirmado")))
+      .all()
+    : [];
+  const confirmedInstallmentIds = new Set(confirmedPaymentRows.map((p) => p.installmentId));
+
+  const eligibilityRows: CashPeriodInstallmentForEligibility[] = periodInstallmentRows.map((r) => ({
+    id: r.id, status: r.status, rendered: r.rendered, hasConfirmedPayment: confirmedInstallmentIds.has(r.id),
+  }));
+  try {
+    assertAllInstallmentsEligibleForCashPeriod(eligibilityRows);
+  } catch (e: any) {
+    if (e instanceof CashPeriodPaymentValidationError) {
+      return c.json({ error: e.message, blockingInstallmentIds: periodInstallmentIds }, 409);
+    }
+    throw e;
+  }
+
+  // 4. Nominal real + snapshot (Regla 3 revalidada siempre acá, nunca solo
+  // al cargar el dato — el plan pudo haberse reconstruido después).
+  const nominalAmountCents = periodInstallmentRows.reduce((s, r) => s + Math.round(r.amount * 100), 0);
+  let snapshot;
+  try {
+    snapshot = buildCashPeriodPaymentSnapshot(nominalAmountCents, cashAmountCents);
+  } catch (e: any) {
+    if (e instanceof CashPeriodPaymentValidationError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
+  // 5. Tolerancia de redondeo (diferencia REAL de instrumentos, nunca el
+  // descuento comercial): los medios pueden diferir del importe contado
+  // contractual (snapshot.cashAmountCents) hasta $5 inclusive, solo con
+  // aceptación explícita — mismo mecanismo auditado que POST
+  // /payment-batches (payment_amount_adjustments), pero acá SOLO se acepta
+  // "ajuste_redondeo": a diferencia de un lote común, el importe contado ya
+  // es un número fijo conocido de antemano (cargado previamente en el
+  // período) — cualquier diferencia contra él es un error de captura del
+  // instrumento, NUNCA una decisión de cuenta corriente del asegurado
+  // (saldo_a_favor/saldo_deudor quedan fuera de este flujo a propósito: el
+  // "descuento" ya vive en discountAmountCents, nunca se reinterpreta como
+  // faltante/sobrante de cuenta corriente).
+  const receivedCents = normalizedSplits.reduce((s, sp) => s + sp.amountCents, 0);
+  const difference = calculateBatchReceivedAppliedDifference(receivedCents, snapshot.cashAmountCents);
+  let roundingAdjustmentToCreate: { amountCents: number; reason: string } | null = null;
+  if (difference.kind !== "exacto") {
+    const resolution = body.accountDifferenceResolution;
+    if (resolution == null || typeof resolution !== "object") {
+      return c.json({
+        error:
+          `La suma de los medios ($${(receivedCents / 100).toFixed(2)}) no coincide con el importe contado a cobrar ` +
+          `($${(snapshot.cashAmountCents / 100).toFixed(2)}). Indicá accountDifferenceResolution.action ("ajuste_redondeo") para continuar.`,
+        code: "CASH_PERIOD_PAYMENT_AMOUNT_DIFFERENCE",
+        receivedCents, cashAmountCents: snapshot.cashAmountCents, differenceCents: difference.differenceCents,
+      }, 400);
+    }
+    if (resolution.action !== "ajuste_redondeo") {
+      return c.json({
+        error:
+          `Una diferencia entre los medios y el importe contado de un período solo puede resolverse como "ajuste_redondeo" ` +
+          `— nunca como saldo a favor/deudor (el importe contado ya es un descuento comercial fijo, no una diferencia de cuenta corriente).`,
+      }, 400);
+    }
+    try {
+      validateRoundingAdjustment({ differenceCents: difference.differenceCents });
+    } catch (e: any) {
+      if (e instanceof InsuredAccountValidationError) return c.json({ error: e.message }, 400);
+      throw e;
+    }
+    const reason = typeof resolution.reason === "string" && resolution.reason.trim()
+      ? resolution.reason.trim()
+      : ROUNDING_ADJUSTMENT_REASON;
+    roundingAdjustmentToCreate = { amountCents: difference.differenceCents, reason };
+  }
+
+  // Detección informativa de posibles cheques duplicados — mismo criterio
+  // que POST /payment-batches.
+  const allNewChecks = splitsWithChecks.flatMap((s) => s.checks);
+  if (allNewChecks.length > 0) {
+    const bankNames = [...new Set(allNewChecks.map((chk) => chk.bankName))];
+    const existingChecks = await loadActiveExistingChecksForDuplicateCheck(db, bankNames);
+    const duplicates = allNewChecks
+      .map((chk) => ({ bankName: chk.bankName, checkNumber: chk.checkNumber, matches: findPossibleCheckDuplicates(chk, existingChecks) }))
+      .filter((d) => d.matches.length > 0);
+    if (duplicates.length > 0 && body.confirmPossibleDuplicates !== true) {
+      return c.json({
+        error: "Se detectaron posibles cheques duplicados (mismo banco y número que cheques ya cargados). Confirmá para continuar.",
+        code: "CHECK_POSSIBLE_DUPLICATE",
+        duplicates,
+      }, 409);
+    }
+  }
+
+  let result: { batchId: number; cashPeriodPaymentId: number };
+  try {
+    result = await db.transaction(async (tx) => {
+      const [batch] = await tx.insert(paymentBatches).values({
+        insuredId: policy.insuredId,
+        // Regla 5/7: SIEMPRE el importe contado — nunca la suma nominal.
+        // Sin recargos Pronto Pago (una modalidad de descuento comercial no
+        // combina con un recargo por pronto pago — ver informe de diagnóstico).
+        baseAmountCents: snapshot.cashAmountCents,
+        surchargeAmountCents: 0,
+        // totalReceivedCents = APLICADO — SIEMPRE el contado contractual,
+        // nunca el real: es lo que cancela las cuotas y lo que se rinde a la
+        // compañía (Regla 5/7), sin importar si los instrumentos entregados
+        // difirieron en centavos (tolerancia de redondeo). receivedAmountCents
+        // = dinero REAL recibido (SUM(splits)) — puede diferir hasta $5 con
+        // aceptación explícita (ver difference/roundingAdjustmentToCreate
+        // arriba); nunca el contado si hay ajuste, para que Caja lo capee
+        // igual que cualquier otro lote con diferencia real/aplicado.
+        totalReceivedCents: snapshot.cashAmountCents,
+        receivedAmountCents: receivedCents,
+        paymentDate: body.paymentDate,
+        status: "confirmado",
+        notes: body.notes || null,
+        createdBy: user.id,
+      }).returning();
+
+      // Re-chequeo dentro de la transacción real (mismo patrón que POST
+      // /payment-batches — PaymentBatchRaceConditionError).
+      const raceCheck = await tx.select({ installmentId: payments.installmentId }).from(payments)
+        .where(and(inArray(payments.installmentId, periodInstallmentIds), eq(payments.status, "confirmado")))
+        .all();
+      if (raceCheck.length > 0) {
+        throw new PaymentBatchRaceConditionError(raceCheck.map((p: any) => p.installmentId));
+      }
+
+      for (const { split, checks } of splitsWithChecks) {
+        const [insertedSplit] = await tx.insert(paymentBatchSplits).values({
+          batchId: batch!.id, method: split.method, amountCents: split.amountCents, notes: split.notes,
+        }).returning();
+        if (checks.length > 0) {
+          await tx.insert(receivedChecks).values(checks.map((chk) => ({
+            batchSplitId: insertedSplit!.id,
+            checkNumber: chk.checkNumber, bankName: chk.bankName, bankCode: chk.bankCode,
+            drawerName: chk.drawerName, drawerDocument: chk.drawerDocument,
+            issueDate: chk.issueDate, dueDate: chk.dueDate, amountCents: chk.amountCents,
+            currency: chk.currency, status: "en_cartera", notes: chk.notes,
+            receivedAt: new Date(), createdBy: user.id, createdAt: new Date(), updatedAt: new Date(),
+          })));
+        }
+      }
+
+      // Cada cuota queda pagada por su importe NOMINAL completo (trazabilidad
+      // hacia la compañía intacta) — el descuento vive únicamente en
+      // cash_period_payments, nunca prorrateado entre las cuotas.
+      for (const inst of periodInstallmentRows) {
+        await tx.insert(payments).values({
+          policyId, installmentId: inst.id, amount: inst.amount,
+          paymentMethod: "contado", paymentDate: body.paymentDate,
+          status: "confirmado", batchId: batch!.id, createdBy: user.id,
+        });
+        await recalculateInstallmentPaymentStatus(tx, inst.id);
+      }
+
+      // Regla 5/6: NUNCA insured_account_movements por el descuento — no se
+      // llama a ese camino en absoluto acá (el descuento comercial vive
+      // únicamente en discountAmountCents). payment_amount_adjustments SÍ se
+      // usa, pero solo para la diferencia REAL de instrumentos (redondeo),
+      // nunca para el descuento — ver roundingAdjustmentToCreate arriba.
+      const [cashPeriodPayment] = await tx.insert(cashPeriodPayments).values({
+        paymentBatchId: batch!.id,
+        policyId,
+        rebillingId,
+        nominalAmountCents: snapshot.nominalAmountCents,
+        cashAmountCents: snapshot.cashAmountCents,
+        discountAmountCents: snapshot.discountAmountCents,
+        status: "confirmado",
+        rendered: 0,
+        createdBy: user.id,
+        createdAt: new Date(),
+      }).returning();
+
+      if (roundingAdjustmentToCreate) {
+        await tx.insert(paymentAmountAdjustments).values({
+          paymentBatchId: batch!.id,
+          amountCents: roundingAdjustmentToCreate.amountCents,
+          reason: roundingAdjustmentToCreate.reason,
+          authorizedBy: user.id,
+          createdBy: user.id,
+          createdAt: new Date(),
+        });
+      }
+
+      return { batchId: batch!.id, cashPeriodPaymentId: cashPeriodPayment!.id };
+    });
+  } catch (e: any) {
+    if (e instanceof PaymentBatchRaceConditionError) {
+      return c.json({ error: e.message, blockingInstallmentIds: e.installmentIds }, 409);
+    }
+    const code = e?.code ?? e?.cause?.code;
+    if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") {
+      return c.json({ error: "Otra operación está en curso sobre este período — reintentá en unos segundos." }, 409);
+    }
+    throw e;
+  }
+
+  return c.json({
+    id: result.batchId,
+    cashPeriodPaymentId: result.cashPeriodPaymentId,
+    nominalAmountCents: snapshot.nominalAmountCents,
+    cashAmountCents: snapshot.cashAmountCents,
+    discountAmountCents: snapshot.discountAmountCents,
+    // Auditable por separado del contado contractual (Regla del ajuste de
+    // redondeo): dinero real recibido (puede diferir hasta $5) y el ajuste
+    // registrado, si hubo alguno — 0/null cuando cerró exacto.
+    actualReceivedCents: receivedCents,
+    roundingAdjustmentCents: roundingAdjustmentToCreate?.amountCents ?? 0,
+    commissionBaseAmountCents: getCommissionBaseAmountCents(snapshot),
+    installmentIds: periodInstallmentIds,
+  }, 201);
+}));
+
+// GET /api/cash-period-payments/:batchId — detalle de auditoría de un cobro
+// de período de contado, por payment_batch_id (1:1). Usado por el
+// comprobante (Regla 8: "Pago contado", período, total nominal, descuento,
+// importe contado, cuotas canceladas) y por cualquier consumidor futuro de
+// la base de comisión real (Regla 9).
+app.get("/cash-period-payments/:batchId", requireAuth(async (c: any) => {
+  const batchId = Number(c.req.param("batchId"));
+  const row = await db.select().from(cashPeriodPayments).where(eq(cashPeriodPayments.paymentBatchId, batchId)).get();
+  if (!row) return c.json({ error: "Este cobro no es un pago de contado por período." }, 404);
+
+  const [policy, rebilling, children, batchRow, adjustmentRow] = await Promise.all([
+    db.select({ id: policies.id, policyNumber: policies.policyNumber, insuredId: policies.insuredId, insuredName: insureds.name, companyName: companies.name })
+      .from(policies)
+      .innerJoin(insureds, eq(policies.insuredId, insureds.id))
+      .innerJoin(companies, eq(policies.companyId, companies.id))
+      .where(eq(policies.id, row.policyId)).get(),
+    row.rebillingId != null
+      ? db.select({ id: rebillings.id, billingStart: rebillings.billingStart, billingEnd: rebillings.billingEnd })
+        .from(rebillings).where(eq(rebillings.id, row.rebillingId)).get()
+      : Promise.resolve(null),
+    db.select({
+      id: payments.id, installmentId: payments.installmentId, amount: payments.amount,
+      number: policyInstallments.number, dueDate: policyInstallments.dueDate,
+    }).from(payments)
+      .leftJoin(policyInstallments, eq(payments.installmentId, policyInstallments.id))
+      .where(eq(payments.batchId, batchId)).all(),
+    db.select({ receivedAmountCents: paymentBatches.receivedAmountCents }).from(paymentBatches).where(eq(paymentBatches.id, batchId)).get(),
+    db.select({ amountCents: paymentAmountAdjustments.amountCents }).from(paymentAmountAdjustments)
+      .where(eq(paymentAmountAdjustments.paymentBatchId, batchId)).get(),
+  ]);
+
+  return c.json({
+    ...row,
+    // Auditable por separado del contado contractual (row.cashAmountCents):
+    // dinero real recibido y el ajuste por redondeo registrado, si hubo
+    // alguno (0/null si cerró exacto) — ver POST
+    // /payment-batches/cash-period-payment para la regla completa.
+    actualReceivedCents: batchRow?.receivedAmountCents ?? row.cashAmountCents,
+    roundingAdjustmentCents: adjustmentRow?.amountCents ?? 0,
+    commissionBaseAmountCents: getCommissionBaseAmountCents(row),
+    policy,
+    rebilling,
+    cancelledInstallments: children.sort((a: any, b: any) => (a.number ?? 0) - (b.number ?? 0)),
+  }, 200);
+}));
+
 // ─── Identificación de un batch multi-asegurado ────────────────────────────
 // payment_batches.insured_id es un dato DERIVADO y con frecuencia NULL desde
 // la migración 0026 (mezcla real, o batch 100% manual) — GET listado/detalle
@@ -3220,9 +4094,19 @@ async function loadBatchCancelContext(dbOrTx: any, batchId: number) {
   const allocationRows = await dbOrTx.select({ id: remittanceAllocations.id })
     .from(remittanceAllocations).where(eq(remittanceAllocations.paymentBatchId, batchId)).all();
 
+  // Migración 0034: si este batch es un cobro de período de contado, se
+  // rinde como UN SOLO remittance_item (source='payment_batch',
+  // sourceId=batchId — ver POST /remittances), nunca por cuota — hay que
+  // incluir esa condición acá para que itemCount refleje correctamente si
+  // ya fue rendido (aunque renderedChildren/allocationCount ya lo bloquean
+  // igual de forma independiente, ver checkBatchCancellable).
+  const cashPeriodPayment = await dbOrTx.select().from(cashPeriodPayments)
+    .where(eq(cashPeriodPayments.paymentBatchId, batchId)).get();
+
   const itemConditions = [] as any[];
   if (childIds.length > 0) itemConditions.push(and(eq(remittanceItems.source, "payment"), inArray(remittanceItems.sourceId, childIds)));
   if (surchargeIds.length > 0) itemConditions.push(and(eq(remittanceItems.source, "cash_entry"), inArray(remittanceItems.sourceId, surchargeIds)));
+  if (cashPeriodPayment) itemConditions.push(and(eq(remittanceItems.source, "payment_batch"), eq(remittanceItems.sourceId, batchId)));
   const itemRows = itemConditions.length > 0
     ? await dbOrTx.select({ id: remittanceItems.id }).from(remittanceItems).where(or(...itemConditions)).all()
     : [];
@@ -3242,7 +4126,7 @@ async function loadBatchCancelContext(dbOrTx: any, batchId: number) {
   return {
     batch, childRows, childIds, surcharges, checkRows,
     allocationCount: allocationRows.length, itemCount: itemRows.length,
-    accountMovements, accountPlan,
+    accountMovements, accountPlan, cashPeriodPayment,
   };
 }
 
@@ -3367,6 +4251,16 @@ app.get("/payment-batches/:id/cancel-check", requireAuth(async (c: any) => {
         id: m.id, type: m.type, signedAmountCents: m.signedAmountCents, status: m.status, insuredId: m.insuredId,
       })),
     },
+    // Migración 0034 — presente solo si este batch es un cobro de período de
+    // contado (ver GET /cash-period-payments/:batchId para el detalle
+    // completo). La UI debe advertir explícitamente que anular revierte el
+    // período entero, no una cuota puntual.
+    cashPeriodPayment: ctx.cashPeriodPayment ? {
+      id: ctx.cashPeriodPayment.id, status: ctx.cashPeriodPayment.status,
+      nominalAmountCents: ctx.cashPeriodPayment.nominalAmountCents,
+      cashAmountCents: ctx.cashPeriodPayment.cashAmountCents,
+      discountAmountCents: ctx.cashPeriodPayment.discountAmountCents,
+    } : null,
   }, 200);
 }));
 
@@ -3440,6 +4334,17 @@ app.post("/payment-batches/:id/cancel", requireAuth(async (c: any) => {
         status: "anulado", cancelledAt: now, cancelledBy: user?.id ?? null, cancellationReason: reason, updatedAt: now,
       }).where(eq(paymentBatches.id, id)).returning();
 
+      // Migración 0034: un cobro de período de contado se anula JUNTO con su
+      // batch, nunca por separado — mismo criterio de trazabilidad que
+      // payment_batches.cancelledAt/cancelledBy (Migración 0027). El WHERE
+      // con status='confirmado' es defensivo (idempotencia), igual que el
+      // resto de este endpoint.
+      if (ctx.cashPeriodPayment && ctx.cashPeriodPayment.status === "confirmado") {
+        await tx.update(cashPeriodPayments).set({
+          status: "anulado", cancelledAt: now, cancelledBy: user?.id ?? null,
+        }).where(and(eq(cashPeriodPayments.id, ctx.cashPeriodPayment.id), eq(cashPeriodPayments.status, "confirmado")));
+      }
+
       for (const r of ctx.childRows as any[]) {
         await tx.update(payments).set({ status: "anulado" }).where(eq(payments.id, r.payment.id));
       }
@@ -3487,6 +4392,7 @@ app.post("/payment-batches/:id/cancel", requireAuth(async (c: any) => {
         voidedSurchargeEntryIds: ctx.surcharges.map((s: any) => s.id),
         voidedCheckIds: ctx.checkRows.map((chk: any) => chk.id),
         voidedAccountMovementIds: ctx.accountPlan.movementIdsToVoid,
+        voidedCashPeriodPaymentId: ctx.cashPeriodPayment?.status === "confirmado" ? ctx.cashPeriodPayment.id : null,
       };
     });
     return c.json({ ok: true, ...result }, 200);
@@ -3816,11 +4722,40 @@ app.get("/received-checks/:id", requireAuth(async (c: any) => {
 
 app.get("/payments/stats", requireAuth(async (c: any) => {
   const all = await db.select({ payment: payments }).from(payments).all();
-  const confirmed = all.filter((r) => r.payment.status === "confirmado");
-  // Total general: una sola vez por payment, desde el padre — no se duplica
-  // ni se recalcula desde splits (evita error de redondeo centavo a centavo
-  // acumulado sobre montos en pesos).
-  const total = confirmed.reduce((s, r) => s + r.payment.amount, 0);
+
+  // Migración 0034: los hijos de un cobro de período de contado guardan el
+  // NOMINAL completo de su propia cuota — sumarlos tal cual (payments.amount)
+  // cuenta la misma plata una vez por cuota (típicamente 4x) en vez de una
+  // sola vez por el importe contado real. Se excluyen acá y se cuentan aparte
+  // por cashAmountCents, igual que GET /payments (misma fuente de verdad,
+  // cash_period_payments, nunca un recálculo distinto).
+  const batchIdsPresent = [...new Set(all.map((r) => r.payment.batchId).filter((id): id is number => id != null))];
+  const cashPeriodRows = batchIdsPresent.length > 0
+    ? await db.select().from(cashPeriodPayments).where(inArray(cashPeriodPayments.paymentBatchId, batchIdsPresent)).all()
+    : [];
+  const cashPeriodByBatchId = new Map(cashPeriodRows.map((r) => [r.paymentBatchId, r]));
+
+  const standalone = all.filter((r) => r.payment.batchId == null || !cashPeriodByBatchId.has(r.payment.batchId));
+  const confirmed = standalone.filter((r) => r.payment.status === "confirmado");
+  const confirmedCashPeriodBatches = cashPeriodRows.filter((r) => r.status === "confirmado");
+
+  // paymentDate real de cada batch de contado — todos los hijos comparten el
+  // mismo (ver POST /payment-batches/cash-period-payment), se toma de
+  // cualquiera de ellos presente en `all`.
+  const paymentDateByBatchId = new Map<number, string>();
+  for (const r of all) {
+    if (r.payment.batchId != null && cashPeriodByBatchId.has(r.payment.batchId) && !paymentDateByBatchId.has(r.payment.batchId)) {
+      paymentDateByBatchId.set(r.payment.batchId, r.payment.paymentDate);
+    }
+  }
+
+  // Total general: una sola vez por payment standalone, desde el padre — no
+  // se duplica ni se recalcula desde splits (evita error de redondeo centavo
+  // a centavo acumulado sobre montos en pesos) — más una sola vez por batch
+  // de contado confirmado, por su importe contractual real.
+  const total = confirmed.reduce((s, r) => s + r.payment.amount, 0)
+    + confirmedCashPeriodBatches.reduce((s, r) => s + r.cashAmountCents / 100, 0);
+  const count = confirmed.length + confirmedCashPeriodBatches.length;
 
   // Etapa 3B: byMethod se arma sumando payment_splits.amount_cents, NUNCA
   // payments.amount — payments.paymentMethod puede valer "combinado" (no es
@@ -3842,7 +4777,25 @@ app.get("/payments/stats", requireAuth(async (c: any) => {
       if (splitCount > 1) combinadoCount++;
     }
   }
-  // Conteo puramente visual (cuántos payments confirmados son combinados) —
+
+  // Mismo criterio para los batches de contado confirmados: SIEMPRE por
+  // payment_batch_splits (medios reales), nunca por payments.paymentMethod
+  // de los hijos (vale "contado", que no es un instrumento real).
+  const confirmedCashPeriodBatchIds = confirmedCashPeriodBatches.map((r) => r.paymentBatchId);
+  if (confirmedCashPeriodBatchIds.length > 0) {
+    const batchSplitRows = await db.select({
+      batchId: paymentBatchSplits.batchId, method: paymentBatchSplits.method, amountCents: paymentBatchSplits.amountCents,
+    }).from(paymentBatchSplits).where(inArray(paymentBatchSplits.batchId, confirmedCashPeriodBatchIds)).all();
+    const splitsCountByBatch = new Map<number, number>();
+    for (const s of batchSplitRows) {
+      byMethod[s.method] = (byMethod[s.method] || 0) + s.amountCents / 100;
+      splitsCountByBatch.set(s.batchId, (splitsCountByBatch.get(s.batchId) ?? 0) + 1);
+    }
+    for (const splitCount of splitsCountByBatch.values()) {
+      if (splitCount > 1) combinadoCount++;
+    }
+  }
+  // Conteo puramente visual (cuántos cobros confirmados son combinados) —
   // nunca un importe, para no confundirlo con un método real al sumar todo
   // byMethod.* como si fueran plata.
   byMethod.combinadoCount = combinadoCount;
@@ -3852,7 +4805,14 @@ app.get("/payments/stats", requireAuth(async (c: any) => {
     const month = r.payment.paymentDate.substring(0, 7);
     byMonth[month] = (byMonth[month] || 0) + r.payment.amount;
   }
-  return c.json({ total, count: confirmed.length, byMethod, byMonth }, 200);
+  for (const r of confirmedCashPeriodBatches) {
+    const paymentDate = paymentDateByBatchId.get(r.paymentBatchId);
+    if (!paymentDate) continue;
+    const month = paymentDate.substring(0, 7);
+    byMonth[month] = (byMonth[month] || 0) + r.cashAmountCents / 100;
+  }
+
+  return c.json({ total, count, byMethod, byMonth }, 200);
 }));
 
 // ─── DELIVERIES ───────────────────────────────────────────────────────────────
@@ -7699,6 +8659,22 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   // batch, con sus splits y (si corresponde) received_checks reales.
   const batchIdsInCartera = new Set<number>();
   for (const p of allPayments) if (p.batchId != null) batchIdsInCartera.add(p.batchId);
+  // Dinero real recibido + grupo de medios de CADA batch referenciado por
+  // algún payment confirmado (rendido o no) — se llena reutilizando
+  // batchRows/splitsByBatchId de acá abajo (sin queries extra), para que
+  // cobradoPeriodo (Totales del período) nunca sume el importe NOMINAL de
+  // los hijos de un batch. Ver sumOwnBatchReceivedCentsForPeriod.
+  const batchInfoForPeriodById = new Map<number, { receivedCents: number; splitGroup: SplitGroup }>();
+  // Porción REAL capeada (min(real, aplicado)) de CADA batch que ya está
+  // rendida — usado por totalCobrado para que rendir (o anular la
+  // rendición de) un batch con diferencia (sobrante/faltante/redondeo, o el
+  // descuento de un pago de contado) nunca cambie el total histórico: es el
+  // mismo cappedTotalCents que ya usa applyBatchToCartera para cartera
+  // pendiente, nunca la suma nominal de payments.amount de los hijos
+  // rendidos (que para un pago de contado es el nominal completo de cada
+  // cuota, mayor al importe contado real). Ver applyBatchToCartera/
+  // BatchCarteraResult.
+  const batchRenderedRealCentsById = new Map<number, number>();
   if (batchIdsInCartera.size > 0) {
     const batchIdsArr = [...batchIdsInCartera];
     const batchRows = await db.select().from(paymentBatches).where(inArray(paymentBatches.id, batchIdsArr)).all();
@@ -7738,7 +8714,16 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
         // cuenta acá más que esto (el sobrante vive en creditoActivoEnCajaCents).
         appliedAmountCents: b.totalReceivedCents,
       };
-      applyBatchToCartera(batchForCartera, carteraBucket, directoCompaniaBucket, carteraInconsistencias);
+      const carteraResult = applyBatchToCartera(batchForCartera, carteraBucket, directoCompaniaBucket, carteraInconsistencias);
+      batchRenderedRealCentsById.set(b.id, carteraResult.renderedRealCents);
+
+      batchInfoForPeriodById.set(b.id, {
+        // receivedAmountCents es NULL solo en filas nunca tocadas por el
+        // backfill de la Migración 0030 (no debería ocurrir hoy) — cae a
+        // totalReceivedCents, idéntico por invariante histórico.
+        receivedCents: b.receivedAmountCents ?? b.totalReceivedCents,
+        splitGroup: classifySplitGroup(splitsByBatchId.get(b.id) ?? []),
+      });
     }
   }
 
@@ -7876,10 +8861,52 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     legacyUnknownMethods: rendidoAcc.legacyUnknownMethods,
   };
 
-  // Total cobrado histórico (en cartera + ya rendido + directo compañía)
+  // Total cobrado histórico (en cartera pendiente + ya rendido, propio y
+  // directo compañía). ANTES sumaba manualRendered/paymentsRendered en
+  // crudo (payments.amount, cash_entries.amount) para TODO pago
+  // rendered=1 — asume que el importe guardado en la fila siempre es dinero
+  // real, lo cual es cierto para un cash_entry, un pago standalone (un solo
+  // split, validado exacto) o un pago nacido rendido de POST
+  // /remittances/items/:id/collect (importe = el de la cuota real que
+  // cierra), pero FALSO para un hijo de payment_batches: guarda el importe
+  // NOMINAL de su cuota (trazabilidad hacia la compañía), nunca la porción
+  // real de dinero del batch — diverge en un pago de contado por período
+  // (descuento comercial, Migración 0034), un sobrante/faltante resuelto, o
+  // un ajuste por redondeo. Con la fórmula vieja, un pago de contado de
+  // $380.000 que cancela $400.000 nominales pasaba de mostrar $380.000
+  // (mientras está en cartera, capeado correctamente) a $400.000 en cuanto
+  // se rendía (paymentsRendered sumaba el nominal de sus 4 hijos) — mismo
+  // problema para cualquier lote normal con faltante rendido por cuota
+  // (rinde el nominal de la cuota, más que lo realmente capeado en cartera
+  // mientras estuvo pendiente).
+  //
+  // No se puede resolver sumando rendidoPorMetodo/rendidoDirectoCompania en
+  // vez de paymentsRendered: esas cifras vienen de remittance_allocations
+  // (instrumentos reales de UNA rendición), y un pago nacido de /collect
+  // NUNCA tiene sus propias allocations (cierra una deuda ya rendida antes,
+  // sin crear una rendición nueva) — sumarlas en vez de paymentsRendered
+  // dejaría afuera exactamente esa plata (ver test "recupero" de
+  // adeudadas). La solución correcta separa standalone (paymentsRendered
+  // sin batchId, dinero real por construcción, se suma tal cual) de hijos
+  // de batch (nunca su nominal — la porción REAL ya capeada de ESE batch,
+  // batchRenderedRealCentsById, contada UNA sola vez por batch aunque tenga
+  // varios hijos rendidos — mismo cappedTotalCents que ya usa
+  // applyBatchToCartera para cartera pendiente, así que rendir o anular la
+  // rendición de un batch nunca mueve el total, solo lo traslada de cartera
+  // a rendido).
+  const standaloneRenderedCents = (paymentsRendered as any[])
+    .filter((p) => p.batchId == null)
+    .reduce((s, p) => s + Math.round((p.amount || 0) * 100), 0);
+  const renderedBatchIds = new Set(
+    (paymentsRendered as any[]).filter((p) => p.batchId != null).map((p) => p.batchId as number)
+  );
+  let batchRenderedCentsForTotal = 0;
+  for (const batchId of renderedBatchIds) {
+    batchRenderedCentsForTotal += batchRenderedRealCentsById.get(batchId) ?? 0;
+  }
   const totalCobrado = cartera.total + directoCompania.total +
     manualRendered.reduce((s: number, e: any) => s + e.amount, 0) +
-    paymentsRendered.reduce((s: number, p: any) => s + p.amount, 0);
+    centsToPesos(standaloneRenderedCents + batchRenderedCentsForTotal);
 
   // Total adeudado = adeudados de rendiciones sin pagar + legacy
   const totalAdeudadoRendiciones = unpaidDebtItems.reduce((s: number, i: any) => s + i.amount, 0);
@@ -8080,16 +9107,37 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   if (periodFrom && periodTo) {
     const DIRECTO_COMPANIA_LOCAL = ["transferencia_compania", "link_pago"];
 
-    // Payments confirmados, grupo propio, dentro del período. Se clasifica
-    // por los splits reales (paymentGroupById), no por payments.paymentMethod
-    // — un combinado "combinado" con splits direct_company no matchea contra
-    // DIRECTO_COMPANIA_LOCAL por string y quedaría mal incluido acá si se
-    // comparara el paymentMethod crudo.
-    const periodPayments = allPayments.filter((p: any) =>
-      p.status === "confirmado" &&
+    // Payments standalone (batchId null) confirmados, grupo propio, dentro
+    // del período. Se clasifica por los splits reales (paymentGroupById), no
+    // por payments.paymentMethod — un combinado "combinado" con splits
+    // direct_company no matchea contra DIRECTO_COMPANIA_LOCAL por string y
+    // quedaría mal incluido acá si se comparara el paymentMethod crudo.
+    // payments.amount de un standalone SIEMPRE es dinero real (un solo split,
+    // validado exacto en POST /payments) — a diferencia de un hijo de batch,
+    // ver comentario de periodBatchesForCobrado más abajo.
+    const periodStandalonePayments = allPayments.filter((p: any) =>
+      p.status === "confirmado" && p.batchId == null &&
       paymentGroupById.get(p.id) !== "direct_company" &&
       p.paymentDate >= periodFrom! && p.paymentDate <= periodTo!
     );
+
+    // Hijos de batch dentro del período, agrupados por batch UNA sola vez —
+    // nunca sumando payments.amount de cada hijo (el importe NOMINAL de su
+    // cuota, no el dinero real recibido por el batch: difiere en un pago de
+    // contado por período, un sobrante/faltante resuelto, o un ajuste por
+    // redondeo). Ver sumOwnBatchReceivedCentsForPeriod/batchInfoForPeriodById.
+    const periodBatchIds = new Set<number>();
+    for (const p of allPayments as any[]) {
+      if (p.status === "confirmado" && p.batchId != null &&
+          p.paymentDate >= periodFrom! && p.paymentDate <= periodTo!) {
+        periodBatchIds.add(p.batchId);
+      }
+    }
+    const periodBatchesForCobrado: PeriodBatchForCobrado[] = [];
+    for (const batchId of periodBatchIds) {
+      const info = batchInfoForPeriodById.get(batchId);
+      if (info) periodBatchesForCobrado.push({ batchId, receivedCents: info.receivedCents, splitGroup: info.splitGroup });
+    }
 
     // Cash entries (rendidos + no rendidos), métodos propios, dentro del período
     const allManual = [...manualInCartera, ...manualRendered];
@@ -8099,7 +9147,8 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     );
 
     cobradoPeriodo =
-      periodPayments.reduce((s: number, p: any) => s + (p.amount || 0), 0) +
+      periodStandalonePayments.reduce((s: number, p: any) => s + (p.amount || 0), 0) +
+      centsToPesos(sumOwnBatchReceivedCentsForPeriod(periodBatchesForCobrado)) +
       periodEntries.reduce((s: number, e: any) => s + (e.amount || 0), 0);
 
     // Rendiciones confirmadas cuya fecha cae en el período — misma fuente
@@ -8351,12 +9400,50 @@ app.get("/remittances", requireAuth(async (c: any) => {
   return c.json(result);
 }));
 
-// GET /api/remittances/:id/items — detalle de items de una rendición
+// GET /api/remittances/:id/items — detalle de items de una rendición.
+// Migración 0034 (Regla 8/12 — comprobante): cada item source='payment_batch'
+// se enriquece con su cash_period_payments (nominal/contado/descuento) + las
+// cuotas canceladas, para que el comprobante muestre "Pago contado", período,
+// total nominal, descuento e importe efectivamente cobrado sin que el
+// frontend tenga que resolverlo aparte.
 app.get("/remittances/:id/items", requireAuth(async (c: any) => {
   const id = Number(c.req.param("id"));
   const items = await db.select().from(remittanceItems)
     .where(eq(remittanceItems.remittanceId, id)).all();
-  return c.json(items);
+
+  const cashPeriodBatchIds = items.filter((i: any) => i.source === "payment_batch").map((i: any) => i.sourceId as number);
+  if (cashPeriodBatchIds.length === 0) return c.json(items);
+
+  const cashPeriodRows = await db.select().from(cashPeriodPayments)
+    .where(inArray(cashPeriodPayments.paymentBatchId, cashPeriodBatchIds)).all();
+  const childRows = await db.select({
+    batchId: payments.batchId, id: payments.id, amount: payments.amount,
+    number: policyInstallments.number, dueDate: policyInstallments.dueDate,
+  }).from(payments)
+    .leftJoin(policyInstallments, eq(payments.installmentId, policyInstallments.id))
+    .where(inArray(payments.batchId, cashPeriodBatchIds)).all();
+  const childrenByBatchId = new Map<number, any[]>();
+  for (const r of childRows as any[]) {
+    const arr = childrenByBatchId.get(r.batchId) ?? [];
+    arr.push({ id: r.id, amount: r.amount, number: r.number, dueDate: r.dueDate });
+    childrenByBatchId.set(r.batchId, arr);
+  }
+  const cashPeriodByBatchId = new Map(cashPeriodRows.map((r: any) => [r.paymentBatchId, r]));
+
+  const result = items.map((item: any) => {
+    if (item.source !== "payment_batch") return item;
+    const cpp = cashPeriodByBatchId.get(item.sourceId);
+    if (!cpp) return item;
+    return {
+      ...item,
+      cashPeriodPayment: {
+        ...cpp,
+        commissionBaseAmountCents: getCommissionBaseAmountCents(cpp),
+        cancelledInstallments: (childrenByBatchId.get(item.sourceId) ?? []).sort((a: any, b: any) => (a.number ?? 0) - (b.number ?? 0)),
+      },
+    };
+  });
+  return c.json(result);
 }));
 
 // POST /api/remittances — crear nueva rendición
@@ -8460,6 +9547,65 @@ app.post("/remittances", requireAuth(async (c: any) => {
       const paymentSourceItems = items.filter((i: any) => i.source === "payment");
       const cashEntrySourceItems = items.filter((i: any) => i.source === "cash_entry");
       const installmentSourceItems = items.filter((i: any) => i.source === "installment");
+      // Migración 0034: un cobro de período de contado se rinde como UN SOLO
+      // instrumento por TODO el batch (sourceId = payment_batches.id) —
+      // nunca por cuota individual, a diferencia de source="payment" (Regla
+      // 8: "representar el período como un único instrumento real aunque
+      // cancele varias cuotas"). Reactiva resolveBatchInstruments (Migración
+      // 0024), en desuso para el resto del sistema desde la Migración 0029
+      // (rendición por cuota) — acá es exactamente lo que corresponde,
+      // porque un cobro de contado nunca se rinde parcialmente por cuota.
+      const paymentBatchSourceItems = items.filter((i: any) => i.source === "payment_batch");
+      // Nunca el mismo payment_batches dos veces en el mismo request — cada
+      // ocurrencia extra generaría un segundo remittance_item con las MISMAS
+      // allocations reales (mismos payment_batch_splits/received_checks),
+      // duplicando el instrumento dentro de esta misma rendición.
+      {
+        const seenBatchIds = new Set<number>();
+        for (const item of paymentBatchSourceItems) {
+          if (seenBatchIds.has(item.sourceId)) {
+            throw new RemittanceAllocationValidationError(`El cobro ${item.sourceId} está repetido en la misma rendición.`);
+          }
+          seenBatchIds.add(item.sourceId);
+        }
+      }
+      const cashPeriodBatchIds = paymentBatchSourceItems.map((i: any) => i.sourceId);
+      const cashPeriodBatchRows = cashPeriodBatchIds.length
+        ? await tx.select({ batch: paymentBatches, cashPeriodPayment: cashPeriodPayments })
+          .from(paymentBatches)
+          .innerJoin(cashPeriodPayments, eq(cashPeriodPayments.paymentBatchId, paymentBatches.id))
+          .where(inArray(paymentBatches.id, cashPeriodBatchIds)).all()
+        : [];
+      const cashPeriodBatchRowsById = new Map(cashPeriodBatchRows.map((r: any) => [r.batch.id, r]));
+      for (const item of paymentBatchSourceItems) {
+        const r = cashPeriodBatchRowsById.get(item.sourceId);
+        // El JOIN con cash_period_payments arriba ya excluye por construcción
+        // cualquier payment_batches "normal" (sin fila propia en esa tabla) —
+        // r es undefined tanto si el batch no existe como si existe pero
+        // nunca fue un pago de contado por período (nunca se puede rendir un
+        // lote común como si fuera un único instrumento de período).
+        if (!r) throw new RemittanceAllocationValidationError(`El cobro ${item.sourceId} no existe o no es un pago de contado por período.`);
+        if (r.batch.status !== "confirmado") throw new RemittanceAllocationValidationError(`El cobro ${item.sourceId} no está confirmado.`);
+        if (r.cashPeriodPayment.status !== "confirmado") throw new RemittanceAllocationValidationError(`El cobro ${item.sourceId} está anulado.`);
+        if (r.cashPeriodPayment.rendered === 1) throw new RemittanceAllocationValidationError(`El cobro ${item.sourceId} ya fue rendido.`);
+        // El importe declarado del ítem nunca puede ser el nominal de las
+        // cuotas (r.cashPeriodPayment.nominalAmountCents) ni ningún otro
+        // valor — debe ser exactamente el importe contado real cobrado
+        // (r.batch.totalReceivedCents, que para un pago de contado por
+        // período siempre es igual a cashAmountCents, ver POST
+        // /payment-batches/cash-period-payment). remittance_items.amount se
+        // guarda tal como llega acá — sin este chequeo, un caller podría
+        // dejar asentado el importe nominal aunque las allocations reales
+        // (validadas más abajo contra instrumentos reales) sigan siendo
+        // exactas por el importe contado.
+        const declaredCents = Math.round((item.amount || 0) * 100);
+        if (declaredCents !== r.batch.totalReceivedCents) {
+          throw new RemittanceAllocationValidationError(
+            `El importe declarado para el cobro ${item.sourceId} ($${(declaredCents / 100).toFixed(2)}) debe ser exactamente ` +
+            `el importe contado real cobrado ($${(r.batch.totalReceivedCents / 100).toFixed(2)}), nunca el nominal de las cuotas.`
+          );
+        }
+      }
 
       const paymentIds = paymentSourceItems.map((i: any) => i.sourceId);
       const paymentRows = paymentIds.length
@@ -8471,6 +9617,37 @@ app.post("/remittances", requireAuth(async (c: any) => {
         if (!p) throw new RemittanceAllocationValidationError(`El pago ${item.sourceId} no existe.`);
         if (p.rendered) throw new RemittanceAllocationValidationError(`El pago ${item.sourceId} ya fue rendido.`);
         if (p.status !== "confirmado") throw new RemittanceAllocationValidationError(`El pago ${item.sourceId} no está confirmado (status=${p.status}).`);
+      }
+
+      // Migración 0034 — Regla 8: ningún hijo de un batch de pago de contado
+      // por período puede rendirse individualmente como source="payment"
+      // (nominal por cuota), ni siquiera si el período todavía no fue
+      // rendido como instrumento único — el período SOLO se rinde entero,
+      // vía source="payment_batch" (chequeado arriba). Sin este guard, un
+      // caller podría rendir cada cuota nominal por separado (sumando el
+      // NOMINAL completo, ignorando el descuento) y/o duplicar el mismo
+      // dinero: una vez como source="payment_batch" (importe contado real) y
+      // otra vez como source="payment" por cada hijo (importe nominal).
+      const paymentBatchIdsAmongPayments = [...new Set(
+        (paymentRows as any[]).filter((p) => p.batchId != null).map((p) => p.batchId as number)
+      )];
+      if (paymentBatchIdsAmongPayments.length > 0) {
+        const cashPeriodOwnersOfChildren = await tx.select({ paymentBatchId: cashPeriodPayments.paymentBatchId })
+          .from(cashPeriodPayments)
+          .where(inArray(cashPeriodPayments.paymentBatchId, paymentBatchIdsAmongPayments))
+          .all();
+        const cashPeriodBatchIdSet = new Set(cashPeriodOwnersOfChildren.map((r: any) => r.paymentBatchId as number));
+        if (cashPeriodBatchIdSet.size > 0) {
+          for (const item of paymentSourceItems) {
+            const p = paymentsById.get(item.sourceId);
+            if (p?.batchId != null && cashPeriodBatchIdSet.has(p.batchId)) {
+              throw new RemittanceAllocationValidationError(
+                `El pago ${item.sourceId} pertenece a un cobro de período de contado (cobro ${p.batchId}) — ese período se ` +
+                `rinde como un único instrumento (source="payment_batch"), nunca por cuota individual.`
+              );
+            }
+          }
+        }
       }
 
       const cashEntryIds2 = cashEntrySourceItems.map((i: any) => i.sourceId);
@@ -8639,6 +9816,47 @@ app.post("/remittances", requireAuth(async (c: any) => {
           });
           allInstruments.push(instrument);
           collectedSources.push({ kind: "cash_entry", amountCents: Math.round(e.amount * 100) });
+        } else if (item.source === "payment_batch") {
+          // Migración 0034 — Regla 8: el instrumento de cobranza REAL del
+          // batch entero (payment_batch_splits/received_checks, el importe
+          // contado tal como se cobró), nunca por cuota — remittanceItemId
+          // queda null (mismo criterio que un batch_split común, ver
+          // resolveBatchInstruments/buildRemittanceAllocations).
+          const r = cashPeriodBatchRowsById.get(item.sourceId)!;
+          const splitsRows = await tx.select().from(paymentBatchSplits).where(eq(paymentBatchSplits.batchId, item.sourceId)).all();
+          const splitIds = (splitsRows as any[]).map((s) => s.id);
+          const checksBySplitId = new Map<number, any[]>();
+          if (splitIds.length > 0) {
+            const checkRows = await tx.select().from(receivedChecks).where(inArray(receivedChecks.batchSplitId, splitIds)).all();
+            for (const chk of checkRows as any[]) {
+              const arr = checksBySplitId.get(chk.batchSplitId!) ?? [];
+              arr.push(chk);
+              checksBySplitId.set(chk.batchSplitId!, arr);
+            }
+          }
+          const instruments = resolveBatchInstruments({
+            paymentBatchId: item.sourceId,
+            splits: (splitsRows as any[]).map((s) => ({
+              id: s.id, method: s.method, amountCents: s.amountCents,
+              checks: (checksBySplitId.get(s.id) ?? []).map((chk: any) => ({ id: chk.id, amountCents: chk.amountCents })),
+            })),
+          });
+          validateAllocationOwnership(instruments, { paymentBatchId: item.sourceId });
+          allInstruments.push(...instruments);
+          // Ronda 2 (tolerancia de redondeo): las allocations siempre
+          // reflejan el INSTRUMENTO REAL (resolveBatchInstruments arma sus
+          // amountCents desde payment_batch_splits/received_checks reales,
+          // nunca el contado contractual) — por eso lo "esperado" acá debe
+          // ser receivedAmountCents (dinero real, puede diferir del contado
+          // hasta $5 con ajuste de redondeo aceptado), nunca
+          // totalReceivedCents (aplicado/contractual, siempre = cashAmountCents
+          // — ver POST /payment-batches/cash-period-payment). El importe
+          // CONTRACTUAL que se comunica a la compañía sigue siendo
+          // cash_period_payments.cashAmountCents, sin cambios — nunca se lee
+          // de acá. Fallback a totalReceivedCents solo por si alguna fila
+          // vieja quedó sin receivedAmountCents (nunca debería pasar, ver
+          // migración 0030).
+          collectedSources.push({ kind: "batch", amountCents: r.batch.receivedAmountCents ?? r.batch.totalReceivedCents });
         }
         // installment / manual_debt: sin instrumento real, cero allocations.
       }
@@ -8688,6 +9906,17 @@ app.post("/remittances", requireAuth(async (c: any) => {
           await tx.update(cashEntries).set({ rendered: 1, renderedAt: new Date() }).where(eq(cashEntries.id, item.sourceId));
         } else if (item.source === "installment") {
           await tx.update(policyInstallments).set({ rendered: 1, renderedAt: new Date() }).where(eq(policyInstallments.id, item.sourceId));
+        } else if (item.source === "payment_batch") {
+          // Migración 0034: el período se rinde entero — marca rendered=1
+          // tanto en cash_period_payments (estado propio del período, ver
+          // migración) como en TODOS sus payments hijos (mismo campo que
+          // applyBatchToCartera lee para excluir de "cartera pendiente" en
+          // Caja — sin esto, Caja seguiría mostrando el período como
+          // pendiente de rendir después de rendido).
+          const now = new Date();
+          await tx.update(cashPeriodPayments).set({ rendered: 1, renderedAt: now })
+            .where(eq(cashPeriodPayments.paymentBatchId, item.sourceId));
+          await tx.update(payments).set({ rendered: 1, renderedAt: now }).where(eq(payments.batchId, item.sourceId));
         }
       }
 
@@ -8728,6 +9957,15 @@ app.delete("/remittances/:id", requireAdmin(async (c: any) => {
           await tx.update(cashEntries).set({ rendered: 0, renderedAt: null }).where(eq(cashEntries.id, item.sourceId));
         } else if (item.source === "installment") {
           await tx.update(policyInstallments).set({ rendered: 0, renderedAt: null }).where(eq(policyInstallments.id, item.sourceId));
+        } else if (item.source === "payment_batch") {
+          // Migración 0034: revierte exactamente lo que hizo el paso 8 de
+          // POST /remittances — cash_period_payments y TODOS sus hijos
+          // vuelven a rendered=0 (Caja vuelve a mostrar el período como
+          // pendiente de rendir). payment_batch_splits/received_checks no se
+          // tocan (mismo criterio que un batch_split común).
+          await tx.update(cashPeriodPayments).set({ rendered: 0, renderedAt: null })
+            .where(eq(cashPeriodPayments.paymentBatchId, item.sourceId));
+          await tx.update(payments).set({ rendered: 0, renderedAt: null }).where(eq(payments.batchId, item.sourceId));
         }
       }
 

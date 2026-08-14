@@ -17,6 +17,10 @@ export interface RebillingModalFormState {
   sumInsured: string;
   deductible: string;
   notes: string;
+  // Importe contado (opcional) de ESTA refacturación puntual — en pesos acá
+  // (como premium/monthlyFee), se convierte a centavos recién en el
+  // payload. Ver src/lib/payments/cash-period-payments.ts.
+  cashPaymentAmount: string;
 }
 
 export function validateRebillingForm(form: RebillingModalFormState, isEditMode: boolean): string | null {
@@ -40,6 +44,11 @@ export function validateRebillingForm(form: RebillingModalFormState, isEditMode:
   if (form.deductible !== "" && (!Number.isFinite(Number(form.deductible)) || Number(form.deductible) < 0)) {
     return "La franquicia debe ser un número mayor o igual a cero";
   }
+  // Regla 3 (>0) — el límite superior contra el nominal lo valida siempre
+  // el backend (acá no siempre se conoce el total real del plan).
+  if (form.cashPaymentAmount !== "" && (!Number.isFinite(Number(form.cashPaymentAmount)) || Number(form.cashPaymentAmount) <= 0)) {
+    return "El importe contado debe ser un número mayor a cero, o vacío";
+  }
   return null;
 }
 
@@ -51,6 +60,7 @@ export interface RebillingEditPayload {
   sumInsured: number | null;
   deductible: number | null;
   notes: string | null;
+  cashPaymentAmountCents: number | null;
 }
 
 /**
@@ -69,6 +79,7 @@ export function buildRebillingEditPayload(form: RebillingModalFormState): Rebill
     sumInsured: form.sumInsured !== "" ? Number(form.sumInsured) : null,
     deductible: form.deductible !== "" ? Number(form.deductible) : null,
     notes: form.notes || null,
+    cashPaymentAmountCents: form.cashPaymentAmount !== "" ? Math.round(Number(form.cashPaymentAmount) * 100) : null,
   };
 }
 

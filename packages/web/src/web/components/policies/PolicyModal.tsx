@@ -6,7 +6,7 @@ import { addCalendarMonths } from "../../../lib/installments/plan";
 import { toArgentinaCalendarDay } from "../../../lib/dates/argentina-date";
 import { parseExpectedInstallmentsInput } from "@/lib/installments-rebuild";
 import {
-  planMonthlyInstallments, nextFirstDueDateOnStartDateChange, type InstRow,
+  planMonthlyInstallments, nextFirstDueDateOnStartDateChange, computeCashPaymentPreview, type InstRow,
 } from "@/lib/policy-installments-form";
 import { formatDate } from "@/lib/utils";
 
@@ -256,6 +256,11 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
     billingCycle: "",
     installments: "",
     paymentMethod: "",
+    // Importe contado (opcional) del período de emisión/renovación — nunca
+    // un medio de pago, ver src/lib/payments/cash-period-payments.ts. En
+    // pesos acá (como premium/monthlyFee); se convierte a centavos recién
+    // al armar el payload.
+    cashPaymentAmount: "",
     // Vigencia
     vigencyPeriod: "anual",
     startDate: toArgentinaCalendarDay(),
@@ -327,6 +332,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
         billingCycle: p.billingCycle || "",
         installments: String(p.installments || ""),
         paymentMethod: p.paymentMethod || "",
+        cashPaymentAmount: p.cashPaymentAmountCents != null ? String(p.cashPaymentAmountCents / 100) : "",
         vigencyPeriod: p.vigencyPeriod || "anual",
         startDate: p.startDate || "",
         endDate: p.endDate || "",
@@ -500,6 +506,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
         sumInsured: form.sumInsured ? Number(form.sumInsured) : null,
         monthlyFee: form.monthlyFee ? Number(form.monthlyFee) : null,
         deductible: form.deductible ? Number(form.deductible) : null,
+        cashPaymentAmountCents: form.cashPaymentAmount ? Math.round(Number(form.cashPaymentAmount) * 100) : null,
         billingCycle: form.billingCycle || null,
         vigencyPeriod: form.vigencyPeriod || null,
         nextRebillingDate: form.nextRebillingDate || null,
@@ -539,10 +546,18 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
         }
         toast.success("Póliza actualizada");
       } else {
-        const policy = await api.post("/api/policies", payload);
+        // Alta: POST /policies nunca persiste cashPaymentAmountCents (no
+        // puede validarlo contra el nominal sin cuotas todavía) — se
+        // conserva acá y se manda recién en installments/generate, que lo
+        // valida y persiste atómico junto con el plan real (ver backend).
+        const { cashPaymentAmountCents, ...createPayload } = payload;
+        const policy = await api.post("/api/policies", createPayload);
         // Save installments if any
         if (finalInstallmentRows.length > 0 && policy.id) {
-          await api.post(`/api/policies/${policy.id}/installments/generate`, { installments: finalInstallmentRows });
+          await api.post(`/api/policies/${policy.id}/installments/generate`, {
+            installments: finalInstallmentRows,
+            cashPaymentAmountCents,
+          });
         }
         // Save insured persons for accidentes/ART
         if ((form.type === "accidentes" || form.type === "art" || form.type === "vida") && policy.id) {
@@ -794,6 +809,39 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
               <label className={labelClass}>Prima / Monto Total (ARS)</label>
               <input className={inputClass} type="number" value={form.premium} onChange={e => set("premium", e.target.value)} placeholder="54000" />
             </div>
+          </div>
+
+          {/* Importe contado (opcional) — modalidad comercial para cancelar
+              TODO el período de una vez por menos que la suma de cuotas;
+              nunca un medio de pago (ver cobranzas.tsx, "Pagar período de
+              contado"). Ahorro acá es solo informativo — la validación real
+              (>0, <= nominal) la hace el backend siempre. */}
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className={labelClass}>Importe contado (opcional)</label>
+              <input
+                className={inputClass} type="number" value={form.cashPaymentAmount}
+                onChange={e => set("cashPaymentAmount", e.target.value)}
+                placeholder="Ej: 50000 — si la compañía ofrece contado"
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Importe para cancelar TODAS las cuotas del período de una sola vez. No es un medio de pago — se cobra igual con efectivo, transferencia, cheque o combinado.
+              </p>
+            </div>
+            {!isEdit && (() => {
+              const preview = computeCashPaymentPreview(installmentRows, form.cashPaymentAmount);
+              if (preview.nominalAmountCents <= 0) return null;
+              return (
+                <div className="flex flex-col justify-center text-xs text-gray-400 gap-1">
+                  <span>Total financiado en cuotas: <span className="text-white">${(preview.nominalAmountCents / 100).toLocaleString("es-AR")}</span></span>
+                  {preview.discountAmountCents != null && (
+                    preview.discountAmountCents >= 0
+                      ? <span className="text-emerald-400">Ahorro contado: ${(preview.discountAmountCents / 100).toLocaleString("es-AR")}</span>
+                      : <span className="text-red-400">El importe contado no puede ser mayor al total financiado.</span>
+                  )}
+                </div>
+              );
+            })()}
           </div>
 
           <div className="grid grid-cols-2 gap-4">

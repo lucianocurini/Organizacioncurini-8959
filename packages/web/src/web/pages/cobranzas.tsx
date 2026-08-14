@@ -6,7 +6,7 @@ import { toast } from "sonner";
 import {
   DollarSign, Plus, Search, TrendingUp, CreditCard,
   Banknote, ArrowRightLeft, Trash2, Edit2, X, ChevronDown, Link, CheckSquare,
-  ClipboardList, AlertCircle, ChevronRight, ReceiptText, Building2, Check, ShoppingCart, Save, Layers, Ban
+  ClipboardList, AlertCircle, ChevronRight, ReceiptText, Building2, Check, ShoppingCart, Save, Layers, Ban, Info,
 } from "lucide-react";
 import { PendingInstallmentsBatchTab } from "@/components/payments/PendingInstallmentsBatchTab";
 import { cn, formatCurrency as _fc, formatCurrencyCents } from "@/lib/utils";
@@ -27,6 +27,12 @@ import {
   computeDefaultRendicionMethod, attachRendicionMethod, CONTABLE_METHODS,
   RENDICION_METHOD_LABELS, getRendicionItemMethodLabel,
 } from "@/lib/rendicion-pending";
+import {
+  type CashPeriodGroup, type CashPeriodSearchRow,
+  resolveCashPeriodModalityAvailability, resolveSelectedCashPeriodCandidate,
+  buildCashPeriodGroupFromCandidate, cashPeriodCandidateKey, cashPeriodCandidateLabel,
+} from "@/lib/cash-period-payment-form";
+import { CashPeriodPaymentModal } from "@/components/policies/CashPeriodPaymentModal";
 
 function formatCurrency(v: number, short = false) {
   if (short) {
@@ -86,7 +92,12 @@ const PP_SURCHARGE = 800;
 
 interface PaymentRow {
   payment: {
-    id: number;
+    // null en filas sintéticas de "Pago de contado" (rediseño): un cobro de
+    // período colapsa sus 4 hijos reales en UNA fila que no es ningún
+    // payments.id real — ver GET /payments en el backend. batchId siempre
+    // presente en ese caso, para la acción "Anular lote".
+    id: number | null;
+    batchId?: number | null;
     policyId: number | null;
     installmentId: number | null;
     manualPayer: string | null;
@@ -103,10 +114,27 @@ interface PaymentRow {
     hasChecks: boolean;
     dueDate: string | null;
     splits: { method: string; amountCents: number; notes: string | null }[];
+    // Presentes solo en la fila colapsada de un cobro de período de contado.
+    isCashPeriodPayment?: boolean;
+    concept?: string;
+    cashPeriodPayment?: {
+      rebillingId: number | null;
+      nominalAmountCents: number;
+      cashAmountCents: number;
+      discountAmountCents: number;
+    } | null;
   };
   policy: { id: number; policyNumber: string } | null;
   insured: { id: number; name: string } | null;
   company: { id: number; name: string } | null;
+}
+
+// Clave estable para key de React / Set<number> de expandedIds — un pago
+// standalone usa su payments.id real; una fila colapsada de contado (id:
+// null) usa -batchId, un espacio de números que nunca colisiona con un
+// payments.id real (siempre positivo).
+function paymentRowKey(r: PaymentRow): number {
+  return r.payment.id ?? -(r.payment.batchId ?? 0);
 }
 
 interface PolicyOption {
@@ -122,7 +150,7 @@ interface Stats {
   byMonth: Record<string, number>;
 }
 
-function PaymentModal({ open, onClose, onSaved, editing }: {
+export function PaymentModal({ open, onClose, onSaved, editing }: {
   open: boolean; onClose: () => void; onSaved: () => void; editing: PaymentRow | null;
 }) {
   const [policies, setPolicies] = useState<PolicyOption[]>([]);
@@ -132,6 +160,20 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
   const [manualMode, setManualMode] = useState(false);
   const [installments, setInstallments] = useState<any[]>([]);
   const [applyProntoPagoSurcharge, setApplyProntoPagoSurcharge] = useState(true);
+
+  // Modalidad de pago (contado vs. cuota) — ÚNICO lugar de Cobranzas donde se
+  // elige (ver comentario de archivo de cash-period-payment-form.ts). Solo
+  // aplica a pagos NUEVOS vinculados a póliza (nunca en edición ni en
+  // imputación manual) — ver resolveCashPeriodModalityAvailability.
+  const [cashPeriodCandidates, setCashPeriodCandidates] = useState<CashPeriodSearchRow[]>([]);
+  const [paymentModality, setPaymentModality] = useState<"cuota" | "contado">("cuota");
+  const [selectedCashPeriodKey, setSelectedCashPeriodKey] = useState("");
+  // Al confirmar un período, se delega TODO el flujo (medios, confirmación,
+  // comprobante) al mismo componente que ya usa el resto del sistema — nunca
+  // se reimplementa un segundo editor de medios para contado acá (Regla:
+  // "única lógica de negocio y un único resultado").
+  const [cashPeriodTarget, setCashPeriodTarget] = useState<CashPeriodGroup | null>(null);
+
   const [form, setForm] = useState({
     policyId: "",
     installmentId: "",
@@ -150,6 +192,12 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
   useEffect(() => {
     if (!open) return;
     api.get("/api/policies").then(setPolicies).catch(() => {});
+    // Reset de modalidad: cada apertura del modal arranca en "cuota" — nunca
+    // se arrastra una elección de contado de una sesión anterior del modal.
+    setPaymentModality("cuota");
+    setSelectedCashPeriodKey("");
+    setCashPeriodTarget(null);
+    setCashPeriodCandidates([]);
     if (editing) {
       const noPolicy = editing.payment.policyId == null;
       setManualMode(noPolicy);
@@ -206,6 +254,21 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
     }
   }, [form.policyId]);
 
+  // Modalidad de pago: se consulta al elegir póliza — solo para pagos NUEVOS
+  // vinculados a póliza (editar un pago existente, o imputación manual,
+  // nunca ofrecen contado). Cambiar de póliza siempre vuelve a "cuota": la
+  // elección de un período no puede sobrevivir a un cambio de póliza.
+  useEffect(() => {
+    setPaymentModality("cuota");
+    setSelectedCashPeriodKey("");
+    if (form.policyId && !editing) {
+      api.get(`/api/policies/cash-period-search?policyId=${form.policyId}`)
+        .then(setCashPeriodCandidates).catch(() => setCashPeriodCandidates([]));
+    } else {
+      setCashPeriodCandidates([]);
+    }
+  }, [form.policyId, editing]);
+
   const filteredPolicies = policies.filter(p =>
     p.policy.policyNumber.toLowerCase().includes(policySearch.toLowerCase()) ||
     (p.insured?.name || "").toLowerCase().includes(policySearch.toLowerCase())
@@ -213,6 +276,13 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
   const selectedPolicy = policies.find(p => String(p.policy.id) === form.policyId);
   const pendingInstallments = installments.filter((i: any) => i.status !== "pagada" && i.status !== "no_exigible" && !i.rendered);
   const selectedInstallment = installments.find((i: any) => String(i.id) === form.installmentId);
+
+  const cashPeriodAvailability = resolveCashPeriodModalityAvailability(cashPeriodCandidates);
+  const showCashPeriodModality = !manualMode && !editing && cashPeriodAvailability.kind === "available";
+  const selectedCashPeriodCandidate = cashPeriodAvailability.kind === "available"
+    ? resolveSelectedCashPeriodCandidate(cashPeriodAvailability.eligibleCandidates, selectedCashPeriodKey)
+    : undefined;
+  const showCuotaFields = manualMode || paymentModality === "cuota";
 
   // Etapa 3B-2: validación completa de la sección de splits — se usa tanto
   // para el disabled del botón Guardar como (repetida) adentro de handleSave,
@@ -314,6 +384,23 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
 
   if (!open) return null;
 
+  // Modalidad "contado", período confirmado: se delega TODO el resto del
+  // flujo (medios de pago, confirmación con advertencia de vencido,
+  // comprobante) al mismo componente ya usado/probado — PaymentModal deja de
+  // renderizar su propio cuerpo mientras esto está activo. "Volver" cierra
+  // solo el sub-flujo (onClose de CashPeriodPaymentModal) y devuelve al
+  // usuario a la elección de modalidad, no a "Imputar pago" desde cero.
+  if (cashPeriodTarget) {
+    return (
+      <CashPeriodPaymentModal
+        policyNumber={selectedPolicy?.policy.policyNumber ?? ""}
+        group={cashPeriodTarget}
+        onClose={() => setCashPeriodTarget(null)}
+        onSaved={() => { onSaved(); onClose(); }}
+      />
+    );
+  }
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/70" onClick={onClose} />
@@ -376,8 +463,103 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
                   )}
                 </div>
               </div>
+
+              {/* Contado configurado pero no disponible (actividad, o sin
+                  cuotas) — se informa el motivo, nunca se ofrece una
+                  alternativa falsa (Regla del usuario). */}
+              {form.policyId && cashPeriodAvailability.kind === "unavailable" && (
+                <p className="text-xs text-gray-500 flex items-start gap-1.5">
+                  <Info className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                  <span>
+                    Esta póliza tiene un importe de contado configurado
+                    ({formatCurrency(cashPeriodAvailability.cashPaymentAmountCents / 100)}) pero no está disponible:{" "}
+                    {cashPeriodAvailability.firstReason}
+                  </span>
+                </p>
+              )}
+
+              {/* Modalidad de pago — ÚNICO lugar de Cobranzas donde se elige
+                  contado vs. cuota (ver cash-period-payment-form.ts). Dos
+                  opciones EXCLUYENTES: elegir contado oculta por completo el
+                  resto del formulario de cuota (showCuotaFields). */}
+              {showCashPeriodModality && cashPeriodAvailability.kind === "available" && (
+                <div className="space-y-2">
+                  <label className="block text-xs text-gray-400 mb-1">Modalidad de pago</label>
+                  <div className="flex rounded-lg border border-[#2d3748] overflow-hidden text-sm">
+                    <button type="button" onClick={() => setPaymentModality("cuota")}
+                      className={cn("flex-1 py-2 text-center transition-colors",
+                        paymentModality === "cuota" ? "bg-blue-600 text-white" : "text-gray-400 hover:text-white hover:bg-[#1a2540]")}>
+                      Pago de cuota
+                    </button>
+                    <button type="button" onClick={() => setPaymentModality("contado")}
+                      className={cn("flex-1 py-2 text-center transition-colors",
+                        paymentModality === "contado" ? "bg-emerald-600 text-white" : "text-gray-400 hover:text-white hover:bg-[#1a2540]")}>
+                      Pago de contado del período
+                      {cashPeriodAvailability.eligibleCandidates.length === 1 &&
+                        ` — ${formatCurrency((cashPeriodAvailability.eligibleCandidates[0]!.cashPaymentAmountCents ?? 0) / 100)}`}
+                    </button>
+                  </div>
+
+                  {paymentModality === "contado" && (
+                    <div className="space-y-3 p-3 bg-emerald-500/5 border border-emerald-500/20 rounded-lg">
+                      {cashPeriodAvailability.eligibleCandidates.length > 1 && (
+                        <div>
+                          <label className="block text-xs text-gray-400 mb-1">Período / refacturación</label>
+                          <select value={selectedCashPeriodKey} onChange={e => setSelectedCashPeriodKey(e.target.value)}
+                            className="w-full px-3 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-blue-500">
+                            <option value="">Seleccionar período...</option>
+                            {cashPeriodAvailability.eligibleCandidates.map(c => (
+                              <option key={cashPeriodCandidateKey(c)} value={cashPeriodCandidateKey(c)}>
+                                {cashPeriodCandidateLabel(c)} — {formatCurrency((c.cashPaymentAmountCents ?? 0) / 100)}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+
+                      {!selectedCashPeriodCandidate ? (
+                        <p className="text-xs text-gray-500">Elegí un período para continuar.</p>
+                      ) : (
+                        <>
+                          <div className="text-xs space-y-1">
+                            <div className="flex justify-between text-gray-400">
+                              <span>Período</span>
+                              <span className="text-white">{cashPeriodCandidateLabel(selectedCashPeriodCandidate)}</span>
+                            </div>
+                            <div className="flex justify-between text-gray-400">
+                              <span>Nominal</span>
+                              <span className="text-white">{formatCurrency(selectedCashPeriodCandidate.nominalAmountCents / 100)}</span>
+                            </div>
+                            <div className="flex justify-between text-gray-400">
+                              <span>Descuento</span>
+                              <span className="text-emerald-400">-{formatCurrency((selectedCashPeriodCandidate.discountAmountCents ?? 0) / 100)}</span>
+                            </div>
+                            <div className="flex justify-between text-gray-300 font-medium border-t border-emerald-500/20 pt-1">
+                              <span>Importe de contado</span>
+                              <span className="text-white">{formatCurrency((selectedCashPeriodCandidate.cashPaymentAmountCents ?? 0) / 100)}</span>
+                            </div>
+                            <div className="flex justify-between text-gray-400">
+                              <span>Fecha límite</span>
+                              <span className={selectedCashPeriodCandidate.deadlineStatus === "vigente" ? "text-emerald-400" : "text-amber-400"}>
+                                {new Date(selectedCashPeriodCandidate.deadline + "T12:00:00").toLocaleDateString("es-AR")}
+                                {" "}({selectedCashPeriodCandidate.deadlineStatus === "vigente" ? "Vigente" : "Vencido"})
+                              </span>
+                            </div>
+                          </div>
+                          <button type="button"
+                            onClick={() => setCashPeriodTarget(buildCashPeriodGroupFromCandidate(selectedCashPeriodCandidate))}
+                            className="w-full py-2 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition-all">
+                            Continuar con pago de contado
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Installment selector */}
-              {pendingInstallments.length > 0 && (
+              {showCuotaFields && pendingInstallments.length > 0 && (
                 <div>
                   <label className="block text-xs text-gray-400 mb-1">Cuota (opcional)</label>
                   <select
@@ -443,6 +625,8 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
             </div>
           )}
 
+          {showCuotaFields && (
+          <>
           {/* Importe */}
           <div>
             <label className="block text-xs text-gray-400 mb-1">Importe *</label>
@@ -636,16 +820,24 @@ function PaymentModal({ open, onClose, onSaved, editing }: {
               rows={2} placeholder="Observaciones opcionales..."
               className="w-full px-3 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white placeholder-gray-500 outline-none focus:border-blue-500 resize-none" />
           </div>
+          </>
+          )}
         </div>
         <div className="flex gap-3 px-6 py-4 border-t border-[#1f2937]">
           <button onClick={onClose}
             className="flex-1 py-2 px-4 rounded-lg border border-[#2d3748] text-gray-400 text-sm hover:text-white hover:bg-[#1a2540] transition-all">
             Cancelar
           </button>
-          <button onClick={handleSave} disabled={isImputarButtonDisabled(saving, splitsValidation.valid)}
-            className="flex-1 py-2 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-all disabled:opacity-50">
-            {saving ? "Guardando..." : editing ? "Guardar cambios" : "Imputar pago"}
-          </button>
+          {/* Con modalidad "contado" ya activa, la acción real es "Continuar
+              con pago de contado" (dentro del bloque de arriba) — este botón
+              quedaría redundante/sin función, así que se oculta en vez de
+              dejarlo deshabilitado sin explicación. */}
+          {showCuotaFields && (
+            <button onClick={handleSave} disabled={isImputarButtonDisabled(saving, splitsValidation.valid)}
+              className="flex-1 py-2 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-all disabled:opacity-50">
+              {saving ? "Guardando..." : editing ? "Guardar cambios" : "Imputar pago"}
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -785,6 +977,27 @@ function CobranzasTab() {
       const status = err?.status;
       if (msg && status && status < 500) toast.error(msg);
       else toast.error("Error al anular el pago");
+    }
+  }
+
+  // Rediseño Pago de contado: una fila colapsada nunca es un payments.id
+  // real (PUT/DELETE /payments/:id ya rechazan tocar un hijo de batch por
+  // separado) — la única corrección posible es anular el cobro completo,
+  // mismo endpoint y mismo efecto (cuotas revierten a su estado anterior)
+  // que "Anular cobro" en Cobrar en lote.
+  async function handleAnularBatch(batchId: number) {
+    if (!confirm(
+      "¿Anular este cobro de período de contado? Las cuotas del período vuelven a su estado anterior — no se puede deshacer."
+    )) return;
+    try {
+      await api.post(`/api/payment-batches/${batchId}/cancel`, { confirm: true, reason: null });
+      toast.success("Cobro de contado anulado");
+      load();
+    } catch (err: any) {
+      const msg = err?.message || "";
+      const status = err?.status;
+      if (msg && status && status < 500) toast.error(msg);
+      else toast.error("Error al anular el cobro de contado");
     }
   }
 
@@ -968,16 +1181,23 @@ function CobranzasTab() {
             <div className="lg:hidden divide-y divide-[#1f2937]">
               {filtered.map(r => {
                 const isManual = r.payment.policyId == null;
+                const isCashPeriod = r.payment.isCashPeriodPayment === true;
                 const displayPolicyNum = r.policy?.policyNumber || r.payment.manualPolicyNumber || "—";
                 const displayInsured = r.insured?.name || r.payment.manualPayer || "—";
+                const rowKey = paymentRowKey(r);
                 return (
-                  <div key={r.payment.id} className="p-4 space-y-3">
+                  <div key={rowKey} className="p-4 space-y-3">
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
                           <p className="text-white font-medium">{displayPolicyNum}</p>
-                          {isManual && (
+                          {isManual && !isCashPeriod && (
                             <span className="px-1.5 py-0.5 rounded text-[10px] border border-orange-500/30 bg-orange-500/10 text-orange-400">manual</span>
+                          )}
+                          {isCashPeriod && (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] border border-emerald-500/30 bg-emerald-500/10 text-emerald-400">
+                              {r.payment.concept || "Pago de contado"}
+                            </span>
                           )}
                         </div>
                         <p className="text-xs text-gray-400 truncate">{displayInsured}</p>
@@ -988,43 +1208,61 @@ function CobranzasTab() {
                       <PaymentMethodBadge splits={r.payment.splits} paymentMethod={r.payment.paymentMethod} compact />
                       {r.payment.splits.length > 1 && (
                         <SplitsExpandToggle
-                          expanded={expandedIds.has(r.payment.id)}
-                          onToggle={() => toggleExpanded(r.payment.id)}
+                          expanded={expandedIds.has(rowKey)}
+                          onToggle={() => toggleExpanded(rowKey)}
                         />
                       )}
                       <span className={cn("px-2 py-0.5 rounded border", STATUS_COLORS[r.payment.status] || "text-gray-400 border-gray-500/30")}>
                         {r.payment.status.charAt(0).toUpperCase() + r.payment.status.slice(1)}
                       </span>
                     </div>
-                    {r.payment.splits.length > 1 && expandedIds.has(r.payment.id) && (
+                    {r.payment.splits.length > 1 && expandedIds.has(rowKey) && (
                       <SplitsDetailPanel splits={r.payment.splits} />
                     )}
                     <div className="flex items-center gap-4 text-xs text-gray-400">
                       <span>Cobrado: {new Date(r.payment.paymentDate + "T12:00:00").toLocaleDateString("es-AR")}</span>
-                      {r.payment.periodMonth && (
+                      {isCashPeriod ? (
+                        <span>Período: {r.payment.cashPeriodPayment?.rebillingId == null ? "Emisión/renovación" : `Refacturación #${r.payment.cashPeriodPayment.rebillingId}`}</span>
+                      ) : r.payment.periodMonth && (
                         <span>Período: {new Date(r.payment.periodMonth + "-02").toLocaleDateString("es-AR", { month: "short", year: "numeric" })}</span>
                       )}
                     </div>
+                    {isCashPeriod && r.payment.cashPeriodPayment && (
+                      <p className="text-xs text-gray-500">
+                        Nominal {formatCurrency(r.payment.cashPeriodPayment.nominalAmountCents / 100)} · Descuento {formatCurrency(r.payment.cashPeriodPayment.discountAmountCents / 100)}
+                      </p>
+                    )}
                     <div className="flex items-center gap-1 text-xs">
                       <span className="text-gray-400">Vence:</span>
                       <DueDateBadge dueDate={r.payment.dueDate} showNull />
                     </div>
                     {r.payment.notes && <p className="text-xs text-gray-400">{r.payment.notes}</p>}
                     <div className="flex items-center gap-2 pt-1">
-                      <button onClick={() => { setEditing(r); setModalOpen(true); }}
-                        className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-blue-400 transition-colors">
-                        <Edit2 className="w-3 h-3" /> Editar
-                      </button>
-                      {r.payment.hasChecks ? (
-                        <button onClick={() => handleAnular(r.payment.id)}
-                          className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-red-500/30 text-red-400 hover:bg-red-500/10 transition-colors">
-                          <Ban className="w-3 h-3" /> Anular pago
-                        </button>
+                      {isCashPeriod ? (
+                        r.payment.status !== "anulado" && (
+                          <button onClick={() => handleAnularBatch(r.payment.batchId!)}
+                            className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-red-500/30 text-red-400 hover:bg-red-500/10 transition-colors">
+                            <Ban className="w-3 h-3" /> Anular lote
+                          </button>
+                        )
                       ) : (
-                        <button onClick={() => handleDelete(r.payment.id)}
-                          className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-red-400 transition-colors">
-                          <Trash2 className="w-3 h-3" /> Eliminar
-                        </button>
+                        <>
+                          <button onClick={() => { setEditing(r); setModalOpen(true); }}
+                            className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-blue-400 transition-colors">
+                            <Edit2 className="w-3 h-3" /> Editar
+                          </button>
+                          {r.payment.hasChecks ? (
+                            <button onClick={() => handleAnular(r.payment.id!)}
+                              className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-red-500/30 text-red-400 hover:bg-red-500/10 transition-colors">
+                              <Ban className="w-3 h-3" /> Anular pago
+                            </button>
+                          ) : (
+                            <button onClick={() => handleDelete(r.payment.id!)}
+                              className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-red-400 transition-colors">
+                              <Trash2 className="w-3 h-3" /> Eliminar
+                            </button>
+                          )}
+                        </>
                       )}
                     </div>
                   </div>
@@ -1050,11 +1288,13 @@ function CobranzasTab() {
                 <tbody>
                   {filtered.map(r => {
                     const isManual = r.payment.policyId == null;
+                    const isCashPeriod = r.payment.isCashPeriodPayment === true;
                     const displayPolicyNum = r.policy?.policyNumber || r.payment.manualPolicyNumber || "—";
                     const displayInsured = r.insured?.name || r.payment.manualPayer || "—";
-                    const isExpanded = r.payment.splits.length > 1 && expandedIds.has(r.payment.id);
+                    const rowKey = paymentRowKey(r);
+                    const isExpanded = r.payment.splits.length > 1 && expandedIds.has(rowKey);
                     return (
-                      <React.Fragment key={r.payment.id}>
+                      <React.Fragment key={rowKey}>
                       <tr className="border-b border-[#1f2937] hover:bg-[#1a2540]/30 transition-colors">
                         <td className="px-5 py-3">
                           <div className="flex items-center gap-2">
@@ -1062,25 +1302,32 @@ function CobranzasTab() {
                               <p className="text-white font-medium">{displayPolicyNum}</p>
                               <p className="text-xs text-gray-400">{displayInsured}</p>
                             </div>
-                            {isManual && (
+                            {isManual && !isCashPeriod && (
                               <span className="px-1.5 py-0.5 rounded text-[10px] border border-orange-500/30 bg-orange-500/10 text-orange-400">
                                 manual
+                              </span>
+                            )}
+                            {isCashPeriod && (
+                              <span className="px-1.5 py-0.5 rounded text-[10px] border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 whitespace-nowrap">
+                                {r.payment.concept || "Pago de contado"}
                               </span>
                             )}
                           </div>
                         </td>
                         <td className="px-3 py-3 text-gray-300 text-xs">
-                          {r.payment.periodMonth
-                            ? new Date(r.payment.periodMonth + "-02").toLocaleDateString("es-AR", { month: "short", year: "numeric" })
-                            : "—"}
+                          {isCashPeriod
+                            ? (r.payment.cashPeriodPayment?.rebillingId == null ? "Emisión/renovación" : `Refacturación #${r.payment.cashPeriodPayment.rebillingId}`)
+                            : r.payment.periodMonth
+                              ? new Date(r.payment.periodMonth + "-02").toLocaleDateString("es-AR", { month: "short", year: "numeric" })
+                              : "—"}
                         </td>
                         <td className="px-3 py-3">
                           <div className="flex items-center gap-1.5">
                             <PaymentMethodBadge splits={r.payment.splits} paymentMethod={r.payment.paymentMethod} />
                             {r.payment.splits.length > 1 && (
                               <SplitsExpandToggle
-                                expanded={expandedIds.has(r.payment.id)}
-                                onToggle={() => toggleExpanded(r.payment.id)}
+                                expanded={expandedIds.has(rowKey)}
+                                onToggle={() => toggleExpanded(rowKey)}
                               />
                             )}
                           </div>
@@ -1100,20 +1347,31 @@ function CobranzasTab() {
                         <td className="px-2 py-3 text-gray-400 text-xs max-w-[90px] truncate">{r.payment.notes || "—"}</td>
                         <td className="px-5 py-3">
                           <div className="flex items-center gap-2 justify-end">
-                            <button onClick={() => { setEditing(r); setModalOpen(true); }}
-                              className="text-gray-400 hover:text-blue-400 transition-colors" title="Editar">
-                              <Edit2 className="w-4 h-4" />
-                            </button>
-                            {r.payment.hasChecks ? (
-                              <button onClick={() => handleAnular(r.payment.id)}
-                                className="text-red-400 hover:text-red-300 transition-colors" title="Anular pago (tiene cheques asociados)">
-                                <Ban className="w-4 h-4" />
-                              </button>
+                            {isCashPeriod ? (
+                              r.payment.status !== "anulado" && (
+                                <button onClick={() => handleAnularBatch(r.payment.batchId!)}
+                                  className="text-red-400 hover:text-red-300 transition-colors" title="Anular lote de contado">
+                                  <Ban className="w-4 h-4" />
+                                </button>
+                              )
                             ) : (
-                              <button onClick={() => handleDelete(r.payment.id)}
-                                className="text-gray-400 hover:text-red-400 transition-colors" title="Eliminar">
-                                <Trash2 className="w-4 h-4" />
-                              </button>
+                              <>
+                                <button onClick={() => { setEditing(r); setModalOpen(true); }}
+                                  className="text-gray-400 hover:text-blue-400 transition-colors" title="Editar">
+                                  <Edit2 className="w-4 h-4" />
+                                </button>
+                                {r.payment.hasChecks ? (
+                                  <button onClick={() => handleAnular(r.payment.id!)}
+                                    className="text-red-400 hover:text-red-300 transition-colors" title="Anular pago (tiene cheques asociados)">
+                                    <Ban className="w-4 h-4" />
+                                  </button>
+                                ) : (
+                                  <button onClick={() => handleDelete(r.payment.id!)}
+                                    className="text-gray-400 hover:text-red-400 transition-colors" title="Eliminar">
+                                    <Trash2 className="w-4 h-4" />
+                                  </button>
+                                )}
+                              </>
                             )}
                           </div>
                         </td>

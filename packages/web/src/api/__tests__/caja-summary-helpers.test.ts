@@ -23,10 +23,12 @@ import {
   assertAdeudadosDetalleMatchesTotal,
   AdeudadosSumMismatchError,
   calculateCajaNetaTotalCents,
+  sumOwnBatchReceivedCentsForPeriod,
   type CarteraInconsistency,
   type BatchForCartera,
   type RemittanceDebtRowForDetalle,
   type CashDebtLegacyRowForDetalle,
+  type PeriodBatchForCobrado,
 } from "../../lib/payments/caja-summary";
 import { calculateExpectedCollectedCents } from "../../lib/payments/remittance-allocations";
 
@@ -384,6 +386,117 @@ describe("applyBatchToCartera", () => {
     );
     // Base capeada 200000, 50% pendiente → 100000 (nunca 110000, la mitad del real).
     expect(cartera.chequeCents).toBe(100000);
+  });
+
+  // ─── renderedRealCents — regresión totalCobrado (rendir no debe reconstruir el nominal) ───
+  //
+  // Complemento exacto de lo que queda en cartera: cappedTotalCents (mismo
+  // capeo real/aplicado de arriba) menos la porción pendiente. Usado por
+  // totalCobrado en index.ts para que rendir (o anular la rendición de) un
+  // batch con diferencia nunca mueva el total histórico — la plata solo se
+  // traslada de "pendiente" a "rendido", nunca cambia de magnitud.
+  describe("applyBatchToCartera — renderedRealCents", () => {
+    test("nada rendido: renderedRealCents es 0", () => {
+      const cartera = emptyMoneyBucket();
+      const directoCompania = emptyDirectCompanyBucket();
+      const result = applyBatchToCartera(mkBatch(), cartera, directoCompania, []);
+      expect(result.renderedRealCents).toBe(0);
+    });
+
+    test("todo rendido, sin diferencia: renderedRealCents == el total (== lo que cartera tenía antes de rendirse)", () => {
+      const cartera = emptyMoneyBucket();
+      const directoCompania = emptyDirectCompanyBucket();
+      const result = applyBatchToCartera(
+        mkBatch({ children: [{ paymentId: 1, status: "confirmado", rendered: 1, amountCents: 100000 }] }),
+        cartera, directoCompania, []
+      );
+      expect(cartera.totalCents).toBe(0); // nada queda pendiente
+      expect(result.renderedRealCents).toBe(100000); // pero se contabilizó como rendido
+    });
+
+    test("pago de contado por período (aplicado=contado real, hijos con el nominal completo): rendido = el contado, nunca el nominal", () => {
+      const cartera = emptyMoneyBucket();
+      const directoCompania = emptyDirectCompanyBucket();
+      // 4 cuotas de $100.000 nominal (total $400.000) pagadas de contado por
+      // $380.000 — mismo patrón exacto que POST /payment-batches/cash-period-payment.
+      const result = applyBatchToCartera(
+        mkBatch({
+          splits: [{ method: "efectivo", amountCents: 380000 * 100, checks: [] }],
+          children: [
+            { paymentId: 1, status: "confirmado", rendered: 1, amountCents: 100000 * 100 },
+            { paymentId: 2, status: "confirmado", rendered: 1, amountCents: 100000 * 100 },
+            { paymentId: 3, status: "confirmado", rendered: 1, amountCents: 100000 * 100 },
+            { paymentId: 4, status: "confirmado", rendered: 1, amountCents: 100000 * 100 },
+          ],
+          appliedAmountCents: 380000 * 100, // batch.totalReceivedCents = cashAmountCents, no el nominal
+        }),
+        cartera, directoCompania, []
+      );
+      expect(result.renderedRealCents).toBe(38000000); // $380.000, nunca $400.000
+    });
+
+    test("sobrante totalmente rendido: renderedRealCents capea al aplicado, nunca al sobrante real", () => {
+      const cartera = emptyMoneyBucket();
+      const directoCompania = emptyDirectCompanyBucket();
+      const result = applyBatchToCartera(
+        mkBatch({
+          splits: [{ method: "cheque", amountCents: 110000, checks: [{ id: 1, amountCents: 110000 }] }],
+          children: [{ paymentId: 1, status: "confirmado", rendered: 1, amountCents: 100000 }],
+          appliedAmountCents: 100000,
+        }),
+        cartera, directoCompania, []
+      );
+      expect(result.renderedRealCents).toBe(100000); // no 110000
+    });
+
+    test("faltante totalmente rendido: renderedRealCents usa el real, nunca infla al nominal aplicado", () => {
+      const cartera = emptyMoneyBucket();
+      const directoCompania = emptyDirectCompanyBucket();
+      const result = applyBatchToCartera(
+        mkBatch({
+          splits: [{ method: "cheque", amountCents: 90000, checks: [{ id: 1, amountCents: 90000 }] }],
+          children: [{ paymentId: 1, status: "confirmado", rendered: 1, amountCents: 100000 }],
+          appliedAmountCents: 100000,
+        }),
+        cartera, directoCompania, []
+      );
+      expect(result.renderedRealCents).toBe(90000); // no 100000
+    });
+
+    test("mixto (uno rendido, uno no): cartera.totalCents + renderedRealCents == el total capeado, sin drift", () => {
+      const cartera = emptyMoneyBucket();
+      const directoCompania = emptyDirectCompanyBucket();
+      const result = applyBatchToCartera(
+        mkBatch({
+          splits: [{ method: "efectivo", amountCents: 100000, checks: [] }],
+          children: [
+            { paymentId: 1, status: "confirmado", rendered: 0, amountCents: 60000 }, // pendiente
+            { paymentId: 2, status: "confirmado", rendered: 1, amountCents: 40000 }, // rendido
+          ],
+        }),
+        cartera, directoCompania, []
+      );
+      expect(cartera.totalCents).toBe(60000);
+      expect(result.renderedRealCents).toBe(40000);
+      expect(cartera.totalCents + result.renderedRealCents).toBe(100000); // cierra exacto
+    });
+
+    test("batch anulado: renderedRealCents es 0", () => {
+      const cartera = emptyMoneyBucket();
+      const directoCompania = emptyDirectCompanyBucket();
+      const result = applyBatchToCartera(mkBatch({ status: "anulado" }), cartera, directoCompania, []);
+      expect(result.renderedRealCents).toBe(0);
+    });
+
+    test("sin hijos confirmados: renderedRealCents es 0", () => {
+      const cartera = emptyMoneyBucket();
+      const directoCompania = emptyDirectCompanyBucket();
+      const result = applyBatchToCartera(
+        mkBatch({ children: [{ paymentId: 1, status: "anulado", rendered: 0, amountCents: 100000 }] }),
+        cartera, directoCompania, []
+      );
+      expect(result.renderedRealCents).toBe(0);
+    });
   });
 });
 
@@ -925,4 +1038,76 @@ describe("assertAdeudadosDetalleMatchesTotal", () => {
 
 test("centsToPesos convierte centavos a pesos", () => {
   expect(centsToPesos(123456)).toBeCloseTo(1234.56, 2);
+});
+
+// ─── sumOwnBatchReceivedCentsForPeriod (subtotal período de Caja) ─────────
+//
+// Regresión: el subtotal "cobrado" de un período no debía sumar el importe
+// NOMINAL de los hijos de un batch — debe capear/reflejar siempre el dinero
+// real (receivedCents), en los 5 escenarios pedidos explícitamente: lote
+// exacto, sobrante, faltante, ajuste de redondeo, y pago de contado por
+// período (el caso que disparó el hallazgo: $400.000 nominal, $380.000
+// contado real — nunca debe sumar $400.000).
+
+function batchInfo(overrides: Partial<PeriodBatchForCobrado> = {}): PeriodBatchForCobrado {
+  return { batchId: 1, receivedCents: 100000, splitGroup: "own", ...overrides };
+}
+
+describe("sumOwnBatchReceivedCentsForPeriod", () => {
+  test("pago de contado por período: nunca suma el nominal, siempre el importe contado real", () => {
+    // $400.000 nominal ya vive únicamente en los payments hijos (no acá) —
+    // el batch de un pago de contado guarda totalReceivedCents/
+    // receivedAmountCents = cashAmountCents ($380.000), nunca el nominal.
+    const total = sumOwnBatchReceivedCentsForPeriod([
+      batchInfo({ batchId: 501, receivedCents: 38000000 }), // $380.000,00
+    ]);
+    expect(total).toBe(38000000);
+    expect(total).not.toBe(40000000);
+  });
+
+  test("lote normal exacto: recibido == aplicado, comportamiento idéntico a sumar el nominal", () => {
+    const total = sumOwnBatchReceivedCentsForPeriod([batchInfo({ receivedCents: 500000 })]);
+    expect(total).toBe(500000);
+  });
+
+  test("sobrante (recibido > aplicado): suma el dinero real recibido, no el nominal aplicado", () => {
+    const total = sumOwnBatchReceivedCentsForPeriod([batchInfo({ receivedCents: 550000 })]);
+    expect(total).toBe(550000);
+  });
+
+  test("faltante (recibido < aplicado): suma el dinero real recibido, no el nominal aplicado", () => {
+    const total = sumOwnBatchReceivedCentsForPeriod([batchInfo({ receivedCents: 480000 })]);
+    expect(total).toBe(480000);
+  });
+
+  test("ajuste por redondeo: suma el dinero real recibido (difiere en centavos del aplicado)", () => {
+    const total = sumOwnBatchReceivedCentsForPeriod([batchInfo({ receivedCents: 500003 })]);
+    expect(total).toBe(500003);
+  });
+
+  test("excluye batches directo compañía (transferencia_compania/link_pago)", () => {
+    const total = sumOwnBatchReceivedCentsForPeriod([
+      batchInfo({ batchId: 1, receivedCents: 100000, splitGroup: "own" }),
+      batchInfo({ batchId: 2, receivedCents: 200000, splitGroup: "direct_company" }),
+    ]);
+    expect(total).toBe(100000);
+  });
+
+  test("excluye 'mixed' defensivamente (no debería ocurrir en un batch real)", () => {
+    const total = sumOwnBatchReceivedCentsForPeriod([batchInfo({ receivedCents: 100000, splitGroup: "mixed" })]);
+    expect(total).toBe(0);
+  });
+
+  test("varios batches propios en el mismo período se suman todos", () => {
+    const total = sumOwnBatchReceivedCentsForPeriod([
+      batchInfo({ batchId: 1, receivedCents: 100000 }),
+      batchInfo({ batchId: 2, receivedCents: 250000 }),
+      batchInfo({ batchId: 3, receivedCents: 38000000 }),
+    ]);
+    expect(total).toBe(38350000);
+  });
+
+  test("array vacío (sin batches en el período) suma 0", () => {
+    expect(sumOwnBatchReceivedCentsForPeriod([])).toBe(0);
+  });
 });

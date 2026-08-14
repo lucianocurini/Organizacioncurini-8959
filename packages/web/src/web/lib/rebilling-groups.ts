@@ -17,6 +17,11 @@ export interface GroupableInstallment {
   status: string;
   notes: string | null;
   rebillingId: number | null;
+  // Presente en los datos reales (GET /policies/:id) pero opcional acá:
+  // grupos armados a mano en tests no siempre lo cargan. Usado por
+  // isCashPeriodEligible (cash-period-payment-form.ts) para decidir si
+  // mostrar "Pagar período de contado".
+  rendered?: number;
 }
 
 export interface GroupableRebilling {

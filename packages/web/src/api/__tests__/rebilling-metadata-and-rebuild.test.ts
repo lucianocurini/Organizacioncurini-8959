@@ -290,6 +290,36 @@ describe("PUT /rebillings/:id — edición de metadata (sin installmentCount/fir
   });
 });
 
+// ─── Migración 0034 — mismo chequeo en el camino LEGACY de PUT (installmentCount presente) ─
+describe("PUT /rebillings/:id — camino legacy de reconstrucción (installmentCount presente)", () => {
+  test("contado ya cargado mayor al NUEVO nominal: rechaza vía PUT legacy, plan anterior y contado intactos", async () => {
+    const policyId = await mkPolicy();
+    try {
+      const created = await callPost(policyId, {
+        billingStart: "2027-06-01", billingEnd: "2027-08-31", monthlyFee: 1000, installmentCount: 3, firstDueDate: "2027-06-01",
+      });
+      const rebId = created.body.id;
+      await db.update(rebillings).set({ cashPaymentAmountCents: 300000 }).where(eq(rebillings.id, rebId)); // $3000
+
+      // PUT con installmentCount presente cae en el camino legacy de
+      // regeneración (mismo runRebillingRebuildTransaction que el rebuild
+      // explícito) — acá el plan nuevo es de $1000, menor al contado cargado.
+      const { status, body } = await callPut(rebId, {
+        billingStart: "2027-06-01", billingEnd: "2027-06-30", monthlyFee: 1000, installmentCount: 1, firstDueDate: "2027-06-01",
+      });
+      expect(status).toBe(409);
+      expect(body.error).toContain("no puede ser mayor a la suma nominal");
+
+      const installments = await getInstallments(policyId);
+      expect(installments.filter((i) => i.rebillingId === rebId).length).toBe(3); // plan anterior intacto
+      const reb = await db.select({ cashPaymentAmountCents: rebillings.cashPaymentAmountCents }).from(rebillings).where(eq(rebillings.id, rebId)).get();
+      expect(reb?.cashPaymentAmountCents).toBe(300000);
+    } finally {
+      await cleanupPolicy(policyId);
+    }
+  });
+});
+
 describe("POST /policies/:id/rebillings — alta nueva sigue exigiendo datos de plan", () => {
   test("sin installmentCount devuelve 400", async () => {
     const policyId = await mkPolicy();
@@ -543,6 +573,58 @@ describe("POST /rebillings/:id/installments/rebuild", () => {
       billingStart: "2027-06-01", billingEnd: "2027-06-30", monthlyFee: 1000, installmentCount: 1, firstDueDate: "2027-06-01",
     });
     expect(status).toBe(404);
+  });
+
+  // ─── Migración 0034 — seguridad de reconstrucción del plan de refacturación ─
+  describe("importe contado vs. nuevo nominal", () => {
+    test("contado ya cargado mayor al NUEVO nominal: rechaza, plan anterior y contado quedan intactos", async () => {
+      const policyId = await mkPolicy();
+      try {
+        const created = await callPost(policyId, {
+          billingStart: "2027-06-01", billingEnd: "2027-08-31", monthlyFee: 1000, installmentCount: 3, firstDueDate: "2027-06-01",
+        });
+        const rebId = created.body.id;
+        await db.update(rebillings).set({ cashPaymentAmountCents: 300000 }).where(eq(rebillings.id, rebId)); // $3000, == nominal actual
+
+        // Reconstruir a un plan más chico ($1000 x 1 = $1000) — el contado ya
+        // cargado ($3000) quedaría mayor al nuevo nominal.
+        const rebuilt = await callRebuild(rebId, {
+          billingStart: "2027-06-01", billingEnd: "2027-06-30", monthlyFee: 1000, installmentCount: 1, firstDueDate: "2027-06-01",
+        });
+        expect(rebuilt.status).toBe(409);
+        expect(rebuilt.body.error).toContain("no puede ser mayor a la suma nominal");
+
+        // El plan anterior (3 cuotas) sigue exactamente igual.
+        const installments = await getInstallments(policyId);
+        expect(installments.filter((i) => i.rebillingId === rebId).length).toBe(3);
+        const reb = await db.select({ cashPaymentAmountCents: rebillings.cashPaymentAmountCents }).from(rebillings).where(eq(rebillings.id, rebId)).get();
+        expect(reb?.cashPaymentAmountCents).toBe(300000); // intacto
+      } finally {
+        await cleanupPolicy(policyId);
+      }
+    });
+
+    test("contado ya cargado igual o menor al nuevo nominal: el rebuild funciona igual que antes", async () => {
+      const policyId = await mkPolicy();
+      try {
+        const created = await callPost(policyId, {
+          billingStart: "2027-06-01", billingEnd: "2027-08-31", monthlyFee: 1000, installmentCount: 3, firstDueDate: "2027-06-01",
+        });
+        const rebId = created.body.id;
+        await db.update(rebillings).set({ cashPaymentAmountCents: 150000 }).where(eq(rebillings.id, rebId)); // $1500 < $3000
+
+        // Reconstruir a un plan más grande ($4000) — el contado ($1500) sigue
+        // siendo válido contra el nuevo nominal, mayor.
+        const rebuilt = await callRebuild(rebId, {
+          billingStart: "2027-06-01", billingEnd: "2027-10-31", monthlyFee: 1000, installmentCount: 4, firstDueDate: "2027-06-01",
+        });
+        expect(rebuilt.status).toBe(200);
+        const reb = await db.select({ cashPaymentAmountCents: rebillings.cashPaymentAmountCents }).from(rebillings).where(eq(rebillings.id, rebId)).get();
+        expect(reb?.cashPaymentAmountCents).toBe(150000); // el rebuild no lo toca, sigue siendo válido
+      } finally {
+        await cleanupPolicy(policyId);
+      }
+    });
   });
 });
 

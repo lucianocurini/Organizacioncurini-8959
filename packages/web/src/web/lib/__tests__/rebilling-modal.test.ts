@@ -15,6 +15,7 @@ function baseForm(overrides: Partial<RebillingModalFormState> = {}): RebillingMo
     sumInsured: "",
     deductible: "",
     notes: "",
+    cashPaymentAmount: "",
     ...overrides,
   };
 }
@@ -101,5 +102,33 @@ describe("computePlanAmountMismatchWarning", () => {
   });
   test("premium vacío no genera advertencia (nada que comparar)", () => {
     expect(computePlanAmountMismatchWarning("2000", "", 3)).toBeNull();
+  });
+});
+
+describe("validateRebillingForm — importe contado (Migración 0034)", () => {
+  test("vacío es válido (opcional)", () => {
+    expect(validateRebillingForm(baseForm({ cashPaymentAmount: "" }), false)).toBeNull();
+  });
+  test("un valor positivo es válido", () => {
+    expect(validateRebillingForm(baseForm({ cashPaymentAmount: "340000" }), true)).toBeNull();
+  });
+  test("rechaza cero o negativo", () => {
+    expect(validateRebillingForm(baseForm({ cashPaymentAmount: "0" }), true)).not.toBeNull();
+    expect(validateRebillingForm(baseForm({ cashPaymentAmount: "-100" }), true)).not.toBeNull();
+  });
+});
+
+describe("buildRebillingEditPayload/buildRebillingCreatePayload — cashPaymentAmountCents", () => {
+  test("convierte pesos a centavos", () => {
+    const payload = buildRebillingEditPayload(baseForm({ cashPaymentAmount: "340000" }));
+    expect(payload.cashPaymentAmountCents).toBe(34000000);
+  });
+  test("vacío es null", () => {
+    const payload = buildRebillingEditPayload(baseForm({ cashPaymentAmount: "" }));
+    expect(payload.cashPaymentAmountCents).toBeNull();
+  });
+  test("se propaga también al payload de alta", () => {
+    const payload = buildRebillingCreatePayload(baseForm({ cashPaymentAmount: "340000" }));
+    expect(payload.cashPaymentAmountCents).toBe(34000000);
   });
 });

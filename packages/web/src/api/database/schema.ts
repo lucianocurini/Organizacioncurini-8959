@@ -94,6 +94,16 @@ export const policies = sqliteTable("policies", {
   cancellationNotes: text("cancellation_notes"),
   cancelledBy: integer("cancelled_by").references(() => users.id),
   cancellationSource: text("cancellation_source"),
+  // Migración 0034 ("Pago de contado por período de facturación") — importe
+  // OPCIONAL, en centavos, que la compañía ofrece para cancelar TODAS las
+  // cuotas del período de EMISIÓN/RENOVACIÓN (rebillingId IS NULL en
+  // policy_installments) por menos que su suma nominal. NULL = sin oferta
+  // cargada, todo sigue funcionando exactamente igual que hoy. Editable
+  // libremente hasta que exista actividad real sobre alguna cuota del
+  // período (pago/imputación/rendición) — ver
+  // src/lib/payments/cash-period-payments.ts. El registro INMUTABLE de un
+  // cobro contado real vive en cash_period_payments (más abajo), nunca acá.
+  cashPaymentAmountCents: integer("cash_payment_amount_cents"),
 });
 
 export const payments = sqliteTable("payments", {
@@ -394,6 +404,10 @@ export const rebillings = sqliteTable("rebillings", {
   deductible: real("deductible"), // franquicia vigente al momento de esta refacturación (histórico por período)
   createdBy: integer("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  // Migración 0034 — mismo campo y mismo criterio que policies.cashPaymentAmountCents
+  // más arriba, pero para el período de ESTA refacturación puntual
+  // (policy_installments.rebillingId = este id).
+  cashPaymentAmountCents: integer("cash_payment_amount_cents"),
 });
 
 export const sessions = sqliteTable("sessions", {
@@ -674,4 +688,48 @@ export const ownMoneyMovements = sqliteTable("own_money_movements", {
   notes: text("notes"),
   createdBy: integer("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+});
+
+// ─── PAGO DE CONTADO POR PERÍODO DE FACTURACIÓN ────────────────────────────
+//
+// Migración 0034. Registro de auditoría INMUTABLE de un cobro que canceló
+// TODAS las cuotas de un período (policyId + rebillingId, mismo criterio de
+// "período" que src/web/lib/rebilling-groups.ts) por un importe menor a su
+// suma nominal — la diferencia es un descuento comercial, nunca un
+// faltante/sobrante/ajuste de redondeo (ver src/lib/payments/
+// cash-period-payments.ts). 1:1 con paymentBatchId — la sola existencia de
+// esta fila con status='confirmado' ES el discriminador "este payment_batches
+// es un cobro de período de contado" (no se agrega ninguna columna a
+// paymentBatches para esto).
+//
+// nominalAmountCents/cashAmountCents/discountAmountCents son un SNAPSHOT al
+// momento del cobro — nunca dependen de policies.cashPaymentAmountCents/
+// rebillings.cashPaymentAmountCents después de creado este registro (esos
+// campos siguen siendo editables hasta el próximo cobro de OTRO período,
+// pero ya no afectan a este).
+//
+// "Cuotas canceladas" no se duplica acá: son exactamente los payments con
+// batchId = paymentBatchId (cada uno con su installmentId real) — misma
+// trazabilidad que cualquier otro payment_batches.
+//
+// rendered/renderedAt: el período se rinde como UN SOLO instrumento (ver
+// POST /remittances, item.source = "payment_batch") — a diferencia de un
+// payment_batches común, donde cada hijo se rinde por separado (Migración
+// 0029), así que este estado no puede vivir en payments.rendered de un
+// hijo puntual.
+export const cashPeriodPayments = sqliteTable("cash_period_payments", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  paymentBatchId: integer("payment_batch_id").notNull().references(() => paymentBatches.id),
+  policyId: integer("policy_id").notNull().references(() => policies.id),
+  rebillingId: integer("rebilling_id").references(() => rebillings.id),
+  nominalAmountCents: integer("nominal_amount_cents").notNull(),
+  cashAmountCents: integer("cash_amount_cents").notNull(),
+  discountAmountCents: integer("discount_amount_cents").notNull(),
+  status: text("status").notNull().default("confirmado"), // confirmado | anulado
+  rendered: integer("rendered").notNull().default(0),
+  renderedAt: integer("rendered_at", { mode: "timestamp" }),
+  cancelledAt: integer("cancelled_at", { mode: "timestamp" }),
+  cancelledBy: integer("cancelled_by").references(() => users.id),
+  createdBy: integer("created_by").notNull().references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 });

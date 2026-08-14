@@ -27,6 +27,7 @@
 import { eq, inArray, and } from "drizzle-orm";
 import { policies, policyInstallments, payments, remittanceItems } from "../../api/database/schema";
 import type { InstallmentPlanResult } from "./plan";
+import { validateCashPaymentAmountAgainstNominal } from "../payments/cash-period-payments";
 
 export type RebuildClassification = "NO_INSTALLMENTS" | "SAFE_TO_REBUILD" | "REQUIRES_MANUAL_REVIEW";
 
@@ -228,6 +229,21 @@ export async function runInstallmentRebuildTransaction(
   }
   const previousCount = recheck.actualCount;
   const previousExpectedCount = recheck.expectedCount;
+
+  // Migración 0034 — Etapa "seguridad de reconstrucción de plan": el importe
+  // contado del período de emisión/renovación (policies.cashPaymentAmountCents)
+  // no lo toca esta reconstrucción, pero el NUEVO nominal del plan puede ser
+  // menor al que había cuando se cargó ese importe — si queda mayor al nuevo
+  // nominal, se rechaza ANTES de borrar ninguna cuota (con `tx`, para ver el
+  // valor real vigente, no uno leído fuera de la transacción). Lanzar acá
+  // aborta toda la transacción (rollback automático de Drizzle) — el plan
+  // anterior queda exactamente como estaba.
+  const policyRow = await tx.select({ cashPaymentAmountCents: policies.cashPaymentAmountCents })
+    .from(policies).where(eq(policies.id, policyId)).get();
+  if (policyRow?.cashPaymentAmountCents != null) {
+    const newNominalCents = Math.round(period.periodAmount * 100);
+    validateCashPaymentAmountAgainstNominal(policyRow.cashPaymentAmountCents, newNominalCents);
+  }
 
   await tx.delete(policyInstallments).where(eq(policyInstallments.policyId, policyId));
 

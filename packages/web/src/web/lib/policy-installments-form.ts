@@ -76,3 +76,29 @@ export function nextFirstDueDateOnStartDateChange(
 ): string {
   return touched ? currentFirstDueDate : newStartDate;
 }
+
+// ─── Importe contado — solo previsualización, NUNCA la validación real ────
+//
+// La validación autoritativa (>0, <= nominal) vive en el backend
+// (src/lib/payments/cash-period-payments.ts, PUT /policies/:id) — esto es
+// puramente informativo para que el usuario vea el ahorro mientras carga el
+// dato, mismo criterio que installmentRows más arriba (previsualización
+// tolerante, nunca bloqueante por sí sola).
+export interface CashPaymentPreview {
+  nominalAmountCents: number;
+  cashAmountCents: number | null;
+  discountAmountCents: number | null;
+}
+
+export function computeCashPaymentPreview(
+  installments: ReadonlyArray<{ amount: number }>,
+  cashPaymentAmountPesos: string,
+): CashPaymentPreview {
+  const nominalAmountCents = installments.reduce((s, i) => s + Math.round(i.amount * 100), 0);
+  const cashPesos = Number(cashPaymentAmountPesos);
+  if (!cashPaymentAmountPesos.trim() || !Number.isFinite(cashPesos) || cashPesos <= 0) {
+    return { nominalAmountCents, cashAmountCents: null, discountAmountCents: null };
+  }
+  const cashAmountCents = Math.round(cashPesos * 100);
+  return { nominalAmountCents, cashAmountCents, discountAmountCents: nominalAmountCents - cashAmountCents };
+}
