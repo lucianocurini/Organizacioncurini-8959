@@ -8,6 +8,7 @@ import { describe, test, expect } from "bun:test";
 import {
   toArgentinaCalendarDay, parseCalendarDayToUtcOrdinal, diffCalendarDays,
   shiftArgentinaMonth, resolveArgentinaMonthKey, addCalendarDays,
+  normalizeToDate, formatArgentinaTimestampLabel,
 } from "../argentina-date";
 
 describe("toArgentinaCalendarDay", () => {
@@ -248,5 +249,86 @@ describe("shiftArgentinaMonth — gráfico de 6 meses de Cobranzas (monthlyData)
     } finally {
       process.env.TZ = original;
     }
+  });
+});
+
+// ─── normalizeToDate / formatArgentinaTimestampLabel — Migración 0035:
+// auditoría de duplicados (poliza-detail.tsx). Bug real reproducido en QA
+// visual local el 17/08/2026: invalidatedAt llega del backend como Date →
+// string ISO (vía Drizzle mode:"timestamp" + c.json()), pero el código
+// asumía epoch en segundos (number) — `Number("2026-08-17T22:40:12.000Z")`
+// es NaN, `new Date(NaN).toISOString()` LANZA `RangeError: Invalid time
+// value` y tira abajo todo el árbol de React (pantalla en blanco, sin
+// ningún error boundary). Estas funciones existen para que ESO nunca vuelva
+// a pasar: normalizan cualquier representación razonable a un Date válido o
+// devuelven null, nunca lanzan.
+describe("normalizeToDate", () => {
+  test("string ISO completo (lo que realmente sirve la API hoy) → Date válido", () => {
+    const d = normalizeToDate("2026-08-17T22:40:12.000Z");
+    expect(d).not.toBeNull();
+    expect(d!.toISOString()).toBe("2026-08-17T22:40:12.000Z");
+  });
+
+  test("epoch en SEGUNDOS (number, columna integer mode:timestamp cruda) → Date válido", () => {
+    // 1787006412 s == 2026-08-17T22:40:12.000Z (mismo instante que el caso ISO de arriba)
+    const d = normalizeToDate(1787006412);
+    expect(d).not.toBeNull();
+    expect(d!.toISOString()).toBe("2026-08-17T22:40:12.000Z");
+  });
+
+  test("epoch en MILISEGUNDOS (number, 13 dígitos) → Date válido, sin confundirlo con segundos", () => {
+    const d = normalizeToDate(1787006412000);
+    expect(d).not.toBeNull();
+    expect(d!.toISOString()).toBe("2026-08-17T22:40:12.000Z");
+  });
+
+  test("instancia de Date ya construida → se devuelve como Date válido", () => {
+    const input = new Date("2026-08-17T22:40:12.000Z");
+    const d = normalizeToDate(input);
+    expect(d).not.toBeNull();
+    expect(d!.getTime()).toBe(input.getTime());
+  });
+
+  test("null/undefined → null, nunca lanza", () => {
+    expect(normalizeToDate(null)).toBeNull();
+    expect(normalizeToDate(undefined)).toBeNull();
+  });
+
+  test("string no parseable → null, nunca lanza", () => {
+    expect(normalizeToDate("no-es-una-fecha")).toBeNull();
+  });
+
+  test("Date inválida (new Date('basura')) → null, nunca lanza", () => {
+    expect(normalizeToDate(new Date("basura"))).toBeNull();
+  });
+
+  test("NaN como number → null, nunca lanza", () => {
+    expect(normalizeToDate(NaN)).toBeNull();
+  });
+});
+
+describe("formatArgentinaTimestampLabel", () => {
+  test("string ISO real (invalidatedAt de GET /policies/:id) → DD/MM/AAAA en Argentina", () => {
+    // 22:40:12 UTC - 3h = 19:40:12 Argentina, mismo día calendario (17/08).
+    expect(formatArgentinaTimestampLabel("2026-08-17T22:40:12.000Z")).toBe("17/08/2026");
+  });
+
+  test("epoch en segundos → mismo resultado que el string ISO equivalente", () => {
+    expect(formatArgentinaTimestampLabel(1787006412)).toBe("17/08/2026");
+  });
+
+  test("cruce de medianoche UTC hacia el día anterior en Argentina (mismo criterio que toArgentinaCalendarDay)", () => {
+    // 2026-08-01T02:00:00Z == 31/07 23:00 Argentina.
+    expect(formatArgentinaTimestampLabel("2026-08-01T02:00:00.000Z")).toBe("31/07/2026");
+  });
+
+  test("null/undefined → null (el caller decide el fallback, ej. 'Fecha no disponible')", () => {
+    expect(formatArgentinaTimestampLabel(null)).toBeNull();
+    expect(formatArgentinaTimestampLabel(undefined)).toBeNull();
+  });
+
+  test("valor corrupto (ni ISO ni epoch) → null, nunca lanza RangeError", () => {
+    expect(formatArgentinaTimestampLabel("no-es-una-fecha")).toBeNull();
+    expect(() => formatArgentinaTimestampLabel("no-es-una-fecha")).not.toThrow();
   });
 });

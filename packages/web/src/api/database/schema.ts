@@ -374,16 +374,35 @@ export const policyInstallments = sqliteTable("policy_installments", {
   number: integer("number").notNull(),
   dueDate: text("due_date").notNull(),
   amount: real("amount").notNull(),
-  status: text("status").notNull().default("pendiente"), // pendiente | pagada | vencida | no_exigible
+  status: text("status").notNull().default("pendiente"), // pendiente | pagada | vencida | no_exigible | duplicada
   // no_exigible: la póliza dueña fue anulada manualmente (ver policies.cancelledAt)
   // con effectiveDate <= dueDate — la cuota deja de ser cobrable, pero nunca se
   // borra ni se confunde con "pagada" (ver src/lib/policies/cancellation.ts).
+  // duplicada (migración 0035): cuota sobrante generada por un error de
+  // importación sobre un período que ya tenía su cuota canónica real — nunca
+  // tuvo cobertura propia, distinto de no_exigible (que sí la tuvo y la
+  // perdió). Nunca exigible/vencida/cobrable/rendible ni parte de la cantidad
+  // real del plan — ver duplicateOfInstallmentId más abajo y
+  // src/lib/policies/duplicate-invalidation.ts para el helper central que
+  // todo consumidor debe reutilizar en vez de repetir el filtro a mano.
   notes: text("notes"),
   rendered: integer("rendered").notNull().default(0), // 1 = rendida a compañía sin cobrar al asegurado
   renderedAt: integer("rendered_at", { mode: "timestamp" }),
   // null = cuota base de la póliza; con valor = generada por esa refacturación puntual
   rebillingId: integer("rebilling_id").references(() => rebillings.id),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
+  // Migración 0035 — invalidación trazable. duplicateOfInstallmentId
+  // (autorreferencial, sin .references() acá por el mismo criterio ya usado
+  // en policies.renewedFromId/parentPolicyId — la FK real vive en el SQL de
+  // la migración, no en el ORM) apunta a la fila CANÓNICA que se conserva
+  // activa; NULL en toda fila que no sea duplicada. invalidatedAt/By/reason
+  // solo se completan junto con status='duplicada', los tres a la vez,
+  // nunca por separado — mismo criterio que policies.cancelledAt/
+  // cancelledBy/cancellationReason (migración 0020).
+  duplicateOfInstallmentId: integer("duplicate_of_installment_id"),
+  invalidatedAt: integer("invalidated_at", { mode: "timestamp" }),
+  invalidatedBy: integer("invalidated_by").references(() => users.id),
+  invalidationReason: text("invalidation_reason"),
 });
 
 export const rebillings = sqliteTable("rebillings", {
@@ -408,6 +427,19 @@ export const rebillings = sqliteTable("rebillings", {
   // más arriba, pero para el período de ESTA refacturación puntual
   // (policy_installments.rebillingId = este id).
   cashPaymentAmountCents: integer("cash_payment_amount_cents"),
+  // Migración 0035 — invalidación trazable, mismo criterio y mismos 5 campos
+  // que policy_installments más arriba (duplicateOfRebillingId sin
+  // .references() acá por la misma razón: autorreferencia, FK real en el SQL
+  // de la migración). status default 'activa' es el valor histórico
+  // implícito de TODA fila existente antes de esta migración — nunca hubo
+  // otro estado. Una refacturación 'duplicada' nunca debe sumarse,
+  // proyectarse ni mostrarse como período activo — ver
+  // src/lib/policies/duplicate-invalidation.ts.
+  status: text("status").notNull().default("activa"), // activa | duplicada
+  duplicateOfRebillingId: integer("duplicate_of_rebilling_id"),
+  invalidatedAt: integer("invalidated_at", { mode: "timestamp" }),
+  invalidatedBy: integer("invalidated_by").references(() => users.id),
+  invalidationReason: text("invalidation_reason"),
 });
 
 export const sessions = sqliteTable("sessions", {

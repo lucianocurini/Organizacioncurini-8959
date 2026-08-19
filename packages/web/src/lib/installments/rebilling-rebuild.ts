@@ -16,6 +16,7 @@ import { policies, rebillings, policyInstallments, payments, remittanceItems } f
 import type { InstallmentPlanResult } from "./plan";
 import type { RebillingPayload } from "./rebilling-plan";
 import { validateCashPaymentAmountAgainstNominal } from "../payments/cash-period-payments";
+import { excludeDuplicateInstallments } from "./duplicate-status";
 
 export type RebillingRebuildClassification = "NO_INSTALLMENTS" | "SAFE_TO_REBUILD" | "REQUIRES_MANUAL_REVIEW";
 
@@ -125,13 +126,17 @@ export async function classifyRebillingGroupForRebuild(dbClient: any, rebillingI
     .get();
   if (!rebillingRow) throw new RebillingNotFoundError(rebillingId);
 
+  // Migración 0035: mismo criterio que rebuild.ts (póliza completa) — una
+  // cuota 'duplicada' de ESTE rebillingId (el caso común: dos cuotas exactas
+  // generadas por la misma refacturación, mismo rebilling_id en ambas) queda
+  // invisible para esta clasificación y nunca se borra al reconstruir.
   const installments: InstallmentRow[] = await dbClient
     .select({
       id: policyInstallments.id, number: policyInstallments.number, dueDate: policyInstallments.dueDate,
       amount: policyInstallments.amount, status: policyInstallments.status, rendered: policyInstallments.rendered,
     })
     .from(policyInstallments)
-    .where(eq(policyInstallments.rebillingId, rebillingId))
+    .where(and(eq(policyInstallments.rebillingId, rebillingId), excludeDuplicateInstallments()))
     .orderBy(policyInstallments.number)
     .all();
 
@@ -202,7 +207,8 @@ export async function runRebillingRebuildTransaction(
   }
 
   if (previousCount > 0) {
-    await tx.delete(policyInstallments).where(eq(policyInstallments.rebillingId, rebillingId));
+    // Nunca borra cuotas 'duplicada' de este rebillingId — auditoría permanente.
+    await tx.delete(policyInstallments).where(and(eq(policyInstallments.rebillingId, rebillingId), excludeDuplicateInstallments()));
   }
 
   const insertedRows = await tx.insert(policyInstallments).values(

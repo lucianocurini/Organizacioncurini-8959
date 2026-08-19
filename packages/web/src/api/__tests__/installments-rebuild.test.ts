@@ -628,3 +628,51 @@ describe("runInstallmentRebuildTransaction — transacción", () => {
     expect(rows[0]!.id).toBe(instId);
   });
 });
+
+// ─── Migración 0035 — invalidación trazable de duplicadas ──────────────────
+describe("classifyInstallmentsForRebuild / runInstallmentRebuildTransaction — cuotas 'duplicada' (Migración 0035)", () => {
+  test("una cuota 'duplicada' no cuenta en actualCount ni bloquea la clasificación", async () => {
+    const policyId = await mkPolicy();
+    await mkInstallment(policyId, 1, "2027-01-01", 1000); // real
+    await mkInstallment(policyId, 2, "2027-02-01", 1000, { status: "duplicada" }); // auditoría, invisible acá
+
+    const result = await classifyInstallmentsForRebuild(db, policyId);
+    expect(result.actualCount).toBe(1); // no 2 — la duplicada no forma parte del plan real
+    expect(result.classification).toBe("SAFE_TO_REBUILD"); // no REQUIRES_MANUAL_REVIEW por "estado no reconocido"
+    expect(result.blockingInstallments).toEqual([]);
+  });
+
+  test("runInstallmentRebuildTransaction NUNCA borra una cuota 'duplicada' — sobrevive intacta a la reconstrucción", async () => {
+    const policyId = await mkPolicy();
+    await mkInstallment(policyId, 1, "2027-01-01", 1000);
+    const dupId = await mkInstallment(policyId, 2, "2027-02-01", 1000, { status: "duplicada" });
+
+    const plan = { installments: [{ number: 1, dueDate: "2027-03-01", amount: 2000 }], totalAmount: 2000, warnings: [] };
+    await db.transaction(async (tx) =>
+      runInstallmentRebuildTransaction(tx, policyId, plan, {
+        periodStart: "2027-01-01", periodEnd: "2027-06-01", periodAmount: 2000,
+      })
+    );
+
+    // La cuota duplicada sigue existiendo, exactamente igual — nunca se tocó.
+    const dupRow = await db.select().from(policyInstallments).where(eq(policyInstallments.id, dupId)).get();
+    expect(dupRow).toBeDefined();
+    expect(dupRow!.status).toBe("duplicada");
+
+    // El plan nuevo se insertó igual, sin verse afectado por la presencia de la duplicada.
+    const allRows = await getInstallments(policyId);
+    const realRows = allRows.filter((r) => r.status !== "duplicada");
+    expect(realRows.length).toBe(1);
+    expect(realRows[0]!.amount).toBe(2000);
+    expect(allRows.some((r) => r.id === dupId && r.status === "duplicada")).toBe(true);
+  });
+
+  test("una póliza con SOLO una cuota 'duplicada' (sin cuotas reales) → NO_INSTALLMENTS, no SAFE_TO_REBUILD por error", async () => {
+    const policyId = await mkPolicy();
+    await mkInstallment(policyId, 1, "2027-01-01", 1000, { status: "duplicada" });
+
+    const result = await classifyInstallmentsForRebuild(db, policyId);
+    expect(result.classification).toBe("NO_INSTALLMENTS");
+    expect(result.actualCount).toBe(0);
+  });
+});

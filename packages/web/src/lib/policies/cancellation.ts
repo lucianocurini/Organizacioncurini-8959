@@ -90,11 +90,17 @@ export interface InstallmentCancellationClassification {
   renderedUnchanged: InstallmentForCancellation[];
   priorDebtUnchanged: InstallmentForCancellation[];
   futureNonCollectible: InstallmentForCancellation[];
+  duplicateUnchanged: InstallmentForCancellation[];
 }
 
 /**
  * Clasifica las cuotas de una póliza según lo que la anulación debe hacerles.
  * Cada cuota cae en EXACTAMENTE un bucket, con esta precedencia:
+ *   0. status="duplicada"    -> duplicateUnchanged (nunca se toca — no es parte
+ *      del plan real, la anulación de la póliza no le compete; ver Migración
+ *      0035. Precedencia MÁS ALTA que "pagada": una fila duplicada nunca
+ *      puede estar pagada de verdad — si lo estuviera, sería un error de
+ *      datos anterior a esta clasificación, no algo que decidir acá).
  *   1. status="pagada"      -> paidUnchanged (nunca se toca, sea cual sea la fecha)
  *   2. rendered=1            -> renderedUnchanged (nunca se toca, aunque no esté "pagada")
  *   3. dueDate < effectiveDate -> priorDebtUnchanged (deuda anterior, sigue exigible)
@@ -102,16 +108,19 @@ export interface InstallmentCancellationClassification {
  * Puro: no toca la base, no muta `installments`. El orden de precedencia
  * importa — una cuota pagada con dueDate posterior a effectiveDate sigue
  * siendo "paidUnchanged", nunca "futureNonCollectible" (nunca se perdona ni
- * se retoca lo ya cobrado).
+ * se retoca lo ya cobrado); una duplicada NUNCA pasa a "no_exigible" — eso
+ * pisaría el marcador de auditoría de la Migración 0035 (ver
+ * src/lib/installments/duplicate-status.ts).
  */
 export function classifyInstallmentsForCancellation(
   installments: InstallmentForCancellation[],
   effectiveDate: string
 ): InstallmentCancellationClassification {
   const result: InstallmentCancellationClassification = {
-    paidUnchanged: [], renderedUnchanged: [], priorDebtUnchanged: [], futureNonCollectible: [],
+    paidUnchanged: [], renderedUnchanged: [], priorDebtUnchanged: [], futureNonCollectible: [], duplicateUnchanged: [],
   };
   for (const inst of installments) {
+    if (inst.status === "duplicada") { result.duplicateUnchanged.push(inst); continue; }
     if (inst.status === "pagada") { result.paidUnchanged.push(inst); continue; }
     if (inst.rendered === 1) { result.renderedUnchanged.push(inst); continue; }
     if (inst.dueDate < effectiveDate) { result.priorDebtUnchanged.push(inst); continue; }

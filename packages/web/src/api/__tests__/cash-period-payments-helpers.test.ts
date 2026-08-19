@@ -141,6 +141,20 @@ describe("checkCashPeriodEligibility — variante sin throw de assertAllInstallm
   });
 });
 
+// ─── Migración 0035 — defensa en profundidad contra cuotas 'duplicada' ─────
+describe("checkCashPeriodEligibility / assertAllInstallmentsEligibleForCashPeriod — status='duplicada' (Migración 0035)", () => {
+  test("bloquea si una cuota es 'duplicada' (el caller ya debería haberla excluido antes, pero se valida igual)", () => {
+    const result = checkCashPeriodEligibility([mkInstallment({ id: 1, status: "duplicada" })]);
+    expect(result.eligible).toBe(false);
+    expect(result.reasons).toEqual(["La cuota 1 es un duplicado invalidado — no es parte del período real."]);
+  });
+  test("assertAllInstallmentsEligibleForCashPeriod lanza con el mismo motivo", () => {
+    expect(() =>
+      assertAllInstallmentsEligibleForCashPeriod([mkInstallment({ id: 1, status: "duplicada" })])
+    ).toThrow(/duplicado invalidado/);
+  });
+});
+
 describe("calculateCashPeriodDeadline", () => {
   test("suma 30 días corridos al inicio del período (emisión/renovación: policy.startDate)", () => {
     expect(calculateCashPeriodDeadline("2026-07-01")).toBe("2026-07-31");

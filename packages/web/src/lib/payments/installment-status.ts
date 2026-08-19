@@ -51,6 +51,14 @@ export async function recalculateInstallmentPaymentStatus(tx: any, installmentId
   const expectedCents = Math.round(installment.amount * 100);
   const hasValidPayment = confirmedPayments.some((p: any) => Math.round(p.amount * 100) === expectedCents);
 
+  // Migración 0035: una cuota 'duplicada' nunca se reconcilia por esta vía —
+  // ni a pagada, ni a pendiente/vencida. En el flujo normal esto nunca debería
+  // dispararse (los guards de creación de payments ya rechazan imputar sobre
+  // una cuota duplicada — ver isInstallmentDuplicate en index.ts), pero si de
+  // todos modos se llega acá (dato corrupto, payment histórico previo a la
+  // invalidación) se preserva el marcador de auditoría sin excepción.
+  if (installment.status === "duplicada") return;
+
   if (hasValidPayment) {
     await tx.update(policyInstallments).set({ status: "pagada" }).where(eq(policyInstallments.id, installmentId));
     return;

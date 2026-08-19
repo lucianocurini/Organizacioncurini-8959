@@ -125,3 +125,61 @@ export function resolveArgentinaMonthKey(value: string | Date | null | undefined
   if (isNaN(date.getTime())) return null;
   return toArgentinaCalendarDay(date).slice(0, 7);
 }
+
+/**
+ * Umbral para distinguir epoch en SEGUNDOS de epoch en MILISEGUNDOS cuando
+ * llega como number crudo: 1e12 ms caen en el año 2001 — cualquier fecha de
+ * negocio real de este proyecto (2020 en adelante) en milisegundos es mayor
+ * a eso, mientras que la misma fecha en segundos es ~1000x menor (~1.6-2.0
+ * mil millones). No hay ambigüedad real en el rango de fechas que maneja la
+ * app.
+ */
+const EPOCH_SECONDS_MS_THRESHOLD = 1e12;
+
+/**
+ * Normaliza CUALQUIER representación de un instante real a un `Date` válido,
+ * o `null` si no se puede — nunca lanza. Pensado para columnas
+ * `integer(..., { mode: "timestamp" })` de este proyecto (guardadas como
+ * epoch en SEGUNDOS en SQLite) que, al pasar por Drizzle + `c.json()`, llegan
+ * al frontend como Date → string ISO serializado — pero admite además las
+ * otras formas (epoch en segundos o en milisegundos como number, o un `Date`
+ * ya construido) para no atarse a un único camino de serialización.
+ *
+ * Motivo: `new Date(x).toISOString()` sin normalizar revienta con
+ * `RangeError: Invalid time value` ante cualquier dato inesperado (ver
+ * poliza-detail.tsx — auditoría de duplicados, Migración 0035) y tira abajo
+ * TODO el árbol de React sin error boundary. Esta función es la barrera:
+ * absorbe lo inesperado y devuelve `null`, nunca lanza.
+ */
+export function normalizeToDate(value: number | string | Date | null | undefined): Date | null {
+  if (value == null) return null;
+  if (value instanceof Date) {
+    return isNaN(value.getTime()) ? null : value;
+  }
+  let ms: number;
+  if (typeof value === "number") {
+    ms = Math.abs(value) < EPOCH_SECONDS_MS_THRESHOLD ? value * 1000 : value;
+  } else {
+    // string: se espera ISO (lo que sirve c.json() para columnas timestamp).
+    // No se intenta interpretar como epoch numérico en segundos/milisegundos
+    // — un epoch como string no es uno de los formatos que este proyecto
+    // produce, y "20260101" parsearía como año inválido igual.
+    const parsed = new Date(value);
+    ms = parsed.getTime();
+  }
+  const date = new Date(ms);
+  return isNaN(date.getTime()) ? null : date;
+}
+
+/**
+ * Etiqueta legible "DD/MM/AAAA" (día calendario Argentina) para un instante
+ * en cualquiera de las formas que acepta `normalizeToDate` — `null` si el
+ * valor falta o es inválido, para que el caller pueda mostrar un fallback
+ * ("Fecha no disponible") sin nunca romper el render.
+ */
+export function formatArgentinaTimestampLabel(value: number | string | Date | null | undefined): string | null {
+  const date = normalizeToDate(value);
+  if (!date) return null;
+  const [y, m, d] = toArgentinaCalendarDay(date).split("-");
+  return `${d}/${m}/${y}`;
+}

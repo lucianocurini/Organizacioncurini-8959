@@ -141,6 +141,12 @@ export function checkCashPeriodEligibility(
   for (const i of installments) {
     if (i.status === "pagada") reasons.push(`La cuota ${i.id} ya está pagada.`);
     else if (i.status === "no_exigible") reasons.push(`La cuota ${i.id} no es exigible.`);
+    // Migración 0035 — defensa en profundidad: el caller (index.ts) ya debe
+    // excluir cuotas 'duplicada' de `installments` ANTES de llamar acá (no
+    // son parte del período real, ver duplicate-status.ts) — pero si una se
+    // colara igual, esto la bloquea explícitamente en vez de dejarla pasar
+    // como "sin razones de bloqueo" por no matchear ningún caso conocido.
+    else if (i.status === "duplicada") reasons.push(`La cuota ${i.id} es un duplicado invalidado — no es parte del período real.`);
     if (i.rendered === 1) reasons.push(`La cuota ${i.id} ya fue rendida.`);
     if (i.hasConfirmedPayment) reasons.push(`La cuota ${i.id} ya tiene un pago confirmado.`);
   }

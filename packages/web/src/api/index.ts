@@ -55,6 +55,7 @@ import {
   appendCancellationNote, isInstallmentNonCollectible, PolicyCancellationValidationError, PolicyAlreadyCancelledError,
   type InstallmentForCancellation,
 } from "../lib/policies/cancellation";
+import { isInstallmentDuplicate, isRebillingDuplicate, excludeDuplicateInstallments, excludeDuplicateRebillings } from "../lib/installments/duplicate-status";
 import {
   normalizeBatchItems, normalizeBatchSplits, validateInstallmentsEligibility,
   calculateBaseAmountCents, resolveBatchSplitGroup, calculateApplicableRivadaviaSurcharges,
@@ -354,6 +355,9 @@ app.get("/policies/cash-period-search", requireAuth(async (c: any) => {
       .where(and(
         eq(policyInstallments.policyId, cand.policyId),
         cand.rebillingId !== null ? eq(policyInstallments.rebillingId, cand.rebillingId) : isNull(policyInstallments.rebillingId),
+        // Migración 0035: una cuota duplicada no es parte del período real —
+        // ni cuenta en el nominal, ni puede bloquear la elegibilidad.
+        excludeDuplicateInstallments(),
       )).all();
 
     const periodInstallmentIds = periodInstallmentRows.map((r) => r.id);
@@ -435,6 +439,24 @@ app.get("/policies/:id", requireAuth(async (c: any) => {
     cancelledByName = cancelledByUser?.name ?? null;
   }
 
+  // Migración 0035 — auditoría de duplicadas: nombres de quien invalidó cada
+  // cuota/refacturación duplicada de esta póliza (instRows/policyRebillings
+  // YA incluyen las filas 'duplicada' tal cual, sin filtrar — el frontend
+  // decide cómo separarlas de las reales; ver src/web/lib/rebilling-groups.ts).
+  // Un solo batch de nombres para ambas listas, sin N+1.
+  const invalidatedByIds = [
+    ...new Set([
+      ...instRows.filter((r: any) => r.invalidatedBy != null).map((r: any) => r.invalidatedBy as number),
+      ...policyRebillings.filter((r: any) => r.invalidatedBy != null).map((r: any) => r.invalidatedBy as number),
+    ]),
+  ];
+  const invalidatedByNameById = new Map<number, string>();
+  if (invalidatedByIds.length > 0) {
+    const invalidatedByUsers = await db.select({ id: users.id, name: users.name }).from(users)
+      .where(inArray(users.id, invalidatedByIds)).all();
+    for (const u of invalidatedByUsers) invalidatedByNameById.set(u.id, u.name);
+  }
+
   // Subpólizas accesoria (accidentes_pasajeros con parentPolicyId = id)
   const subPolicies = await db
     .select({ policy: policies, company: companies, insured: insureds })
@@ -443,7 +465,10 @@ app.get("/policies/:id", requireAuth(async (c: any) => {
     .leftJoin(insureds, eq(policies.insuredId, insureds.id))
     .where(eq(policies.parentPolicyId, id));
 
-  return c.json({ ...result, rebillings: policyRebillings, installments: instRows, subPolicies, cancelledByName }, 200);
+  return c.json({
+    ...result, rebillings: policyRebillings, installments: instRows, subPolicies, cancelledByName,
+    invalidatedByNames: Object.fromEntries(invalidatedByNameById),
+  }, 200);
 }));
 
 // ─── Rebillings ───────────────────────────────────────────────────────────────
@@ -467,10 +492,13 @@ app.get("/policies/:id/rebillings", requireAuth(async (c: any) => {
 // históricas sin cuotas vinculadas simplemente devuelven [] acá — ese es
 // justamente el caso que PUT (caso A) sabe completar.
 async function loadRebillingGroup(dbClient: any, rebillingId: number) {
+  // Migración 0035: excluye cuotas 'duplicada' — no son parte del grupo real
+  // (defensa en profundidad: en el caso común no deberían tener este
+  // rebillingId de todos modos, ver duplicate-status.ts).
   return dbClient
     .select({ id: policyInstallments.id, status: policyInstallments.status, rendered: policyInstallments.rendered })
     .from(policyInstallments)
-    .where(eq(policyInstallments.rebillingId, rebillingId))
+    .where(and(eq(policyInstallments.rebillingId, rebillingId), excludeDuplicateInstallments()))
     .all();
 }
 
@@ -507,10 +535,11 @@ const REB_EDIT_BLOCK_MSG = "No se puede editar la refacturación porque tiene cu
 // renovación tiene actividad — mismo criterio que ya bloquea la edición del
 // plan de una refacturación, sin duplicar esa lógica.
 async function loadPolicyBaseInstallmentGroup(dbClient: any, policyId: number) {
+  // Migración 0035: excluye cuotas 'duplicada' — no son parte del período real.
   return dbClient
     .select({ id: policyInstallments.id, status: policyInstallments.status, rendered: policyInstallments.rendered })
     .from(policyInstallments)
-    .where(and(eq(policyInstallments.policyId, policyId), isNull(policyInstallments.rebillingId)))
+    .where(and(eq(policyInstallments.policyId, policyId), isNull(policyInstallments.rebillingId), excludeDuplicateInstallments()))
     .all();
 }
 
@@ -629,6 +658,12 @@ app.put("/rebillings/:id", requireAuth(async (c: any) => {
 
   const existing = await db.select().from(rebillings).where(eq(rebillings.id, id)).get();
   if (!existing) return c.json({ error: "La refacturación ya no existe" }, 404);
+  // Migración 0035: una refacturación invalidada por duplicada no se edita
+  // por ninguna vía — está fuera del plan real, corregirla no tiene sentido
+  // (la corrección, si hiciera falta, es sobre la CANÓNICA).
+  if (isRebillingDuplicate(existing.status)) {
+    return c.json({ error: "Esta refacturación fue invalidada por duplicada — no se puede editar." }, 409);
+  }
 
   const currentGroup = await loadRebillingGroup(db, id);
   const currentInstallmentIds = currentGroup.map((i: any) => i.id);
@@ -795,6 +830,11 @@ app.post("/rebillings/:id/installments/rebuild", requireAuth(async (c: any) => {
   }
   const existing = await db.select().from(rebillings).where(eq(rebillings.id, id)).get();
   if (!existing) return c.json({ error: "La refacturación ya no existe" }, 404);
+  // Migración 0035: no se corrige el plan de una refacturación invalidada por
+  // duplicada — mismo criterio que PUT /rebillings/:id.
+  if (isRebillingDuplicate(existing.status)) {
+    return c.json({ error: "Esta refacturación fue invalidada por duplicada — no se puede corregir su plan." }, 409);
+  }
 
   const body = await c.req.json();
 
@@ -873,8 +913,15 @@ app.delete("/rebillings/:id", requireAuth(async (c: any) => {
     return c.json({ error: "ID de refacturación inválido." }, 400);
   }
 
-  const rebilling = await db.select({ id: rebillings.id, policyId: rebillings.policyId }).from(rebillings).where(eq(rebillings.id, id)).get();
+  const rebilling = await db.select({ id: rebillings.id, policyId: rebillings.policyId, status: rebillings.status }).from(rebillings).where(eq(rebillings.id, id)).get();
   if (!rebilling) return c.json({ error: "La refacturación ya no existe" }, 404);
+  // Migración 0035: una refacturación invalidada por duplicada nunca se borra
+  // físicamente por esta vía — el registro es justamente lo que queda para
+  // auditoría. La invalidación (o su reversión) es un acto administrativo
+  // aparte, nunca un DELETE.
+  if (isRebillingDuplicate(rebilling.status)) {
+    return c.json({ error: "Esta refacturación fue invalidada por duplicada — no se puede eliminar (queda como registro de auditoría)." }, 409);
+  }
 
   // Migración 0031 — un seguimiento de Envíos y Entregas vinculado a esta
   // refacturación puntual (deliveries.rebillingId) bloquea el borrado, con
@@ -1002,7 +1049,23 @@ app.post("/policies/:id/installments/generate", requireAuth(async (c: any) => {
 
 // Update a single installment
 app.put("/installments/:id", requireAuth(async (c: any) => {
+  const id = Number(c.req.param("id"));
   const body = await c.req.json();
+
+  // Migración 0035: esta ruta genérica nunca es la vía para invalidar por
+  // duplicada (eso exige duplicateOfInstallmentId + invalidatedBy + reason
+  // juntos, vía el saneamiento dedicado) ni para revertirlo — una cuota ya
+  // 'duplicada' es un registro de auditoría, no editable por acá.
+  const current = await db.select({ status: policyInstallments.status }).from(policyInstallments)
+    .where(eq(policyInstallments.id, id)).get();
+  if (!current) return c.json({ error: "La cuota no existe." }, 404);
+  if (isInstallmentDuplicate(current.status)) {
+    return c.json({ error: "Esta cuota fue invalidada por duplicada — no se puede editar (queda como registro de auditoría)." }, 409);
+  }
+  if ("status" in body && isInstallmentDuplicate(body.status)) {
+    return c.json({ error: "No se puede marcar una cuota como duplicada desde esta vía — usar el saneamiento dedicado." }, 400);
+  }
+
   const update: any = {};
   if ("dueDate" in body) update.dueDate = body.dueDate;
   if ("amount" in body) update.amount = Number(body.amount);
@@ -1011,7 +1074,7 @@ app.put("/installments/:id", requireAuth(async (c: any) => {
   const [row] = await db
     .update(policyInstallments)
     .set(update)
-    .where(eq(policyInstallments.id, Number(c.req.param("id"))))
+    .where(eq(policyInstallments.id, id))
     .returning();
   return c.json(row, 200);
 }));
@@ -2127,6 +2190,11 @@ app.post("/payments", requireAuth(async (c: any) => {
     if (isInstallmentNonCollectible(installmentRow.status)) {
       return c.json({ error: "La cuota indicada no es exigible: la póliza fue anulada antes de su vencimiento." }, 409);
     }
+    // Migración 0035: una cuota duplicada nunca es cobrable, sin importar
+    // isConfirmed — mismo criterio que no_exigible arriba.
+    if (isInstallmentDuplicate(installmentRow.status)) {
+      return c.json({ error: "La cuota indicada es un duplicado invalidado — no corresponde imputar pagos sobre ella." }, 409);
+    }
   }
 
   // Importe vs. cuota: solo aplica a pagos confirmados vinculados a una cuota.
@@ -2384,6 +2452,10 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
     // que la anulación de su póliza ya dejó no exigible.
     if (isInstallmentNonCollectible(newInstallmentRow.status)) {
       return c.json({ error: "La cuota indicada no es exigible: la póliza fue anulada antes de su vencimiento." }, 409);
+    }
+    // Migración 0035: mismo bloqueo que POST /payments.
+    if (isInstallmentDuplicate(newInstallmentRow.status)) {
+      return c.json({ error: "La cuota indicada es un duplicado invalidado — no corresponde imputar pagos sobre ella." }, 409);
     }
   }
 
@@ -3472,6 +3544,8 @@ app.post("/payment-batches/cash-period-payment", requireAuth(async (c: any) => {
     .where(and(
       eq(policyInstallments.policyId, policyId),
       rebillingId !== null ? eq(policyInstallments.rebillingId, rebillingId) : isNull(policyInstallments.rebillingId),
+      // Migración 0035: una cuota duplicada no es parte del período real.
+      excludeDuplicateInstallments(),
     )).all();
 
   const periodInstallmentIds = periodInstallmentRows.map((r) => r.id);
@@ -7619,9 +7693,13 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
   const endDateExclusive = `${nextYear}-${String(nextMon).padStart(2, "0")}-01`;
 
   // ── 1. Rebillings — dedup by (policyId, billingStart, billingEnd, premiumCents) ──
+  // Migración 0035: excluye refacturaciones 'duplicada' — con el histórico ya
+  // saneado, extraDuplicateRows (más abajo) vuelve a reflejar duplicados
+  // reales sin sanear, no registros de auditoría ya invalidados.
   const rebConditions: any[] = [
     gte(rebillings.billingStart, startDate),
     lt(rebillings.billingStart, endDateExclusive),
+    excludeDuplicateRebillings(),
   ];
   if (companyId) rebConditions.push(eq(policies.companyId, companyId));
   if (validType) rebConditions.push(eq(policies.type, validType));
@@ -9669,6 +9747,9 @@ app.post("/remittances", requireAuth(async (c: any) => {
         if (!inst) throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} no existe.`);
         if (inst.rendered) throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} ya fue rendida.`);
         if (inst.status === "no_exigible") throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} no es exigible y no puede rendirse.`);
+        // Migración 0035: una cuota duplicada no puede declararse adeudada ni
+        // rendirse por ninguna vía.
+        if (isInstallmentDuplicate(inst.status)) throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} es un duplicado invalidado y no puede rendirse.`);
       }
 
       // Recargos pronto_pago auto-incluidos: reconsultar dentro de la tx.
@@ -10058,6 +10139,13 @@ app.post("/remittances/items/:id/collect", requireAuth(async (c: any) => {
       if (installmentRow.status === "pagada") {
         throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} ya está pagada.`);
       }
+      // Migración 0035: defensa en profundidad — con /remittances/uncollected
+      // ya excluyendo duplicadas, este ítem nunca debería tener
+      // debtorStatus="adeudado" apuntando a una cuota duplicada, pero se
+      // valida igual antes de crear el payment real.
+      if (isInstallmentDuplicate(installmentRow.status)) {
+        throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} es un duplicado invalidado y no puede cobrarse por esta vía.`);
+      }
 
       // Nunca pagos parciales (mismo invariante que POST /payments): el
       // importe del cobro es siempre el de la cuota real, nunca lo que
@@ -10195,6 +10283,9 @@ app.get("/remittances/uncollected", requireAuth(async (c: any) => {
     .where(and(
       ne(policyInstallments.status, "pagada"),
       ne(policyInstallments.status, "no_exigible"),
+      // Migración 0035: una cuota duplicada no es una deuda real — nunca debe
+      // ofrecerse para declararse "adeudada" en una rendición nueva.
+      excludeDuplicateInstallments(),
       eq(policyInstallments.rendered, 0),
       ne(policies.status, "cancelada"),
     ))

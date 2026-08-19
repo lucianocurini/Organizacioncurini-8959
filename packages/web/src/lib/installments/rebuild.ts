@@ -28,6 +28,7 @@ import { eq, inArray, and } from "drizzle-orm";
 import { policies, policyInstallments, payments, remittanceItems } from "../../api/database/schema";
 import type { InstallmentPlanResult } from "./plan";
 import { validateCashPaymentAmountAgainstNominal } from "../payments/cash-period-payments";
+import { excludeDuplicateInstallments } from "./duplicate-status";
 
 export type RebuildClassification = "NO_INSTALLMENTS" | "SAFE_TO_REBUILD" | "REQUIRES_MANUAL_REVIEW";
 
@@ -143,6 +144,12 @@ export async function classifyInstallmentsForRebuild(
   if (!policyRow) throw new PolicyNotFoundError(policyId);
   const expectedCount = policyRow.installments ?? null;
 
+  // Migración 0035: una cuota 'duplicada' NUNCA es parte del plan real — ni
+  // cuenta para actualCount/expectedCount, ni puede bloquear la
+  // reconstrucción (fail-closed de KNOWN_SAFE_STATUSES la trataría como
+  // "estado no reconocido" si llegara hasta acá). Queda completamente
+  // invisible para esta clasificación, y por eso mismo runInstallmentRebuildTransaction
+  // la excluye también del DELETE — nunca se borra físicamente.
   const installments: InstallmentRow[] = await dbClient
     .select({
       id: policyInstallments.id,
@@ -153,7 +160,7 @@ export async function classifyInstallmentsForRebuild(
       rebillingId: policyInstallments.rebillingId,
     })
     .from(policyInstallments)
-    .where(eq(policyInstallments.policyId, policyId))
+    .where(and(eq(policyInstallments.policyId, policyId), excludeDuplicateInstallments()))
     .orderBy(policyInstallments.number)
     .all();
 
@@ -245,7 +252,9 @@ export async function runInstallmentRebuildTransaction(
     validateCashPaymentAmountAgainstNominal(policyRow.cashPaymentAmountCents, newNominalCents);
   }
 
-  await tx.delete(policyInstallments).where(eq(policyInstallments.policyId, policyId));
+  // Nunca borra cuotas 'duplicada' — quedan permanentemente disponibles para
+  // auditoría (ver comentario de classifyInstallmentsForRebuild arriba).
+  await tx.delete(policyInstallments).where(and(eq(policyInstallments.policyId, policyId), excludeDuplicateInstallments()));
 
   const insertedRows = await tx
     .insert(policyInstallments)

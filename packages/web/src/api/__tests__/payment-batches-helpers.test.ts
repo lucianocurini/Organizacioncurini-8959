@@ -232,6 +232,10 @@ describe("validateInstallmentsEligibility", () => {
   test("rechaza cuota no_exigible", () => {
     expect(() => validateInstallmentsEligibility([ctx({ installmentStatus: "no_exigible" })])).toThrow(/no es exigible/);
   });
+  // Migración 0035: una cuota duplicada nunca es cobrable, ni siquiera en lote.
+  test("rechaza cuota duplicada", () => {
+    expect(() => validateInstallmentsEligibility([ctx({ installmentStatus: "duplicada" })])).toThrow(/duplicado invalidado/);
+  });
   test("rechaza cuota rendered=1", () => {
     expect(() => validateInstallmentsEligibility([ctx({ rendered: 1 })])).toThrow(/ya fue rendida/);
   });

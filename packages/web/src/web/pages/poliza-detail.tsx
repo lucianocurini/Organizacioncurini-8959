@@ -8,7 +8,7 @@ import { PolicyModal } from "@/components/policies/PolicyModal";
 import { RebillingModal } from "@/components/policies/RebillingModal";
 import { toast } from "sonner";
 import { buildInstallmentPlan, InstallmentPlanError } from "../../lib/installments/plan";
-import { toArgentinaCalendarDay } from "../../lib/dates/argentina-date";
+import { toArgentinaCalendarDay, formatArgentinaTimestampLabel } from "../../lib/dates/argentina-date";
 import {
   compareExpectedVsActual, EXPECTED_VS_ACTUAL_LABELS, shouldShowRebuildButton,
   decideRebuildUiAction, buildRebuildRequestBody, summarizeRebuildPlan,
@@ -21,7 +21,7 @@ import {
   normalizeCancellationError, shouldRefreshAfterCancelResponse, NON_COLLECTIBLE_STATUS_LABEL,
   type CancellationFormInput, type CancellationPreviewSummary,
 } from "@/lib/policy-cancellation";
-import { groupInstallmentsByRebilling, countLinkedInstallments } from "@/lib/rebilling-groups";
+import { groupInstallmentsByRebilling, countLinkedInstallments, extractDuplicateInstallments, extractDuplicateRebillings } from "@/lib/rebilling-groups";
 import { buildQuickAddDeliveryPayload, normalizeDeliveryError } from "@/lib/deliveries-form";
 import { calculateCashPeriodDeadline, getCashPeriodDeadlineStatus } from "@/lib/cash-period-payment-form";
 
@@ -155,7 +155,14 @@ export default function PolizaDetail() {
 
   const p = row.policy;
   const subPoliciesList: any[] = row.subPolicies ?? [];
-  const rebillingsList: any[] = row.rebillings ?? [];
+  // Migración 0035: TODA la sección operativa de Refacturaciones (contador,
+  // tarjetas con sus acciones editar/reconstruir/enviar/eliminar, y los
+  // selects de "Refacturación asociada" en Generar cuotas / Corregir plan)
+  // nunca debe ver una refacturación 'duplicada' — únicamente
+  // allRebillingsList (sin filtrar) llega a extractDuplicateRebillings más
+  // abajo, exclusivamente para la sección de auditoría.
+  const allRebillingsList: any[] = row.rebillings ?? [];
+  const rebillingsList: any[] = allRebillingsList.filter((r: any) => (r.status ?? "activa") !== "duplicada");
   const typeInfo = POLICY_TYPES[p.type];
   const statusInfo = STATUS_TYPES[p.status];
   const Icon = typeIcons[p.type] || FileText;
@@ -530,6 +537,14 @@ export default function PolizaDetail() {
         {/* ─── Cuotas ──────────────────────────────────────────────────────── */}
         {(() => {
           const installmentsList: any[] = row.installments ?? [];
+          // Migración 0035: "cantidad real de cuotas" del plan NUNCA incluye
+          // duplicadas — installmentsList (sin filtrar) se sigue usando para
+          // armar los grupos (groupInstallmentsByRebilling ya las excluye
+          // internamente) y para la sección de auditoría más abajo.
+          const realInstallmentsList = installmentsList.filter((i: any) => i.status !== "duplicada");
+          const duplicateInstallmentRecords = extractDuplicateInstallments(installmentsList);
+          const duplicateRebillingRecords = extractDuplicateRebillings(allRebillingsList);
+          const invalidatedByNames: Record<string, string> = row.invalidatedByNames ?? {};
           const STATUS_COLOR: Record<string, string> = {
             pendiente: "bg-yellow-500/20 text-yellow-400 border-yellow-500/30",
             pagada: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
@@ -548,7 +563,7 @@ export default function PolizaDetail() {
           // null nunca es "no coincide" — no hay nada contra qué comparar (misma
           // regla que classifyInstallmentsForRebuild en el backend).
           const expectedCount: number | null = p.installments ?? null;
-          const comparison = compareExpectedVsActual(expectedCount, installmentsList.length);
+          const comparison = compareExpectedVsActual(expectedCount, realInstallmentsList.length);
 
           // Esta reconstrucción (Subetapa 2B, /policies/:id/installments/rebuild)
           // es EXCLUSIVA de la emisión original: classifyInstallmentsForRebuild
@@ -560,8 +575,8 @@ export default function PolizaDetail() {
           // puntual (lista de Refacturaciones, más abajo) — que sí es la acción
           // correcta ahí. Se oculta acá, nunca se toca la clasificación del
           // backend.
-          const hasAnyRebillingLinkedInstallment = installmentsList.some((i: any) => i.rebillingId !== null);
-          const showRebuildButton = shouldShowRebuildButton(installmentsList.length, comparison) && !hasAnyRebillingLinkedInstallment;
+          const hasAnyRebillingLinkedInstallment = realInstallmentsList.some((i: any) => i.rebillingId !== null);
+          const showRebuildButton = shouldShowRebuildButton(realInstallmentsList.length, comparison) && !hasAnyRebillingLinkedInstallment;
 
           // Consulta (o reutiliza) rebuild-check al pulsar "Corregir plan de
           // cuotas" — no se dispara automáticamente al cargar la página, para
@@ -713,19 +728,24 @@ export default function PolizaDetail() {
               <div className="flex items-center gap-2 mb-3">
                 <ListOrdered className="w-4 h-4 text-amber-400" />
                 <h2 className="text-sm font-semibold text-white" style={{ fontFamily: "Syne, sans-serif" }}>Cuotas</h2>
-                {installmentsList.length > 0 && (
-                  <span className="text-xs text-gray-500 bg-[#1f2937] px-2 py-0.5 rounded-full">{installmentsList.length}</span>
+                {realInstallmentsList.length > 0 && (
+                  <span className="text-xs text-gray-500 bg-[#1f2937] px-2 py-0.5 rounded-full">{realInstallmentsList.length}</span>
                 )}
-                {installmentsList.length > 0 && (
+                {realInstallmentsList.length > 0 && (
                   <span className="text-xs text-gray-600 ml-2">
-                    {installmentsList.filter((i: any) => i.status === "pagada").length} pagadas ·{" "}
-                    {installmentsList.filter((i: any) => i.status === "pendiente").length} pendientes ·{" "}
-                    {installmentsList.filter((i: any) => i.status === "vencida").length} vencidas
+                    {realInstallmentsList.filter((i: any) => i.status === "pagada").length} pagadas ·{" "}
+                    {realInstallmentsList.filter((i: any) => i.status === "pendiente").length} pendientes ·{" "}
+                    {realInstallmentsList.filter((i: any) => i.status === "vencida").length} vencidas
                   </span>
                 )}
-                {(installmentsList.length === 0 || showRebuildButton) && (
+                {duplicateInstallmentRecords.length > 0 && (
+                  <span className="text-xs text-orange-400 bg-orange-500/10 border border-orange-500/20 rounded-full px-2 py-0.5">
+                    {duplicateInstallmentRecords.length} duplicada{duplicateInstallmentRecords.length === 1 ? "" : "s"}
+                  </span>
+                )}
+                {(realInstallmentsList.length === 0 || showRebuildButton) && (
                   <div className="ml-auto flex items-center gap-2">
-                    {installmentsList.length === 0 && (
+                    {realInstallmentsList.length === 0 && (
                       <button
                         onClick={openGenForm}
                         className="text-xs px-3 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-lg hover:bg-amber-500/20 transition-all flex items-center gap-1.5"
@@ -751,7 +771,7 @@ export default function PolizaDetail() {
               <div className="mb-3 flex items-center gap-2 text-xs flex-wrap">
                 <span className="text-gray-500">Cuotas esperadas: <span className="text-gray-300">{expectedCount ?? "Sin definir"}</span></span>
                 <span className="text-gray-700">·</span>
-                <span className="text-gray-500">Cuotas reales: <span className="text-gray-300">{installmentsList.length}</span></span>
+                <span className="text-gray-500">Cuotas reales: <span className="text-gray-300">{realInstallmentsList.length}</span></span>
                 <span className={cn(
                   "px-2 py-0.5 rounded-full border",
                   comparison.status === "no_coincide" ? "bg-amber-500/10 text-amber-400 border-amber-500/20" :
@@ -1060,6 +1080,104 @@ export default function PolizaDetail() {
                 </div>
                 );
               })()}
+
+              {/* Migración 0035 — auditoría de cuotas duplicadas invalidadas.
+                  Solo lectura, nunca se mezcla con la tabla de cuotas reales de
+                  arriba (que ya las excluye) — identifica canónica, fecha,
+                  usuario y motivo de cada invalidación. */}
+              {duplicateInstallmentRecords.length > 0 && (
+                <div className="mt-4 bg-[#111827] border border-orange-500/20 rounded-xl overflow-hidden">
+                  <div className="flex items-center gap-2 px-4 py-2.5 border-b border-orange-500/20 bg-orange-500/5">
+                    <Ban className="w-3.5 h-3.5 text-orange-400" />
+                    <h3 className="text-xs font-semibold text-orange-300 uppercase tracking-wider">
+                      Cuotas duplicadas (auditoría) — {duplicateInstallmentRecords.length}
+                    </h3>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs min-w-[720px]">
+                      <thead>
+                        <tr className="text-[11px] text-gray-500 border-b border-[#1f2937]">
+                          <th className="text-left px-4 py-2 font-medium">#</th>
+                          <th className="text-left px-3 py-2 font-medium">Vencimiento</th>
+                          <th className="text-left px-3 py-2 font-medium">Importe</th>
+                          <th className="text-left px-3 py-2 font-medium">Canónica</th>
+                          <th className="text-left px-3 py-2 font-medium">Invalidada</th>
+                          <th className="text-left px-3 py-2 font-medium">Usuario</th>
+                          <th className="text-left px-3 py-2 font-medium">Motivo</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {duplicateInstallmentRecords.map((d) => (
+                          <tr key={d.id} className="border-b border-[#1f2937] last:border-0">
+                            <td className="px-4 py-2 text-gray-500 font-mono">{d.number}</td>
+                            <td className="px-3 py-2 text-gray-400">{formatDate(d.dueDate)}</td>
+                            <td className="px-3 py-2 text-gray-400">{formatCurrency(d.amount)}</td>
+                            <td className="px-3 py-2 text-gray-400">
+                              {d.canonical
+                                ? `#${d.canonical.id} — ${formatDate(d.canonical.dueDate)} — ${formatCurrency(d.canonical.amount)}`
+                                : d.duplicateOfInstallmentId != null ? `#${d.duplicateOfInstallmentId}` : "—"}
+                            </td>
+                            <td className="px-3 py-2 text-gray-500">
+                              {formatArgentinaTimestampLabel(d.invalidatedAt) ?? "Fecha no disponible"}
+                            </td>
+                            <td className="px-3 py-2 text-gray-500">
+                              {d.invalidatedBy != null ? (invalidatedByNames[String(d.invalidatedBy)] ?? `Usuario #${d.invalidatedBy}`) : "—"}
+                            </td>
+                            <td className="px-3 py-2 text-gray-500 max-w-[320px] whitespace-normal break-words" title={d.invalidationReason ?? undefined}>
+                              {d.invalidationReason ?? "—"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {duplicateRebillingRecords.length > 0 && (
+                <div className="mt-4 bg-[#111827] border border-orange-500/20 rounded-xl overflow-hidden">
+                  <div className="flex items-center gap-2 px-4 py-2.5 border-b border-orange-500/20 bg-orange-500/5">
+                    <Ban className="w-3.5 h-3.5 text-orange-400" />
+                    <h3 className="text-xs font-semibold text-orange-300 uppercase tracking-wider">
+                      Refacturaciones duplicadas (auditoría) — {duplicateRebillingRecords.length}
+                    </h3>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs min-w-[640px]">
+                      <thead>
+                        <tr className="text-[11px] text-gray-500 border-b border-[#1f2937]">
+                          <th className="text-left px-4 py-2 font-medium">Período</th>
+                          <th className="text-left px-3 py-2 font-medium">Canónica</th>
+                          <th className="text-left px-3 py-2 font-medium">Invalidada</th>
+                          <th className="text-left px-3 py-2 font-medium">Usuario</th>
+                          <th className="text-left px-3 py-2 font-medium">Motivo</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {duplicateRebillingRecords.map((d) => (
+                          <tr key={d.id} className="border-b border-[#1f2937] last:border-0">
+                            <td className="px-4 py-2 text-gray-400">{formatDate(d.billingStart)} → {formatDate(d.billingEnd)}</td>
+                            <td className="px-3 py-2 text-gray-400">
+                              {d.canonical
+                                ? `#${d.canonical.id} — ${formatDate(d.canonical.billingStart)} → ${formatDate(d.canonical.billingEnd)}`
+                                : d.duplicateOfRebillingId != null ? `#${d.duplicateOfRebillingId}` : "—"}
+                            </td>
+                            <td className="px-3 py-2 text-gray-500">
+                              {formatArgentinaTimestampLabel(d.invalidatedAt) ?? "Fecha no disponible"}
+                            </td>
+                            <td className="px-3 py-2 text-gray-500">
+                              {d.invalidatedBy != null ? (invalidatedByNames[String(d.invalidatedBy)] ?? `Usuario #${d.invalidatedBy}`) : "—"}
+                            </td>
+                            <td className="px-3 py-2 text-gray-500 max-w-[320px] whitespace-normal break-words" title={d.invalidationReason ?? undefined}>
+                              {d.invalidationReason ?? "—"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
 
               {/* Corregir plan de cuotas — modal separado del de "Generar cuotas":
                   usa exclusivamente POST /installments/rebuild, nunca el endpoint

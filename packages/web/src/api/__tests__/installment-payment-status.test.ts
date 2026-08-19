@@ -162,3 +162,25 @@ describe("6. Cuota futura sin payment válido", () => {
     expect((await getInstallment(instId))?.status).toBe("pendiente");
   });
 });
+
+// ─── Migración 0035 — invalidación trazable de duplicadas ──────────────────
+describe("7. Cuota 'duplicada' — nunca se reconcilia (Migración 0035)", () => {
+  test("sin payment válido, dueDate pasada → sigue 'duplicada', NUNCA pasa a 'vencida'", async () => {
+    const policyId = await mkPolicy();
+    const instId = await mkInstallment(policyId, "2020-01-01", 1000);
+    await db.update(policyInstallments).set({ status: "duplicada" }).where(eq(policyInstallments.id, instId));
+
+    await recalc(instId);
+    expect((await getInstallment(instId))?.status).toBe("duplicada");
+  });
+
+  test("con un payment confirmado de importe exacto vinculado (dato corrupto hipotético) → sigue 'duplicada', NUNCA pasa a 'pagada'", async () => {
+    const policyId = await mkPolicy();
+    const instId = await mkInstallment(policyId, "2027-06-01", 1000);
+    await db.update(policyInstallments).set({ status: "duplicada" }).where(eq(policyInstallments.id, instId));
+    await mkPayment(instId, 1000, "confirmado");
+
+    await recalc(instId);
+    expect((await getInstallment(instId))?.status).toBe("duplicada");
+  });
+});

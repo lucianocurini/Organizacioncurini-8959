@@ -757,3 +757,88 @@ describe("Regresión QA visual — rebillingId === objetivo NUNCA es motivo de b
     }
   });
 });
+
+// ─── Migración 0035 — refacturación invalidada por duplicada ──────────────
+describe("Refacturación status='duplicada' — bloqueada para editar/corregir/eliminar (Migración 0035)", () => {
+  test("PUT /rebillings/:id sobre una duplicada → 409, no modifica nada", async () => {
+    const policyId = await mkPolicy();
+    try {
+      const created = await callPost(policyId, {
+        billingStart: "2027-06-01", billingEnd: "2027-08-31", monthlyFee: 1000, installmentCount: 3, firstDueDate: "2027-06-01",
+      });
+      const rebId = created.body.id;
+      await db.update(rebillings).set({ status: "duplicada" }).where(eq(rebillings.id, rebId));
+
+      const { status, body } = await callPut(rebId, { notes: "intento de edición" });
+      expect(status).toBe(409);
+      expect(body.error).toMatch(/duplicada/);
+
+      const stillDuplicada = await db.select({ status: rebillings.status, notes: rebillings.notes }).from(rebillings).where(eq(rebillings.id, rebId)).get();
+      expect(stillDuplicada?.status).toBe("duplicada");
+      expect(stillDuplicada?.notes).not.toBe("intento de edición");
+    } finally {
+      await cleanupPolicy(policyId);
+    }
+  });
+
+  test("POST /rebillings/:id/installments/rebuild sobre una duplicada → 409, no toca cuotas", async () => {
+    const policyId = await mkPolicy();
+    try {
+      const created = await callPost(policyId, {
+        billingStart: "2027-06-01", billingEnd: "2027-08-31", monthlyFee: 1000, installmentCount: 3, firstDueDate: "2027-06-01",
+      });
+      const rebId = created.body.id;
+      await db.update(rebillings).set({ status: "duplicada" }).where(eq(rebillings.id, rebId));
+      const before = await getInstallments(policyId);
+
+      const { status } = await callRebuild(rebId, {
+        billingStart: "2027-06-01", billingEnd: "2027-10-31", monthlyFee: 2000, installmentCount: 5, firstDueDate: "2027-06-01",
+      });
+      expect(status).toBe(409);
+
+      const after = await getInstallments(policyId);
+      expect(after).toEqual(before);
+    } finally {
+      await cleanupPolicy(policyId);
+    }
+  });
+
+  test("DELETE /rebillings/:id sobre una duplicada → 409, el registro de auditoría nunca se borra", async () => {
+    const policyId = await mkPolicy();
+    try {
+      const created = await callPost(policyId, {
+        billingStart: "2027-06-01", billingEnd: "2027-08-31", monthlyFee: 1000, installmentCount: 3, firstDueDate: "2027-06-01",
+      });
+      const rebId = created.body.id;
+      await db.update(rebillings).set({ status: "duplicada" }).where(eq(rebillings.id, rebId));
+
+      const res = await app.fetch(new Request(`http://localhost/api/rebillings/${rebId}`, { method: "DELETE", headers: authHeaders() }));
+      expect(res.status).toBe(409);
+
+      const stillThere = await db.select({ id: rebillings.id }).from(rebillings).where(eq(rebillings.id, rebId)).get();
+      expect(stillThere).toBeDefined();
+    } finally {
+      await cleanupPolicy(policyId);
+    }
+  });
+
+  test("GET /policies/:id sigue devolviendo la refacturación duplicada (visible para auditoría, no oculta)", async () => {
+    const policyId = await mkPolicy();
+    try {
+      const created = await callPost(policyId, {
+        billingStart: "2027-06-01", billingEnd: "2027-08-31", monthlyFee: 1000, installmentCount: 3, firstDueDate: "2027-06-01",
+      });
+      const rebId = created.body.id;
+      await db.update(rebillings).set({ status: "duplicada", invalidationReason: "duplicado exacto de importación" }).where(eq(rebillings.id, rebId));
+
+      const res = await app.fetch(new Request(`http://localhost/api/policies/${policyId}`, { headers: authHeaders() }));
+      const body = await res.json();
+      const found = body.rebillings.find((r: any) => r.id === rebId);
+      expect(found).toBeDefined();
+      expect(found.status).toBe("duplicada");
+      expect(found.invalidationReason).toBe("duplicado exacto de importación");
+    } finally {
+      await cleanupPolicy(policyId);
+    }
+  });
+});

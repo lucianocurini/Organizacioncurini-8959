@@ -129,6 +129,49 @@ describe("classifyInstallmentsForCancellation", () => {
     classifyInstallmentsForCancellation(installments, "2027-06-01");
     expect(installments).toEqual(copy);
   });
+
+  // ─── Migración 0035 — invalidación trazable de duplicadas ────────────────
+  describe("status='duplicada' (Migración 0035)", () => {
+    test("cuota duplicada, dueDate futura → duplicateUnchanged, NUNCA futureNonCollectible ('no_exigible' no se reutiliza)", () => {
+      const result = classifyInstallmentsForCancellation(
+        [inst({ id: 1, status: "duplicada", dueDate: "2027-12-01" })], "2027-06-01"
+      );
+      expect(result.duplicateUnchanged.map((i) => i.id)).toEqual([1]);
+      expect(result.futureNonCollectible).toEqual([]);
+    });
+
+    test("cuota duplicada con rendered=1 (dato corrupto hipotético) → sigue siendo duplicateUnchanged, no renderedUnchanged", () => {
+      const result = classifyInstallmentsForCancellation(
+        [inst({ id: 1, status: "duplicada", rendered: 1, dueDate: "2027-12-01" })], "2027-06-01"
+      );
+      expect(result.duplicateUnchanged.map((i) => i.id)).toEqual([1]);
+      expect(result.renderedUnchanged).toEqual([]);
+    });
+
+    test("cuota duplicada con dueDate anterior a effectiveDate → sigue siendo duplicateUnchanged, no priorDebtUnchanged", () => {
+      const result = classifyInstallmentsForCancellation(
+        [inst({ id: 1, status: "duplicada", dueDate: "2027-01-01" })], "2027-06-01"
+      );
+      expect(result.duplicateUnchanged.map((i) => i.id)).toEqual([1]);
+      expect(result.priorDebtUnchanged).toEqual([]);
+    });
+
+    test("conjunto mixto: duplicada convive con los otros 4 buckets sin interferir", () => {
+      const installments = [
+        inst({ id: 1, status: "pagada", dueDate: "2027-08-01" }),
+        inst({ id: 2, rendered: 1, dueDate: "2027-08-01" }),
+        inst({ id: 3, dueDate: "2027-05-01" }),
+        inst({ id: 4, dueDate: "2027-07-01" }),
+        inst({ id: 5, status: "duplicada", dueDate: "2027-09-01" }),
+      ];
+      const result = classifyInstallmentsForCancellation(installments, "2027-06-01");
+      expect(result.paidUnchanged.map((i) => i.id)).toEqual([1]);
+      expect(result.renderedUnchanged.map((i) => i.id)).toEqual([2]);
+      expect(result.priorDebtUnchanged.map((i) => i.id)).toEqual([3]);
+      expect(result.futureNonCollectible.map((i) => i.id)).toEqual([4]);
+      expect(result.duplicateUnchanged.map((i) => i.id)).toEqual([5]);
+    });
+  });
 });
 
 describe("isInstallmentNonCollectible", () => {

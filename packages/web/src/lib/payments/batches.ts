@@ -270,6 +270,11 @@ export function validateInstallmentsEligibility(items: BatchItemContext[]): void
       if (i.installmentStatus === "no_exigible") {
         throw new PaymentBatchValidationError(`La cuota ${i.installmentId} no es exigible.`);
       }
+      // Migración 0035: mismo criterio que "pagada"/"no_exigible" — una cuota
+      // duplicada nunca es cobrable, ni siquiera dentro de un lote.
+      if (i.installmentStatus === "duplicada") {
+        throw new PaymentBatchValidationError(`La cuota ${i.installmentId} es un duplicado invalidado — no corresponde cobrarla.`);
+      }
       if (i.rendered === 1) {
         throw new PaymentBatchValidationError(`La cuota ${i.installmentId} ya fue rendida.`);
       }

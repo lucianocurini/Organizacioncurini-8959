@@ -98,6 +98,44 @@ describe("summarizeInstallments", () => {
   });
 
   test("lista vacía → todos los totales en cero", () => {
-    expect(summarizeInstallments([])).toEqual({ total: 0, pagadas: 0, pendientes: 0, vencidas: 0 });
+    expect(summarizeInstallments([])).toEqual({ total: 0, pagadas: 0, pendientes: 0, vencidas: 0, duplicadas: 0 });
+  });
+});
+
+// ─── Migración 0035 — invalidación trazable de duplicadas ──────────────────
+describe("groupInstallmentsByRebilling — excluye cuotas 'duplicada' (Migración 0035)", () => {
+  test("una cuota 'duplicada' no aparece en ningún grupo", () => {
+    const dup = { id: 99, number: 2, dueDate: "2027-02-01", amount: 1000, status: "duplicada", notes: null, rebillingId: null };
+    const groups = groupInstallmentsByRebilling([...original, dup], []);
+    const originalGroup = groups.find((g) => g.key === "original")!;
+    expect(originalGroup.installments.map((i) => i.id)).toEqual([1, 2]);
+    expect(originalGroup.installments.some((i) => i.status === "duplicada")).toBe(false);
+  });
+
+  test("una refacturación 'duplicada' no genera grupo propio", () => {
+    const rebDup = { ...rebA, status: "duplicada" };
+    const groups = groupInstallmentsByRebilling([...instA], [rebDup]);
+    expect(groups.find((g) => g.key === "10")).toBeUndefined();
+  });
+
+  test("refacturación sin status informado se trata como 'activa' (compatibilidad hacia atrás)", () => {
+    const groups = groupInstallmentsByRebilling([...instA], [rebA]);
+    expect(groups.find((g) => g.key === "10")).toBeDefined();
+  });
+});
+
+describe("countLinkedInstallments — excluye 'duplicada' del conteo real (Migración 0035)", () => {
+  test("una cuota duplicada del mismo rebillingId no suma", () => {
+    const dup = { id: 99, rebillingId: 10, status: "duplicada" };
+    expect(countLinkedInstallments([...instA, dup], 10)).toBe(instA.length);
+  });
+});
+
+describe("summarizeInstallments — separa 'duplicada' del resto (Migración 0035)", () => {
+  test("duplicadas no suman a total/pagadas/pendientes/vencidas, se informan aparte", () => {
+    const dup = { status: "duplicada" };
+    const totals = summarizeInstallments([...original, ...instA, ...instB, dup]);
+    expect(totals.total).toBe(5); // igual que antes, sin la duplicada
+    expect(totals.duplicadas).toBe(1);
   });
 });
