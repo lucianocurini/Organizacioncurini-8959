@@ -207,6 +207,14 @@ export const paymentBatches = sqliteTable("payment_batches", {
   // src/lib/payments/insured-account.ts para los helpers que usan la
   // diferencia entre ambos.
   receivedAmountCents: integer("received_amount_cents"),
+  // Migración 0036 (titular de cuenta explícito): elegido por quien cobra,
+  // independiente de insuredId de arriba (que sigue siendo un dato DERIVADO
+  // de los ítems del batch, sin cambios). Un lote puede mezclar pólizas de
+  // varios asegurados reales y aun así tener un único titular de cuenta
+  // explícito — a diferencia de insuredId, que queda NULL en ese caso. NULL
+  // para todo batch que no use el flujo de cuenta corriente con titular
+  // (Etapa 1B-2/1B-3, todavía sin implementar).
+  accountHolderInsuredId: integer("account_holder_insured_id").references(() => insureds.id),
 });
 
 // Etapa 4A: medios reales de un payment_batches — una sola vez por medio,
@@ -645,6 +653,13 @@ export const insuredAccountMovements = sqliteTable("insured_account_movements", 
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
   settledAt: integer("settled_at", { mode: "timestamp" }),
   notes: text("notes"),
+  // Migración 0036: fecha efectiva del movimiento (YYYY-MM-DD, validada en
+  // aplicación, sin CHECK de formato a nivel DB — mismo criterio que el
+  // resto de las columnas de fecha en TEXT de este esquema), separada de
+  // createdAt (momento REAL de inserción, nunca backdateado). NULL en toda
+  // fila histórica — se interpreta como "fecha efectiva = fecha de
+  // createdAt", sin reescribir nada retroactivamente.
+  effectiveDate: text("effective_date"),
 });
 
 // Ajuste manual PURO para el caso sin asegurado real (batch 100%
@@ -661,6 +676,55 @@ export const paymentAmountAdjustments = sqliteTable("payment_amount_adjustments"
   reason: text("reason").notNull(),
   authorizedBy: integer("authorized_by").notNull().references(() => users.id),
   createdBy: integer("created_by").notNull().references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  // Migración 0036: mismo criterio que insuredAccountMovements.effectiveDate
+  // de arriba — fecha efectiva separada de createdAt, NULL en todo lo
+  // histórico.
+  effectiveDate: text("effective_date"),
+});
+
+// ─── FINANCIACIÓN DE LOTES CON TITULAR DE CUENTA (Migración 0036) ─────────
+//
+// Etapa 1B-1 — solo esquema, ningún endpoint usa todavía estas dos tablas
+// (eso es Etapa 1B-2/1B-3). Ver src/api/migrations/0036_account_holder_funding.sql
+// para el diseño completo y la justificación de cada CHECK/índice.
+
+// Reparto fuente↔destino de UN lote — con qué plata (real o virtual) se
+// canceló cada destino nominal. No reemplaza payment_batch_splits/
+// received_checks (instrumentos de cobranza reales) ni remittance_allocations
+// (instrumento con el que se rinde a la compañía) — es el eslabón nuevo
+// entre "cuánto puso el cliente/su cuenta corriente" y "a qué cuota/recargo
+// se lo aplicó".
+export const paymentBatchFundingAllocations = sqliteTable("payment_batch_funding_allocations", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  paymentBatchId: integer("payment_batch_id").notNull().references(() => paymentBatches.id),
+  // Fuente — exactamente una de las tres (CHECK en la migración 0036).
+  paymentBatchSplitId: integer("payment_batch_split_id").references(() => paymentBatchSplits.id),
+  sourceAccountMovementId: integer("source_account_movement_id").references(() => insuredAccountMovements.id),
+  paymentAmountAdjustmentId: integer("payment_amount_adjustment_id").references(() => paymentAmountAdjustments.id),
+  // Destino — exactamente uno de los tres (CHECK en la migración 0036).
+  paymentId: integer("payment_id").references(() => payments.id),
+  cashEntryId: integer("cash_entry_id").references(() => cashEntries.id),
+  destinationAccountMovementId: integer("destination_account_movement_id").references(() => insuredAccountMovements.id),
+  amountCents: integer("amount_cents").notNull(),
+  createdBy: integer("created_by").notNull().references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+});
+
+// Idempotencia de la operación de financiación con titular de cuenta — sin
+// precedente en el proyecto. Diseño "sin placeholder": la fila se inserta
+// una sola vez, al final de la transacción que crea el batch, cuando ya se
+// conocen todos sus valores (por eso los 4 campos son NOT NULL desde el
+// esquema, sin estado intermedio incompleto).
+export const accountHolderFundingIdempotencyKeys = sqliteTable("account_holder_funding_idempotency_keys", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  createdBy: integer("created_by").notNull().references(() => users.id),
+  endpoint: text("endpoint").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  requestFingerprint: text("request_fingerprint").notNull(),
+  paymentBatchId: integer("payment_batch_id").notNull().references(() => paymentBatches.id),
+  responseStatus: integer("response_status").notNull(),
+  responseSnapshot: text("response_snapshot").notNull(),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 });
 
