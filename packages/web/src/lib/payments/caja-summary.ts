@@ -20,6 +20,7 @@
 import { OWN_METHODS, DIRECT_COMPANY_METHODS } from "./splits";
 import { classifyRemittanceAllocationState } from "./remittance-allocations";
 import { toArgentinaCalendarDay } from "../dates/argentina-date";
+import { apportionCents } from "./apportion";
 
 // ─── Métodos contables ──────────────────────────────────────────────────────
 
@@ -159,32 +160,14 @@ export interface BatchForCartera {
   appliedAmountCents?: number;
 }
 
-/**
- * Reparte totalCents en centavos ENTEROS entre weights, sin drift (método
- * del resto mayor / Hamilton — floor de cada porción proporcional, y el
- * remanente entero se asigna a quienes tienen el resto fraccionario más
- * grande). Garantiza sum(resultado) === totalCents exacto. Usado solo para
- * ESTIMAR/MOSTRAR cuánta plata de un batch parcialmente rendido sigue en la
- * oficina, por método — nunca para decidir qué instrumento físico (cheque/
- * transferencia) se le entrega a qué compañía, eso lo define cada rendición
- * real con su propio instrumento de salida (ver Migración 0029).
- */
-function apportionCents(totalCents: number, weights: ReadonlyArray<number>): number[] {
-  const sumWeights = weights.reduce((s, w) => s + w, 0);
-  if (sumWeights <= 0 || totalCents <= 0) return weights.map(() => 0);
-  const raw = weights.map((w) => (totalCents * w) / sumWeights);
-  const floors = raw.map((r) => Math.floor(r));
-  let remainder = totalCents - floors.reduce((s, f) => s + f, 0);
-  const order = raw
-    .map((r, i) => ({ i, frac: r - floors[i]! }))
-    .sort((a, b) => b.frac - a.frac);
-  const result = [...floors];
-  for (let k = 0; k < order.length && remainder > 0; k++) {
-    result[order[k]!.i]! += 1;
-    remainder--;
-  }
-  return result;
-}
+// apportionCents (reparto Hamilton/resto mayor) vive ahora en ./apportion —
+// extraída para poder reutilizarse desde account-holder-funding.ts sin
+// duplicar el algoritmo. Comportamiento idéntico al de la función privada
+// original (mismo nombre, misma firma). Usada acá solo para ESTIMAR/MOSTRAR
+// cuánta plata de un batch parcialmente rendido sigue en la oficina, por
+// método — nunca para decidir qué instrumento físico (cheque/transferencia)
+// se le entrega a qué compañía, eso lo define cada rendición real con su
+// propio instrumento de salida (ver Migración 0029).
 
 export interface BatchCarteraResult {
   // Porción del total REAL capeado (min(real, aplicado)) que corresponde a
