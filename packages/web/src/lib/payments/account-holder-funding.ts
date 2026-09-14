@@ -59,20 +59,57 @@ function assertSafeAggregateCents(label: string, value: number): void {
   }
 }
 
+// ─── Validación de forma de entradas (objetos/arrays) y de ids canónicos ───
+//
+// Todo export público de este módulo puede recibir datos ajenos a TypeScript
+// (JSON deserializado, un caller sin tipos) — nunca debe dejar escapar un
+// TypeError crudo por acceder a una propiedad de undefined/null. Los ids
+// deben ser strings no vacíos, sin espacios al inicio o al final: se
+// rechazan en vez de recortarse, para que la unicidad se compruebe siempre
+// sobre el valor canónico (" split-1 " y "split-1" no pueden coexistir).
+
+function assertPlainObject(label: string, value: unknown): asserts value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new FundingValidationError(
+      `${label} debe ser un objeto (recibido: ${value === null ? "null" : Array.isArray(value) ? "array" : typeof value}).`
+    );
+  }
+}
+
+function assertArray(label: string, value: unknown): asserts value is unknown[] {
+  if (!Array.isArray(value)) {
+    throw new FundingValidationError(`${label} debe ser un array (recibido: ${value === null ? "null" : typeof value}).`);
+  }
+}
+
+function assertCanonicalId(label: string, value: unknown): asserts value is string {
+  if (typeof value !== "string") {
+    throw new FundingValidationError(`${label} debe ser un string (recibido: ${value === null ? "null" : typeof value}).`);
+  }
+  if (value.trim() === "") {
+    throw new FundingValidationError(`${label} no puede estar vacío ni compuesto solo de espacios.`);
+  }
+  if (value !== value.trim()) {
+    throw new FundingValidationError(
+      `${label} no puede tener espacios al inicio o al final (recibido: "${value}") — se rechaza en vez de recortar.`
+    );
+  }
+}
+
 // ─── Destinos ───────────────────────────────────────────────────────────────
 
 export type FundingDestinationKind = "payment" | "pronto_pago";
 
 export interface FundingDestinationInput {
-  /** Identificador opaco del destino (payment.id o cash_entry.id) — este módulo no sabe ni le importa cuál. */
-  id: string | number;
+  /** Identificador opaco del destino (payment.id o cash_entry.id) — este módulo no sabe ni le importa cuál. Debe ser un string canónico (ver assertCanonicalId). */
+  id: string;
   kind: FundingDestinationKind;
   /** Importe nominal del destino, en centavos. Debe ser > 0. */
   nominalCents: number;
 }
 
 export interface DestinationFundingBreakdown {
-  id: string | number;
+  id: string;
   kind: FundingDestinationKind;
   nominalCents: number;
   creditCents: number;
@@ -84,7 +121,7 @@ export interface DestinationFundingBreakdown {
 // ─── Reparto en cascada (waterfall) de UNA fuente sobre destinos restantes ──
 
 interface TierWaterfallResult {
-  portionsById: Map<string | number, number>;
+  portionsById: Map<string, number>;
   consumedCents: number;
 }
 
@@ -98,15 +135,15 @@ interface TierWaterfallResult {
  */
 function waterfallOverTier(
   sourceCents: number,
-  tierIds: ReadonlyArray<string | number>,
-  remainingCentsById: Map<string | number, number>
+  tierIds: ReadonlyArray<string>,
+  remainingCentsById: Map<string, number>
 ): TierWaterfallResult {
   const weights = tierIds.map((id) => remainingCentsById.get(id) ?? 0);
   const tierTotal = weights.reduce((s, w) => s + w, 0);
   assertSafeAggregateCents("La suma de los montos pendientes de los destinos de este tier", tierTotal);
   const toApply = Math.min(Math.max(sourceCents, 0), tierTotal);
   const portions = apportionCents(toApply, weights);
-  const portionsById = new Map<string | number, number>();
+  const portionsById = new Map<string, number>();
   tierIds.forEach((id, i) => {
     const portion = portions[i]!;
     portionsById.set(id, portion);
@@ -125,16 +162,16 @@ function waterfallOverTier(
  */
 function waterfallCreditOrRounding(
   sourceCents: number,
-  paymentIds: ReadonlyArray<string | number>,
-  prontoPagoIds: ReadonlyArray<string | number>,
-  remainingCentsById: Map<string | number, number>
-): { portionsById: Map<string | number, number>; unconsumedCents: number } {
+  paymentIds: ReadonlyArray<string>,
+  prontoPagoIds: ReadonlyArray<string>,
+  remainingCentsById: Map<string, number>
+): { portionsById: Map<string, number>; unconsumedCents: number } {
   const tier1 = waterfallOverTier(sourceCents, paymentIds, remainingCentsById);
   const overflow = sourceCents - tier1.consumedCents;
   const tier2 = waterfallOverTier(overflow, prontoPagoIds, remainingCentsById);
   const unconsumedCents = overflow - tier2.consumedCents;
 
-  const portionsById = new Map<string | number, number>();
+  const portionsById = new Map<string, number>();
   for (const [id, cents] of tier1.portionsById) portionsById.set(id, cents);
   for (const [id, cents] of tier2.portionsById) portionsById.set(id, cents);
   return { portionsById, unconsumedCents };
@@ -171,6 +208,8 @@ export interface FundingDistributionResult {
  * ver validateFundingDistribution, un paso separado y explícito.
  */
 export function distributeAccountHolderFunding(input: FundingDistributionInput): FundingDistributionResult {
+  assertPlainObject("input", input);
+  assertArray("input.destinations", input.destinations);
   assertSafeAmountCents("creditAppliedCents", input.creditAppliedCents, { min: 0 });
   assertSafeAmountCents("roundingCoverageCents", input.roundingCoverageCents, { min: 0 });
 
@@ -178,13 +217,13 @@ export function distributeAccountHolderFunding(input: FundingDistributionInput):
     throw new FundingValidationError("destinations no puede estar vacío: no hay ningún destino sobre el cual distribuir fondos.");
   }
 
-  const seenDestinationIds = new Set<string | number>();
-  for (const d of input.destinations) {
-    if (typeof d.id === "string" && d.id.trim() === "") {
-      throw new FundingValidationError("El id de un destino no puede ser una cadena vacía.");
-    }
+  const seenDestinationIds = new Set<string>();
+  input.destinations.forEach((d, index) => {
+    assertPlainObject(`El destino en la posición ${index}`, d);
+    assertCanonicalId(`El id del destino en la posición ${index}`, d.id);
+
     if (seenDestinationIds.has(d.id)) {
-      throw new FundingValidationError(`El id de destino "${String(d.id)}" está duplicado — cada destino debe tener un id único.`);
+      throw new FundingValidationError(`El id de destino "${d.id}" está duplicado — cada destino debe tener un id único.`);
     }
     seenDestinationIds.add(d.id);
 
@@ -193,11 +232,11 @@ export function distributeAccountHolderFunding(input: FundingDistributionInput):
     }
 
     assertSafeAmountCents(`El destino ${d.id} (nominalCents)`, d.nominalCents, { min: 1 });
-  }
+  });
 
   const paymentIds = input.destinations.filter((d) => d.kind === "payment").map((d) => d.id);
   const prontoPagoIds = input.destinations.filter((d) => d.kind === "pronto_pago").map((d) => d.id);
-  const remainingCentsById = new Map<string | number, number>(input.destinations.map((d) => [d.id, d.nominalCents]));
+  const remainingCentsById = new Map<string, number>(input.destinations.map((d) => [d.id, d.nominalCents]));
 
   const credit = waterfallCreditOrRounding(input.creditAppliedCents, paymentIds, prontoPagoIds, remainingCentsById);
   const rounding = waterfallCreditOrRounding(input.roundingCoverageCents, paymentIds, prontoPagoIds, remainingCentsById);
@@ -244,11 +283,30 @@ export function validateFundingDistribution(
   result: FundingDistributionResult,
   expected: FundingDistributionExpectations
 ): void {
-  const seenDestinationIds = new Set<string | number>();
-  for (const d of result.destinations) {
+  assertPlainObject("result", result);
+  assertPlainObject("expected", expected);
+  assertArray("result.destinations", result.destinations);
+
+  for (const [label, value] of [
+    ["result.creditConsumedCents", result.creditConsumedCents],
+    ["result.roundingConsumedCents", result.roundingConsumedCents],
+    ["result.cashAggregateCents", result.cashAggregateCents],
+    ["result.unconsumedCreditCents", result.unconsumedCreditCents],
+    ["result.unconsumedRoundingCents", result.unconsumedRoundingCents],
+  ] as const) {
+    assertSafeAmountCents(label, value, { min: 0 });
+  }
+  assertSafeAmountCents("expected.creditAppliedCents", expected.creditAppliedCents, { min: 0 });
+  assertSafeAmountCents("expected.roundingCoverageCents", expected.roundingCoverageCents, { min: 0 });
+
+  const seenDestinationIds = new Set<string>();
+  result.destinations.forEach((d, index) => {
+    assertPlainObject(`El destino del resultado en la posición ${index}`, d);
+    assertCanonicalId(`El id del destino del resultado en la posición ${index}`, d.id);
+
     if (seenDestinationIds.has(d.id)) {
       throw new FundingValidationError(
-        `El id de destino "${String(d.id)}" está duplicado en el resultado — no se puede validar un resultado con ids repetidos.`
+        `El id de destino "${d.id}" está duplicado en el resultado — no se puede validar un resultado con ids repetidos.`
       );
     }
     seenDestinationIds.add(d.id);
@@ -279,7 +337,7 @@ export function validateFundingDistribution(
         `El destino ${d.id} no cierra: cash+crédito+redondeo=$${(sum / 100).toFixed(2)}, nominal=$${(d.nominalCents / 100).toFixed(2)}.`
       );
     }
-  }
+  });
 
   if (result.unconsumedCreditCents > 0) {
     throw new FundingValidationError(

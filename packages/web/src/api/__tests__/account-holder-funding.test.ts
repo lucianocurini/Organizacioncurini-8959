@@ -374,3 +374,205 @@ describe("distributeAccountHolderFunding — validación estricta de destination
     ).toThrow(FundingValidationError);
   });
 });
+
+describe("distributeAccountHolderFunding — entradas superiores mal formadas (nunca TypeError crudo)", () => {
+  test("rechaza input undefined", () => {
+    expect(() => distributeAccountHolderFunding(undefined as unknown as any)).toThrow(FundingValidationError);
+  });
+
+  test("rechaza input null", () => {
+    expect(() => distributeAccountHolderFunding(null as unknown as any)).toThrow(FundingValidationError);
+  });
+
+  test("rechaza input primitivo (string, número, boolean)", () => {
+    for (const invalid of ["x", 42, true]) {
+      expect(() => distributeAccountHolderFunding(invalid as unknown as any)).toThrow(FundingValidationError);
+    }
+  });
+
+  test("rechaza input array (no es un objeto plano)", () => {
+    expect(() => distributeAccountHolderFunding([] as unknown as any)).toThrow(FundingValidationError);
+  });
+
+  test("rechaza destinations undefined", () => {
+    expect(() =>
+      distributeAccountHolderFunding({ destinations: undefined, creditAppliedCents: 0, roundingCoverageCents: 0 } as unknown as any)
+    ).toThrow(FundingValidationError);
+  });
+
+  test("rechaza destinations no-array (objeto, string, número)", () => {
+    for (const invalid of [{}, "d1", 5]) {
+      expect(() =>
+        distributeAccountHolderFunding({ destinations: invalid, creditAppliedCents: 0, roundingCoverageCents: 0 } as unknown as any)
+      ).toThrow(FundingValidationError);
+    }
+  });
+
+  test("ninguno de los casos anteriores escapa como TypeError", () => {
+    const invalidInputs: unknown[] = [undefined, null, "x", 42, [], { destinations: undefined }, { destinations: "x" }];
+    for (const invalid of invalidInputs) {
+      try {
+        distributeAccountHolderFunding(invalid as unknown as any);
+        throw new Error("se esperaba que lanzara");
+      } catch (err) {
+        expect(err).toBeInstanceOf(FundingValidationError);
+        expect(err).not.toBeInstanceOf(TypeError);
+      }
+    }
+  });
+});
+
+describe("distributeAccountHolderFunding — elementos null/no objeto dentro de destinations", () => {
+  test("rechaza un destino null en la posición 0", () => {
+    expect(() =>
+      distributeAccountHolderFunding({ destinations: [null], creditAppliedCents: 0, roundingCoverageCents: 0 } as unknown as any)
+    ).toThrow(FundingValidationError);
+  });
+
+  test("rechaza un destino primitivo (string/número) e informa la posición", () => {
+    const valid: FundingDestinationInput = { id: "d1", kind: "payment", nominalCents: 1000 };
+    for (const invalid of ["x", 5, true]) {
+      let thrown: unknown;
+      try {
+        distributeAccountHolderFunding({
+          destinations: [valid, invalid],
+          creditAppliedCents: 0,
+          roundingCoverageCents: 0,
+        } as unknown as any);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(FundingValidationError);
+      expect((thrown as Error).message).toContain("posición 1");
+    }
+  });
+
+  test("rechaza un destino array", () => {
+    expect(() =>
+      distributeAccountHolderFunding({
+        destinations: [[]],
+        creditAppliedCents: 0,
+        roundingCoverageCents: 0,
+      } as unknown as any)
+    ).toThrow(FundingValidationError);
+  });
+});
+
+describe("distributeAccountHolderFunding — ids canónicos (sin espacios al inicio/final, no vacíos)", () => {
+  test("rechaza un id que no es string (número inyectado en runtime)", () => {
+    expect(() =>
+      distributeAccountHolderFunding({
+        destinations: [{ id: 123, kind: "payment", nominalCents: 1000 }],
+        creditAppliedCents: 0,
+        roundingCoverageCents: 0,
+      } as unknown as any)
+    ).toThrow(FundingValidationError);
+  });
+
+  test("rechaza un id con espacio inicial o final en vez de recortarlo silenciosamente", () => {
+    for (const paddedId of [" split-1", "split-1 ", " split-1 "]) {
+      expect(() =>
+        distributeAccountHolderFunding({
+          destinations: [{ id: paddedId, kind: "payment", nominalCents: 1000 }],
+          creditAppliedCents: 0,
+          roundingCoverageCents: 0,
+        })
+      ).toThrow(FundingValidationError);
+    }
+  });
+
+  test('"split-1" y " split-1 " no coexisten: el segundo se rechaza por formato, no se compara como duplicado silencioso', () => {
+    expect(() =>
+      distributeAccountHolderFunding({
+        destinations: [
+          { id: "split-1", kind: "payment", nominalCents: 1000 },
+          { id: " split-1 ", kind: "payment", nominalCents: 500 },
+        ],
+        creditAppliedCents: 0,
+        roundingCoverageCents: 0,
+      })
+    ).toThrow(FundingValidationError);
+  });
+
+  test("acepta espacios internos que no generan ambigüedad", () => {
+    expect(() =>
+      distributeAccountHolderFunding({
+        destinations: [{ id: "split uno", kind: "payment", nominalCents: 1000 }],
+        creditAppliedCents: 0,
+        roundingCoverageCents: 0,
+      })
+    ).not.toThrow();
+  });
+});
+
+describe("validateFundingDistribution — entradas superiores mal formadas (nunca TypeError crudo)", () => {
+  const expected = { creditAppliedCents: 0, roundingCoverageCents: 0 };
+
+  test("rechaza result undefined/null", () => {
+    expect(() => validateFundingDistribution(undefined as unknown as any, expected)).toThrow(FundingValidationError);
+    expect(() => validateFundingDistribution(null as unknown as any, expected)).toThrow(FundingValidationError);
+  });
+
+  test("rechaza expected undefined/null", () => {
+    const result = distributeAccountHolderFunding({
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 1000 }],
+      creditAppliedCents: 0,
+      roundingCoverageCents: 0,
+    });
+    expect(() => validateFundingDistribution(result, undefined as unknown as any)).toThrow(FundingValidationError);
+    expect(() => validateFundingDistribution(result, null as unknown as any)).toThrow(FundingValidationError);
+  });
+
+  test("rechaza result.destinations no-array", () => {
+    const corrupted = {
+      destinations: "no-array",
+      creditConsumedCents: 0,
+      roundingConsumedCents: 0,
+      cashAggregateCents: 0,
+      unconsumedCreditCents: 0,
+      unconsumedRoundingCents: 0,
+    };
+    expect(() => validateFundingDistribution(corrupted as unknown as any, expected)).toThrow(FundingValidationError);
+  });
+
+  test("rechaza un destino null dentro de result.destinations", () => {
+    const corrupted = {
+      destinations: [null],
+      creditConsumedCents: 0,
+      roundingConsumedCents: 0,
+      cashAggregateCents: 0,
+      unconsumedCreditCents: 0,
+      unconsumedRoundingCents: 0,
+    };
+    expect(() => validateFundingDistribution(corrupted as unknown as any, expected)).toThrow(FundingValidationError);
+  });
+
+  test("rechaza campos numéricos agregados faltantes (undefined) en result", () => {
+    const corrupted = {
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 1000, creditCents: 0, roundingCents: 0, cashCents: 1000 }],
+      creditConsumedCents: undefined,
+      roundingConsumedCents: 0,
+      cashAggregateCents: 1000,
+      unconsumedCreditCents: 0,
+      unconsumedRoundingCents: 0,
+    };
+    expect(() => validateFundingDistribution(corrupted as unknown as any, expected)).toThrow(FundingValidationError);
+  });
+
+  test("ninguno de los casos anteriores escapa como TypeError", () => {
+    const attempts: Array<() => void> = [
+      () => validateFundingDistribution(undefined as unknown as any, expected),
+      () => validateFundingDistribution(null as unknown as any, expected),
+      () => validateFundingDistribution({ destinations: null } as unknown as any, expected),
+    ];
+    for (const attempt of attempts) {
+      try {
+        attempt();
+        throw new Error("se esperaba que lanzara");
+      } catch (err) {
+        expect(err).toBeInstanceOf(FundingValidationError);
+        expect(err).not.toBeInstanceOf(TypeError);
+      }
+    }
+  });
+});
