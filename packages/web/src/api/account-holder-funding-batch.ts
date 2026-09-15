@@ -35,6 +35,7 @@
 import { and, eq, inArray } from "drizzle-orm";
 import {
   insuredAccountMovements, paymentAmountAdjustments, paymentBatchSplits, payments, cashEntries, paymentBatchFundingAllocations,
+  accountHolderFundingIdempotencyKeys,
 } from "./database/schema";
 import {
   calculateInsuredAccountBalance, type InsuredAccountMovementForBalance,
@@ -420,9 +421,20 @@ export async function persistAccountHolderFundingArtifacts(
       createdAt: new Date(),
       effectiveDate: params.paymentDate,
     }).returning();
-    creditMovementId = row!.id;
-    movementSnapshots.set(creditMovementId, {
-      id: creditMovementId, insuredId: accountHolderInsuredId, type: "aplicacion_saldo_favor",
+    // Narrowing explícito: `row` es `any` (AccountHolderFundingDbClient lo es
+    // a propósito, ver su tipo) — asignar row!.id directamente a una `let`
+    // tipada `number | null` NO la angosta a `number` (TS no angosta a partir
+    // de un valor `any`, conserva el tipo declarado). insertedId, con su
+    // propia anotación de tipo explícita, sí lo hace — sin `as number` ni
+    // `any` nuevos. Garantía en runtime: `tx.insert(...).values(UNA fila)
+    // .returning()` siempre devuelve exactamente una fila con id real
+    // (autoincrement) — el `!` sobre `row` ya era el criterio existente de
+    // todo este archivo (ver el resto de este método y
+    // insertAccountHolderFundingIdempotencyRow), no algo nuevo introducido acá.
+    const insertedId: number = row!.id;
+    creditMovementId = insertedId;
+    movementSnapshots.set(insertedId, {
+      id: insertedId, insuredId: accountHolderInsuredId, type: "aplicacion_saldo_favor",
       status: "activo", originBatchId: batch.id, signedAmountCents,
     });
   }
@@ -443,9 +455,11 @@ export async function persistAccountHolderFundingArtifacts(
       createdAt: new Date(),
       effectiveDate: params.paymentDate,
     }).returning();
-    debtMovementId = row!.id;
-    movementSnapshots.set(debtMovementId, {
-      id: debtMovementId, insuredId: accountHolderInsuredId, type: "saldo_deudor",
+    // Ver comentario de narrowing explícito en el bloque de creditMovementId, arriba — mismo criterio.
+    const insertedId: number = row!.id;
+    debtMovementId = insertedId;
+    movementSnapshots.set(insertedId, {
+      id: insertedId, insuredId: accountHolderInsuredId, type: "saldo_deudor",
       status: "activo", originBatchId: batch.id, signedAmountCents,
     });
   }
@@ -466,9 +480,11 @@ export async function persistAccountHolderFundingArtifacts(
       createdAt: new Date(),
       effectiveDate: params.paymentDate,
     }).returning();
-    newCreditMovementId = row!.id;
-    movementSnapshots.set(newCreditMovementId, {
-      id: newCreditMovementId, insuredId: accountHolderInsuredId, type: "saldo_a_favor",
+    // Ver comentario de narrowing explícito en el bloque de creditMovementId, arriba — mismo criterio.
+    const insertedId: number = row!.id;
+    newCreditMovementId = insertedId;
+    movementSnapshots.set(insertedId, {
+      id: insertedId, insuredId: accountHolderInsuredId, type: "saldo_a_favor",
       status: "activo", originBatchId: batch.id, signedAmountCents,
     });
   }
@@ -486,8 +502,10 @@ export async function persistAccountHolderFundingArtifacts(
       createdAt: new Date(),
       effectiveDate: params.paymentDate,
     }).returning();
-    roundingAdjustmentId = row!.id;
-    adjustmentSnapshots.set(roundingAdjustmentId, { id: roundingAdjustmentId, paymentBatchId: batch.id, amountCents });
+    // Ver comentario de narrowing explícito en el bloque de creditMovementId, arriba — mismo criterio.
+    const insertedId: number = row!.id;
+    roundingAdjustmentId = insertedId;
+    adjustmentSnapshots.set(insertedId, { id: insertedId, paymentBatchId: batch.id, amountCents });
   }
 
   // ─── Construcción de la matriz completa — SOLO ahora que hay IDs reales ───
@@ -551,4 +569,257 @@ export async function persistAccountHolderFundingArtifacts(
   }
 
   return { creditMovementId, debtMovementId, newCreditMovementId, roundingAdjustmentId, allocationRows, allocationIds };
+}
+
+// ─── 5. Idempotencia del flujo con titular ──────────────────────────────
+// Etapa 1B-3-C1. Migración 0036, tabla
+// account_holder_funding_idempotency_keys (ver cabecera de esa migración:
+// diseño "sin placeholder" — la fila se inserta UNA sola vez, al final de la
+// misma transacción externa que ya insertó el batch completo y corrió
+// persistAccountHolderFundingArtifacts, cuando ya se conocen todos sus
+// valores reales — nunca hay un INSERT parcial seguido de un UPDATE). Esta
+// etapa agrega solo 3 helpers atómicos (buscar / resolver / insertar). La
+// orquestación completa — el guard en POST /payment-batches, el cómputo real
+// del hash SHA-256 sobre canonicalizeFundingRequest (account-holder-funding-
+// fingerprint.ts) y la relectura de la fila ganadora fuera de esta
+// transacción cuando este INSERT pierde una carrera — es una subetapa
+// posterior (1B-3-C2 en adelante). index.ts NO importa este módulo todavía.
+//
+// ─── Por qué responseSnapshot es un string opaco, nunca un objeto ─────────
+// account_holder_funding_idempotency_keys.response_snapshot es TEXT NOT NULL
+// (migración 0036) — en database/schema.ts es `text("response_snapshot").
+// notNull()`, sin `mode: "json"` (Drizzle no define ese modo para SQLite en
+// este proyecto; ninguna otra columna TEXT de todo schema.ts lo usa
+// tampoco). Los fixtures reales de la propia migración
+// (migration-0036-account-holder-funding.test.ts) insertan literales como
+// '{"id":1}' o '{}': confirma que el CONTENIDO esperado es JSON, pero la
+// COLUMNA no lo tipa, no lo parsea ni lo valida como tal — es un string
+// crudo. Por eso estos helpers NUNCA hacen JSON.parse/JSON.stringify sobre
+// este campo: lo reciben como el string ya serializado por un caller futuro
+// (quien arme el response real de POST /payment-batches) y lo devuelven bit
+// a bit tal cual se guardó (punto 2 del pedido: "no reinterpretar ni
+// reconstruir el snapshot"). La única validación acá es "string no vacío"
+// (coherente con NOT NULL y con "sin placeholders") — nunca se exige que sea
+// JSON válido, esa responsabilidad es de quien lo arma.
+//
+// ─── endpoint: constante duplicada a propósito ─────────────────────────────
+// FUNDING_REQUEST_FINGERPRINT_ENDPOINT (account-holder-funding-fingerprint.
+// ts) tiene el mismo valor "POST /payment-batches" pero no está exportada
+// (ese módulo la trata como un detalle interno de su propia forma canónica,
+// no como una constante pública) — mismo criterio que el resto de este
+// archivo (assertPlainObject/assertSafePositiveInt duplicados en vez de
+// importados): este módulo es dueño de su propio contrato de idempotencia y
+// no depende de un símbolo interno de otro módulo. Si algún día divergieran,
+// sería un bug real detectable (un idempotencyKey nunca podría resolverse
+// porque el fingerprint canónico usa un endpoint y esta tabla otro) — no un
+// caso silencioso.
+
+export class FundingIdempotencyConflictError extends Error {}
+
+const ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT = "POST /payment-batches";
+const HTTP_STATUS_MIN = 100;
+const HTTP_STATUS_MAX = 599;
+
+function assertNonEmptyString(label: string, value: unknown): asserts value is string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new AccountHolderFundingBatchError(`${label} debe ser un string no vacío (recibido: ${value === null ? "null" : typeof value}).`);
+  }
+}
+
+/** responseStatus: código HTTP real de la respuesta ya calculada — entero seguro dentro del rango válido 100..599. */
+function assertHttpStatus(label: string, value: unknown): asserts value is number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < HTTP_STATUS_MIN || value > HTTP_STATUS_MAX) {
+    throw new AccountHolderFundingBatchError(
+      `${label} debe ser un código HTTP entero entre ${HTTP_STATUS_MIN} y ${HTTP_STATUS_MAX} (recibido: ${value}).`
+    );
+  }
+}
+
+/** Este módulo maneja exclusivamente la idempotencia de POST /payment-batches — cualquier otro valor se rechaza acá, aunque el esquema (UNIQUE compuesto) permitiría conviver con otro endpoint real. */
+function assertIdempotencyEndpoint(label: string, value: unknown): asserts value is string {
+  if (value !== ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT) {
+    throw new AccountHolderFundingBatchError(
+      `${label} debe ser exactamente "${ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT}" (recibido: ${
+        value === null ? "null" : typeof value === "string" ? `"${value}"` : typeof value
+      }).`
+    );
+  }
+}
+
+/**
+ * Recorta y valida 1..200 code points Unicode DESPUÉS del recorte — mismo
+ * CHECK exacto que la migración 0036 (length(idempotency_key) BETWEEN 1 AND
+ * 200; SQLite length() sobre TEXT cuenta caracteres, no bytes). Duplicado a
+ * propósito de requireIdempotencyKey (account-holder-funding-request.ts,
+ * Etapa 1B-3-A): mismo criterio, módulo y clase de error distintos. El
+ * spread de string itera por code point (a diferencia de .length, que cuenta
+ * unidades UTF-16 y duplicaría el conteo de caracteres fuera del BMP).
+ */
+function assertAndTrimIdempotencyKey(label: string, value: unknown): string {
+  if (typeof value !== "string") {
+    throw new AccountHolderFundingBatchError(`${label} debe ser un string (recibido: ${value === null ? "null" : typeof value}).`);
+  }
+  const trimmed = value.trim();
+  const length = [...trimmed].length;
+  if (length < 1 || length > 200) {
+    throw new AccountHolderFundingBatchError(
+      `${label} debe tener entre 1 y 200 caracteres Unicode después de recortar espacios (recibido: ${length}).`
+    );
+  }
+  return trimmed;
+}
+
+export interface AccountHolderFundingIdempotencyRow {
+  id: number;
+  createdBy: number;
+  endpoint: string;
+  idempotencyKey: string;
+  requestFingerprint: string;
+  paymentBatchId: number;
+  responseStatus: number;
+  responseSnapshot: string;
+  createdAt: Date;
+}
+
+export interface FindAccountHolderFundingIdempotencyRowParams {
+  createdBy: number;
+  endpoint: string;
+  idempotencyKey: string;
+}
+
+/**
+ * Busca por la clave única real — UNIQUE(created_by, endpoint,
+ * idempotency_key), migración 0036. Sin escrituras. Devuelve null si no hay
+ * fila (caso normal: primera vez que se ve esta clave) — nunca lanza por
+ * "no encontrado". `dbClient` puede ser `database` o `tx`, igual que el
+ * resto del módulo (ver AccountHolderFundingDbClient).
+ */
+export async function findAccountHolderFundingIdempotencyRow(
+  dbClient: AccountHolderFundingDbClient,
+  params: FindAccountHolderFundingIdempotencyRowParams
+): Promise<AccountHolderFundingIdempotencyRow | null> {
+  assertPlainObject("params", params);
+  assertSafePositiveInt("createdBy", params.createdBy);
+  assertIdempotencyEndpoint("endpoint", params.endpoint);
+  const idempotencyKey = assertAndTrimIdempotencyKey("idempotencyKey", params.idempotencyKey);
+
+  const row = await dbClient
+    .select()
+    .from(accountHolderFundingIdempotencyKeys)
+    .where(
+      and(
+        eq(accountHolderFundingIdempotencyKeys.createdBy, params.createdBy),
+        eq(accountHolderFundingIdempotencyKeys.endpoint, params.endpoint),
+        eq(accountHolderFundingIdempotencyKeys.idempotencyKey, idempotencyKey)
+      )
+    )
+    .get();
+
+  if (!row) return null;
+  return {
+    id: row.id as number,
+    createdBy: row.createdBy as number,
+    endpoint: row.endpoint as string,
+    idempotencyKey: row.idempotencyKey as string,
+    requestFingerprint: row.requestFingerprint as string,
+    paymentBatchId: row.paymentBatchId as number,
+    responseStatus: row.responseStatus as number,
+    responseSnapshot: row.responseSnapshot as string,
+    createdAt: row.createdAt as Date,
+  };
+}
+
+export interface ResolvedIdempotentFundingResponse {
+  paymentBatchId: number;
+  responseStatus: number;
+  responseSnapshot: string;
+}
+
+/**
+ * Dada una fila ya encontrada (findAccountHolderFundingIdempotencyRow) y el
+ * fingerprint REAL del request actual: si coincide con el guardado, es un
+ * reintento legítimo de la misma idempotencyKey — devuelve exactamente
+ * responseStatus/responseSnapshot/paymentBatchId ya guardados, sin
+ * reinterpretar ni reconstruir el snapshot. Si NO coincide, la misma
+ * idempotencyKey se está reusando con un request semánticamente distinto —
+ * lanza FundingIdempotencyConflictError (el caller la traduce a HTTP 409).
+ * Pura — sin DB, sin efectos, testeable sin el harness SQLite.
+ */
+export function resolveExistingIdempotentFundingRow(
+  existingRow: AccountHolderFundingIdempotencyRow,
+  requestFingerprint: string
+): ResolvedIdempotentFundingResponse {
+  assertPlainObject("existingRow", existingRow);
+  assertSafePositiveInt("existingRow.paymentBatchId", existingRow.paymentBatchId);
+  assertNonEmptyString("existingRow.requestFingerprint", existingRow.requestFingerprint);
+  assertHttpStatus("existingRow.responseStatus", existingRow.responseStatus);
+  assertNonEmptyString("existingRow.responseSnapshot", existingRow.responseSnapshot);
+  assertNonEmptyString("requestFingerprint", requestFingerprint);
+
+  if (existingRow.requestFingerprint !== requestFingerprint) {
+    throw new FundingIdempotencyConflictError(
+      `La idempotencyKey ya fue usada con un request distinto (el fingerprint no coincide) — batch existente ${existingRow.paymentBatchId}.`
+    );
+  }
+
+  return {
+    paymentBatchId: existingRow.paymentBatchId,
+    responseStatus: existingRow.responseStatus,
+    responseSnapshot: existingRow.responseSnapshot,
+  };
+}
+
+export interface InsertAccountHolderFundingIdempotencyRowParams {
+  createdBy: number;
+  endpoint: string;
+  idempotencyKey: string;
+  requestFingerprint: string;
+  paymentBatchId: number;
+  responseStatus: number;
+  /** String ya serializado por el caller (típicamente JSON) — ver cabecera de esta sección. Nunca se parsea acá. */
+  responseSnapshot: string;
+}
+
+/**
+ * Inserta la fila COMPLETA de idempotencia — todos los valores reales ya
+ * conocidos, ningún placeholder ni actualización posterior. Debe llamarse
+ * SIEMPRE al final de la misma transacción externa que ya creó el batch (el
+ * mismo `tx` que recibió persistAccountHolderFundingArtifacts) — nunca abre
+ * su propia transacción, nunca importa la conexión global. Si la fila
+ * colisiona con el UNIQUE(created_by, endpoint, idempotency_key) — otra
+ * request concurrente con la misma clave ganó la carrera — el error crudo
+ * del driver se propaga TAL CUAL: esta función no tiene try/catch, nunca lo
+ * atrapa ni lo traduce. Es responsabilidad de la transacción externa hacer
+ * rollback completo de todo lo que esta request ya escribió (batch,
+ * payments, movimientos, allocations). La relectura de la fila ganadora
+ * fuera de esta transacción es una subetapa posterior (1B-3-C2+).
+ */
+export async function insertAccountHolderFundingIdempotencyRow(
+  tx: AccountHolderFundingDbClient,
+  params: InsertAccountHolderFundingIdempotencyRowParams
+): Promise<number> {
+  assertPlainObject("params", params);
+  assertSafePositiveInt("createdBy", params.createdBy);
+  assertIdempotencyEndpoint("endpoint", params.endpoint);
+  const idempotencyKey = assertAndTrimIdempotencyKey("idempotencyKey", params.idempotencyKey);
+  assertNonEmptyString("requestFingerprint", params.requestFingerprint);
+  assertSafePositiveInt("paymentBatchId", params.paymentBatchId);
+  assertHttpStatus("responseStatus", params.responseStatus);
+  assertNonEmptyString("responseSnapshot", params.responseSnapshot);
+
+  const [row] = await tx
+    .insert(accountHolderFundingIdempotencyKeys)
+    .values({
+      createdBy: params.createdBy,
+      endpoint: params.endpoint,
+      idempotencyKey,
+      requestFingerprint: params.requestFingerprint,
+      paymentBatchId: params.paymentBatchId,
+      responseStatus: params.responseStatus,
+      responseSnapshot: params.responseSnapshot,
+      createdAt: new Date(),
+    })
+    .returning();
+
+  return row!.id as number;
 }

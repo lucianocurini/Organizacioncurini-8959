@@ -40,10 +40,16 @@ import {
   planFundingWithFreshBalance,
   assertFundingPlanUnchanged,
   persistAccountHolderFundingArtifacts,
+  findAccountHolderFundingIdempotencyRow,
+  resolveExistingIdempotentFundingRow,
+  insertAccountHolderFundingIdempotencyRow,
   AccountHolderFundingBatchError,
   FundingPlanRaceConditionError,
+  FundingIdempotencyConflictError,
   type PlanFundingWithFreshBalanceParams,
   type PersistAccountHolderFundingArtifactsParams,
+  type AccountHolderFundingIdempotencyRow,
+  type InsertAccountHolderFundingIdempotencyRowParams,
 } from "../account-holder-funding-batch";
 import {
   planAccountHolderBatchFunding,
@@ -200,8 +206,11 @@ beforeAll(async () => {
 // Aísla cada test sin recrear nada — insureds/users quedan fijos toda la
 // corrida. Etapa 1B-3-B2 agrega tablas mutables nuevas (payment_batches y
 // todo lo que cuelga de un batch) — se limpian en orden hijo->padre para
-// respetar foreign_keys=ON (default real de @libsql/client).
+// respetar foreign_keys=ON (default real de @libsql/client). Etapa 1B-3-C1
+// agrega account_holder_funding_idempotency_keys, que referencia
+// payment_batches — se limpia antes que su padre por la misma razón.
 beforeEach(async () => {
+  await client!.execute(`DELETE FROM account_holder_funding_idempotency_keys`);
   await client!.execute(`DELETE FROM payment_batch_funding_allocations`);
   await client!.execute(`DELETE FROM insured_account_movements`);
   await client!.execute(`DELETE FROM payment_amount_adjustments`);
@@ -1334,5 +1343,352 @@ describe("persistAccountHolderFundingArtifacts", () => {
     expect(fx.splitIdByKey).toEqual(splitSnapshot);
     expect(fx.paymentIdByKey).toEqual(paymentSnapshot);
     expect(fx.cashEntryIdByKey).toEqual(cashEntrySnapshot);
+  });
+});
+
+// ─── 6. Idempotencia del flujo con titular — Etapa 1B-3-C1 ─────────────────
+
+const IDEMP_ENDPOINT = "POST /payment-batches";
+
+/** Batch mínimo válido, solo como blanco real de la FK payment_batch_id — sin splits/payments/cash_entries (no los necesita ningún test de esta sección). */
+async function insertPlainBatch(overrides: { accountHolderInsuredId?: number | null; status?: "confirmado" | "anulado" } = {}): Promise<number> {
+  return insertBatch(client!, {
+    accountHolderInsuredId: overrides.accountHolderInsuredId ?? insuredId,
+    baseAmountCents: 100000,
+    totalReceivedCents: 100000,
+    paymentDate: PDATE,
+    status: overrides.status,
+    createdBy: userId,
+  });
+}
+
+function buildIdempotencyRowParams(batchId: number, overrides: Partial<InsertAccountHolderFundingIdempotencyRowParams> = {}): InsertAccountHolderFundingIdempotencyRowParams {
+  return {
+    createdBy: userId,
+    endpoint: IDEMP_ENDPOINT,
+    idempotencyKey: "qa-key-1",
+    requestFingerprint: "fp-qa-1",
+    paymentBatchId: batchId,
+    responseStatus: 201,
+    responseSnapshot: JSON.stringify({ id: batchId }),
+    ...overrides,
+  };
+}
+
+describe("findAccountHolderFundingIdempotencyRow", () => {
+  test("lookup inexistente: devuelve null", async () => {
+    const row = await findAccountHolderFundingIdempotencyRow(db, { createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: "no-existe" });
+    expect(row).toBeNull();
+  });
+
+  test("inserción completa y lectura exacta: todos los campos coinciden bit a bit", async () => {
+    const batchId = await insertPlainBatch();
+    const snapshot = JSON.stringify({ id: batchId, status: 201, splits: [1, 2, 3] });
+    const insertedId = await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, {
+      idempotencyKey: "qa-key-exact", requestFingerprint: "fp-exact", responseStatus: 201, responseSnapshot: snapshot,
+    }));
+
+    const row = await findAccountHolderFundingIdempotencyRow(db, { createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: "qa-key-exact" });
+    expect(row).not.toBeNull();
+    expect(row!.id).toBe(insertedId);
+    expect(row!.createdBy).toBe(userId);
+    expect(row!.endpoint).toBe(IDEMP_ENDPOINT);
+    expect(row!.idempotencyKey).toBe("qa-key-exact");
+    expect(row!.requestFingerprint).toBe("fp-exact");
+    expect(row!.paymentBatchId).toBe(batchId);
+    expect(row!.responseStatus).toBe(201);
+    expect(row!.responseSnapshot).toBe(snapshot);
+    expect(row!.createdAt).toBeInstanceOf(Date);
+  });
+
+  test("lookup recorta idempotencyKey antes de buscar: coincide con la clave guardada ya recortada", async () => {
+    const batchId = await insertPlainBatch();
+    await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, { idempotencyKey: "  clave-con-espacios  " }));
+
+    const row = await findAccountHolderFundingIdempotencyRow(db, { createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: "clave-con-espacios" });
+    expect(row).not.toBeNull();
+    expect(row!.idempotencyKey).toBe("clave-con-espacios");
+  });
+
+  test("determinismo: dos lecturas consecutivas devuelven el mismo contenido", async () => {
+    const batchId = await insertPlainBatch();
+    await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, { idempotencyKey: "qa-key-determinismo" }));
+
+    const first = await findAccountHolderFundingIdempotencyRow(db, { createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: "qa-key-determinismo" });
+    const second = await findAccountHolderFundingIdempotencyRow(db, { createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: "qa-key-determinismo" });
+    expect(first).toEqual(second);
+  });
+
+  test("no muta el objeto params recibido", async () => {
+    const params = { createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: "  qa-key-no-mutar  " };
+    const snapshot = { ...params };
+    await findAccountHolderFundingIdempotencyRow(db, params);
+    expect(params).toEqual(snapshot);
+  });
+
+  test.each([[0], [-1], [1.5], [NaN]])("createdBy inválido (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    await expect(findAccountHolderFundingIdempotencyRow(db, { createdBy: bad as number, endpoint: IDEMP_ENDPOINT, idempotencyKey: "x" })).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([["GET /payment-batches"], ["POST /payment-batches/"], [""], [" POST /payment-batches"], [null], [undefined], [123]])(
+    "endpoint inválido (%p) lanza AccountHolderFundingBatchError",
+    async (bad) => {
+      await expect(findAccountHolderFundingIdempotencyRow(db, { createdBy: userId, endpoint: bad as string, idempotencyKey: "x" })).rejects.toThrow(AccountHolderFundingBatchError);
+    }
+  );
+
+  test.each([[""], ["   "], [123], [null], [undefined], [true], [[]], [{}]])("idempotencyKey inválida (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    await expect(findAccountHolderFundingIdempotencyRow(db, { createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: bad as string })).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test("idempotencyKey de 201 caracteres lanza AccountHolderFundingBatchError", async () => {
+    await expect(
+      findAccountHolderFundingIdempotencyRow(db, { createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: "x".repeat(201) })
+    ).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test("idempotencyKey cuenta code points Unicode, no unidades UTF-16: 200 emoji fuera del BMP no lanza", async () => {
+    const key = "😀".repeat(200);
+    expect(key.length).toBe(400); // unidades UTF-16 — confirma que no es lo que se usa para validar
+    await expect(findAccountHolderFundingIdempotencyRow(db, { createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: key })).resolves.toBeNull();
+  });
+
+  test.each([[null], [undefined], [[]], ["x"]])("params no-objeto (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    await expect(findAccountHolderFundingIdempotencyRow(db, bad as any)).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+});
+
+describe("resolveExistingIdempotentFundingRow", () => {
+  function makeRow(overrides: Partial<AccountHolderFundingIdempotencyRow> = {}): AccountHolderFundingIdempotencyRow {
+    return {
+      id: 1, createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: "qa-key-1",
+      requestFingerprint: "fp-real", paymentBatchId: 42, responseStatus: 201,
+      responseSnapshot: JSON.stringify({ id: 42 }), createdAt: new Date(),
+      ...overrides,
+    };
+  }
+
+  test("mismo fingerprint: devuelve exactamente responseStatus/responseSnapshot/paymentBatchId almacenados, sin reinterpretar el snapshot", () => {
+    const row = makeRow({ responseSnapshot: '{"raw":"tal cual"}' });
+    const result = resolveExistingIdempotentFundingRow(row, "fp-real");
+    expect(result).toEqual({ paymentBatchId: 42, responseStatus: 201, responseSnapshot: '{"raw":"tal cual"}' });
+  });
+
+  test("fingerprint diferente: lanza FundingIdempotencyConflictError", () => {
+    const row = makeRow({ requestFingerprint: "fp-guardado" });
+    expect(() => resolveExistingIdempotentFundingRow(row, "fp-distinto")).toThrow(FundingIdempotencyConflictError);
+  });
+
+  test("no muta la fila recibida", () => {
+    const row = makeRow();
+    const snapshot = { ...row };
+    resolveExistingIdempotentFundingRow(row, row.requestFingerprint);
+    expect(row).toEqual(snapshot);
+  });
+
+  test("determinismo: dos llamadas con los mismos argumentos devuelven el mismo resultado", () => {
+    const row = makeRow();
+    const a = resolveExistingIdempotentFundingRow(row, row.requestFingerprint);
+    const b = resolveExistingIdempotentFundingRow(row, row.requestFingerprint);
+    expect(a).toEqual(b);
+  });
+
+  test.each([[""], [123], [null], [undefined]])("requestFingerprint inválido (%p) lanza AccountHolderFundingBatchError", (bad) => {
+    const row = makeRow();
+    expect(() => resolveExistingIdempotentFundingRow(row, bad as string)).toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([[0], [-1], [1.5]])("existingRow.paymentBatchId inválido (%p) lanza AccountHolderFundingBatchError", (bad) => {
+    const row = makeRow({ paymentBatchId: bad as number });
+    expect(() => resolveExistingIdempotentFundingRow(row, row.requestFingerprint)).toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([[99], [0], [-1], [600], [1.5]])("existingRow.responseStatus inválido (%p) lanza AccountHolderFundingBatchError", (bad) => {
+    const row = makeRow({ responseStatus: bad as number });
+    expect(() => resolveExistingIdempotentFundingRow(row, row.requestFingerprint)).toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([[""], [null], [undefined]])("existingRow.responseSnapshot inválido (%p) lanza AccountHolderFundingBatchError", (bad) => {
+    const row = makeRow({ responseSnapshot: bad as string });
+    expect(() => resolveExistingIdempotentFundingRow(row, row.requestFingerprint)).toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([[null], [undefined], [[]], ["x"]])("existingRow no-objeto (%p) lanza AccountHolderFundingBatchError", (bad) => {
+    expect(() => resolveExistingIdempotentFundingRow(bad as any, "fp")).toThrow(AccountHolderFundingBatchError);
+  });
+});
+
+describe("insertAccountHolderFundingIdempotencyRow", () => {
+  test("mismo fingerprint end-to-end: find + resolve devuelven status/snapshot/batch guardados", async () => {
+    const batchId = await insertPlainBatch();
+    const snapshot = JSON.stringify({ id: batchId, ok: true });
+    await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, {
+      idempotencyKey: "qa-key-e2e", requestFingerprint: "fp-e2e", responseStatus: 201, responseSnapshot: snapshot,
+    }));
+
+    const row = await findAccountHolderFundingIdempotencyRow(db, { createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: "qa-key-e2e" });
+    const resolved = resolveExistingIdempotentFundingRow(row!, "fp-e2e");
+    expect(resolved).toEqual({ paymentBatchId: batchId, responseStatus: 201, responseSnapshot: snapshot });
+  });
+
+  test("dos claves idénticas para usuarios distintos coexisten", async () => {
+    const batchId1 = await insertPlainBatch();
+    const batchId2 = await insertPlainBatch();
+    const [{ id: otherUserId }] = (await client!.execute(`INSERT INTO users (name) VALUES ('QA otro usuario') RETURNING id`)).rows as any[];
+
+    const id1 = await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId1, { createdBy: userId, idempotencyKey: "clave-compartida" }));
+    const id2 = await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId2, { createdBy: Number(otherUserId), idempotencyKey: "clave-compartida" }));
+
+    expect(id1).not.toBe(id2);
+    const row1 = await findAccountHolderFundingIdempotencyRow(db, { createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: "clave-compartida" });
+    const row2 = await findAccountHolderFundingIdempotencyRow(db, { createdBy: Number(otherUserId), endpoint: IDEMP_ENDPOINT, idempotencyKey: "clave-compartida" });
+    expect(row1!.paymentBatchId).toBe(batchId1);
+    expect(row2!.paymentBatchId).toBe(batchId2);
+  });
+
+  test("mismo (createdBy, idempotencyKey) con endpoint distinto: el ESQUEMA los deja coexistir (UNIQUE compuesto), aunque el helper dedicado solo acepta el endpoint real", async () => {
+    const batchId1 = await insertPlainBatch();
+    const batchId2 = await insertPlainBatch();
+
+    // Bypass deliberado del helper — SQL crudo — para probar el comportamiento
+    // real del UNIQUE(created_by, endpoint, idempotency_key) de la migración
+    // 0036, independiente de que este módulo solo maneje POST /payment-batches.
+    await client!.execute(
+      `INSERT INTO account_holder_funding_idempotency_keys (created_by, endpoint, idempotency_key, request_fingerprint, payment_batch_id, response_status, response_snapshot, created_at) VALUES (?, 'POST /payment-batches', 'clave-endpoint', 'fp-a', ?, 201, '{}', ?)`,
+      [userId, batchId1, Date.now()]
+    );
+    await client!.execute(
+      `INSERT INTO account_holder_funding_idempotency_keys (created_by, endpoint, idempotency_key, request_fingerprint, payment_batch_id, response_status, response_snapshot, created_at) VALUES (?, 'POST /payment-batches-otro', 'clave-endpoint', 'fp-b', ?, 201, '{}', ?)`,
+      [userId, batchId2, Date.now()]
+    );
+    expect(await countRows(client!, "account_holder_funding_idempotency_keys")).toBe(2);
+
+    // El helper dedicado, en cambio, rechaza el endpoint no permitido — nunca
+    // asume que "cualquier string" es válido solo porque el esquema lo acepte.
+    await expect(
+      insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId1, { endpoint: "POST /payment-batches-otro", idempotencyKey: "clave-endpoint-2" }))
+    ).rejects.toThrow(AccountHolderFundingBatchError);
+    await expect(
+      findAccountHolderFundingIdempotencyRow(db, { createdBy: userId, endpoint: "POST /payment-batches-otro", idempotencyKey: "clave-endpoint" })
+    ).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test("UNIQUE duplicado (mismo created_by+endpoint+idempotencyKey) se propaga tal cual — nunca se traduce a AccountHolderFundingBatchError", async () => {
+    const batchId1 = await insertPlainBatch();
+    const batchId2 = await insertPlainBatch();
+
+    await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId1, { idempotencyKey: "clave-unique-dup", requestFingerprint: "fp-a" }));
+
+    let caught: unknown = null;
+    try {
+      await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId2, { idempotencyKey: "clave-unique-dup", requestFingerprint: "fp-b" }));
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).not.toBeNull();
+    expect(caught).not.toBeInstanceOf(AccountHolderFundingBatchError);
+    // drizzle-orm/libsql envuelve el error real del driver en DrizzleQueryError
+    // (.cause = el LibsqlError original) — el mensaje de UNIQUE vive ahí, no
+    // en el mensaje de nivel superior ("Failed query: ..."). Cualquiera de
+    // los dos niveles alcanza para confirmar que es el error crudo del
+    // driver, nunca uno traducido por este helper.
+    const rawMessage = String((caught as any)?.cause?.message ?? (caught as Error).message);
+    expect(rawMessage).toContain("UNIQUE constraint failed");
+
+    // Solo la primera fila quedó insertada — la segunda nunca se persistió.
+    expect(await countRows(client!, "account_holder_funding_idempotency_keys")).toBe(1);
+  });
+
+  test("ningún placeholder: los valores guardados son EXACTAMENTE los pasados, sin defaults ni relleno", async () => {
+    const batchId = await insertPlainBatch();
+    const params = buildIdempotencyRowParams(batchId, {
+      idempotencyKey: "qa-key-sin-placeholder", requestFingerprint: "fp-real-y-completo",
+      responseStatus: 422, responseSnapshot: JSON.stringify({ error: "algo falló", details: [1, 2, 3] }),
+    });
+    await insertAccountHolderFundingIdempotencyRow(db, params);
+
+    const row = await findAccountHolderFundingIdempotencyRow(db, { createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: "qa-key-sin-placeholder" });
+    expect(row!.requestFingerprint).toBe(params.requestFingerprint);
+    expect(row!.responseStatus).toBe(422);
+    expect(row!.responseSnapshot).toBe(params.responseSnapshot);
+    expect(row!.paymentBatchId).toBe(batchId);
+  });
+
+  test("prueba con transacción externa: el error UNIQUE hace rollback de una escritura previa en la misma transacción", async () => {
+    const batchId1 = await insertPlainBatch();
+    const batchId2 = await insertPlainBatch();
+
+    await expect(
+      db.transaction(async (tx: any) => {
+        // Escritura previa real dentro de la misma transacción externa.
+        await insertAccountHolderFundingIdempotencyRow(tx, buildIdempotencyRowParams(batchId1, { idempotencyKey: "clave-rollback-tx", requestFingerprint: "fp-primera" }));
+        // Segunda escritura con la MISMA clave natural — colisiona con la anterior, todavía sin commitear.
+        await insertAccountHolderFundingIdempotencyRow(tx, buildIdempotencyRowParams(batchId2, { idempotencyKey: "clave-rollback-tx", requestFingerprint: "fp-segunda" }));
+      })
+    ).rejects.toThrow();
+
+    // El rollback de la transacción externa deshace también la primera
+    // escritura, ya exitosa dentro de esa misma transacción.
+    expect(await countRows(client!, "account_holder_funding_idempotency_keys")).toBe(0);
+  });
+
+  test.each([[0], [-1], [1.5], [NaN]])("createdBy inválido (%p) lanza AccountHolderFundingBatchError sin escribir nada", async (bad) => {
+    const batchId = await insertPlainBatch();
+    await expect(insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, { createdBy: bad as number }))).rejects.toThrow(AccountHolderFundingBatchError);
+    expect(await countRows(client!, "account_holder_funding_idempotency_keys")).toBe(0);
+  });
+
+  test.each([["GET /payment-batches"], [""], [null], [undefined], [123]])("endpoint inválido (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    const batchId = await insertPlainBatch();
+    await expect(insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, { endpoint: bad as string }))).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([[""], ["   "], [123], [null], [undefined]])("idempotencyKey inválida (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    const batchId = await insertPlainBatch();
+    await expect(insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, { idempotencyKey: bad as string }))).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test("idempotencyKey de 201 caracteres lanza AccountHolderFundingBatchError", async () => {
+    const batchId = await insertPlainBatch();
+    await expect(insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, { idempotencyKey: "x".repeat(201) }))).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([[""], [123], [null], [undefined]])("requestFingerprint inválido (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    const batchId = await insertPlainBatch();
+    await expect(insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, { requestFingerprint: bad as string }))).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([[0], [-1], [1.5]])("paymentBatchId con forma inválida (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    await expect(insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(bad as number))).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test("paymentBatchId con forma válida pero de un batch inexistente: la FK real se propaga tal cual (no es un error de forma)", async () => {
+    const nonExistentBatchId = 999999;
+    await expect(
+      insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(nonExistentBatchId, { idempotencyKey: "qa-key-fk-inexistente" }))
+    ).rejects.not.toBeInstanceOf(AccountHolderFundingBatchError);
+    expect(await countRows(client!, "account_holder_funding_idempotency_keys")).toBe(0);
+  });
+
+  test.each([[99], [0], [-1], [600], [1.5], [NaN]])("responseStatus inválido (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    const batchId = await insertPlainBatch();
+    await expect(insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, { responseStatus: bad as number }))).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([[""], [123], [null], [undefined]])("responseSnapshot inválido (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    const batchId = await insertPlainBatch();
+    await expect(insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, { responseSnapshot: bad as string }))).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([[null], [undefined], [[]], ["x"]])("params no-objeto (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    await expect(insertAccountHolderFundingIdempotencyRow(db, bad as any)).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test("no muta el objeto params recibido", async () => {
+    const batchId = await insertPlainBatch();
+    const params = buildIdempotencyRowParams(batchId, { idempotencyKey: "  clave-no-mutar  " });
+    const snapshot = { ...params };
+    await insertAccountHolderFundingIdempotencyRow(db, params);
+    expect(params).toEqual(snapshot);
   });
 });
