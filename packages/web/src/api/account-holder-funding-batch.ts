@@ -823,3 +823,345 @@ export async function insertAccountHolderFundingIdempotencyRow(
 
   return row!.id as number;
 }
+
+// ─── 6. Orquestación transaccional completa — Etapa 1B-3-C2 ───────────────
+// Coordina, sin duplicar ninguna regla económica ni de negocio, TODO el
+// flujo del modo titular en una sola transacción real — pero todavía SIN
+// conectar a POST /payment-batches (index.ts no importa este módulo). La
+// creación de las filas base (payment_batches, payment_batch_splits,
+// received_checks, payments, cash_entries de recargo) es responsabilidad de
+// `dependencies`, inyectada por el futuro caller (index.ts) — este módulo no
+// conoce policyId/installmentId/cheques/recargos ni ninguna de las ~700
+// líneas de resolución de ítems reales de POST /payment-batches hoy; solo
+// sabe que esas filas existen y necesita sus ids reales + el BatchSnapshot.
+//
+// ─── Orden real dentro de la transacción (pedido, con una sola desviación
+// documentada) ───────────────────────────────────────────────────────────
+//   revalidación de idempotencia (SELECT, antes de cualquier escritura)
+//   -> batch -> revalidación de saldo/plan -> splits+cheques y
+//   payments+recargos (un solo callback, createChildRows) -> movimientos/
+//   ajuste + funding allocations (persistAccountHolderFundingArtifacts,
+//   que YA internamente hace movimientos antes que allocations) -> fila
+//   completa de idempotencia (última escritura).
+//
+// Única desviación del orden literal pedido: "splits y cheques" y "payments
+// y recargos" se piden como DOS pasos separados, acá son UNO
+// (createChildRows). Imposibilidad demostrada: en el flujo real (index.ts)
+// ya están interleaved — cada split se inserta junto con SUS cheques en la
+// misma iteración, y cada payment se inserta junto con SU recargo Pronto
+// Pago en la suya — partirlos en dos callbacks distintos no reflejaría el
+// código real ni traería ningún beneficio de integridad (no hay ninguna FK
+// entre un split y un payment, a diferencia de batch -> children, que sí
+// necesita el id real del batch). El orden RELATIVO entre splits y payments
+// nunca importó ni en el código legacy ni acá.
+//
+// La revalidación de idempotencia ocurre ANTES del batch (no después, como
+// insinúa la posición de "batch" en la lista) porque es la única forma de
+// cumplir el requisito "encontrar la fila en la revalidación interna no crea
+// un segundo batch" — si se revalidara después de crear el batch, ya
+// existiría un batch huérfano que revertir (correcto igual, por rollback,
+// pero entonces el orden pedido no tendría sentido con ese requisito). Nota
+// de performance, no de corrección: el código legacy evita a propósito que
+// la primera sentencia de su transacción sea un SELECT (contención de locks
+// medida empíricamente, ver comentario en POST /payment-batches, index.ts)
+// — acá la primera sentencia SÍ es un SELECT (la revalidación de
+// idempotencia), sobre una tabla nueva y todavía sin tráfico real (el modo
+// titular no está conectado). Si al activarlo se observara contención
+// similar, ver ese mismo comentario en index.ts para el patrón de mitigación
+// — no se replica preventivamente acá sin evidencia real de este flujo.
+//
+// ─── Carrera UNIQUE de idempotencia — por qué NO se puede reproducir con
+// concurrencia real en los tests ─────────────────────────────────────────
+// Reproducir la carrera real requeriría dos transacciones SQLite abiertas al
+// mismo tiempo sobre el mismo archivo — con libsql en modo archivo local
+// eso son locks a nivel de archivo (no de fila): la segunda conexión
+// bloquearía o fallaría de forma dependiente del timing exacto, exactamente
+// lo que el pedido prohíbe testear. Por eso la detección
+// (isAccountHolderFundingIdempotencyUniqueViolation) y la reconciliación
+// (reconcileAccountHolderFundingIdempotencyConflict) son funciones propias,
+// testeables de forma aislada y determinista; y el "punto de fallo" para
+// probar el cableado completo se inyecta pasando un `runTransaction` que
+// falla directamente (runAccountHolderFundingTransaction, exportada para
+// eso) — nunca con sleeps, locks reales ni condiciones de carrera genuinas.
+// El test real de UNIQUE ya existente de 1B-3-C1 (dos inserts con la misma
+// clave dentro de la misma transacción) se reutiliza para validar el
+// detector contra un error REAL del driver, no solo contra uno sintético.
+
+const ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_TABLE_NAME = "account_holder_funding_idempotency_keys";
+
+/**
+ * true si `error` (lo que rechazó `db.transaction(...)`) es el UNIQUE(created_by,
+ * endpoint, idempotency_key) de esta tabla específica — nunca un falso
+ * positivo con otro UNIQUE del mismo batch (p.ej. los 9 índices parciales de
+ * payment_batch_funding_allocations): exige tanto la frase de SQLite como el
+ * nombre de ESTA tabla. drizzle-orm/libsql envuelve el error real del driver
+ * en DrizzleQueryError (`.cause` = el LibsqlError original, ver
+ * insertAccountHolderFundingIdempotencyRow más arriba y su test) — se
+ * inspecciona el mensaje en ambos niveles porque cuál de los dos lo trae
+ * depende de la versión del driver, nunca se asume uno solo.
+ */
+export function isAccountHolderFundingIdempotencyUniqueViolation(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const cause = (error as { cause?: unknown }).cause;
+  const causeMessage = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
+  const combined = `${error.message}\n${causeMessage}`;
+  return combined.includes("UNIQUE constraint failed") && combined.includes(ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_TABLE_NAME);
+}
+
+export interface AccountHolderFundingIdempotencyReconciliationParams {
+  createdBy: number;
+  idempotencyKey: string;
+  requestFingerprint: string;
+}
+
+/**
+ * Se llama SOLO después de perder la carrera UNIQUE (la transacción propia
+ * ya se revirtió por completo). Relee la fila ganadora con `dbClient`
+ * (nunca `tx` — la transacción que falló ya no existe) y aplica la MISMA
+ * regla de siempre: mismo fingerprint -> responseStatus/responseSnapshot/
+ * paymentBatchId exactos del ganador; fingerprint distinto ->
+ * FundingIdempotencyConflictError. Si no encuentra ninguna fila (estado
+ * inesperado — se detectó el UNIQUE pero no hay fila que lo explique) lanza
+ * un error de dominio explícito en vez de fallar en silencio o reintentar.
+ */
+export async function reconcileAccountHolderFundingIdempotencyConflict(
+  dbClient: AccountHolderFundingDbClient,
+  params: AccountHolderFundingIdempotencyReconciliationParams
+): Promise<RunAccountHolderFundingBatchResult> {
+  const existingRow = await findAccountHolderFundingIdempotencyRow(dbClient, {
+    createdBy: params.createdBy,
+    endpoint: ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT,
+    idempotencyKey: params.idempotencyKey,
+  });
+  if (!existingRow) {
+    throw new AccountHolderFundingBatchError(
+      `Se detectó una colisión UNIQUE de idempotencia (createdBy=${params.createdBy}, idempotencyKey="${params.idempotencyKey}") pero no se encontró ninguna fila al releer — estado inesperado, no se puede reconciliar.`
+    );
+  }
+  return resolveExistingIdempotentFundingRow(existingRow, params.requestFingerprint);
+}
+
+/**
+ * Lookup + resolución en un solo paso — usado tanto para el chequeo rápido
+ * previo a la transacción como para la revalidación interna (misma lógica,
+ * distinto `dbClient`: `database` afuera, `tx` adentro). null si no hay
+ * fila (caso normal). Puede lanzar FundingIdempotencyConflictError (fila
+ * encontrada con fingerprint distinto).
+ */
+async function lookupAndResolveIdempotency(
+  dbClient: AccountHolderFundingDbClient,
+  lookupParams: FindAccountHolderFundingIdempotencyRowParams,
+  requestFingerprint: string
+): Promise<RunAccountHolderFundingBatchResult | null> {
+  const existingRow = await findAccountHolderFundingIdempotencyRow(dbClient, lookupParams);
+  if (!existingRow) return null;
+  return resolveExistingIdempotentFundingRow(existingRow, requestFingerprint);
+}
+
+export interface AccountHolderFundingChildRows {
+  /** sourceKey del plan (allocations con sourceKind="split") -> id real de payment_batch_splits. */
+  splitIdByKey: ReadonlyMap<string, number>;
+  /** destinationKey del plan (destinationKind="payment") -> id real de payments. */
+  paymentIdByKey: ReadonlyMap<string, number>;
+  /** destinationKey del plan (destinationKind="pronto_pago") -> id real de cash_entries. */
+  cashEntryIdByKey: ReadonlyMap<string, number>;
+}
+
+export interface AccountHolderFundingResponseSnapshotContext {
+  batch: BatchSnapshot;
+  childRows: AccountHolderFundingChildRows;
+  artifacts: PersistAccountHolderFundingArtifactsResult;
+}
+
+export interface AccountHolderFundingResponseSnapshot {
+  responseStatus: number;
+  /** String ya serializado (ver "responseSnapshot es un string opaco", 1B-3-C1) — este módulo nunca lo construye ni lo interpreta. */
+  responseSnapshot: string;
+}
+
+/**
+ * Contrato explícito de lo que el futuro caller (index.ts) debe inyectar —
+ * TODO lo que este módulo no sabe hacer ni debe duplicar. Ninguna de las 3
+ * funciones tiene acceso a payment_batch_funding_allocations ni a
+ * account_holder_funding_idempotency_keys: no se les pasa ninguna referencia
+ * a persistAccountHolderFundingArtifacts/insertAccountHolderFundingIdempotencyRow,
+ * así que no pueden insertar ahí por su cuenta salvo que el propio caller
+ * decida importarlas — no es una garantía en tiempo de compilación, es el
+ * contrato de diseño: estas 3 funciones solo devuelven datos, nunca deciden
+ * qué se persiste en esas dos tablas.
+ */
+export interface AccountHolderFundingBatchDependencies {
+  /** Inserta ÚNICAMENTE la fila de payment_batches — primera escritura real de la transacción. Nunca splits/payments/cashEntries/allocations/idempotencia. */
+  createBatch(tx: AccountHolderFundingDbClient): Promise<BatchSnapshot>;
+  /** Inserta splits+cheques+payments+recargos Pronto Pago del batch YA creado. Nunca el batch mismo, nunca allocations/idempotencia. */
+  createChildRows(tx: AccountHolderFundingDbClient, batch: BatchSnapshot): Promise<AccountHolderFundingChildRows>;
+  /** Puro en cuanto a decisiones (no escribe nada propio) — arma el string de respuesta final a partir de lo ya persistido. Recibe `tx` solo por si necesita leer datos de exhibición (nombres, etc.) ya committeados en esta misma transacción. */
+  buildResponseSnapshot(tx: AccountHolderFundingDbClient, ctx: AccountHolderFundingResponseSnapshotContext): Promise<AccountHolderFundingResponseSnapshot>;
+}
+
+export interface RunAccountHolderFundingBatchParams {
+  /** Cliente Drizzle CON `.transaction()` — siempre `database`, nunca `tx` (este es el punto de entrada que ABRE la transacción). */
+  db: AccountHolderFundingDbClient;
+  createdBy: number;
+  idempotencyKey: string;
+  requestFingerprint: string;
+  accountHolderInsuredId: number;
+  paymentDate: string;
+  destinations: ReadonlyArray<FundingDestinationInput>;
+  realSplits: ReadonlyArray<FundingPlanSplitInput>;
+  creditAppliedCents: number;
+  roundingCoverageCents: number;
+  debtAuthorized: boolean;
+  debtReason: string | null;
+  dependencies: AccountHolderFundingBatchDependencies;
+}
+
+export interface RunAccountHolderFundingBatchResult {
+  paymentBatchId: number;
+  responseStatus: number;
+  responseSnapshot: string;
+}
+
+/**
+ * Envoltorio try/catch/reconciliación alrededor de UNA ejecución de la
+ * transacción completa — aislado del resto de runAccountHolderFundingBatch
+ * exclusivamente para que un test pueda inyectar un `runTransaction` que
+ * falle de forma controlada (ver cabecera de esta sección, "por qué NO se
+ * puede reproducir con concurrencia real"), sin mockear nada de DB. Si
+ * `runTransaction()` lanza un error UNIQUE de esta tabla específica,
+ * reconcilia releyendo con `db` (nunca con el `tx` ya muerto). Cualquier
+ * otro error (incluido FundingPlanRaceConditionError,
+ * FundingIdempotencyConflictError de la revalidación interna, o cualquier
+ * error de DB no relacionado) se propaga tal cual — nunca se disfraza.
+ */
+export async function runAccountHolderFundingTransaction(
+  db: AccountHolderFundingDbClient,
+  runTransaction: () => Promise<RunAccountHolderFundingBatchResult>,
+  reconciliation: AccountHolderFundingIdempotencyReconciliationParams
+): Promise<RunAccountHolderFundingBatchResult> {
+  try {
+    return await runTransaction();
+  } catch (error) {
+    if (isAccountHolderFundingIdempotencyUniqueViolation(error)) {
+      return await reconcileAccountHolderFundingIdempotencyConflict(db, reconciliation);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Orquesta el flujo COMPLETO del modo titular de POST /payment-batches —
+ * todavía sin conectar (index.ts no llama a esta función). Ver cabecera de
+ * la sección para el orden exacto y las decisiones de diseño. No abre
+ * ninguna transacción propia fuera de la única `params.db.transaction(...)`
+ * que le corresponde como punto de entrada; nunca importa la conexión
+ * global (recibe `params.db` inyectado, igual que el resto del archivo).
+ */
+export async function runAccountHolderFundingBatch(
+  params: RunAccountHolderFundingBatchParams
+): Promise<RunAccountHolderFundingBatchResult> {
+  assertPlainObject("params", params);
+  assertSafePositiveInt("createdBy", params.createdBy);
+  const idempotencyKey = assertAndTrimIdempotencyKey("idempotencyKey", params.idempotencyKey);
+  assertNonEmptyString("requestFingerprint", params.requestFingerprint);
+  assertSafePositiveInt("accountHolderInsuredId", params.accountHolderInsuredId);
+  if (!isValidCalendarDate(params.paymentDate)) {
+    throw new AccountHolderFundingBatchError(`paymentDate debe ser una fecha calendario válida en formato YYYY-MM-DD (recibido: ${params.paymentDate}).`);
+  }
+  assertPlainObject("dependencies", params.dependencies);
+  for (const fnName of ["createBatch", "createChildRows", "buildResponseSnapshot"] as const) {
+    if (typeof (params.dependencies as Record<string, unknown>)[fnName] !== "function") {
+      throw new AccountHolderFundingBatchError(`dependencies.${fnName} debe ser una función (recibido: ${typeof (params.dependencies as Record<string, unknown>)[fnName]}).`);
+    }
+  }
+  if (!params.db || typeof (params.db as Record<string, unknown>).transaction !== "function") {
+    throw new AccountHolderFundingBatchError("db debe ser un cliente Drizzle con .transaction() (recibido inválido).");
+  }
+
+  const planParams: PlanFundingWithFreshBalanceParams = {
+    insuredId: params.accountHolderInsuredId,
+    destinations: params.destinations,
+    realSplits: params.realSplits,
+    creditAppliedCents: params.creditAppliedCents,
+    roundingCoverageCents: params.roundingCoverageCents,
+    debtAuthorized: params.debtAuthorized,
+  };
+  const idempotencyLookupParams: FindAccountHolderFundingIdempotencyRowParams = {
+    createdBy: params.createdBy,
+    endpoint: ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT,
+    idempotencyKey,
+  };
+
+  // ─── 1. Lookup rápido de idempotencia, fuera de la transacción ─────────
+  const earlyHit = await lookupAndResolveIdempotency(params.db, idempotencyLookupParams, params.requestFingerprint);
+  if (earlyHit) return earlyHit;
+
+  // ─── 2. Plan preliminar, fuera de la transacción ───────────────────────
+  const preliminary = await planFundingWithFreshBalance(params.db, planParams);
+
+  // ─── 3. Transacción única ───────────────────────────────────────────────
+  const runTransaction = (): Promise<RunAccountHolderFundingBatchResult> =>
+    params.db.transaction(async (tx: AccountHolderFundingDbClient) => {
+      // Revalidación de idempotencia — primera operación de la transacción,
+      // antes de cualquier escritura (ver cabecera de la sección).
+      const internalHit = await lookupAndResolveIdempotency(tx, idempotencyLookupParams, params.requestFingerprint);
+      if (internalHit) return internalHit;
+
+      const batch = await params.dependencies.createBatch(tx);
+      assertPlainObject("dependencies.createBatch() resultado", batch);
+      assertSafePositiveInt("batch.id", batch.id);
+      if (batch.accountHolderInsuredId !== params.accountHolderInsuredId) {
+        throw new AccountHolderFundingBatchError(
+          `dependencies.createBatch() devolvió un batch con accountHolderInsuredId=${batch.accountHolderInsuredId}, distinto del titular solicitado (${params.accountHolderInsuredId}).`
+        );
+      }
+
+      // Revalidación de saldo/plan con el saldo releído DENTRO de la
+      // transacción — si difiere del preliminar, lanza
+      // FundingPlanRaceConditionError y la transacción entera (incluido el
+      // batch recién insertado) se revierte.
+      const fresh = await planFundingWithFreshBalance(tx, planParams);
+      assertFundingPlanUnchanged(preliminary.plan, fresh.plan);
+
+      const childRows = await params.dependencies.createChildRows(tx, batch);
+      assertPlainObject("dependencies.createChildRows() resultado", childRows);
+      assertMap("childRows.splitIdByKey", childRows.splitIdByKey);
+      assertMap("childRows.paymentIdByKey", childRows.paymentIdByKey);
+      assertMap("childRows.cashEntryIdByKey", childRows.cashEntryIdByKey);
+
+      const artifacts = await persistAccountHolderFundingArtifacts(tx, {
+        batch,
+        plan: fresh.plan,
+        paymentDate: params.paymentDate,
+        createdBy: params.createdBy,
+        debtReason: params.debtReason,
+        splitIdByKey: childRows.splitIdByKey,
+        paymentIdByKey: childRows.paymentIdByKey,
+        cashEntryIdByKey: childRows.cashEntryIdByKey,
+      });
+
+      const { responseStatus, responseSnapshot } = await params.dependencies.buildResponseSnapshot(tx, { batch, childRows, artifacts });
+      assertHttpStatus("responseStatus (buildResponseSnapshot)", responseStatus);
+      assertNonEmptyString("responseSnapshot (buildResponseSnapshot)", responseSnapshot);
+
+      // Última escritura de la transacción — ver cabecera de la sección.
+      await insertAccountHolderFundingIdempotencyRow(tx, {
+        createdBy: params.createdBy,
+        endpoint: ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT,
+        idempotencyKey,
+        requestFingerprint: params.requestFingerprint,
+        paymentBatchId: batch.id,
+        responseStatus,
+        responseSnapshot,
+      });
+
+      return { paymentBatchId: batch.id, responseStatus, responseSnapshot };
+    });
+
+  // ─── 4. Carrera UNIQUE — reconciliación fuera de la transacción ────────
+  return runAccountHolderFundingTransaction(params.db, runTransaction, {
+    createdBy: params.createdBy,
+    idempotencyKey,
+    requestFingerprint: params.requestFingerprint,
+  });
+}

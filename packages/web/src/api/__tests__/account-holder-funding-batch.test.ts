@@ -31,10 +31,12 @@
 import { test, expect, describe, beforeAll, beforeEach, afterAll } from "bun:test";
 import { createClient, type Client } from "@libsql/client";
 import { drizzle } from "drizzle-orm/libsql";
+import { eq } from "drizzle-orm";
+import { sqliteTable, integer, text, real } from "drizzle-orm/sqlite-core";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { insuredAccountMovements } from "../database/schema";
+import { insuredAccountMovements, accountHolderFundingIdempotencyKeys } from "../database/schema";
 import {
   loadActiveAccountHolderBalanceCents,
   planFundingWithFreshBalance,
@@ -43,6 +45,10 @@ import {
   findAccountHolderFundingIdempotencyRow,
   resolveExistingIdempotentFundingRow,
   insertAccountHolderFundingIdempotencyRow,
+  isAccountHolderFundingIdempotencyUniqueViolation,
+  reconcileAccountHolderFundingIdempotencyConflict,
+  runAccountHolderFundingTransaction,
+  runAccountHolderFundingBatch,
   AccountHolderFundingBatchError,
   FundingPlanRaceConditionError,
   FundingIdempotencyConflictError,
@@ -50,6 +56,10 @@ import {
   type PersistAccountHolderFundingArtifactsParams,
   type AccountHolderFundingIdempotencyRow,
   type InsertAccountHolderFundingIdempotencyRowParams,
+  type AccountHolderFundingBatchDependencies,
+  type AccountHolderFundingChildRows,
+  type RunAccountHolderFundingBatchParams,
+  type RunAccountHolderFundingBatchResult,
 } from "../account-holder-funding-batch";
 import {
   planAccountHolderBatchFunding,
@@ -58,6 +68,7 @@ import {
   type FundingPlanSplitInput,
 } from "../../lib/payments/account-holder-funding-plan";
 import type { FundingDestinationInput } from "../../lib/payments/account-holder-funding";
+import type { BatchSnapshot } from "../../lib/payments/account-holder-funding-allocations";
 import { applyMigration0036AccountHolderFunding } from "../../lib/migrations/apply-0036-account-holder-funding";
 import type { Sql0036Client } from "../../lib/migrations/apply-0036-account-holder-funding";
 
@@ -1690,5 +1701,721 @@ describe("insertAccountHolderFundingIdempotencyRow", () => {
     const snapshot = { ...params };
     await insertAccountHolderFundingIdempotencyRow(db, params);
     expect(params).toEqual(snapshot);
+  });
+});
+
+// ─── 7. runAccountHolderFundingBatch — orquestación completa, Etapa 1B-3-C2 ─
+//
+// Las dependencias FAKE de acá insertan filas REALES (payment_batches/
+// payment_batch_splits/payments/cash_entries) vía `tx` — nunca simulan datos
+// en memoria — para que persistAccountHolderFundingArtifacts (llamado por el
+// orquestador real, sin mocks) reciba exactamente lo que recibiría en
+// producción.
+//
+// Tablas Drizzle LOCALES (testPaymentBatches/testPaymentBatchSplits/
+// testPayments/testCashEntries), no los objetos importados de
+// database/schema.ts: Drizzle arma el INSERT con TODAS las columnas
+// declaradas en el objeto de tabla (default o NULL para las que no se pasan
+// en `.values()`, no solo las presentes) — confirmado empíricamente acá (un
+// primer intento con los objetos completos de schema.ts falló con "table
+// payment_batches has no column named notes", porque esa tabla física
+// (createSchema, arriba) es la versión MÍNIMA histórica de este harness, sin
+// notes/updatedAt/cancelledAt/etc.). Estas tablas locales declaran
+// ÚNICAMENTE las columnas reales del DDL de createSchema — nunca se usan
+// para nada fuera de esta sección.
+const testPaymentBatches = sqliteTable("payment_batches", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  insuredId: integer("insured_id"),
+  baseAmountCents: integer("base_amount_cents").notNull(),
+  surchargeAmountCents: integer("surcharge_amount_cents").notNull().default(0),
+  totalReceivedCents: integer("total_received_cents").notNull(),
+  paymentDate: text("payment_date").notNull(),
+  status: text("status").notNull().default("confirmado"),
+  createdBy: integer("created_by"),
+  createdAt: integer("created_at"),
+  receivedAmountCents: integer("received_amount_cents"),
+  accountHolderInsuredId: integer("account_holder_insured_id"),
+});
+const testPaymentBatchSplits = sqliteTable("payment_batch_splits", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  batchId: integer("batch_id").notNull(),
+  method: text("method").notNull(),
+  amountCents: integer("amount_cents").notNull(),
+  createdAt: integer("created_at"),
+});
+const testPayments = sqliteTable("payments", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  batchId: integer("batch_id"),
+  amount: real("amount").notNull(),
+  paymentMethod: text("payment_method").notNull(),
+  paymentDate: text("payment_date").notNull(),
+  status: text("status").notNull().default("confirmado"),
+  createdAt: integer("created_at"),
+});
+const testCashEntries = sqliteTable("cash_entries", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  clientName: text("client_name").notNull(),
+  amount: real("amount").notNull(),
+  paymentMethod: text("payment_method").notNull(),
+  paymentDate: text("payment_date").notNull(),
+  entryType: text("entry_type").notNull().default("normal"),
+  paymentId: integer("payment_id"),
+  status: text("status").notNull().default("activo"),
+  createdAt: integer("created_at"),
+});
+
+interface OrchestrationFixtureConfig {
+  accountHolderInsuredId: number;
+  paymentDate: string;
+  createdBy: number;
+  destinations: FundingDestinationInput[];
+  realSplits: FundingPlanSplitInput[];
+  batchStatus?: "confirmado" | "anulado";
+  /** Solo para el test defensivo de titular inconsistente — el resto nunca lo usa. */
+  batchAccountHolderInsuredIdOverride?: number;
+}
+
+function buildOrchestrationDependencies(cfg: OrchestrationFixtureConfig): AccountHolderFundingBatchDependencies {
+  const baseAmountCents = cfg.destinations.filter((d) => d.kind === "payment").reduce((acc, d) => acc + d.nominalCents, 0);
+  const surchargeAmountCents = cfg.destinations.filter((d) => d.kind === "pronto_pago").reduce((acc, d) => acc + d.nominalCents, 0);
+  const totalReceivedCents = cfg.realSplits.reduce((acc, s) => acc + s.amountCents, 0);
+
+  return {
+    createBatch: async (tx: any): Promise<BatchSnapshot> => {
+      const accountHolderInsuredId = cfg.batchAccountHolderInsuredIdOverride ?? cfg.accountHolderInsuredId;
+      const status = cfg.batchStatus ?? "confirmado";
+      const [row] = await tx.insert(testPaymentBatches).values({
+        accountHolderInsuredId,
+        baseAmountCents: baseAmountCents || 1,
+        surchargeAmountCents,
+        totalReceivedCents: totalReceivedCents || 1,
+        paymentDate: cfg.paymentDate,
+        status,
+        createdBy: cfg.createdBy,
+      }).returning({ id: testPaymentBatches.id });
+      return { id: row!.id as number, status, accountHolderInsuredId };
+    },
+    createChildRows: async (tx: any, batch: BatchSnapshot): Promise<AccountHolderFundingChildRows> => {
+      const splitIdByKey = new Map<string, number>();
+      for (const s of cfg.realSplits) {
+        const [row] = await tx.insert(testPaymentBatchSplits).values({
+          batchId: batch.id, method: "efectivo", amountCents: s.amountCents,
+        }).returning({ id: testPaymentBatchSplits.id });
+        splitIdByKey.set(s.id, row!.id as number);
+      }
+
+      const paymentIdByKey = new Map<string, number>();
+      const cashEntryIdByKey = new Map<string, number>();
+      const paymentDestinations = cfg.destinations.filter((d) => d.kind === "payment");
+      const prontoPagoDestinations = cfg.destinations.filter((d) => d.kind === "pronto_pago");
+
+      for (const d of paymentDestinations) {
+        const [row] = await tx.insert(testPayments).values({
+          amount: d.nominalCents / 100, paymentMethod: "lote", paymentDate: cfg.paymentDate,
+          status: "confirmado", batchId: batch.id,
+        }).returning({ id: testPayments.id });
+        paymentIdByKey.set(d.id, row!.id as number);
+      }
+
+      let hostPaymentId: number | null = paymentDestinations.length > 0 ? paymentIdByKey.get(paymentDestinations[0]!.id)! : null;
+      if (prontoPagoDestinations.length > 0 && hostPaymentId === null) {
+        const [row] = await tx.insert(testPayments).values({
+          amount: 1, paymentMethod: "lote", paymentDate: cfg.paymentDate, status: "confirmado", batchId: batch.id,
+        }).returning({ id: testPayments.id });
+        hostPaymentId = row!.id as number;
+      }
+      for (const d of prontoPagoDestinations) {
+        const [row] = await tx.insert(testCashEntries).values({
+          clientName: "QA", amount: d.nominalCents / 100, paymentMethod: "lote", paymentDate: cfg.paymentDate,
+          entryType: "pronto_pago_surcharge", paymentId: hostPaymentId!, status: "activo",
+        }).returning({ id: testCashEntries.id });
+        cashEntryIdByKey.set(d.id, row!.id as number);
+      }
+
+      return { splitIdByKey, paymentIdByKey, cashEntryIdByKey };
+    },
+    buildResponseSnapshot: async (_tx: any, ctx) => ({
+      responseStatus: 201,
+      responseSnapshot: JSON.stringify({ batchId: ctx.batch.id, allocations: ctx.artifacts.allocationRows.length }),
+    }),
+  };
+}
+
+function buildOrchestrationParams(args: {
+  idempotencyKey: string;
+  requestFingerprint: string;
+  destinations: FundingDestinationInput[];
+  realSplits: FundingPlanSplitInput[];
+  accountHolderInsuredId?: number;
+  paymentDate?: string;
+  creditAppliedCents?: number;
+  roundingCoverageCents?: number;
+  debtAuthorized?: boolean;
+  debtReason?: string | null;
+  dependencies?: AccountHolderFundingBatchDependencies;
+  db?: any;
+}): RunAccountHolderFundingBatchParams {
+  const accountHolderInsuredId = args.accountHolderInsuredId ?? insuredId;
+  const paymentDate = args.paymentDate ?? PDATE;
+  return {
+    db: args.db ?? db,
+    createdBy: userId,
+    idempotencyKey: args.idempotencyKey,
+    requestFingerprint: args.requestFingerprint,
+    accountHolderInsuredId,
+    paymentDate,
+    destinations: args.destinations,
+    realSplits: args.realSplits,
+    creditAppliedCents: args.creditAppliedCents ?? 0,
+    roundingCoverageCents: args.roundingCoverageCents ?? 0,
+    debtAuthorized: args.debtAuthorized ?? false,
+    debtReason: args.debtReason ?? null,
+    dependencies: args.dependencies ?? buildOrchestrationDependencies({
+      accountHolderInsuredId, paymentDate, createdBy: userId, destinations: args.destinations, realSplits: args.realSplits,
+    }),
+  };
+}
+
+/** Cuenta llamadas a `.transaction()` sin alterar su comportamiento real — Proxy transparente para todo lo demás. */
+function withTransactionSpy(realDb: any): { db: any; transactionCallCount: () => number } {
+  let count = 0;
+  const proxied = new Proxy(realDb, {
+    get(target, prop, receiver) {
+      if (prop === "transaction") {
+        return (...args: any[]) => {
+          count++;
+          return (target as any).transaction(...args);
+        };
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+  return { db: proxied, transactionCallCount: () => count };
+}
+
+/** Cuenta llamadas a cada dependencia sin alterar su comportamiento real. */
+function withDependencyCallCounters(deps: AccountHolderFundingBatchDependencies): {
+  deps: AccountHolderFundingBatchDependencies;
+  counts: { createBatch: number; createChildRows: number; buildResponseSnapshot: number };
+} {
+  const counts = { createBatch: 0, createChildRows: 0, buildResponseSnapshot: 0 };
+  return {
+    counts,
+    deps: {
+      createBatch: async (tx) => { counts.createBatch++; return deps.createBatch(tx); },
+      createChildRows: async (tx, batch) => { counts.createChildRows++; return deps.createChildRows(tx, batch); },
+      buildResponseSnapshot: async (tx, ctx) => { counts.buildResponseSnapshot++; return deps.buildResponseSnapshot(tx, ctx); },
+    },
+  };
+}
+
+/** Mismo shape real que produce @libsql/client + drizzle-orm/libsql (DrizzleQueryError con .cause = LibsqlError) — ver el test "UNIQUE duplicado" de la sección 6, que confirmó este shape contra un error REAL. */
+function makeSyntheticIdempotencyUniqueError(): Error {
+  const err = new Error(
+    `Failed query: insert into "account_holder_funding_idempotency_keys" (...) values (...)`
+  ) as Error & { cause?: unknown };
+  err.cause = new Error(
+    "UNIQUE constraint failed: account_holder_funding_idempotency_keys.created_by, account_holder_funding_idempotency_keys.endpoint, account_holder_funding_idempotency_keys.idempotency_key"
+  );
+  return err;
+}
+
+/**
+ * Inyecta el punto de fallo (ver cabecera de la sección 6 en el archivo de
+ * implementación, "por qué NO se puede reproducir con concurrencia real"):
+ * intercepta ÚNICAMENTE la llamada `tx.insert(accountHolderFundingIdempotencyKeys)`
+ * dentro de la transacción real (todo lo demás — batch/splits/payments/
+ * movimientos/allocations — se escribe de verdad, con la MISMA `tx` real, y
+ * se revierte de verdad cuando la sentencia inyectada lanza) y, recién
+ * DESPUÉS de que esa transacción real ya terminó de revertirse (en el
+ * `.catch` de la promesa de `.transaction()`, nunca dentro de ella), ejecuta
+ * `onFailure` — secuencial y determinista, sin locks ni timing.
+ */
+function withInjectedIdempotencyUniqueFailure(realDb: any, onFailure: () => Promise<void>): any {
+  return new Proxy(realDb, {
+    get(target, prop, receiver) {
+      if (prop === "transaction") {
+        return (cb: any) =>
+          (target as any)
+            .transaction((tx: any) => {
+              const wrappedTx = new Proxy(tx, {
+                get(txTarget, txProp, txReceiver) {
+                  if (txProp === "insert") {
+                    return (table: any) => {
+                      if (table === accountHolderFundingIdempotencyKeys) {
+                        throw makeSyntheticIdempotencyUniqueError();
+                      }
+                      return (txTarget as any).insert(table);
+                    };
+                  }
+                  return Reflect.get(txTarget, txProp, txReceiver);
+                },
+              });
+              return cb(wrappedTx);
+            })
+            .catch(async (err: any) => {
+              await onFailure();
+              throw err;
+            });
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+}
+
+describe("isAccountHolderFundingIdempotencyUniqueViolation", () => {
+  test("detecta un error REAL de UNIQUE de esta tabla (mismo mecanismo que la Etapa 1B-3-C1)", async () => {
+    const batchId1 = await insertPlainBatch();
+    const batchId2 = await insertPlainBatch();
+    await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId1, { idempotencyKey: "qa-detector-real", requestFingerprint: "fp-a" }));
+
+    let caught: unknown = null;
+    try {
+      await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId2, { idempotencyKey: "qa-detector-real", requestFingerprint: "fp-b" }));
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).not.toBeNull();
+    expect(isAccountHolderFundingIdempotencyUniqueViolation(caught)).toBe(true);
+  });
+
+  test("no detecta un error genérico no relacionado", () => {
+    expect(isAccountHolderFundingIdempotencyUniqueViolation(new Error("fallo de red cualquiera"))).toBe(false);
+  });
+
+  test("no detecta un UNIQUE de OTRA tabla (mismo texto, distinto nombre de tabla)", () => {
+    const err = new Error("Failed query") as Error & { cause?: unknown };
+    err.cause = new Error("UNIQUE constraint failed: payment_batch_funding_allocations.payment_batch_split_id, payment_batch_funding_allocations.payment_id");
+    expect(isAccountHolderFundingIdempotencyUniqueViolation(err)).toBe(false);
+  });
+
+  test.each([[null], [undefined], ["string plano"], [{ message: "UNIQUE constraint failed: account_holder_funding_idempotency_keys" }]])(
+    "valores que no son Error (%p) devuelven false",
+    (bad) => {
+      expect(isAccountHolderFundingIdempotencyUniqueViolation(bad)).toBe(false);
+    }
+  );
+});
+
+describe("reconcileAccountHolderFundingIdempotencyConflict", () => {
+  test("mismo fingerprint: devuelve status/snapshot/batch del ganador ya guardado", async () => {
+    const batchId = await insertPlainBatch();
+    const snapshot = JSON.stringify({ id: batchId });
+    await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, {
+      idempotencyKey: "qa-reconcile-1", requestFingerprint: "fp-ganador", responseStatus: 201, responseSnapshot: snapshot,
+    }));
+
+    const result = await reconcileAccountHolderFundingIdempotencyConflict(db, { createdBy: userId, idempotencyKey: "qa-reconcile-1", requestFingerprint: "fp-ganador" });
+    expect(result).toEqual({ paymentBatchId: batchId, responseStatus: 201, responseSnapshot: snapshot });
+  });
+
+  test("fingerprint distinto: FundingIdempotencyConflictError", async () => {
+    const batchId = await insertPlainBatch();
+    await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, { idempotencyKey: "qa-reconcile-2", requestFingerprint: "fp-guardado" }));
+
+    await expect(
+      reconcileAccountHolderFundingIdempotencyConflict(db, { createdBy: userId, idempotencyKey: "qa-reconcile-2", requestFingerprint: "fp-otro" })
+    ).rejects.toThrow(FundingIdempotencyConflictError);
+  });
+
+  test("no encuentra ninguna fila: AccountHolderFundingBatchError explícito, nunca en silencio", async () => {
+    await expect(
+      reconcileAccountHolderFundingIdempotencyConflict(db, { createdBy: userId, idempotencyKey: "qa-reconcile-inexistente", requestFingerprint: "fp-x" })
+    ).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+});
+
+describe("runAccountHolderFundingTransaction — envoltorio try/catch/reconciliación", () => {
+  test("runTransaction exitoso: devuelve su resultado sin llamar a reconciliación", async () => {
+    const expected: RunAccountHolderFundingBatchResult = { paymentBatchId: 1, responseStatus: 201, responseSnapshot: "{}" };
+    const result = await runAccountHolderFundingTransaction(db, async () => expected, { createdBy: userId, idempotencyKey: "x", requestFingerprint: "y" });
+    expect(result).toBe(expected);
+  });
+
+  test("runTransaction lanza un error UNIQUE inyectado: reconcilia con el ganador pre-existente", async () => {
+    const batchId = await insertPlainBatch();
+    const snapshot = JSON.stringify({ winner: true });
+    await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, {
+      idempotencyKey: "qa-wrapper-unique", requestFingerprint: "fp-ganador", responseStatus: 201, responseSnapshot: snapshot,
+    }));
+
+    const result = await runAccountHolderFundingTransaction(
+      db,
+      async () => { throw makeSyntheticIdempotencyUniqueError(); },
+      { createdBy: userId, idempotencyKey: "qa-wrapper-unique", requestFingerprint: "fp-ganador" }
+    );
+    expect(result).toEqual({ paymentBatchId: batchId, responseStatus: 201, responseSnapshot: snapshot });
+  });
+
+  test("runTransaction lanza un error no-UNIQUE: se propaga sin reconciliar", async () => {
+    await expect(
+      runAccountHolderFundingTransaction(
+        db,
+        async () => { throw new AccountHolderFundingBatchError("fallo no relacionado con UNIQUE"); },
+        { createdBy: userId, idempotencyKey: "qa-wrapper-otro", requestFingerprint: "fp-z" }
+      )
+    ).rejects.toThrow("fallo no relacionado con UNIQUE");
+  });
+});
+
+describe("runAccountHolderFundingBatch — Etapa 1B-3-C2", () => {
+  test("cache hit previo (mismo fingerprint): no abre transacción ni ejecuta creación", async () => {
+    const batchId = await insertPlainBatch();
+    const snapshot = JSON.stringify({ cached: true });
+    await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, {
+      idempotencyKey: "qa-cache-hit", requestFingerprint: "fp-cache", responseStatus: 201, responseSnapshot: snapshot,
+    }));
+
+    const spy = withTransactionSpy(db);
+    const { deps, counts } = withDependencyCallCounters(buildOrchestrationDependencies({
+      accountHolderInsuredId: insuredId, paymentDate: PDATE, createdBy: userId,
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+    }));
+
+    const result = await runAccountHolderFundingBatch(buildOrchestrationParams({
+      idempotencyKey: "qa-cache-hit", requestFingerprint: "fp-cache",
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+      dependencies: deps, db: spy.db,
+    }));
+
+    expect(result).toEqual({ paymentBatchId: batchId, responseStatus: 201, responseSnapshot: snapshot });
+    expect(spy.transactionCallCount()).toBe(0);
+    expect(counts.createBatch).toBe(0);
+    expect(counts.createChildRows).toBe(0);
+    expect(counts.buildResponseSnapshot).toBe(0);
+  });
+
+  test("conflicto previo (fingerprint distinto): 409 de dominio, tampoco abre transacción", async () => {
+    const batchId = await insertPlainBatch();
+    await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(batchId, { idempotencyKey: "qa-conflicto-previo", requestFingerprint: "fp-guardado" }));
+
+    const spy = withTransactionSpy(db);
+    await expect(
+      runAccountHolderFundingBatch(buildOrchestrationParams({
+        idempotencyKey: "qa-conflicto-previo", requestFingerprint: "fp-distinto",
+        destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+        db: spy.db,
+      }))
+    ).rejects.toThrow(FundingIdempotencyConflictError);
+    expect(spy.transactionCallCount()).toBe(0);
+  });
+
+  test("fila encontrada en la revalidación interna (aparece entre el lookup rápido y la apertura de la tx): no crea un segundo batch", async () => {
+    // Simula, de forma determinista y secuencial (nunca con timing/locks
+    // reales), que "otra request" terminó y committeó su fila ganadora justo
+    // después del lookup rápido pero antes de abrir la transacción propia —
+    // el `db.transaction` fake inserta esa fila primero, luego abre la
+    // transacción real.
+    const winnerBatchId = await insertPlainBatch();
+    const winnerSnapshot = JSON.stringify({ winner: true });
+    const winnerParams = buildIdempotencyRowParams(winnerBatchId, {
+      idempotencyKey: "qa-revalidacion-interna", requestFingerprint: "fp-ganador-interno", responseStatus: 201, responseSnapshot: winnerSnapshot,
+    });
+
+    const dbWithLateWinner = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === "transaction") {
+          return async (cb: any) => {
+            await insertAccountHolderFundingIdempotencyRow(db, winnerParams);
+            return target.transaction(cb);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    const { deps, counts } = withDependencyCallCounters(buildOrchestrationDependencies({
+      accountHolderInsuredId: insuredId, paymentDate: PDATE, createdBy: userId,
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+    }));
+
+    const result = await runAccountHolderFundingBatch(buildOrchestrationParams({
+      idempotencyKey: "qa-revalidacion-interna", requestFingerprint: "fp-ganador-interno",
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+      dependencies: deps, db: dbWithLateWinner,
+    }));
+
+    expect(result).toEqual({ paymentBatchId: winnerBatchId, responseStatus: 201, responseSnapshot: winnerSnapshot });
+    expect(counts.createBatch).toBe(0); // nunca se creó un segundo batch
+    expect(await countRows(client!, "payment_batches")).toBe(1); // solo el batch "ganador" pre-existente
+  });
+
+  test("éxito completo: orden observable batch->children->artifacts->responseSnapshot->idempotencia (última escritura)", async () => {
+    const steps: string[] = [];
+    const realDeps = buildOrchestrationDependencies({
+      accountHolderInsuredId: insuredId, paymentDate: PDATE, createdBy: userId,
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 80000 }, { id: "d2", kind: "pronto_pago", nominalCents: 20000 }],
+      realSplits: [{ id: "s1", amountCents: 100000 }],
+    });
+    const instrumentedDeps: AccountHolderFundingBatchDependencies = {
+      createBatch: async (tx) => {
+        steps.push("createBatch:start");
+        const batch = await realDeps.createBatch(tx);
+        steps.push("createBatch:end");
+        return batch;
+      },
+      createChildRows: async (tx, batch) => {
+        steps.push("createChildRows:start");
+        const batchRows = await tx.select({ id: testPaymentBatches.id }).from(testPaymentBatches).where(eq(testPaymentBatches.id, batch.id)).all();
+        expect(batchRows.length).toBe(1); // el batch YA existe de verdad en esta misma tx
+        const result = await realDeps.createChildRows(tx, batch);
+        steps.push("createChildRows:end");
+        return result;
+      },
+      buildResponseSnapshot: async (tx, ctx) => {
+        steps.push("buildResponseSnapshot:start");
+        expect(ctx.artifacts.allocationRows.length).toBeGreaterThan(0); // artifacts YA persistidos de verdad
+        const idempSoFar = await findAccountHolderFundingIdempotencyRow(tx, { createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: "qa-orden-observable" });
+        expect(idempSoFar).toBeNull(); // la fila de idempotencia TODAVÍA no existe
+        const result = await realDeps.buildResponseSnapshot(tx, ctx);
+        steps.push("buildResponseSnapshot:end");
+        return result;
+      },
+    };
+
+    const result = await runAccountHolderFundingBatch(buildOrchestrationParams({
+      idempotencyKey: "qa-orden-observable", requestFingerprint: "fp-orden",
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 80000 }, { id: "d2", kind: "pronto_pago", nominalCents: 20000 }],
+      realSplits: [{ id: "s1", amountCents: 100000 }], creditAppliedCents: 0,
+      dependencies: instrumentedDeps,
+    }));
+
+    expect(steps).toEqual(["createBatch:start", "createBatch:end", "createChildRows:start", "createChildRows:end", "buildResponseSnapshot:start", "buildResponseSnapshot:end"]);
+    expect(result.paymentBatchId).toBeGreaterThan(0);
+
+    const finalRow = await findAccountHolderFundingIdempotencyRow(db, { createdBy: userId, endpoint: IDEMP_ENDPOINT, idempotencyKey: "qa-orden-observable" });
+    expect(finalRow).not.toBeNull();
+    expect(finalRow!.paymentBatchId).toBe(result.paymentBatchId);
+    expect(finalRow!.responseSnapshot).toBe(result.responseSnapshot);
+  });
+
+  test("cambio de saldo dentro de la transacción: rollback total — el ceiling de crédito disponible ya no alcanza (AccountHolderFundingPlanError, ver nota)", async () => {
+    // El plan preliminar (fuera de la tx) ve $300 de crédito disponible,
+    // suficiente para creditAppliedCents=$300. `createBatch` (parte real de
+    // la transacción) simula que otra operación consumió ese crédito justo
+    // antes — la revalidación fresca (con `tx`, ya dentro de la
+    // transacción) ve el saldo bajo y su PROPIO ceiling interno rechaza el
+    // plan. No es FundingPlanRaceConditionError: ese error es para un plan
+    // que CIERRA pero difiere del preliminar — un saldo insuficiente nunca
+    // llega a cerrar un plan nuevo, revienta antes (mismo comportamiento ya
+    // documentado y testeado para planFundingWithFreshBalance más arriba,
+    // "integración — cambio de saldo real..." — no se duplica esa prueba,
+    // se confirma que la orquestación la propaga y revierte todo).
+    await insertMovement(db, { insuredId, type: "saldo_a_favor", signedAmountCents: 30000, createdBy: userId });
+
+    const deps = buildOrchestrationDependencies({
+      accountHolderInsuredId: insuredId, paymentDate: PDATE, createdBy: userId,
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 70000 }],
+    });
+    const sabotagingDeps: AccountHolderFundingBatchDependencies = {
+      ...deps,
+      createBatch: async (tx) => {
+        const batch = await deps.createBatch(tx);
+        await insertMovement(tx, { insuredId, type: "aplicacion_saldo_favor", signedAmountCents: -20000, createdBy: userId });
+        return batch;
+      },
+    };
+
+    await expect(
+      runAccountHolderFundingBatch(buildOrchestrationParams({
+        idempotencyKey: "qa-saldo-cambia", requestFingerprint: "fp-saldo",
+        destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 70000 }],
+        creditAppliedCents: 30000, dependencies: sabotagingDeps,
+      }))
+    ).rejects.toThrow(AccountHolderFundingPlanError);
+
+    // Rollback total: ni el batch ni el movimiento "saboteador" quedaron.
+    expect(await countRows(client!, "payment_batches")).toBe(0);
+    expect((await db.select().from(insuredAccountMovements).all()).length).toBe(1); // solo el saldo_a_favor inicial, sembrado FUERA de la tx fallida
+  });
+
+  test("error durante artifacts (mapping incompleto): rollback del batch y sus hijos", async () => {
+    const deps = buildOrchestrationDependencies({
+      accountHolderInsuredId: insuredId, paymentDate: PDATE, createdBy: userId,
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+    });
+    const brokenMappingDeps: AccountHolderFundingBatchDependencies = {
+      ...deps,
+      createChildRows: async (tx, batch) => {
+        const rows = await deps.createChildRows(tx, batch);
+        return { ...rows, paymentIdByKey: new Map() }; // "d1" nunca se mapea -> persistAccountHolderFundingArtifacts debe rechazar
+      },
+    };
+
+    await expect(
+      runAccountHolderFundingBatch(buildOrchestrationParams({
+        idempotencyKey: "qa-artifacts-falla", requestFingerprint: "fp-artifacts",
+        destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+        dependencies: brokenMappingDeps,
+      }))
+    ).rejects.toThrow();
+
+    expect(await countRows(client!, "payment_batches")).toBe(0);
+    expect(await countRows(client!, "payment_batch_splits")).toBe(0);
+    expect(await countRows(client!, "payments")).toBe(0);
+    expect(await countRows(client!, "account_holder_funding_idempotency_keys")).toBe(0);
+  });
+
+  test("UNIQUE perdido: rollback completo de la transacción propia, relectura externa y respuesta exacta del ganador", async () => {
+    let winnerBatchId: number | null = null;
+    const dbInjected = withInjectedIdempotencyUniqueFailure(db, async () => {
+      winnerBatchId = await insertPlainBatch();
+      await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(winnerBatchId, {
+        idempotencyKey: "qa-unique-perdido", requestFingerprint: "fp-nuestro", responseStatus: 201, responseSnapshot: JSON.stringify({ winner: true }),
+      }));
+    });
+
+    const result = await runAccountHolderFundingBatch(buildOrchestrationParams({
+      idempotencyKey: "qa-unique-perdido", requestFingerprint: "fp-nuestro",
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+      db: dbInjected,
+    }));
+
+    if (winnerBatchId === null) throw new Error("winnerBatchId no fue asignado — bug en el fixture del test"); // narrowing real, no solo un expect
+    expect(result).toEqual({ paymentBatchId: winnerBatchId, responseStatus: 201, responseSnapshot: JSON.stringify({ winner: true }) });
+    // Nuestra propia transacción (batch/splits/payments) se revirtió por
+    // completo — solo sobrevive el batch del "ganador" insertado después.
+    expect(await countRows(client!, "payment_batches")).toBe(1);
+    expect(await countRows(client!, "account_holder_funding_idempotency_keys")).toBe(1);
+  });
+
+  test("UNIQUE perdido con fingerprint distinto: conflicto de dominio, nunca el UNIQUE crudo", async () => {
+    let winnerBatchId: number | null = null;
+    const dbInjected = withInjectedIdempotencyUniqueFailure(db, async () => {
+      winnerBatchId = await insertPlainBatch();
+      await insertAccountHolderFundingIdempotencyRow(db, buildIdempotencyRowParams(winnerBatchId, {
+        idempotencyKey: "qa-unique-perdido-conflicto", requestFingerprint: "fp-del-ganador",
+      }));
+    });
+
+    await expect(
+      runAccountHolderFundingBatch(buildOrchestrationParams({
+        idempotencyKey: "qa-unique-perdido-conflicto", requestFingerprint: "fp-nuestro-distinto",
+        destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+        db: dbInjected,
+      }))
+    ).rejects.toThrow(FundingIdempotencyConflictError);
+  });
+
+  test("error DB no relacionado con UNIQUE: se propaga sin disfrazar, no se confunde con una carrera de idempotencia", async () => {
+    const deps = buildOrchestrationDependencies({
+      accountHolderInsuredId: insuredId, paymentDate: PDATE, createdBy: userId,
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+    });
+    const brokenDeps: AccountHolderFundingBatchDependencies = {
+      ...deps,
+      createChildRows: async () => { throw new Error("fallo de DB no relacionado — QA"); },
+    };
+
+    await expect(
+      runAccountHolderFundingBatch(buildOrchestrationParams({
+        idempotencyKey: "qa-error-no-unique", requestFingerprint: "fp-no-unique",
+        destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+        dependencies: brokenDeps,
+      }))
+    ).rejects.toThrow("fallo de DB no relacionado — QA");
+
+    expect(await countRows(client!, "payment_batches")).toBe(0);
+    expect(await countRows(client!, "account_holder_funding_idempotency_keys")).toBe(0);
+  });
+
+  test("determinismo: dos ejecuciones estructuralmente iguales con claves distintas producen resultados consistentes", async () => {
+    const destinations: FundingDestinationInput[] = [{ id: "d1", kind: "payment", nominalCents: 100000 }];
+    const realSplits: FundingPlanSplitInput[] = [{ id: "s1", amountCents: 100000 }];
+
+    const resultA = await runAccountHolderFundingBatch(buildOrchestrationParams({
+      idempotencyKey: "qa-determinismo-a", requestFingerprint: "fp-determinismo-a", destinations, realSplits,
+    }));
+    const resultB = await runAccountHolderFundingBatch(buildOrchestrationParams({
+      idempotencyKey: "qa-determinismo-b", requestFingerprint: "fp-determinismo-b", destinations, realSplits,
+    }));
+
+    expect(resultA.responseStatus).toBe(resultB.responseStatus);
+    expect(resultA.paymentBatchId).not.toBe(resultB.paymentBatchId); // batches reales distintos
+    const snapA = JSON.parse(resultA.responseSnapshot);
+    const snapB = JSON.parse(resultB.responseSnapshot);
+    expect(snapA.allocations).toBe(snapB.allocations); // misma forma económica
+  });
+
+  test("no muta params.destinations/realSplits ni el objeto dependencies recibido", async () => {
+    const destinations: FundingDestinationInput[] = [{ id: "d1", kind: "payment", nominalCents: 100000 }];
+    const realSplits: FundingPlanSplitInput[] = [{ id: "s1", amountCents: 100000 }];
+    const params = buildOrchestrationParams({ idempotencyKey: "qa-no-mutar", requestFingerprint: "fp-no-mutar", destinations, realSplits });
+    const destinationsSnapshot = JSON.parse(JSON.stringify(params.destinations));
+    const realSplitsSnapshot = JSON.parse(JSON.stringify(params.realSplits));
+    const dependenciesRef = params.dependencies;
+
+    await runAccountHolderFundingBatch(params);
+
+    expect(params.destinations).toEqual(destinationsSnapshot);
+    expect(params.realSplits).toEqual(realSplitsSnapshot);
+    expect(params.dependencies).toBe(dependenciesRef);
+  });
+
+  test.each([[0], [-1], [1.5], [NaN]])("createdBy inválido (%p vía db directo) lanza AccountHolderFundingBatchError", async (bad) => {
+    const params = buildOrchestrationParams({
+      idempotencyKey: "qa-val-createdby", requestFingerprint: "fp-val",
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+    });
+    (params as any).createdBy = bad;
+    await expect(runAccountHolderFundingBatch(params)).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([[""], ["   "], [123], [null]])("idempotencyKey inválida (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    const params = buildOrchestrationParams({
+      idempotencyKey: "qa-val-key", requestFingerprint: "fp-val",
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+    });
+    (params as any).idempotencyKey = bad;
+    await expect(runAccountHolderFundingBatch(params)).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([[""], [123], [null]])("requestFingerprint inválido (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    const params = buildOrchestrationParams({
+      idempotencyKey: "qa-val-fp", requestFingerprint: "fp-val",
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+    });
+    (params as any).requestFingerprint = bad;
+    await expect(runAccountHolderFundingBatch(params)).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([[0], [-1], [1.5]])("accountHolderInsuredId inválido (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    const params = buildOrchestrationParams({
+      idempotencyKey: "qa-val-insured", requestFingerprint: "fp-val",
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+    });
+    (params as any).accountHolderInsuredId = bad;
+    await expect(runAccountHolderFundingBatch(params)).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test("paymentDate inválido lanza AccountHolderFundingBatchError", async () => {
+    const params = buildOrchestrationParams({
+      idempotencyKey: "qa-val-date", requestFingerprint: "fp-val",
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+    });
+    (params as any).paymentDate = "15/01/2026";
+    await expect(runAccountHolderFundingBatch(params)).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([["createBatch"], ["createChildRows"], ["buildResponseSnapshot"]])("dependencies.%s no-función lanza AccountHolderFundingBatchError", async (fnName) => {
+    const params = buildOrchestrationParams({
+      idempotencyKey: "qa-val-deps", requestFingerprint: "fp-val",
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+    });
+    (params.dependencies as any)[fnName] = "no soy una función";
+    await expect(runAccountHolderFundingBatch(params)).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([[null], [undefined], [{}], ["x"]])("db inválido (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    const params = buildOrchestrationParams({
+      idempotencyKey: "qa-val-db", requestFingerprint: "fp-val",
+      destinations: [{ id: "d1", kind: "payment", nominalCents: 100000 }], realSplits: [{ id: "s1", amountCents: 100000 }],
+    });
+    (params as any).db = bad;
+    await expect(runAccountHolderFundingBatch(params)).rejects.toThrow(AccountHolderFundingBatchError);
+  });
+
+  test.each([[null], [undefined], [[]], ["x"]])("params no-objeto (%p) lanza AccountHolderFundingBatchError", async (bad) => {
+    await expect(runAccountHolderFundingBatch(bad as any)).rejects.toThrow(AccountHolderFundingBatchError);
   });
 });
