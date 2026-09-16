@@ -15,13 +15,26 @@ import {
   type FundingAllocationRenderStatus,
 } from "../../lib/payments/account-holder-funding-caja";
 
+const DEFAULT_ALLOCATION: FundingAllocationRenderStatus = {
+  sourceKind: "credit_movement",
+  sourceId: 1,
+  amountCents: 1000,
+  destinationRendered: false,
+  parentActive: true,
+};
+
 function allocation(overrides: Partial<FundingAllocationRenderStatus>): FundingAllocationRenderStatus {
+  // Merge campo por campo con `in` (nunca `??`/spread-tras-Partial): preserva
+  // exactamente cualquier valor de override, incluido null/false/0 — los
+  // tests de validación (sección 17/19) dependen de que un override explícito
+  // a null/"false"/0 llegue intacto al validador, no se reemplace por el
+  // default.
   return {
-    sourceKind: "credit_movement",
-    sourceId: 1,
-    amountCents: 1000,
-    destinationRendered: false,
-    ...overrides,
+    sourceKind: "sourceKind" in overrides ? (overrides.sourceKind as any) : DEFAULT_ALLOCATION.sourceKind,
+    sourceId: "sourceId" in overrides ? (overrides.sourceId as any) : DEFAULT_ALLOCATION.sourceId,
+    amountCents: "amountCents" in overrides ? (overrides.amountCents as any) : DEFAULT_ALLOCATION.amountCents,
+    destinationRendered: "destinationRendered" in overrides ? (overrides.destinationRendered as any) : DEFAULT_ALLOCATION.destinationRendered,
+    parentActive: "parentActive" in overrides ? (overrides.parentActive as any) : DEFAULT_ALLOCATION.parentActive,
   };
 }
 
@@ -369,5 +382,88 @@ describe("18. overflow seguro", () => {
         allocation({ sourceKind: "debt_movement", sourceId: 2, amountCents: Number.MAX_SAFE_INTEGER, destinationRendered: true }),
       ])
     ).toThrow(AccountHolderFundingCajaError);
+  });
+});
+
+// ─── 19: parentActive — Etapa 1B-3-D ────────────────────────────────────
+
+describe("19. parentActive=false ignora la allocation por completo", () => {
+  test("credit_movement con parentActive=false no aporta nada, ni pendiente ni rendido", () => {
+    const result = calculateAllocationRenderedCajaImpact([
+      allocation({ sourceKind: "credit_movement", sourceId: 1, amountCents: 5000, destinationRendered: false, parentActive: false }),
+      allocation({ sourceKind: "credit_movement", sourceId: 1, amountCents: 7000, destinationRendered: true, parentActive: false }),
+    ]);
+    expect(result).toEqual(ZERO_IMPACT);
+  });
+
+  test("debt_movement con parentActive=false no aporta nada", () => {
+    const result = calculateAllocationRenderedCajaImpact([
+      allocation({ sourceKind: "debt_movement", sourceId: 1, amountCents: 8000, destinationRendered: true, parentActive: false }),
+    ]);
+    expect(result).toEqual(ZERO_IMPACT);
+  });
+
+  test("rounding_adjustment con parentActive=false no aporta nada", () => {
+    const result = calculateAllocationRenderedCajaImpact([
+      allocation({ sourceKind: "rounding_adjustment", sourceId: 1, amountCents: 300, destinationRendered: true, parentActive: false }),
+    ]);
+    expect(result).toEqual(ZERO_IMPACT);
+  });
+
+  test("mezcla: allocations con parentActive=false no afectan los totales de las que sí siguen vigentes", () => {
+    const result = calculateAllocationRenderedCajaImpact([
+      allocation({ sourceKind: "credit_movement", sourceId: 1, amountCents: 10000, destinationRendered: true, parentActive: true }),
+      allocation({ sourceKind: "credit_movement", sourceId: 2, amountCents: 99999, destinationRendered: true, parentActive: false }), // batch anulado: ignorado
+      allocation({ sourceKind: "debt_movement", sourceId: 3, amountCents: 99999, destinationRendered: false, parentActive: false }), // movimiento anulado: ignorado
+    ]);
+    expect(result).toEqual({ ...ZERO_IMPACT, creditConsumedRenderedCents: 10000 });
+  });
+
+  test("array con TODAS las allocations parentActive=false: batch/movimiento enteramente anulado aporta 0", () => {
+    const result = calculateAllocationRenderedCajaImpact([
+      allocation({ sourceKind: "credit_movement", sourceId: 1, amountCents: 10000, destinationRendered: false, parentActive: false }),
+      allocation({ sourceKind: "debt_movement", sourceId: 2, amountCents: 20000, destinationRendered: true, parentActive: false }),
+      allocation({ sourceKind: "rounding_adjustment", sourceId: 3, amountCents: 300, destinationRendered: true, parentActive: false }),
+    ]);
+    expect(result).toEqual(ZERO_IMPACT);
+  });
+});
+
+describe("20. parentActive estrictamente booleano — nunca por coerción truthy/falsy", () => {
+  test("acepta exactamente true y exactamente false", () => {
+    expect(() => calculateAllocationRenderedCajaImpact([allocation({ parentActive: true })])).not.toThrow();
+    expect(() => calculateAllocationRenderedCajaImpact([allocation({ parentActive: false })])).not.toThrow();
+  });
+
+  test('el string truthy "false" NUNCA se interpreta como activo — no se acepta por coerción', () => {
+    let thrown: unknown;
+    try {
+      calculateAllocationRenderedCajaImpact([allocation({ parentActive: "false" as unknown as any })]);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(AccountHolderFundingCajaError);
+  });
+
+  test("rechaza parentActive ausente, null, 0/1 y otros valores truthy/falsy", () => {
+    for (const invalid of [undefined, null, 0, 1, "true", [], {}]) {
+      expect(() =>
+        calculateAllocationRenderedCajaImpact([allocation({ parentActive: invalid as unknown as any })])
+      ).toThrow(AccountHolderFundingCajaError);
+    }
+  });
+
+  test("una fila malformada (parentActive inválido) nunca escapa como TypeError crudo, ni siquiera cuando otra fila del mismo array sí sería ignorada", () => {
+    let thrown: unknown;
+    try {
+      calculateAllocationRenderedCajaImpact([
+        allocation({ parentActive: false }),
+        allocation({ parentActive: undefined as unknown as any }),
+      ]);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(AccountHolderFundingCajaError);
+    expect(thrown).not.toBeInstanceOf(TypeError);
   });
 });

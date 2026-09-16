@@ -86,10 +86,8 @@ import {
 } from "../lib/payments/caja-summary";
 import {
   calculateBatchReceivedAppliedDifference, validateInsuredAccountMovement, InsuredAccountValidationError,
-  summarizeInsuredAccountBalances, calculateCreditActiveInCaja, calculateCreditRegularizedInCaja,
-  calculateCobroSaldoDeudorInCaja, isSafeToCancelAccountMovementOrigin, type InsuredAccountMovementForCaja,
+  summarizeInsuredAccountBalances,
   MAX_ROUNDING_ADJUSTMENT_CENTS, ROUNDING_ADJUSTMENT_REASON, validateRoundingAdjustment,
-  calculatePaymentAmountAdjustmentCreditInCaja, type PaymentAmountAdjustmentForCaja,
 } from "../lib/payments/insured-account";
 import {
   isValidChannel, validateDeliveryLink, DeliveryValidationError,
@@ -103,6 +101,8 @@ import {
   getCommissionBaseAmountCents, calculateCashPeriodDeadline, getCashPeriodDeadlineStatus,
   CashPeriodPaymentValidationError, type CashPeriodInstallmentForEligibility,
 } from "../lib/payments/cash-period-payments";
+import { loadAccountMovementCajaTotals } from "./account-holder-funding-caja-loader";
+import { resolveAccountMovementCancelPlan } from "./account-holder-batch-cancel-plan";
 
 const app = new Hono().basePath("/api");
 
@@ -4202,82 +4202,6 @@ async function loadBatchCancelContext(dbOrTx: any, batchId: number) {
     allocationCount: allocationRows.length, itemCount: itemRows.length,
     accountMovements, accountPlan, cashPeriodPayment,
   };
-}
-
-// ─── Fase 2D: seguridad de cuenta corriente al cancelar un batch ───────────
-interface AccountMovementCancelPlan {
-  safe: boolean;
-  blockReasons: string[];
-  movementIdsToVoid: number[];
-}
-
-/**
- * Para cada insured_account_movement activo que este batch (o alguno de sus
- * hijos) originó, decide si anularlo es matemáticamente seguro — ver
- * isSafeToCancelAccountMovementOrigin (insured-account.ts). Un movimiento ya
- * anulado no vuelve a evaluarse (nada que anular de nuevo — idempotencia).
- * Nunca escribe nada: solo decide qué haría falta anular y qué lo bloquea.
- */
-async function resolveAccountMovementCancelPlan(
-  dbOrTx: any,
-  accountMovements: ReadonlyArray<any>
-): Promise<AccountMovementCancelPlan> {
-  const activeOwnMovements = accountMovements.filter((m: any) => m.status === "activo");
-  if (activeOwnMovements.length === 0) return { safe: true, blockReasons: [], movementIdsToVoid: [] };
-
-  const blockReasons: string[] = [];
-  const movementIdsToVoid: number[] = [];
-
-  for (const m of activeOwnMovements as any[]) {
-    if (m.type !== "saldo_a_favor" && m.type !== "saldo_deudor") {
-      // Otro tipo originado directo por un batch/pago (ningún endpoint lo
-      // genera así hoy) — no consume ni cierra nada del pool por sí mismo,
-      // se anula sin chequeo adicional.
-      movementIdsToVoid.push(m.id);
-      continue;
-    }
-
-    // Pool GLOBAL del mismo asegurado, sin este movimiento — nunca se
-    // escribe nada acá, solo lectura para decidir.
-    const siblingRows = await dbOrTx.select().from(insuredAccountMovements)
-      .where(and(eq(insuredAccountMovements.insuredId, m.insuredId), ne(insuredAccountMovements.id, m.id)))
-      .all();
-    const activeSiblings = (siblingRows as any[]).filter((s) => s.status === "activo");
-
-    const thisOriginAmountCents = Math.abs(m.signedAmountCents);
-    let totalActivePoolCents = thisOriginAmountCents;
-    let totalActiveConsumptionCents = 0;
-
-    if (m.type === "saldo_a_favor") {
-      for (const s of activeSiblings) {
-        if (s.type === "saldo_a_favor") totalActivePoolCents += s.signedAmountCents;
-        else if (s.type === "aplicacion_saldo_favor" || s.type === "devolucion_saldo_favor") {
-          totalActiveConsumptionCents += Math.abs(s.signedAmountCents);
-        } else if (s.type === "ajuste_manual" && s.signedAmountCents < 0) {
-          totalActiveConsumptionCents += Math.abs(s.signedAmountCents);
-        }
-      }
-    } else {
-      // saldo_deudor
-      for (const s of activeSiblings) {
-        if (s.type === "saldo_deudor") totalActivePoolCents += Math.abs(s.signedAmountCents);
-        else if (s.type === "cobro_saldo_deudor") totalActiveConsumptionCents += Math.abs(s.signedAmountCents);
-      }
-    }
-
-    const safe = isSafeToCancelAccountMovementOrigin({ thisOriginAmountCents, totalActivePoolCents, totalActiveConsumptionCents });
-    if (safe) {
-      movementIdsToVoid.push(m.id);
-    } else {
-      blockReasons.push(
-        `El movimiento de cuenta corriente ${m.id} (${m.type}) del asegurado ${m.insuredId} ya fue parcial o totalmente ` +
-        `consumido/cobrado por otra operación de su cuenta corriente — no se puede determinar de forma segura que ` +
-        `anularlo no afecte esa otra operación. Requiere revisión manual antes de anular este cobro.`
-      );
-    }
-  }
-
-  return { safe: blockReasons.length === 0, blockReasons, movementIdsToVoid };
 }
 
 function buildCancelCheckInput(ctx: NonNullable<Awaited<ReturnType<typeof loadBatchCancelContext>>>) {
@@ -9055,9 +8979,6 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   // ── Fase 2C: cuenta corriente de asegurados (sobrantes/faltantes) ─────────
   // Fuente única: insured_account_movements (Migración 0030) — nunca se
   // mezcla con cash_debts/Adeudados/remittance_items (Regla 6 del pedido).
-  // relatedPaymentId solo importa para aplicacion_saldo_favor (necesita saber
-  // si esa cuota futura ya se rindió, ver calculateCreditActiveInCaja) — se
-  // resuelve con una sola query adicional, batcheada.
   const accountMovementRows = await db.select({
     id: insuredAccountMovements.id,
     insuredId: insuredAccountMovements.insuredId,
@@ -9065,31 +8986,44 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     signedAmountCents: insuredAccountMovements.signedAmountCents,
     status: insuredAccountMovements.status,
     relatedPaymentId: insuredAccountMovements.relatedPaymentId,
+    originBatchId: insuredAccountMovements.originBatchId,
   }).from(insuredAccountMovements).all();
 
-  const relatedPaymentIdsForCredit = [...new Set(
-    accountMovementRows
-      .filter((m: any) => m.type === "aplicacion_saldo_favor" && m.relatedPaymentId != null)
-      .map((m: any) => m.relatedPaymentId as number)
-  )];
-  const relatedPaymentRenderedById = new Map<number, boolean>();
-  if (relatedPaymentIdsForCredit.length > 0) {
-    const relatedRows = await db.select({ id: payments.id, rendered: payments.rendered })
-      .from(payments).where(inArray(payments.id, relatedPaymentIdsForCredit)).all();
-    for (const r of relatedRows as any[]) relatedPaymentRenderedById.set(r.id, r.rendered === 1);
-  }
+  // ── Ajustes por redondeo (payment_amount_adjustments) ───────────────────
+  // Deliberadamente AJENA a cuentaCorriente de abajo — esta tabla no tiene
+  // insuredId. Solo soporta origen por lote hoy (paymentBatchId — ningún
+  // endpoint escribe todavía con paymentId, ver POST /payments standalone).
+  const roundingAdjustmentRowsRaw = await db.select({
+    id: paymentAmountAdjustments.id,
+    paymentBatchId: paymentAmountAdjustments.paymentBatchId,
+    amountCents: paymentAmountAdjustments.amountCents,
+  }).from(paymentAmountAdjustments).where(isNotNull(paymentAmountAdjustments.paymentBatchId)).all();
 
-  const movementsForCaja: InsuredAccountMovementForCaja[] = accountMovementRows.map((m: any) => ({
-    type: m.type,
-    signedAmountCents: m.signedAmountCents,
-    status: m.status,
-    relatedPaymentRendered: m.relatedPaymentId != null ? (relatedPaymentRenderedById.get(m.relatedPaymentId) ?? false) : null,
-  }));
+  // Etapa 1B-3-D: partición legacy/titular + los 6 totales de Caja que
+  // dependen de insured_account_movements/payment_amount_adjustments, en UNA
+  // sola función testeada de punta a punta (account-holder-funding-caja-
+  // loader.ts) — un batch con accountHolderInsuredId != null usa los MISMOS
+  // types (aplicacion_saldo_favor/saldo_deudor/saldo_a_favor) que el modelo
+  // legacy "sobrantes/faltantes" pero con semántica distinta (un movimiento
+  // puede financiar varios destinos que se rinden en momentos distintos,
+  // nunca 1:1 con relatedPaymentId; el redondeo titular es SIEMPRE un gasto
+  // absorbido por la oficina, nunca un sobrante real) — sin esta partición,
+  // sumar ambos modelos con la misma fórmula sería doble conteo. Cuando no
+  // hay ningún batch titular, produce EXACTAMENTE los mismos 4 números que
+  // el cálculo legacy anterior (Caja legacy no cambia).
+  const cajaMovementTotals = await loadAccountMovementCajaTotals(db, {
+    movements: accountMovementRows as any,
+    adjustments: roundingAdjustmentRowsRaw as any,
+  });
+  const { creditoActivoEnCajaCents, creditoRegularizadoCents, cobrosSaldoDeudorCents, roundingAdjustmentCreditCents } = cajaMovementTotals;
 
+  // cuentaCorriente (informativo, panel de saldos del asegurado) sigue
+  // siendo GLOBAL — un único ledger por asegurado, mezcla legacy y titular a
+  // propósito (no es una cifra de Caja, ver comentario de
+  // account-holder-funding-caja-loader.ts). Solo las 3 cifras DE CAJA de
+  // abajo (creditoActivoEnCaja/creditoRegularizado/cobrosSaldoDeudor)
+  // necesitan la partición, ya resuelta arriba.
   const insuredBalances = summarizeInsuredAccountBalances(accountMovementRows as any);
-  const creditoActivoEnCajaCents = calculateCreditActiveInCaja(movementsForCaja);
-  const creditoRegularizadoCents = calculateCreditRegularizedInCaja(movementsForCaja);
-  const cobrosSaldoDeudorCents = calculateCobroSaldoDeudorInCaja(movementsForCaja);
 
   const cuentaCorriente = {
     saldosAFavorPendientes: centsToPesos(insuredBalances.saldosAFavorPendientesCents),
@@ -9099,38 +9033,6 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     cobrosSaldoDeudor: centsToPesos(cobrosSaldoDeudorCents),
     byInsured: insuredBalances.byInsured.map((b) => ({ insuredId: b.insuredId, balance: centsToPesos(b.balanceCents) })),
   };
-
-  // ── Ajustes por redondeo (payment_amount_adjustments) ───────────────────
-  // Deliberadamente AJENA a cuentaCorriente de arriba — esta tabla no tiene
-  // insuredId, así que no hay ningún query que "olvidar filtrar" para que un
-  // ajuste de redondeo no aparezca como deuda/crédito de ningún asegurado
-  // (ver diagnóstico: la exclusión es por construcción del esquema, no por
-  // disciplina de filtrado). Solo soporta origen por lote hoy (paymentBatchId
-  // — ningún endpoint escribe todavía con paymentId, ver POST /payments
-  // standalone, sin cambios en esta etapa). "Activo" = el batch dueño de la
-  // fila sigue "confirmado" (no anulado) — se resuelve en el momento de leer,
-  // sin que la fila de payment_amount_adjustments necesite su propia columna
-  // de estado ni que POST /payment-batches/:id/cancel la toque nunca.
-  const roundingAdjustmentRows = await db.select({
-    id: paymentAmountAdjustments.id,
-    paymentBatchId: paymentAmountAdjustments.paymentBatchId,
-    amountCents: paymentAmountAdjustments.amountCents,
-  }).from(paymentAmountAdjustments).where(isNotNull(paymentAmountAdjustments.paymentBatchId)).all();
-
-  const roundingAdjustmentBatchIds = [...new Set(
-    roundingAdjustmentRows.map((r: any) => r.paymentBatchId as number)
-  )];
-  const roundingAdjustmentBatchStatusById = new Map<number, string>();
-  if (roundingAdjustmentBatchIds.length > 0) {
-    const rows = await db.select({ id: paymentBatches.id, status: paymentBatches.status })
-      .from(paymentBatches).where(inArray(paymentBatches.id, roundingAdjustmentBatchIds)).all();
-    for (const r of rows as any[]) roundingAdjustmentBatchStatusById.set(r.id, r.status);
-  }
-  const roundingAdjustmentsForCaja: PaymentAmountAdjustmentForCaja[] = roundingAdjustmentRows.map((r: any) => ({
-    amountCents: r.amountCents,
-    parentActive: roundingAdjustmentBatchStatusById.get(r.paymentBatchId!) === "confirmado",
-  }));
-  const roundingAdjustmentCreditCents = calculatePaymentAmountAdjustmentCreditInCaja(roundingAdjustmentsForCaja);
 
   // ── Caja propia — histórico ───────────────────────────────────────────────
   const cpComisiones  = allCommissions.filter((c: any) => c.status !== "anulado").reduce((s: number, c: any) => s + c.amount, 0);
@@ -9154,13 +9056,24 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   const cajaTransferencia = cartera.transferencia;
   const cajaCheque = cartera.cheque;
   const cajaRecargosProntoPago = cartera.recargosProntoPago;
-  const cajaNeta = centsToPesos(calculateCajaNetaTotalCents({
-    carteraTotalCents: carteraBucket.totalCents,
-    creditoActivoEnCajaCents,
-    creditoRegularizadoCents,
-    cobrosSaldoDeudorCents,
-    roundingAdjustmentCreditCents,
-  })); // Pendiente de rendir actual + cuenta corriente de asegurados + ajustes de redondeo
+  // Etapa 1B-3-D: saldo deudor/redondeo titulares SOLO impactan Caja cuando
+  // su destino ya se rindió (gasto real reconocido en ese momento, ver
+  // account-holder-funding-caja.ts) — nunca mientras están pendientes. A
+  // diferencia de creditoActivoEnCajaCents (que ya absorbió su porción
+  // titular arriba, mismo signo que el resto de esa fórmula),
+  // debtRenderedExpenseCents/roundingRenderedExpenseCents son SIEMPRE una
+  // salida de Caja — se restan directo, en centavos, antes de convertir a
+  // pesos (calculateCajaNetaTotalCents no los conoce; ningún otro término de
+  // esa fórmula tiene esta polaridad "siempre resta").
+  const cajaNeta = centsToPesos(
+    calculateCajaNetaTotalCents({
+      carteraTotalCents: carteraBucket.totalCents,
+      creditoActivoEnCajaCents,
+      creditoRegularizadoCents,
+      cobrosSaldoDeudorCents,
+      roundingAdjustmentCreditCents,
+    }) - cajaMovementTotals.titularDebtExpenseCents - cajaMovementTotals.titularRoundingExpenseCents
+  ); // Pendiente de rendir actual + cuenta corriente de asegurados + ajustes de redondeo + financiación con titular (créditos ya netos arriba, deuda/redondeo titulares restados acá)
 
   // Diferencia de caja/cartera = pendiente total de rendir (cajaNeta) menos
   // adeudados. Los gastos NO se restan acá — son un movimiento de Caja

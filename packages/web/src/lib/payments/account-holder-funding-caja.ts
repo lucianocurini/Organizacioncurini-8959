@@ -106,6 +106,32 @@ export interface FundingAllocationRenderStatus {
   amountCents: number;
   /** Leído EN VIVO desde payments.rendered/cashEntries.rendered del destino de esta allocation en el momento del cálculo — nunca un valor cacheado. */
   destinationRendered: boolean;
+  /**
+   * true solo si la fuente sigue vigente para Caja — resuelto por el caller
+   * (Etapa 1B-3-D), nunca inferido acá (este módulo no toca DB):
+   *   - credit_movement/debt_movement (insured_account_movements): el batch
+   *     dueño (originBatchId) sigue "confirmado" Y el movimiento sigue
+   *     "activo". Ambas condiciones — un movimiento puede anularse sin que
+   *     el batch se anule (ver resolveAccountMovementCancelPlan, index.ts),
+   *     y viceversa un batch nunca queda "anulado" con un movimiento
+   *     saldo_a_favor/saldo_deudor todavía "activo" (cancelación atómica),
+   *     pero SÍ puede quedar "anulado" con su aplicacion_saldo_favor/
+   *     saldo_deudor de consumo todavía sin anular en algún estado
+   *     intermedio no contemplado hoy — se chequean ambas por seguridad, sin
+   *     depender de esa invariante.
+   *   - rounding_adjustment (payment_amount_adjustments): sin columna status
+   *     propia — depende ÚNICAMENTE de que el batch dueño siga "confirmado"
+   *     (mismo criterio que PaymentAmountAdjustmentForCaja.parentActive en
+   *     insured-account.ts, reutilizado acá con el mismo nombre a propósito).
+   * false === "ignorar por completo" (ver calculateAllocationRenderedCajaImpact):
+   * ni pendiente ni rendido, la allocation entera se descarta de los 6
+   * totales — un batch anulado nunca debe volver a aparecer en Caja, y
+   * payment_batch_funding_allocations/payment_amount_adjustments nunca se
+   * tocan ni se marcan al anular (quedan como historial, ver POST
+   * /payment-batches/:id/cancel) — esta es la única exclusión, 100% de
+   * lectura, sin escribir nada.
+   */
+  parentActive: boolean;
 }
 
 export interface AllocationRenderedCajaImpact {
@@ -137,6 +163,13 @@ export interface AllocationRenderedCajaImpact {
  * forzar. No escribe nada, no cachea nada: revertir una rendición (volver
  * destinationRendered a false) y volver a llamar a esta función con el
  * mismo conjunto de allocations reproduce exactamente el estado anterior.
+ *
+ * parentActive=false (fuente ya no vigente — batch anulado y/o movimiento
+ * anulado, ver FundingAllocationRenderStatus.parentActive) se valida como
+ * cualquier otro campo (nunca escapa un TypeError crudo por una fila
+ * malformada) pero, a diferencia de destinationRendered, NO decide en qué
+ * bucket cae la allocation — la excluye ENTERA de los 6 totales, como si
+ * nunca hubiera existido.
  */
 export function calculateAllocationRenderedCajaImpact(
   allocations: ReadonlyArray<FundingAllocationRenderStatus>
@@ -160,6 +193,9 @@ export function calculateAllocationRenderedCajaImpact(
     assertSafePositiveId(`El sourceId de la allocation en la posición ${index}`, a.sourceId);
     assertSafePositiveAmountCents(`El amountCents de la allocation en la posición ${index}`, a.amountCents);
     assertStrictBoolean(`El destinationRendered de la allocation en la posición ${index}`, a.destinationRendered);
+    assertStrictBoolean(`El parentActive de la allocation en la posición ${index}`, a.parentActive);
+
+    if (a.parentActive === false) return; // fuente ya no vigente (batch y/o movimiento anulado) — se ignora por completo, ver cabecera.
 
     const amountCents = a.amountCents as number;
     const rendered = a.destinationRendered as boolean;
