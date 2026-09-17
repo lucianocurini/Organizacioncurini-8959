@@ -103,6 +103,19 @@ import {
 } from "../lib/payments/cash-period-payments";
 import { loadAccountMovementCajaTotals } from "./account-holder-funding-caja-loader";
 import { resolveAccountMovementCancelPlan } from "./account-holder-batch-cancel-plan";
+import {
+  insertPaymentBatchRow, checkInstallmentPaymentRace, insertBatchSplitsAndChecks, insertBatchChildren,
+  PaymentBatchRaceConditionError, type BatchChildContextForInsert,
+} from "./payment-batch-shared-inserts";
+import {
+  parseFundingRequest, AccountHolderFundingRequestError, type FundingRequestParseResult,
+} from "../lib/payments/account-holder-funding-request";
+import { FundingRequestFingerprintInputError } from "../lib/payments/account-holder-funding-fingerprint";
+import {
+  runAccountHolderFundingBatch, findAccountHolderFundingIdempotencyRow, resolveExistingIdempotentFundingRow,
+} from "./account-holder-funding-batch";
+import { formatAccountHolderFundingBatchSuccess, mapAccountHolderFundingBatchError } from "./payment-batch-titular-response";
+import { buildTitularFundingInput, buildTitularFundingDependencies } from "./payment-batch-titular-dependencies";
 
 const app = new Hono().basePath("/api");
 
@@ -2852,11 +2865,6 @@ app.get("/installments/pending-for-payment", requireAuth(async (c: any) => {
 //      pero no es una garantía formal de idempotencia. Una idempotency key
 //      persistida (columna nueva + índice único) queda pendiente para
 //      cuando se justifique una migración.
-class PaymentBatchRaceConditionError extends Error {
-  constructor(public installmentIds: number[]) {
-    super(`Otra solicitud ya cobró la(s) cuota(s) ${installmentIds.join(", ")} mientras se procesaba este pedido.`);
-  }
-}
 app.post("/payment-batches", requireAuth(async (c: any) => {
   const user = c.get("user");
   const body = await c.req.json();
@@ -2871,50 +2879,78 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
   // batch se DERIVA al final (resolveBatchInsuredId), nunca se exige en el
   // body ni se valida contra él.
 
-  // 1. Validación básica de forma (pura, sin tocar la base todavía).
-  let normalizedItems;
+  // 1. Validación básica de forma (pura, sin tocar la base todavía) +
+  // detección de modo (Etapa 1B-3-E) — parseFundingRequest hace EXACTAMENTE
+  // la misma normalización de items/splits/cheques que este endpoint ya
+  // hacía inline (mismas funciones, mismo orden: normalizeBatchItems ->
+  // normalizeBatchSplits -> cheques por split), nunca una segunda copia de
+  // esas reglas. mode="legacy" cuando accountHolderInsuredId está ausente —
+  // el resto del handler para ese caso es idéntico al de antes de esta
+  // etapa. mode="titular" exige idempotencyKey y nunca deja pasar un campo
+  // "solo titular" con un valor no neutro por el camino legacy (ver cabecera
+  // de account-holder-funding-request.ts).
+  let parsed: FundingRequestParseResult;
   try {
-    normalizedItems = normalizeBatchItems(body.items);
+    parsed = parseFundingRequest(body);
   } catch (e: any) {
-    if (e instanceof PaymentBatchValidationError) return c.json({ error: e.message }, 400);
-    throw e;
-  }
-  let normalizedSplits;
-  try {
-    normalizedSplits = normalizeBatchSplits(body.splits);
-  } catch (e: any) {
-    if (e instanceof PaymentBatchValidationError) return c.json({ error: e.message }, 400);
-    throw e;
-  }
-
-  // Etapa 4B: cheques por split cheque. Un split method='cheque' debe traer
-  // ≥1 cheque cuya suma sea exacta al importe del split; ningún otro split
-  // puede traer cheques. Los cheques nunca se vinculan a un payment hijo —
-  // solo al split cheque que representan (ver received-checks.ts).
-  interface SplitWithChecks { split: NormalizedPaymentBatchSplit; checks: NormalizedReceivedCheck[] }
-  let splitsWithChecks: SplitWithChecks[];
-  try {
-    splitsWithChecks = normalizedSplits.map((split, i) => {
-      const rawChecks = body.splits[i]?.checks;
-      if (split.method === "cheque") {
-        if (!Array.isArray(rawChecks) || rawChecks.length === 0) {
-          throw new PaymentBatchValidationError(`El split cheque (medio ${i + 1}) debe incluir al menos un cheque.`);
-        }
-        const checks = rawChecks.map((raw: any, j: number) => normalizeReceivedCheck(raw, `cheque ${j + 1} del medio ${i + 1}`));
-        const totalsCheck = validateChecksMatchSplit(checks, split.amountCents);
-        if (!totalsCheck.valid) throw new PaymentBatchValidationError(totalsCheck.errorMessage!);
-        return { split, checks };
-      }
-      if (Array.isArray(rawChecks) && rawChecks.length > 0) {
-        throw new PaymentBatchValidationError(`El medio ${i + 1} (${split.method}) no puede incluir cheques.`);
-      }
-      return { split, checks: [] };
-    });
-  } catch (e: any) {
-    if (e instanceof PaymentBatchValidationError || e instanceof ReceivedCheckValidationError) {
+    if (
+      e instanceof PaymentBatchValidationError || e instanceof ReceivedCheckValidationError ||
+      e instanceof AccountHolderFundingRequestError || e instanceof FundingRequestFingerprintInputError
+    ) {
       return c.json({ error: e.message }, 400);
     }
     throw e;
+  }
+  const { normalizedItems, splitsWithChecks, mode } = parsed;
+  // Mismos NormalizedPaymentBatchSplit que antes (sin cheques) — derivado de
+  // splitsWithChecks para que resolveBatchSplitGroup/receivedCents usen
+  // exactamente los mismos valores que ya validó parseFundingRequest, sin
+  // volver a normalizar nada.
+  const normalizedSplits = splitsWithChecks.map((s) => s.split);
+
+  // Etapa 1B-3-E — replay temprano (ANTES de "el titular debe existir", de
+  // "cuotas ya pagadas", de "elegibilidad" y de "cheque posible duplicado"):
+  // todas esas validaciones leen estado que el PROPIO cobro original, si ya
+  // tuvo éxito, ya modificó (cuota ahora "pagada", payment confirmado,
+  // cheque ahora en cartera). Si se ejecutaran antes que este chequeo, un
+  // reintento legítimo con la misma idempotencyKey (misma request) sería
+  // rechazado por su propio efecto anterior en vez de devolver la respuesta
+  // cacheada — justo lo que la idempotencia de este modo existe para evitar
+  // (ver "Un replay exitoso debe encontrar la respuesta cacheada antes de
+  // cualquier validación DB mutable", Etapa 1B-3-E). runAccountHolderFundingBatch
+  // ya hace este mismo lookup como su primer paso (earlyHit) y otra vez
+  // dentro de la transacción — esto es una capa adicional para todo lo que
+  // el endpoint valida ANTES de invocarla, no un reemplazo de esas dos.
+  if (mode === "titular") {
+    const earlyIdempotencyRow = await findAccountHolderFundingIdempotencyRow(db, {
+      createdBy: user.id,
+      endpoint: "POST /payment-batches",
+      idempotencyKey: parsed.idempotencyKey!,
+    });
+    if (earlyIdempotencyRow) {
+      try {
+        const resolved = resolveExistingIdempotentFundingRow(earlyIdempotencyRow, parsed.fingerprint);
+        const formatted = formatAccountHolderFundingBatchSuccess(resolved);
+        return c.json(formatted.body as any, formatted.status as any);
+      } catch (e: any) {
+        const mapped = mapAccountHolderFundingBatchError(e);
+        if (mapped) return c.json(mapped.body as any, mapped.status as any);
+        throw e;
+      }
+    }
+  }
+
+  // Modo titular: el titular de cuenta debe existir de verdad — nunca se
+  // confía en el id que manda el body (mismo criterio que el resto de este
+  // endpoint para installmentId/policyId, ver cabecera de batches.ts). Sin
+  // este chequeo, un id inexistente reventaría más abajo con un error crudo
+  // de FK al insertar payment_batches.account_holder_insured_id (foreign_keys
+  // está ON en esta base).
+  if (mode === "titular") {
+    const accountHolderRow = await db.select({ id: insureds.id }).from(insureds).where(eq(insureds.id, parsed.dto.accountHolderInsuredId!)).get();
+    if (!accountHolderRow) {
+      return c.json({ error: `El titular de cuenta ${parsed.dto.accountHolderInsuredId} no existe.` }, 404);
+    }
   }
 
   // 2-3. Cargar TODOS los orígenes reales — cuotas existentes y, para cobros
@@ -3139,82 +3175,91 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
   // esta fase (ni siquiera se mira accountDifferenceResolution si vino).
   const appliedCents = totals.totalReceivedCents;
   const receivedCents = normalizedSplits.reduce((sum, s) => sum + s.amountCents, 0);
-  const difference = calculateBatchReceivedAppliedDifference(receivedCents, appliedCents);
 
-  let accountMovementToCreate: { type: "saldo_a_favor" | "saldo_deudor"; reason: string | null } | null = null;
+  let accountMovementToCreate: { type: "saldo_a_favor" | "saldo_deudor"; reason: string | null; differenceCents: number } | null = null;
   // Tolerancia de redondeo (payment_amount_adjustments, sin insuredId —
   // funciona igual con lote de un asegurado, multiasegurado o 100% manual,
   // ver validateRoundingAdjustment/MAX_ROUNDING_ADJUSTMENT_CENTS en
   // insured-account.ts). Nunca escribe en insured_account_movements.
   let roundingAdjustmentToCreate: { amountCents: number; reason: string } | null = null;
 
-  if (difference.kind !== "exacto") {
-    const expectedAction = difference.kind; // "saldo_a_favor" | "saldo_deudor" — sentido real de la diferencia (no aplica a ajuste_redondeo, que no tiene "sentido" fijo por asegurado)
-    const resolution = body.accountDifferenceResolution;
+  // Etapa 1B-3-E: accountDifferenceResolution es EXCLUSIVO del camino
+  // legacy — parseFundingRequest ya garantiza que viene null en modo
+  // titular (mutuamente excluyentes, ver cabecera de
+  // account-holder-funding-request.ts). En modo titular, la diferencia
+  // real entre dinero recibido y nominal aplicado se explica siempre por
+  // crédito/redondeo/deuda — nunca por este mecanismo.
+  if (mode === "legacy") {
+    const difference = calculateBatchReceivedAppliedDifference(receivedCents, appliedCents);
 
-    if (resolution == null || typeof resolution !== "object") {
-      return c.json({
-        error:
-          `La suma de los medios ($${(receivedCents / 100).toFixed(2)}) no coincide con el total a aplicar a las cuotas ` +
-          `($${(appliedCents / 100).toFixed(2)}). Indicá accountDifferenceResolution.action ("saldo_a_favor", ` +
-          `"saldo_deudor" o "ajuste_redondeo") para continuar.`,
-        code: "PAYMENT_BATCH_AMOUNT_DIFFERENCE",
-        receivedCents, appliedCents, differenceCents: difference.differenceCents,
-      }, 400);
-    }
+    if (difference.kind !== "exacto") {
+      const expectedAction = difference.kind; // "saldo_a_favor" | "saldo_deudor" — sentido real de la diferencia (no aplica a ajuste_redondeo, que no tiene "sentido" fijo por asegurado)
+      const resolution = body.accountDifferenceResolution;
 
-    if (resolution.action === "ajuste_redondeo") {
-      // El backend nunca confía en que el frontend ya filtró el tope de $5 —
-      // se revalida acá siempre, incluso si llega forzado con una diferencia
-      // mayor. A diferencia de saldo_a_favor/saldo_deudor, no exige
-      // derivedInsuredId (payment_amount_adjustments no tiene insuredId).
-      try {
-        validateRoundingAdjustment({ differenceCents: difference.differenceCents });
-      } catch (e: any) {
-        if (e instanceof InsuredAccountValidationError) return c.json({ error: e.message }, 400);
-        throw e;
-      }
-      const reason = typeof resolution.reason === "string" && resolution.reason.trim()
-        ? resolution.reason.trim()
-        : ROUNDING_ADJUSTMENT_REASON;
-      roundingAdjustmentToCreate = { amountCents: difference.differenceCents, reason };
-    } else if (resolution.action === "saldo_a_favor" || resolution.action === "saldo_deudor") {
-      if (resolution.action !== expectedAction) {
+      if (resolution == null || typeof resolution !== "object") {
         return c.json({
           error:
-            `accountDifferenceResolution.action ("${resolution.action}") no coincide con el sentido real de la diferencia ` +
-            `("${expectedAction}").`,
+            `La suma de los medios ($${(receivedCents / 100).toFixed(2)}) no coincide con el total a aplicar a las cuotas ` +
+            `($${(appliedCents / 100).toFixed(2)}). Indicá accountDifferenceResolution.action ("saldo_a_favor", ` +
+            `"saldo_deudor" o "ajuste_redondeo") para continuar.`,
+          code: "PAYMENT_BATCH_AMOUNT_DIFFERENCE",
+          receivedCents, appliedCents, differenceCents: difference.differenceCents,
         }, 400);
       }
-      // Multiasegurado (Regla 5) y 100% manual_payment sin asegurado real
-      // (Caso B) comparten la misma señal: resolveBatchInsuredId ya devuelve
-      // null en ambos casos — ningún dueño único al que atribuir la diferencia.
-      if (derivedInsuredId == null) {
-        return c.json({
-          error:
-            "No se puede determinar un único asegurado real para asignar la diferencia de este cobro (el cobro mezcla más de " +
-            "un asegurado, o es una imputación 100% manual sin asegurado real). Separá este cobro para poder generar el saldo.",
-        }, 400);
+
+      if (resolution.action === "ajuste_redondeo") {
+        // El backend nunca confía en que el frontend ya filtró el tope de $5 —
+        // se revalida acá siempre, incluso si llega forzado con una diferencia
+        // mayor. A diferencia de saldo_a_favor/saldo_deudor, no exige
+        // derivedInsuredId (payment_amount_adjustments no tiene insuredId).
+        try {
+          validateRoundingAdjustment({ differenceCents: difference.differenceCents });
+        } catch (e: any) {
+          if (e instanceof InsuredAccountValidationError) return c.json({ error: e.message }, 400);
+          throw e;
+        }
+        const reason = typeof resolution.reason === "string" && resolution.reason.trim()
+          ? resolution.reason.trim()
+          : ROUNDING_ADJUSTMENT_REASON;
+        roundingAdjustmentToCreate = { amountCents: difference.differenceCents, reason };
+      } else if (resolution.action === "saldo_a_favor" || resolution.action === "saldo_deudor") {
+        if (resolution.action !== expectedAction) {
+          return c.json({
+            error:
+              `accountDifferenceResolution.action ("${resolution.action}") no coincide con el sentido real de la diferencia ` +
+              `("${expectedAction}").`,
+          }, 400);
+        }
+        // Multiasegurado (Regla 5) y 100% manual_payment sin asegurado real
+        // (Caso B) comparten la misma señal: resolveBatchInsuredId ya devuelve
+        // null en ambos casos — ningún dueño único al que atribuir la diferencia.
+        if (derivedInsuredId == null) {
+          return c.json({
+            error:
+              "No se puede determinar un único asegurado real para asignar la diferencia de este cobro (el cobro mezcla más de " +
+              "un asegurado, o es una imputación 100% manual sin asegurado real). Separá este cobro para poder generar el saldo.",
+          }, 400);
+        }
+        const reason = typeof resolution.reason === "string" && resolution.reason.trim() ? resolution.reason.trim() : null;
+        try {
+          validateInsuredAccountMovement({
+            insuredId: derivedInsuredId,
+            type: resolution.action,
+            signedAmountCents: difference.differenceCents,
+            reason,
+          });
+        } catch (e: any) {
+          if (e instanceof InsuredAccountValidationError) return c.json({ error: e.message }, 400);
+          throw e;
+        }
+        accountMovementToCreate = { type: resolution.action, reason, differenceCents: difference.differenceCents };
+      } else {
+        // Cualquier action fuera de las 3 soportadas hoy (incluido, a propósito,
+        // un futuro "ajuste_manual"/"devolucion_inmediata" — Caso D, no
+        // implementado todavía) se rechaza acá con un mensaje explícito, en vez
+        // de caer silenciosamente a ningún branch.
+        return c.json({ error: `accountDifferenceResolution.action no soportada en esta etapa: "${resolution.action}".` }, 400);
       }
-      const reason = typeof resolution.reason === "string" && resolution.reason.trim() ? resolution.reason.trim() : null;
-      try {
-        validateInsuredAccountMovement({
-          insuredId: derivedInsuredId,
-          type: resolution.action,
-          signedAmountCents: difference.differenceCents,
-          reason,
-        });
-      } catch (e: any) {
-        if (e instanceof InsuredAccountValidationError) return c.json({ error: e.message }, 400);
-        throw e;
-      }
-      accountMovementToCreate = { type: resolution.action, reason };
-    } else {
-      // Cualquier action fuera de las 3 soportadas hoy (incluido, a propósito,
-      // un futuro "ajuste_manual"/"devolucion_inmediata" — Caso D, no
-      // implementado todavía) se rechaza acá con un mensaje explícito, en vez
-      // de caer silenciosamente a ningún branch.
-      return c.json({ error: `accountDifferenceResolution.action no soportada en esta etapa: "${resolution.action}".` }, 400);
     }
   }
 
@@ -3242,6 +3287,76 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
     }
   }
 
+  // Etapa 1B-3-E — modo titular: conecta runAccountHolderFundingBatch (Etapa
+  // 1B-3-C2, hasta ahora sin ningún caller) usando los MISMOS helpers de
+  // inserción que el camino legacy de abajo (payment-batch-shared-inserts.ts)
+  // vía callbacks — nunca una segunda versión del flujo de creación. Orden
+  // real dentro de la transacción (ya implementado en
+  // runAccountHolderFundingBatch, ver ese archivo): idempotencia -> batch ->
+  // saldo/plan fresco -> splits+cheques y payments+recargos (un solo
+  // callback, createChildRows) -> movimientos/ajuste + funding allocations
+  // (persistAccountHolderFundingArtifacts) -> idempotencia completa (última
+  // escritura).
+  if (mode === "titular") {
+    // Etapa 1B-3-E: destinations/realSplits/dependencies se construyen en
+    // payment-batch-titular-dependencies.ts — mismo módulo que usan los
+    // tests de integración, para que index.ts y los tests ejecuten
+    // exactamente el mismo cableado (nunca dos versiones que puedan divergir).
+    const { destinations, realSplits, childInsertItems } = buildTitularFundingInput({
+      contexts, displays, applicableSurchargeContexts: applicableSurchargeSet, splitsWithChecks,
+    });
+    const dependencies = buildTitularFundingDependencies({
+      derivedInsuredId,
+      baseAmountCents: totals.baseAmountCents,
+      surchargeAmountCents: totals.surchargeAmountCents,
+      totalReceivedCents: totals.totalReceivedCents,
+      receivedCents,
+      paymentDate: body.paymentDate,
+      // Etapa 1B-3-E: notes en modo titular usa el mismo valor YA recortado
+      // que entró al fingerprint (parsed.dto.notes) — nunca `body.notes ||
+      // null` sin recortar (eso es exclusivo del camino legacy, sin
+      // cambios, ver más abajo).
+      notes: parsed.dto.notes,
+      createdBy: user.id,
+      accountHolderInsuredId: parsed.dto.accountHolderInsuredId!,
+      installmentIds,
+      splitsWithChecks,
+      childInsertItems,
+    });
+
+    try {
+      const result = await runAccountHolderFundingBatch({
+        db,
+        createdBy: user.id,
+        idempotencyKey: parsed.idempotencyKey!,
+        requestFingerprint: parsed.fingerprint,
+        accountHolderInsuredId: parsed.dto.accountHolderInsuredId!,
+        paymentDate: body.paymentDate,
+        destinations,
+        realSplits,
+        creditAppliedCents: parsed.dto.creditAppliedCents,
+        roundingCoverageCents: parsed.dto.roundingCoverageCents,
+        debtAuthorized: parsed.dto.debtAuthorized,
+        debtReason: parsed.dto.debtReason,
+        dependencies,
+      });
+
+      // responseSnapshot es un string opaco (ver account-holder-funding-batch.ts)
+      // — nunca se confía en que sea JSON válido, ni siquiera cuando lo
+      // acabamos de escribir nosotros mismos en buildResponseSnapshot: un
+      // reintento puede haber releído la fila ganadora de OTRA request
+      // (carrera UNIQUE) o de una ejecución previa. Un fallo acá nunca debe
+      // filtrar el contenido corrupto ni el error de parseo — ver
+      // formatAccountHolderFundingBatchSuccess.
+      const formatted = formatAccountHolderFundingBatchSuccess(result);
+      return c.json(formatted.body as any, formatted.status as any);
+    } catch (e: any) {
+      const mapped = mapAccountHolderFundingBatchError(e);
+      if (mapped) return c.json(mapped.body as any, mapped.status as any);
+      throw e;
+    }
+  }
+
   // 11-16. Todo o nada: batch, splits, hijos, recargos y recálculo de cuotas
   // en una sola transacción real.
   let batchId: number;
@@ -3257,7 +3372,12 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
     // "LÍMITE CONOCIDO" arriba) sigue siendo real: si encuentra un pago
     // confirmado que no estaba antes, tira la excepción y toda la
     // transacción — incluido este insert — se revierte igual.
-    const [batch] = await tx.insert(paymentBatches).values({
+    //
+    // Etapa 1B-3-E: batch/race-check/splits+cheques/hijos+recargos ahora se
+    // insertan vía payment-batch-shared-inserts.ts — mismos inserts, mismo
+    // orden, mismos valores que antes de esta etapa (reutilizados también
+    // por el modo titular de arriba, nunca una segunda versión).
+    const batch = await insertPaymentBatchRow(tx, {
       insuredId: derivedInsuredId,
       baseAmountCents: totals.baseAmountCents,
       surchargeAmountCents: totals.surchargeAmountCents,
@@ -3266,112 +3386,31 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
       // (Regla 3), esté o no esté "exacto" contra lo aplicado.
       receivedAmountCents: receivedCents,
       paymentDate: body.paymentDate,
-      status: "confirmado",
       notes: body.notes || null,
       createdBy: user.id,
-    }).returning();
+    });
 
     // Re-chequeo DENTRO de la transacción real, ya en modo escritura (ver
     // comentario arriba). Si otra request confirmó un pago para alguna de
     // estas cuotas entre el chequeo de más arriba (fuera de la tx) y este
     // punto, se aborta acá — el rollback deshace también el insert del batch
     // recién hecho, así que no queda nada a medias.
-    const raceCheck = await tx.select({ installmentId: payments.installmentId })
-      .from(payments)
-      .where(and(inArray(payments.installmentId, installmentIds), eq(payments.status, "confirmado")))
-      .all();
-    if (raceCheck.length > 0) {
-      throw new PaymentBatchRaceConditionError(raceCheck.map((p: any) => p.installmentId));
-    }
+    await checkInstallmentPaymentRace(tx, installmentIds);
 
     // Splits uno por uno (no bulk) porque cada split cheque necesita su
     // propio id ya generado antes de poder insertar los cheques que cuelgan
     // de él — nunca se confía en un id de split que mande el frontend.
-    for (const { split, checks } of splitsWithChecks) {
-      const [insertedSplit] = await tx.insert(paymentBatchSplits).values({
-        batchId: batch!.id, method: split.method, amountCents: split.amountCents, notes: split.notes,
-      }).returning();
-
-      if (checks.length > 0) {
-        await tx.insert(receivedChecks).values(checks.map((chk) => ({
-          batchSplitId: insertedSplit!.id,
-          checkNumber: chk.checkNumber,
-          bankName: chk.bankName,
-          bankCode: chk.bankCode,
-          drawerName: chk.drawerName,
-          drawerDocument: chk.drawerDocument,
-          issueDate: chk.issueDate,
-          dueDate: chk.dueDate,
-          amountCents: chk.amountCents,
-          currency: chk.currency,
-          status: "en_cartera",
-          notes: chk.notes,
-          receivedAt: new Date(),
-          createdBy: user.id,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        })));
-      }
-    }
+    await insertBatchSplitsAndChecks(tx, batch.id, splitsWithChecks, user.id);
 
     // Único hijo "sin ambigüedad" del batch — solo se usa para
     // relatedPaymentId/relatedInstallmentId de un eventual saldo_deudor (ver
     // más abajo). Con 2+ ítems no hay forma no ambigua de elegir "la cuota
     // relacionada" entre varias, así que esos campos quedan null a propósito
     // (decisión documentada, ver Regla 4C del pedido).
-    let singleChildId: number | null = null;
-
-    for (let idx = 0; idx < contexts.length; idx++) {
-      const ctxItem = contexts[idx]!;
-      const display = displays[idx]!;
-
-      // installmentId/policyId NULL para una imputación completamente
-      // manual (sin ninguna fila real detrás); policyId real para un cobro
-      // manual con póliza. notes = la descripción cargada (cualquier tipo de
-      // cobro manual) — un payment hijo de cuota nunca tuvo notes propias en
-      // este flujo. manualPayer/manualPolicyNumber/manualCompany solo se
-      // completan para la imputación completamente libre — mismas columnas
-      // que ya usa POST /payments standalone para su modo "Imputación
-      // manual" (ver batches.ts).
-      const [child] = await tx.insert(payments).values({
-        policyId: ctxItem.policyId,
-        installmentId: ctxItem.installmentId,
-        amount: ctxItem.amount,
-        paymentMethod: "lote",
-        paymentDate: body.paymentDate,
-        notes: ctxItem.kind !== "installment" ? ctxItem.description : null,
-        manualPayer: ctxItem.kind === "manual_payment" ? ctxItem.manualPayer : null,
-        manualPolicyNumber: ctxItem.kind === "manual_payment" ? ctxItem.manualPolicyNumber : null,
-        manualCompany: ctxItem.kind === "manual_payment" ? ctxItem.manualCompany : null,
-        status: "confirmado",
-        batchId: batch!.id,
-        createdBy: user.id,
-      }).returning();
-
-      if (contexts.length === 1) singleChildId = child!.id;
-
-      if (applicableSurchargeSet.has(ctxItem)) {
-        await tx.insert(cashEntries).values({
-          clientName: display.insuredName ?? "—",
-          policyNumber: display.policyNumber ?? null,
-          companyName: display.companyName ?? null,
-          amount: SURCHARGE_AMOUNT_CENTS / 100,
-          paymentMethod: "lote",
-          paymentDate: body.paymentDate,
-          entryType: "pronto_pago_surcharge",
-          paymentId: child!.id,
-          rendered: 0,
-          notes: "Recargo Pronto Pago Rivadavia",
-          createdBy: user.id,
-        });
-      }
-
-      // Solo una cuota real tiene un status que recalcular — un cobro
-      // manual no tiene installmentId ni policy_installments detrás.
-      if (ctxItem.kind === "installment") {
-        await recalculateInstallmentPaymentStatus(tx, ctxItem.installmentId!);
-      }
-    }
+    const childInsertItems: BatchChildContextForInsert[] = contexts.map((ctxItem, idx) => ({
+      ctxItem, display: displays[idx]!, hasSurcharge: applicableSurchargeSet.has(ctxItem),
+    }));
+    const { singleChildId } = await insertBatchChildren(tx, batch.id, childInsertItems, body.paymentDate, user.id);
 
     // Fase 2B: movimiento de cuenta corriente por la diferencia
     // recibido/aplicado, ya validado por completo antes de abrir esta
@@ -3382,9 +3421,9 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
       await tx.insert(insuredAccountMovements).values({
         insuredId: derivedInsuredId!,
         type: accountMovementToCreate.type,
-        signedAmountCents: difference.differenceCents,
+        signedAmountCents: accountMovementToCreate.differenceCents,
         status: "activo",
-        originBatchId: batch!.id,
+        originBatchId: batch.id,
         relatedPaymentId: accountMovementToCreate.type === "saldo_deudor" ? singleChildId : null,
         relatedInstallmentId:
           accountMovementToCreate.type === "saldo_deudor" && singleItem?.kind === "installment"
@@ -3402,7 +3441,7 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
     // se escribe insuredId ni se toca insured_account_movements.
     if (roundingAdjustmentToCreate) {
       await tx.insert(paymentAmountAdjustments).values({
-        paymentBatchId: batch!.id,
+        paymentBatchId: batch.id,
         amountCents: roundingAdjustmentToCreate.amountCents,
         reason: roundingAdjustmentToCreate.reason,
         authorizedBy: user.id,
@@ -3411,7 +3450,7 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
       });
     }
 
-    return batch!.id;
+    return batch.id;
     });
   } catch (e: any) {
     if (e instanceof PaymentBatchRaceConditionError) {
