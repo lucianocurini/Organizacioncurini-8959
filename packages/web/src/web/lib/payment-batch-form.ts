@@ -843,6 +843,29 @@ export interface PaymentBatchCreatePayload {
   // cuotas — nunca se manda ni siquiera con valor null cuando no hay
   // diferencia (mismo criterio que el backend: "ni siquiera se mira si vino").
   accountDifferenceResolution?: AccountDifferenceResolutionPayload;
+  // Etapa 1B-4 — modo titular (accountHolderInsuredId presente): mutuamente
+  // excluyente con accountDifferenceResolution (ver
+  // account-holder-funding-request.ts, el backend rechaza un request que
+  // traiga los dos). Nunca presentes en el payload legacy — ver
+  // buildPaymentBatchPayload, que solo los agrega cuando params.titular viene
+  // no-null.
+  accountHolderInsuredId?: number;
+  creditAppliedCents?: number;
+  roundingCoverageCents?: number;
+  debtAuthorized?: boolean;
+  debtReason?: string | null;
+  idempotencyKey?: string;
+}
+
+/** Campos exclusivos del modo titular — ver PaymentBatchCreatePayload. */
+export interface PaymentBatchTitularPayloadInput {
+  accountHolderInsuredId: number;
+  creditAppliedCents: number;
+  roundingCoverageCents: number;
+  debtAuthorized: boolean;
+  /** Debe ser null cuando debtAuthorized=false — mismo contrato exacto que exige el backend (account-holder-funding-request.ts). */
+  debtReason: string | null;
+  idempotencyKey: string;
 }
 
 /**
@@ -851,7 +874,10 @@ export interface PaymentBatchCreatePayload {
  * server-side, ya no se manda). Un installment nunca manda importe (el
  * backend siempre relee installment.amount de la base); los dos tipos de
  * cobro manual sí, porque no hay ninguna otra fuente de verdad para su
- * importe.
+ * importe. `titular` ausente/null (modo legacy, comportamiento sin cambios
+ * desde antes de Etapa 1B-4): ninguno de los campos exclusivos del modo
+ * titular aparece en el payload — nunca se manda accountHolderInsuredId ni
+ * idempotencyKey por accidente.
  */
 export function buildPaymentBatchPayload(params: {
   paymentDate: string;
@@ -861,6 +887,7 @@ export function buildPaymentBatchPayload(params: {
   applyProntoPagoSurcharge?: boolean;
   confirmPossibleDuplicates?: boolean;
   accountDifferenceResolution?: AccountDifferenceResolutionPayload | null;
+  titular?: PaymentBatchTitularPayloadInput | null;
 }): PaymentBatchCreatePayload {
   return {
     paymentDate: params.paymentDate,
@@ -899,6 +926,14 @@ export function buildPaymentBatchPayload(params: {
     applyProntoPagoSurcharge: params.applyProntoPagoSurcharge,
     confirmPossibleDuplicates: params.confirmPossibleDuplicates,
     ...(params.accountDifferenceResolution ? { accountDifferenceResolution: params.accountDifferenceResolution } : {}),
+    ...(params.titular ? {
+      accountHolderInsuredId: params.titular.accountHolderInsuredId,
+      creditAppliedCents: params.titular.creditAppliedCents,
+      roundingCoverageCents: params.titular.roundingCoverageCents,
+      debtAuthorized: params.titular.debtAuthorized,
+      debtReason: params.titular.debtReason,
+      idempotencyKey: params.titular.idempotencyKey,
+    } : {}),
   };
 }
 

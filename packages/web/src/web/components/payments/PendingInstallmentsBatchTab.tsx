@@ -3,7 +3,7 @@ import { api } from "@/lib/api";
 import { toast } from "sonner";
 import {
   Search, Loader2, X, Plus, Trash2, ReceiptText, Layers, RefreshCw, Info, ChevronDown, ShoppingCart, FileEdit, Users,
-  Pencil, Ban, AlertTriangle,
+  Pencil, Ban, AlertTriangle, Wallet, UserCheck,
 } from "lucide-react";
 import { cn, formatCurrency, formatCurrencyCents } from "@/lib/utils";
 import { toArgentinaCalendarDay } from "../../../lib/dates/argentina-date";
@@ -27,6 +27,13 @@ import {
   syncChequeSplitAmounts, isRoundingAdjustmentEligible, buildRoundingAdjustmentPayload,
   validateBatchDifferenceResolutionWithRounding,
 } from "@/lib/payment-batch-form";
+import {
+  type TitularFormState, type AccountHolderOption, type AccountHolderBalance,
+  emptyTitularFormState, selectAccountHolder, clearAccountHolder, setDebtAuthorized,
+  parseNonNegativeCentsInput, validateTitularEconomicFields, computeTitularPreview, buildTitularPayloadInput,
+  computeTitularEconomicFingerprint, generateIdempotencyKey, buildTitularSummaryLines,
+  MAX_ROUNDING_ADJUSTMENT_CENTS,
+} from "@/lib/payment-batch-titular-form";
 import { CheckSubForm } from "./CheckSubForm";
 
 const METHOD_LABELS: Record<string, string> = {
@@ -682,6 +689,30 @@ function BatchPaymentModal({
   // independiente del radio saldo_a_favor/saldo_deudor, nunca preseleccionado.
   const [roundingAccepted, setRoundingAccepted] = useState(false);
 
+  // ─── Etapa 1B-4: modo titular de cuenta ("Titular de cuenta y saldo a
+  // favor") — opcional, apagado por defecto (modo legacy sin cambios). Ver
+  // payment-batch-titular-form.ts para toda la lógica pura.
+  const [titular, setTitular] = useState<TitularFormState>(emptyTitularFormState());
+  const [titularSearch, setTitularSearch] = useState("");
+  const [titularSearchResults, setTitularSearchResults] = useState<AccountHolderOption[]>([]);
+  const [titularSearchOpen, setTitularSearchOpen] = useState(false);
+  const [titularSearchLoading, setTitularSearchLoading] = useState(false);
+  const [titularBalance, setTitularBalance] = useState<AccountHolderBalance | null>(null);
+  const [titularBalanceLoading, setTitularBalanceLoading] = useState(false);
+  const [titularBalanceError, setTitularBalanceError] = useState(false);
+  // Fingerprint económico con el que se generó titular.idempotencyKey — si el
+  // fingerprint ACTUAL ya no coincide, la key vigente quedó obsoleta (Regla 4
+  // del pedido: cualquier cambio económico invalida la key).
+  const [titularKeyFingerprint, setTitularKeyFingerprint] = useState<string | null>(null);
+  // Checkbox de confirmación explícita (Regla 6) — se resetea junto con la
+  // key cada vez que cambia algo económico, nunca se arrastra a una versión
+  // distinta del cobro.
+  const [titularConfirmed, setTitularConfirmed] = useState(false);
+  // true tras un 409 CHECK_POSSIBLE_DUPLICATE — el próximo envío reintenta
+  // con confirmPossibleDuplicates:true, reusando la MISMA idempotencyKey
+  // (Regla 4: mismo intento semántico).
+  const [titularDuplicateWarning, setTitularDuplicateWarning] = useState(false);
+
   const subtotal = calculateCartTotal(cart);
   const targetCents = calculateBatchTargetAmountCents(cart, splits);
   const surchargeCents = targetCents - Math.round(subtotal * 100);
@@ -706,6 +737,86 @@ function BatchPaymentModal({
     setRoundingAccepted(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [difference.differenceCents]);
+
+  // ─── Etapa 1B-4: modo titular — búsqueda de asegurado ──────────────────
+  const isTitularMode = titular.accountHolder != null;
+
+  useEffect(() => {
+    if (!titularSearchOpen || titularSearch.trim() === "") { setTitularSearchResults([]); return; }
+    let cancelled = false;
+    setTitularSearchLoading(true);
+    api.get(`/api/insureds?q=${encodeURIComponent(titularSearch.trim())}`)
+      .then((rows: Array<{ id: number; name: string }>) => {
+        if (cancelled) return;
+        setTitularSearchResults(rows.map((r) => ({ insuredId: r.id, name: r.name })));
+      })
+      .catch(() => { if (!cancelled) setTitularSearchResults([]); })
+      .finally(() => { if (!cancelled) setTitularSearchLoading(false); });
+    return () => { cancelled = true; };
+  }, [titularSearch, titularSearchOpen]);
+
+  // ─── Saldo del titular seleccionado ─────────────────────────────────────
+  useEffect(() => {
+    setTitularBalance(null);
+    if (!titular.accountHolder) { setTitularBalanceError(false); return; }
+    let cancelled = false;
+    setTitularBalanceLoading(true);
+    setTitularBalanceError(false);
+    api.get(`/api/insureds/${titular.accountHolder.insuredId}/account-holder-balance`)
+      .then((data: AccountHolderBalance) => { if (!cancelled) setTitularBalance(data); })
+      .catch(() => { if (!cancelled) { setTitularBalance(null); setTitularBalanceError(true); } })
+      .finally(() => { if (!cancelled) setTitularBalanceLoading(false); });
+    return () => { cancelled = true; };
+  }, [titular.accountHolder?.insuredId]);
+
+  const titularAvailableCreditCents = titularBalance?.availableCreditCents ?? 0;
+  const titularFieldsValidation = isTitularMode ? validateTitularEconomicFields(titular, titularAvailableCreditCents) : null;
+  const titularCreditAppliedCents = parseNonNegativeCentsInput(titular.creditAppliedInput) ?? 0;
+  const titularRoundingCoverageCents = parseNonNegativeCentsInput(titular.roundingCoverageInput) ?? 0;
+  const titularPreview = isTitularMode
+    ? computeTitularPreview({
+        targetCents, splits, creditAppliedCents: titularCreditAppliedCents, roundingCoverageCents: titularRoundingCoverageCents,
+        availableCreditCents: titularAvailableCreditCents, debtAuthorized: titular.debtAuthorized,
+      })
+    : null;
+
+  const titularEconomicFingerprint = isTitularMode
+    ? computeTitularEconomicFingerprint({
+        paymentDate, cart, splits, notes: notes || null, accountHolderInsuredId: titular.accountHolder!.insuredId,
+        creditAppliedCents: titularCreditAppliedCents, roundingCoverageCents: titularRoundingCoverageCents,
+        debtAuthorized: titular.debtAuthorized, debtReason: titular.debtReason,
+      })
+    : null;
+
+  // Regla 4 del pedido: cualquier cambio económico (cuota agregada/quitada,
+  // medio/cheque editado, crédito, redondeo, deuda, o el titular mismo)
+  // invalida la idempotencyKey vigente — la próxima confirmación genera una
+  // nueva. También descarta la confirmación explícita y el aviso de cheque
+  // duplicado: ninguno de los dos corresponde ya a estos números nuevos.
+  useEffect(() => {
+    if (titularEconomicFingerprint == null) return;
+    if (titularEconomicFingerprint === titularKeyFingerprint) return;
+    setTitular((t) => (t.idempotencyKey != null ? { ...t, idempotencyKey: null } : t));
+    setTitularKeyFingerprint(null);
+    setTitularConfirmed(false);
+    setTitularDuplicateWarning(false);
+  }, [titularEconomicFingerprint, titularKeyFingerprint]);
+
+  function handleSelectTitular(holder: AccountHolderOption) {
+    setTitular(selectAccountHolder(holder));
+    setTitularSearch("");
+    setTitularSearchOpen(false);
+    setTitularConfirmed(false);
+    setTitularDuplicateWarning(false);
+  }
+
+  function handleClearTitular() {
+    setTitular(clearAccountHolder());
+    setTitularBalance(null);
+    setTitularKeyFingerprint(null);
+    setTitularConfirmed(false);
+    setTitularDuplicateWarning(false);
+  }
 
   function setSplitsAndSync(next: BatchSplitFormRow[]) {
     const target = calculateBatchTargetAmountCents(cart, next);
@@ -755,6 +866,13 @@ function BatchPaymentModal({
       submissionLock = false;
       return;
     }
+
+    if (isTitularMode) {
+      await handleTitularSubmit();
+      submissionLock = false;
+      return;
+    }
+
     if (!differenceValidation.valid) {
       toast.error(differenceValidation.errorMessage ?? "Resolvé la diferencia entre lo recibido y lo aplicado.");
       submissionLock = false;
@@ -780,7 +898,69 @@ function BatchPaymentModal({
     }
   }
 
-  const disabled = isBatchSubmitDisabled(submitting, validation.valid && differenceValidation.valid, cart.length > 0);
+  // ─── Etapa 1B-4: envío del modo titular ─────────────────────────────────
+  // Reusa idempotencyKey vigente si el fingerprint económico no cambió desde
+  // que se generó (Regla 4) — nunca genera una nueva key en un reintento por
+  // error de red ni en la confirmación de un cheque posiblemente duplicado
+  // (mismo request semántico). Solo se descarta la key (vuelve a null) desde
+  // el efecto de invalidación de arriba, cuando algo económico cambió, o
+  // explícitamente tras un envío exitoso.
+  async function handleTitularSubmit() {
+    if (!titularFieldsValidation?.valid) {
+      toast.error(titularFieldsValidation?.errorMessage ?? "Revisá los datos del titular.");
+      return;
+    }
+    if (!titularPreview?.ok) {
+      toast.error(titularPreview?.errorMessage ?? "No se pudo calcular el cierre del cobro con titular.");
+      return;
+    }
+    if (!titularConfirmed) {
+      toast.error("Confirmá el cobro con titular antes de continuar.");
+      return;
+    }
+    const holder = titular.accountHolder!;
+    const key = titular.idempotencyKey ?? generateIdempotencyKey();
+    if (titular.idempotencyKey == null) {
+      setTitular((t) => ({ ...t, idempotencyKey: key }));
+      setTitularKeyFingerprint(titularEconomicFingerprint);
+    }
+
+    setSubmitting(true);
+    try {
+      const payload = buildPaymentBatchPayload({
+        paymentDate, cart, splits, notes: notes || null,
+        confirmPossibleDuplicates: titularDuplicateWarning,
+        titular: buildTitularPayloadInput({
+          accountHolderInsuredId: holder.insuredId,
+          creditAppliedCents: titularCreditAppliedCents,
+          roundingCoverageCents: titularRoundingCoverageCents,
+          debtAuthorized: titular.debtAuthorized,
+          debtReason: titular.debtReason,
+          idempotencyKey: key,
+        }),
+      });
+      const result = await api.post("/api/payment-batches", payload);
+      setTitular((t) => ({ ...t, idempotencyKey: null }));
+      setTitularKeyFingerprint(null);
+      setTitularConfirmed(false);
+      setTitularDuplicateWarning(false);
+      onCreated(result.id);
+    } catch (err: any) {
+      if (err?.body?.code === "CHECK_POSSIBLE_DUPLICATE") {
+        setTitularDuplicateWarning(true);
+        toast.error("Se detectaron posibles cheques duplicados. Verificá y confirmá de nuevo para continuar.");
+      } else {
+        const normalized = normalizeBatchSubmitError(err);
+        toast.error(normalized.message);
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const legacyValid = validation.valid && differenceValidation.valid;
+  const titularValid = validation.valid && !titularBalanceLoading && titularBalance != null && !!titularFieldsValidation?.valid && !!titularPreview?.ok && titularConfirmed;
+  const disabled = isBatchSubmitDisabled(submitting, isTitularMode ? titularValid : legacyValid, cart.length > 0);
 
   return (
     <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 p-4 overflow-y-auto">
@@ -908,8 +1088,12 @@ function BatchPaymentModal({
             {/* Fase 2E: sobrante/faltante — dinero real (SUM(splits)) distinto
                 de lo aplicado a las cuotas seleccionadas (target). Nunca se
                 muestra si coinciden (difference.kind === "exacto"): mismo
-                comportamiento que antes de esta fase. */}
-            {validation.valid && difference.kind !== "exacto" && (
+                comportamiento que antes de esta fase. Etapa 1B-4: en modo
+                titular esta diferencia se resuelve con crédito/redondeo/
+                deuda (ver más abajo) — accountDifferenceResolution es
+                mutuamente excluyente con accountHolderInsuredId (Regla 5),
+                así que este bloque nunca se muestra con un titular activo. */}
+            {!isTitularMode && validation.valid && difference.kind !== "exacto" && (
               <div className={cn(
                 "mt-3 rounded-xl border p-3 space-y-2",
                 difference.kind === "saldo_a_favor" ? "bg-emerald-500/10 border-emerald-500/20" : "bg-red-500/10 border-red-500/20"
@@ -985,6 +1169,146 @@ function BatchPaymentModal({
                     )}
                   </>
                 ))}
+              </div>
+            )}
+          </div>
+
+          {/* Etapa 1B-4: modo titular de cuenta — opcional, apagado por
+              defecto. Seleccionar un titular activa el modo nuevo (oculta el
+              bloque de sobrante/faltante de arriba); quitarlo vuelve al modo
+              legacy y limpia todos sus campos (handleClearTitular). */}
+          <div className="bg-white/5 border border-white/10 rounded-xl p-4 space-y-3">
+            <div className="flex items-center gap-2">
+              <UserCheck className="w-4 h-4 text-blue-400" />
+              <h3 className="text-sm font-semibold text-white">Titular de cuenta y saldo a favor</h3>
+              <span className="text-[11px] text-white/30">(opcional)</span>
+            </div>
+
+            {!titular.accountHolder ? (
+              <div className="relative">
+                <div className="relative">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-white/30" />
+                  <input
+                    value={titularSearch}
+                    onChange={(e) => { setTitularSearch(e.target.value); setTitularSearchOpen(true); }}
+                    onFocus={() => setTitularSearchOpen(true)}
+                    placeholder="Buscar asegurado para usar como titular de cuenta..."
+                    className="w-full pl-9 pr-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white text-sm placeholder-white/30 outline-none focus:border-blue-500"
+                  />
+                </div>
+                {titularSearchOpen && titularSearch.trim() !== "" && (
+                  <div className="absolute z-20 w-full mt-1 bg-[#0d1117] border border-white/10 rounded-lg shadow-xl max-h-52 overflow-y-auto">
+                    {titularSearchLoading ? (
+                      <p className="text-white/40 text-xs px-3 py-2 flex items-center gap-1.5"><Loader2 className="w-3 h-3 animate-spin" /> Buscando...</p>
+                    ) : titularSearchResults.length === 0 ? (
+                      <p className="text-white/40 text-xs px-3 py-2">Sin resultados.</p>
+                    ) : (
+                      titularSearchResults.map((r) => (
+                        <button key={r.insuredId} type="button" onClick={() => handleSelectTitular(r)}
+                          className="w-full text-left px-3 py-2 text-sm text-white hover:bg-white/5 transition-colors">
+                          {r.name}
+                        </button>
+                      ))
+                    )}
+                  </div>
+                )}
+                <p className="text-[11px] text-white/30 mt-1.5">Sin titular: el cobro funciona exactamente igual que siempre (modo legacy).</p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-3 px-3 py-2 bg-blue-500/10 border border-blue-500/20 rounded-lg">
+                  <span className="text-sm text-white">{titular.accountHolder.name}</span>
+                  <button type="button" onClick={handleClearTitular} className="text-white/40 hover:text-red-400" title="Quitar titular (vuelve al modo legacy)">
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-2 text-xs">
+                  <Wallet className="w-3.5 h-3.5 text-white/40 flex-shrink-0" />
+                  {titularBalanceLoading ? (
+                    <span className="text-white/40 flex items-center gap-1.5"><Loader2 className="w-3 h-3 animate-spin" /> Consultando saldo...</span>
+                  ) : titularBalanceError ? (
+                    <span className="text-red-400">No se pudo consultar el saldo de este titular.</span>
+                  ) : titularBalance ? (
+                    <span className={cn("font-mono", titularBalance.balanceCents < 0 ? "text-red-400" : "text-emerald-400")}>
+                      Saldo: {formatCurrencyCents(titularBalance.balanceCents)}
+                      {titularBalance.balanceCents < 0 && " (el titular ya debe plata — crédito disponible $0,00)"}
+                    </span>
+                  ) : null}
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-white/50 mb-1">Crédito aplicado</label>
+                    <input type="number" value={titular.creditAppliedInput}
+                      onChange={(e) => setTitular((t) => ({ ...t, creditAppliedInput: e.target.value }))}
+                      placeholder="0.00" max={titularAvailableCreditCents / 100}
+                      className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-blue-500" />
+                    <p className="text-[10px] text-white/30 mt-0.5">Máximo disponible: {formatCurrencyCents(Math.max(0, titularAvailableCreditCents))}</p>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-white/50 mb-1">Redondeo cubierto por oficina</label>
+                    <input type="number" value={titular.roundingCoverageInput}
+                      onChange={(e) => setTitular((t) => ({ ...t, roundingCoverageInput: e.target.value }))}
+                      placeholder="0.00" max={MAX_ROUNDING_ADJUSTMENT_CENTS / 100}
+                      className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-blue-500" />
+                    <p className="text-[10px] text-white/30 mt-0.5">Máximo: {formatCurrencyCents(MAX_ROUNDING_ADJUSTMENT_CENTS)}</p>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="flex items-center gap-2 text-xs text-white/70">
+                    <input type="checkbox" checked={titular.debtAuthorized}
+                      onChange={(e) => setTitular((t) => setDebtAuthorized(t, e.target.checked))}
+                      className="accent-blue-600" />
+                    Autorizar deuda nueva si falta cubrir el total
+                  </label>
+                  {titular.debtAuthorized && (
+                    <textarea value={titular.debtReason}
+                      onChange={(e) => setTitular((t) => ({ ...t, debtReason: e.target.value }))}
+                      rows={2} placeholder="Motivo de la deuda autorizada..."
+                      className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-blue-500 resize-none" />
+                  )}
+                </div>
+
+                {titularFieldsValidation && !titularFieldsValidation.valid && (
+                  <p className="text-xs text-red-400">{titularFieldsValidation.errorMessage}</p>
+                )}
+
+                {titularFieldsValidation?.valid && titularPreview && (
+                  titularPreview.ok ? (
+                    <div className="bg-white/5 border border-white/10 rounded-lg p-3 space-y-1">
+                      <p className="text-[11px] text-white/40 uppercase tracking-wider mb-1">Resumen del cierre</p>
+                      {buildTitularSummaryLines(titularPreview.plan).map((line) => (
+                        <div key={line.label} className="flex justify-between text-xs">
+                          <span className="text-white/60">{line.label}</span>
+                          <span className={cn(
+                            "font-mono",
+                            line.kind === "debt" ? "text-red-400" : line.kind === "credit" ? "text-emerald-400" : "text-white"
+                          )}>
+                            {formatCurrencyCents(line.amountCents)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-amber-300">{titularPreview.errorMessage}</p>
+                  )
+                )}
+
+                {titularDuplicateWarning && (
+                  <div className="flex items-start gap-2 px-3 py-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-xs text-amber-300">
+                    <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                    <span>Se detectaron posibles cheques duplicados. Verificá los datos y confirmá de nuevo para continuar de todos modos.</span>
+                  </div>
+                )}
+
+                {titularFieldsValidation?.valid && titularPreview?.ok && (
+                  <label className="flex items-start gap-2 text-xs text-white/70">
+                    <input type="checkbox" checked={titularConfirmed} onChange={(e) => setTitularConfirmed(e.target.checked)} className="mt-0.5 accent-blue-600" />
+                    Confirmo el cobro con estos datos de titular de cuenta (saldo usado, medios reales, redondeo y deuda/sobrante resultante de arriba).
+                  </label>
+                )}
               </div>
             )}
           </div>

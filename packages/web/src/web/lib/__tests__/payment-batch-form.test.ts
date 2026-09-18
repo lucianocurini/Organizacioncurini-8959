@@ -718,6 +718,72 @@ describe("buildPaymentBatchPayload — accountDifferenceResolution (Fase 2E)", (
   });
 });
 
+describe("buildPaymentBatchPayload — modo titular (Etapa 1B-4)", () => {
+  test("sin titular: ninguno de los 6 campos exclusivos aparece en el payload (payload legacy sin cambios)", () => {
+    const payload = buildPaymentBatchPayload({
+      paymentDate: "2027-06-01",
+      cart: [installmentCartItem({ amount: 1000 })],
+      splits: [createBatchSplitRow("efectivo", "1000")],
+    });
+    for (const key of ["accountHolderInsuredId", "creditAppliedCents", "roundingCoverageCents", "debtAuthorized", "debtReason", "idempotencyKey"]) {
+      expect(key in payload).toBe(false);
+    }
+  });
+
+  test("titular null explícito: tampoco aparece ninguno de los 6 campos", () => {
+    const payload = buildPaymentBatchPayload({
+      paymentDate: "2027-06-01",
+      cart: [installmentCartItem({ amount: 1000 })],
+      splits: [createBatchSplitRow("efectivo", "1000")],
+      titular: null,
+    });
+    for (const key of ["accountHolderInsuredId", "creditAppliedCents", "roundingCoverageCents", "debtAuthorized", "debtReason", "idempotencyKey"]) {
+      expect(key in payload).toBe(false);
+    }
+  });
+
+  test("con titular: incluye exactamente los 6 campos, con los valores dados", () => {
+    const payload = buildPaymentBatchPayload({
+      paymentDate: "2027-06-01",
+      cart: [installmentCartItem({ amount: 1000 })],
+      splits: [createBatchSplitRow("efectivo", "700")],
+      titular: {
+        accountHolderInsuredId: 42,
+        creditAppliedCents: 30000,
+        roundingCoverageCents: 0,
+        debtAuthorized: false,
+        debtReason: null,
+        idempotencyKey: "key-abc-123",
+      },
+    });
+    expect(payload.accountHolderInsuredId).toBe(42);
+    expect(payload.creditAppliedCents).toBe(30000);
+    expect(payload.roundingCoverageCents).toBe(0);
+    expect(payload.debtAuthorized).toBe(false);
+    expect(payload.debtReason).toBeNull();
+    expect(payload.idempotencyKey).toBe("key-abc-123");
+    expect("accountDifferenceResolution" in payload).toBe(false);
+  });
+
+  test("con titular y deuda autorizada: debtReason viaja tal cual", () => {
+    const payload = buildPaymentBatchPayload({
+      paymentDate: "2027-06-01",
+      cart: [installmentCartItem({ amount: 1000 })],
+      splits: [createBatchSplitRow("efectivo", "0")],
+      titular: {
+        accountHolderInsuredId: 7,
+        creditAppliedCents: 0,
+        roundingCoverageCents: 0,
+        debtAuthorized: true,
+        debtReason: "cliente pidió financiar el resto",
+        idempotencyKey: "key-debt-1",
+      },
+    });
+    expect(payload.debtAuthorized).toBe(true);
+    expect(payload.debtReason).toBe("cliente pidió financiar el resto");
+  });
+});
+
 describe("cheques — obligatorios y validados por split método=cheque", () => {
   test("split cheque sin ningún cheque cargado → inválido", () => {
     const splits: BatchSplitFormRow[] = [createBatchSplitRow("cheque", "1000")];

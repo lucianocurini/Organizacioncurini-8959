@@ -116,6 +116,7 @@ import {
 } from "./account-holder-funding-batch";
 import { formatAccountHolderFundingBatchSuccess, mapAccountHolderFundingBatchError } from "./payment-batch-titular-response";
 import { buildTitularFundingInput, buildTitularFundingDependencies } from "./payment-batch-titular-dependencies";
+import { loadAccountHolderBalanceSummary } from "./account-holder-balance";
 
 const app = new Hono().basePath("/api");
 
@@ -238,6 +239,23 @@ app.get("/insureds", requireAuth(async (c: any) => {
   }
   const list = await db.select().from(insureds).orderBy(insureds.name).all();
   return c.json(list, 200);
+}));
+
+// Etapa 1B-4 — saldo activo de un titular de cuenta, para la UI de "Cobrar en
+// lote" (selector de titular + tope de crédito aplicable). Sin escrituras —
+// ver account-holder-balance.ts (loadAccountHolderBalanceSummary), mismo
+// chequeo de existencia real que ya usa POST /payment-batches en modo
+// titular.
+app.get("/insureds/:id/account-holder-balance", requireAuth(async (c: any) => {
+  const insuredId = Number(c.req.param("id"));
+  if (!Number.isSafeInteger(insuredId) || insuredId <= 0) {
+    return c.json({ error: "El id del asegurado debe ser un entero positivo." }, 400);
+  }
+  const summary = await loadAccountHolderBalanceSummary(db, insuredId);
+  if (!summary) {
+    return c.json({ error: `El asegurado ${insuredId} no existe.` }, 404);
+  }
+  return c.json(summary, 200);
 }));
 
 app.post("/insureds", requireAuth(async (c: any) => {
