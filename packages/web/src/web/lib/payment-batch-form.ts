@@ -955,6 +955,8 @@ export interface PaymentBatchSummary {
   // Fase 2G: dinero REAL recibido (ver receivedCentsOf) — nullable solo por
   // defensividad de tipos, igual que en PaymentBatchDetail.batch (Fase 2F).
   receivedAmountCents: number | null;
+  /** Etapa 1B-4: null/ausente = batch legacy; presente = batch con titular de cuenta. */
+  accountHolderInsuredId?: number | null;
   itemCount: number;
   splitCount: number;
   checkCount: number;
@@ -1047,6 +1049,8 @@ export interface PaymentBatchDetail {
     receivedAmountCents: number | null;
     paymentDate: string; status: string; notes: string | null; createdAt: string;
     cancelledAt: string | null; cancellationReason: string | null;
+    /** Etapa 1B-4: null/ausente = batch legacy. */
+    accountHolderInsuredId?: number | null;
   };
   insuredSummary: BatchInsuredSummary;
   items: PaymentBatchDetailItem[];
@@ -1055,6 +1059,21 @@ export interface PaymentBatchDetail {
   integrity: Record<string, unknown>;
   accountMovements: BatchDetailAccountMovement[];
   amountAdjustments: BatchDetailAmountAdjustment[];
+  /** Etapa 1B-4: solo batches con titular de cuenta (null/ausente en legacy). */
+  accountHolder?: { id: number; name: string } | null;
+  fundingAllocations?: BatchDetailFundingAllocation[];
+}
+
+/** Fila persistida de payment_batch_funding_allocations (GET /payment-batches/:id). */
+export interface BatchDetailFundingAllocation {
+  id: number;
+  paymentBatchSplitId: number | null;
+  sourceAccountMovementId: number | null;
+  paymentAmountAdjustmentId: number | null;
+  paymentId: number | null;
+  cashEntryId: number | null;
+  destinationAccountMovementId: number | null;
+  amountCents: number;
 }
 
 // ─── Fase 2F — comprobante consistente con sobrantes/faltantes ─────────────

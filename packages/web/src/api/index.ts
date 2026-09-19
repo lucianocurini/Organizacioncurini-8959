@@ -117,6 +117,7 @@ import {
 import { formatAccountHolderFundingBatchSuccess, mapAccountHolderFundingBatchError } from "./payment-batch-titular-response";
 import { buildTitularFundingInput, buildTitularFundingDependencies } from "./payment-batch-titular-dependencies";
 import { loadAccountHolderBalanceSummary } from "./account-holder-balance";
+import { loadBatchFundingDetail } from "./payment-batch-funding-detail";
 
 const app = new Hono().basePath("/api");
 
@@ -3952,6 +3953,9 @@ app.get("/payment-batches", requireAuth(async (c: any) => {
     // sobrante/faltante de un cobro exacto. Mismo campo ya expuesto en
     // GET /payment-batches/:id (Fase 2F) — nunca se cambia su significado.
     receivedAmountCents: paymentBatches.receivedAmountCents,
+    // Etapa 1B-4: el listado distingue un batch con titular de cuenta (su
+    // diferencia real-vs-aplicado NO es un faltante, ver comprobante).
+    accountHolderInsuredId: paymentBatches.accountHolderInsuredId,
     notes: paymentBatches.notes,
     createdAt: paymentBatches.createdAt,
   }).from(paymentBatches)
@@ -4026,6 +4030,7 @@ app.get("/payment-batches", requireAuth(async (c: any) => {
       totalAmountCents: b.baseAmountCents,
       totalReceivedCents: b.totalReceivedCents,
       receivedAmountCents: b.receivedAmountCents,
+      accountHolderInsuredId: b.accountHolderInsuredId ?? null,
       itemCount: itemCounts.get(b.id) ?? 0,
       splitCount: splitCounts.get(b.id) ?? 0,
       checkCount: checkCounts.get(b.id) ?? 0,
@@ -4178,7 +4183,9 @@ app.get("/payment-batches/:id", requireAuth(async (c: any) => {
     possibleDuplicateChecks,
   };
 
-  return c.json({ batch, insuredSummary, items: childRows, splits: splitsWithChecksOut, surcharges, integrity, accountMovements, amountAdjustments }, 200);
+  const { accountHolder, fundingAllocations } = await loadBatchFundingDetail(db, id, batch.accountHolderInsuredId ?? null);
+
+  return c.json({ batch, insuredSummary, items: childRows, splits: splitsWithChecksOut, surcharges, integrity, accountMovements, amountAdjustments, accountHolder, fundingAllocations }, 200);
 }));
 
 // ─── ANULACIÓN DE UN LOTE CONFIRMADO (corrección segura, con trazabilidad) ──

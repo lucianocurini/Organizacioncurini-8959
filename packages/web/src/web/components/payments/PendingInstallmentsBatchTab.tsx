@@ -34,6 +34,7 @@ import {
   computeTitularEconomicFingerprint, generateIdempotencyKey, buildTitularSummaryLines,
   MAX_ROUNDING_ADJUSTMENT_CENTS,
 } from "@/lib/payment-batch-titular-form";
+import { summarizeTitularBatchFunding, buildTitularBatchFundingLines } from "../../lib/payment-batch-titular-detail";
 import { CheckSubForm } from "./CheckSubForm";
 
 const METHOD_LABELS: Record<string, string> = {
@@ -577,6 +578,18 @@ export function PendingInstallmentsBatchTab() {
                   {(() => {
                     const receivedCents = receivedCentsOf(b);
                     const difference = calculateBatchReceivedAppliedDifference(receivedCents, b.totalReceivedCents);
+                    // Etapa 1B-4: con titular de cuenta la diferencia real-vs-
+                    // aplicado la cubren crédito/redondeo/deuda — no es un
+                    // faltante (el desglose está en el comprobante).
+                    if (b.accountHolderInsuredId != null && difference.kind !== "exacto") {
+                      return (
+                        <div className="flex flex-col items-end leading-tight">
+                          <span className="text-white font-mono">{formatCurrencyCents(b.totalReceivedCents)}</span>
+                          <span className="text-white/35 font-mono text-[10px]">Aplicado · medios reales: {formatCurrencyCents(receivedCents)}</span>
+                          <span className="text-blue-300 text-[10px] font-medium">Con titular de cuenta</span>
+                        </div>
+                      );
+                    }
                     if (difference.kind === "exacto") {
                       return <span className="text-white font-mono">{formatCurrencyCents(receivedCents)}</span>;
                     }
@@ -1423,6 +1436,48 @@ function BatchReceiptModal({
               receivedCentsOf/calculateBatchReceivedAppliedDifference). Sin
               diferencia, se muestra igual que siempre — sin ruido nuevo. */}
           {(() => {
+            // Etapa 1B-4: batch con titular de cuenta — el dinero real es menor
+            // al aplicado a propósito (lo cubren crédito/redondeo/deuda), así
+            // que nunca se calcula "Faltante" como aplicado - medios reales.
+            // Desglose desde allocations/movimientos persistidos.
+            const titularFunding = summarizeTitularBatchFunding(detail);
+            if (titularFunding) {
+              if (titularFunding.kind === "inactive") {
+                return (
+                  <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-3 space-y-1 text-xs">
+                    {titularFunding.accountHolder && (
+                      <div className="flex justify-between"><span className="text-white/60">Titular de cuenta</span><span className="text-white">{titularFunding.accountHolder.name}</span></div>
+                    )}
+                    <p className="text-red-300">Cobro anulado — la financiación con titular de cuenta ya no está vigente.</p>
+                  </div>
+                );
+              }
+              return (
+                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 p-3 space-y-1.5">
+                  {titularFunding.accountHolder && (
+                    <div className="flex justify-between text-xs">
+                      <span className="text-white/60">Titular de cuenta</span>
+                      <span className="text-white font-medium">{titularFunding.accountHolder.name}</span>
+                    </div>
+                  )}
+                  {buildTitularBatchFundingLines(titularFunding).map((line) => (
+                    <div key={line.label} className={cn(
+                      "flex justify-between text-xs",
+                      line.kind === "total" && "pt-1.5 border-t border-emerald-500/20 text-sm font-medium",
+                      line.kind === "difference" && (line.amountCents === 0 ? "text-emerald-300 font-medium" : "text-amber-300 font-medium"),
+                    )}>
+                      <span className={line.kind === "difference" ? "" : "text-white/60"}>{line.label}</span>
+                      <span className={cn(
+                        "font-mono",
+                        line.kind === "debt" ? "text-red-400" : line.kind === "credit" ? "text-emerald-400" : line.kind === "difference" ? "" : "text-white"
+                      )}>
+                        {formatCurrencyCents(line.amountCents)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              );
+            }
             const receivedCents = receivedCentsOf(detail.batch);
             const difference = calculateBatchReceivedAppliedDifference(receivedCents, detail.batch.totalReceivedCents);
             if (difference.kind === "exacto") {
