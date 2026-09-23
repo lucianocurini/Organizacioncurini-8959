@@ -382,7 +382,11 @@ function validateResolution(raw: unknown): FingerprintAccountDifferenceResolutio
   assertExactKeys("input.accountDifferenceResolution", raw, RESOLUTION_KEYS);
   const action = raw.action;
   if (!RESOLUTION_ACTIONS.has(action as string)) {
-    throw new FundingRequestFingerprintInputError(`input.accountDifferenceResolution.action inválida: ${String(action)}.`);
+    // Mismo texto exacto que el guard legacy de POST /payment-batches
+    // (index.ts) para una action no soportada — nunca un mensaje propio de
+    // este módulo, para no romper la trazabilidad del mensaje que ya ven
+    // los callers de la etapa legacy.
+    throw new FundingRequestFingerprintInputError(`accountDifferenceResolution.action no soportada en esta etapa: "${action}".`);
   }
   if (action === "saldo_a_favor") {
     assertNullableCanonicalString("input.accountDifferenceResolution.reason", raw.reason);

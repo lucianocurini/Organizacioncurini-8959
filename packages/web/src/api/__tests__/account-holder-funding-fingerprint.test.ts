@@ -384,9 +384,16 @@ describe("accountDifferenceResolution — tres variantes discriminadas", () => {
     expect(() => canonicalizeFundingRequest(input)).toThrow(FundingRequestFingerprintInputError);
   });
 
-  test("action desconocida lanza", () => {
+  test("action desconocida lanza con el mismo mensaje legacy exacto que el guard de POST /payment-batches (index.ts)", () => {
     const input = legacyInput({ accountDifferenceResolution: { action: "ajuste_manual", reason: "x" } as any });
-    expect(() => canonicalizeFundingRequest(input)).toThrow(FundingRequestFingerprintInputError);
+    let error: unknown;
+    try {
+      canonicalizeFundingRequest(input);
+    } catch (e) {
+      error = e;
+    }
+    expect(error).toBeInstanceOf(FundingRequestFingerprintInputError);
+    expect((error as Error).message).toBe('accountDifferenceResolution.action no soportada en esta etapa: "ajuste_manual".');
   });
 });
 
