@@ -60,7 +60,10 @@ async function createSchema(c: Client): Promise<void> {
       id INTEGER PRIMARY KEY AUTOINCREMENT, policy_number TEXT NOT NULL, type TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'activa', company_id INTEGER NOT NULL REFERENCES companies(id),
       insured_id INTEGER NOT NULL REFERENCES insureds(id), start_date TEXT NOT NULL, end_date TEXT NOT NULL,
-      is_rebilling INTEGER NOT NULL DEFAULT 0, parent_policy_id INTEGER
+      is_rebilling INTEGER NOT NULL DEFAULT 0, parent_policy_id INTEGER,
+      -- Columnas reales que lee la regla única de cobrabilidad
+      -- (installment-collectability-loader.ts, revalidación dentro de createChildRows).
+      renewed_from_id INTEGER, cancellation_effective_date TEXT
     )
   `);
   await c.execute(`

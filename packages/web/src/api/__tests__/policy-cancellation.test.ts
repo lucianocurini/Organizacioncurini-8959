@@ -358,14 +358,25 @@ describe("Guards de no_exigible en payments", () => {
     expect(status).toBe(409);
   });
 
-  test("33. deuda anterior a la anulación se puede pagar con normalidad", async () => {
+  test("33. deuda anterior a la anulación: se cobra hasta el día efectivo inclusive; desde el día siguiente, sin póliza vigente en la cadena, se bloquea", async () => {
+    // Regla única de cobrabilidad (2026-09-25): la póliza cancelada sigue
+    // vigente DURANTE su fecha efectiva y queda fuera desde el día siguiente;
+    // sin otra póliza vigente en la cadena, sus cuotas (incluso las
+    // anteriores a la cancelación) ya no se ofrecen ni se aceptan.
     const policyId = await mkPolicy();
     const priorInstId = await mkInstallment(policyId, 1, "2027-05-01", 1000);
     await callCancel(policyId, { effectiveDate: "2027-06-01", reason: "x" });
     expect((await getInstallment(priorInstId))!.status).toBe("pendiente");
 
+    const blocked = await callPostPayment({
+      policyId, installmentId: priorInstId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-06-02",
+    });
+    expect(blocked.status).toBe(400);
+    expect(blocked.body.code).toBe("INSTALLMENT_NOT_COLLECTABLE");
+    expect((await getInstallment(priorInstId))!.status).toBe("pendiente");
+
     const { status } = await callPostPayment({
-      policyId, installmentId: priorInstId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-06-10",
+      policyId, installmentId: priorInstId, amount: 1000, paymentMethod: "efectivo", paymentDate: "2027-06-01",
     });
     expect(status).toBe(201);
     expect((await getInstallment(priorInstId))!.status).toBe("pagada");

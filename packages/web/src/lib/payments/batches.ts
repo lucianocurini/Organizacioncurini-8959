@@ -250,10 +250,11 @@ export function resolveBatchInsuredId(items: BatchItemContext[]): number | null 
  * Elegibilidad por ítem:
  *  - installment: pendiente/vencida únicamente (nunca "pagada" — evita
  *    duplicar el cobro), sin rendir todavía (rendered=1 significa que la
- *    agencia ya la rindió a la compañía sin cobrarle al asegurado), exigible
- *    (no_exigible es una cuota de una póliza anulada manualmente) y con su
- *    póliza no cancelada. Sin pagos parciales: el importe imputado es
- *    siempre installment.amount completo.
+ *    agencia ya la rindió a la compañía sin cobrarle al asegurado) y
+ *    exigible (no_exigible es una cuota de una póliza anulada manualmente).
+ *    La vigencia/cancelación de la póliza la decide la regla única de
+ *    cobrabilidad (installment-collectability.ts), no este helper. Sin pagos
+ *    parciales: el importe imputado es siempre installment.amount completo.
  *  - policy_manual_payment: no hay cuota ni estado de cobro previo que
  *    validar (es dinero nuevo, no preexistente) — el único requisito es que
  *    la póliza indicada no esté cancelada.
@@ -278,9 +279,11 @@ export function validateInstallmentsEligibility(items: BatchItemContext[]): void
       if (i.rendered === 1) {
         throw new PaymentBatchValidationError(`La cuota ${i.installmentId} ya fue rendida.`);
       }
-      if (i.policyStatus === "cancelada") {
-        throw new PaymentBatchValidationError(`La póliza de la cuota ${i.installmentId} está cancelada.`);
-      }
+      // Póliza cancelada: ya NO se rechaza acá por status. La decide la regla
+      // única de cobrabilidad (installment-collectability.ts) según la fecha
+      // efectiva de cancelación — misma decisión que el cobro individual.
+      // Una cancelada sin fecha efectiva válida sigue bloqueada (400
+      // INSTALLMENT_NOT_COLLECTABLE), nunca se cobra.
     } else if (i.kind === "policy_manual_payment") {
       if (i.policyStatus === "cancelada") {
         throw new PaymentBatchValidationError(`La póliza del cobro manual (póliza ${i.policyId}) está cancelada.`);

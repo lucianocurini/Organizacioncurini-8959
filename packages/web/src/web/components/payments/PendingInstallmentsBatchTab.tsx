@@ -8,6 +8,10 @@ import {
 import { cn, formatCurrency, formatCurrencyCents } from "@/lib/utils";
 import { toArgentinaCalendarDay } from "../../../lib/dates/argentina-date";
 import {
+  buildPendingForPaymentQuery, looksLikeIsoDate, parseCollectableInstallmentIds, resolveCartCollectability,
+  type CollectableCheckState,
+} from "@/lib/collectable-installments";
+import {
   type PendingInstallmentForPayment, type BatchSplitFormRow, type PaymentBatchSummary,
   type PaymentBatchDetail, type BatchCartItem, type ManualPaymentFormState,
   type PaymentBatchCancelCheckResponse, type BatchEditFormState, type BatchDifferenceResolutionFormState,
@@ -679,7 +683,9 @@ export function PendingInstallmentsBatchTab() {
 
 // ─── Modal "Cobrar en lote" ─────────────────────────────────────────────────────
 
-function BatchPaymentModal({
+// Exportado solo para el test de presentación
+// (__tests__/batch-payment-modal-collectability.test.tsx).
+export function BatchPaymentModal({
   cart, onClose, onCreated,
 }: {
   cart: BatchCartItem[];
@@ -725,6 +731,33 @@ function BatchPaymentModal({
   // con confirmPossibleDuplicates:true, reusando la MISMA idempotencyKey
   // (Regla 4: mismo intento semántico).
   const [titularDuplicateWarning, setTitularDuplicateWarning] = useState(false);
+
+  // Regla única de cobrabilidad: el carrito se arma con la lista de HOY, pero
+  // la fecha de pago se elige recién acá. La lista de cuotas cobrables
+  // (GET /installments/pending-for-payment?paymentDate=) se pide al abrir y
+  // en cada cambio de fecha — NO al cambiar el carrito: agregar o quitar
+  // ítems se evalúa contra el último resultado de esa fecha. Fail closed: un
+  // error, una respuesta inválida o un resultado de otra fecha bloquean
+  // Confirmar. El backend la revalida igual dentro de la transacción.
+  const [collectableCheck, setCollectableCheck] = useState<CollectableCheckState>({ status: "loading", paymentDate });
+  const [collectableCheckRetry, setCollectableCheckRetry] = useState(0);
+  useEffect(() => {
+    if (!looksLikeIsoDate(paymentDate)) { setCollectableCheck({ status: "invalid_date", paymentDate }); return; }
+    // cancelled: la respuesta de una fecha anterior (efecto ya limpiado) nunca
+    // pisa el estado de la fecha actual.
+    let cancelled = false;
+    setCollectableCheck({ status: "loading", paymentDate });
+    api.get(buildPendingForPaymentQuery({ paymentDate }))
+      .then((rows: unknown) => {
+        if (cancelled) return;
+        const collectableIds = parseCollectableInstallmentIds(rows);
+        setCollectableCheck(collectableIds ? { status: "ok", paymentDate, collectableIds } : { status: "error", paymentDate });
+      })
+      .catch(() => { if (!cancelled) setCollectableCheck({ status: "error", paymentDate }); });
+    return () => { cancelled = true; };
+  }, [paymentDate, collectableCheckRetry]);
+  const cartCollectability = resolveCartCollectability(cart, collectableCheck, paymentDate);
+  const unavailableInstallmentIds = cartCollectability.unavailableIds;
 
   const subtotal = calculateCartTotal(cart);
   const targetCents = calculateBatchTargetAmountCents(cart, splits);
@@ -973,7 +1006,7 @@ function BatchPaymentModal({
 
   const legacyValid = validation.valid && differenceValidation.valid;
   const titularValid = validation.valid && !titularBalanceLoading && titularBalance != null && !!titularFieldsValidation?.valid && !!titularPreview?.ok && titularConfirmed;
-  const disabled = isBatchSubmitDisabled(submitting, isTitularMode ? titularValid : legacyValid, cart.length > 0);
+  const disabled = isBatchSubmitDisabled(submitting, (isTitularMode ? titularValid : legacyValid) && cartCollectability.canConfirm, cart.length > 0);
 
   return (
     <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 p-4 overflow-y-auto">
@@ -999,6 +1032,9 @@ function BatchPaymentModal({
                 {cart.map((item) => (
                   <tr key={cartItemKey(item)} className="border-b border-white/5 last:border-0">
                     <td className="px-3 py-2 text-white/80">
+                      {item.kind === "installment" && unavailableInstallmentIds.includes(item.installmentId) && (
+                        <span className="mr-1.5 text-[10px] px-1.5 py-0.5 rounded border border-amber-500/30 bg-amber-500/10 text-amber-400">no disponible</span>
+                      )}
                       {item.kind === "installment"
                         ? `Cuota #${item.installmentNumber} — ${item.policyNumber} — vence ${fmtDate(item.dueDate)}`
                         : item.kind === "policy_manual_payment"
@@ -1038,6 +1074,26 @@ function BatchPaymentModal({
               <label className="text-xs text-white/50 block mb-1">Fecha de pago *</label>
               <input type="date" value={paymentDate} onChange={(e) => setPaymentDate(e.target.value)}
                 className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-blue-500" />
+              {cartCollectability.kind === "unavailable" && (
+                <p className="text-xs text-amber-400 mt-1">
+                  {unavailableInstallmentIds.length === 1 ? "1 cuota del carrito no está disponible" : `${unavailableInstallmentIds.length} cuotas del carrito no están disponibles`}{" "}
+                  para cobrar con esta fecha de pago. Quitalas o cambiá la fecha para continuar.
+                </p>
+              )}
+              {cartCollectability.kind === "checking" && (
+                <p className="text-xs text-white/40 mt-1">Validando las cuotas para esta fecha…</p>
+              )}
+              {cartCollectability.kind === "invalid_date" && (
+                <p className="text-xs text-amber-400 mt-1">Ingresá una fecha de pago válida para validar las cuotas.</p>
+              )}
+              {cartCollectability.kind === "error" && (
+                <p className="text-xs text-red-400 mt-1">
+                  No se pudieron validar las cuotas para esta fecha. Reintentá antes de confirmar.{" "}
+                  <button type="button" onClick={() => setCollectableCheckRetry((n) => n + 1)} className="underline hover:text-red-300">
+                    Reintentar
+                  </button>
+                </p>
+              )}
             </div>
             <div>
               <label className="text-xs text-white/50 block mb-1">Notas</label>

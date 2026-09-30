@@ -67,8 +67,16 @@ async function mkInstallment(policyId: number, number: number, dueDate: string, 
   return i!.id;
 }
 
+// Fecha de pago de referencia de la regla única de cobrabilidad — dentro de
+// la vigencia de mkPolicy (2027-01-01..2027-12-31). Sin ella el endpoint usa
+// "hoy", y estas pólizas de fixture todavía serían futuras.
+const PENDING_REFERENCE_DATE = "2027-06-01";
+
 async function callPending(query: string = "") {
-  const res = await app.fetch(new Request(`http://localhost/api/installments/pending-for-payment${query}`, { headers: authHeaders() }));
+  const withDate = query.includes("paymentDate=")
+    ? query
+    : `${query}${query.startsWith("?") ? "&" : "?"}paymentDate=${PENDING_REFERENCE_DATE}`;
+  const res = await app.fetch(new Request(`http://localhost/api/installments/pending-for-payment${withDate}`, { headers: authHeaders() }));
   return { status: res.status, body: await res.json() };
 }
 
@@ -493,16 +501,18 @@ describe("GET /api/payment-batches — listado", () => {
   test("filtro dateFrom/dateTo funciona", async () => {
     const policyId = await mkPolicy(insuredId, companyId);
     const instId = await mkInstallment(policyId, 1, "2027-06-01", 300);
+    // paymentDate dentro de la vigencia de la póliza de fixture (regla única
+    // de cobrabilidad) — antes usaba 2020, anterior al inicio de la póliza.
     const created = await callPost({
-      insuredId, paymentDate: "2020-01-15", notes: null,
+      insuredId, paymentDate: "2027-01-15", notes: null,
       items: [{ installmentId: instId }], splits: [{ method: "efectivo", amount: 300 }],
     });
     expect(created.status).toBe(201);
 
-    const inRange = await callListBatches(`?insuredId=${insuredId}&dateFrom=2020-01-01&dateTo=2020-01-31`);
+    const inRange = await callListBatches(`?insuredId=${insuredId}&dateFrom=2027-01-01&dateTo=2027-01-31`);
     expect(inRange.body.some((b: any) => b.id === created.body.id)).toBe(true);
 
-    const outOfRange = await callListBatches(`?insuredId=${insuredId}&dateFrom=2021-01-01`);
+    const outOfRange = await callListBatches(`?insuredId=${insuredId}&dateFrom=2027-02-01`);
     expect(outOfRange.body.some((b: any) => b.id === created.body.id)).toBe(false);
   });
 

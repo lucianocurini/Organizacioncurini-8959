@@ -239,8 +239,8 @@ describe("validateInstallmentsEligibility", () => {
   test("rechaza cuota rendered=1", () => {
     expect(() => validateInstallmentsEligibility([ctx({ rendered: 1 })])).toThrow(/ya fue rendida/);
   });
-  test("rechaza póliza cancelada (cuota)", () => {
-    expect(() => validateInstallmentsEligibility([ctx({ policyStatus: "cancelada" })])).toThrow(/cancelada/);
+  test("póliza cancelada (cuota): ya no se decide acá — la decide la regla única de cobrabilidad por fecha efectiva", () => {
+    expect(() => validateInstallmentsEligibility([ctx({ policyStatus: "cancelada" })])).not.toThrow();
   });
   test("acepta pendiente y vencida", () => {
     expect(() => validateInstallmentsEligibility([ctx({ installmentStatus: "pendiente" })])).not.toThrow();

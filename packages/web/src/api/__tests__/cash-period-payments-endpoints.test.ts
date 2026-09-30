@@ -1427,7 +1427,15 @@ describe("GET /policies/cash-period-search", () => {
     await mkFourInstallmentPeriod(policyId, 100000); // nominal 4 * 100000 * 100 = 40.000.000 centavos
     await setPolicyCashAmount(policyId, 38000000);
 
-    const { status, body } = await callSearch({ policyId: String(policyId) });
+    // Regla única de cobrabilidad: con la fecha de hoy la póliza todavía es
+    // futura → el período aparece pero NO elegible, con el motivo.
+    const today = await callSearch({ policyId: String(policyId) });
+    expect(today.body).toHaveLength(1);
+    expect(today.body[0].eligible).toBe(false);
+    expect(today.body[0].ineligibleReasons.join(" ")).toContain("todavía no inició su vigencia");
+
+    // Con una fecha de pago dentro de la vigencia, elegible.
+    const { status, body } = await callSearch({ policyId: String(policyId), paymentDate: "2099-01-15" });
     expect(status).toBe(200);
     expect(body).toHaveLength(1);
     const row = body[0];
@@ -1512,17 +1520,21 @@ describe("GET /policies/cash-period-search", () => {
     await mkFourInstallmentPeriod(policyId, 100000);
     await setPolicyCashAmount(policyId, 38000000);
 
+    // Fecha de pago dentro de la vigencia de la póliza (regla única de
+    // cobrabilidad — antes cobraba en 2027 una póliza que empieza en 2099).
+    const PAY_DATE = "2099-01-15";
+
     // 1. Antes de cobrar: elegible.
-    const before = await callSearch({ policyId: String(policyId) });
+    const before = await callSearch({ policyId: String(policyId), paymentDate: PAY_DATE });
     expect(before.body[0].eligible).toBe(true);
 
     // 2. Se cobra de contado → el período deja de estar elegible (todas las
     // cuotas ahora tienen un payment confirmado vinculado).
     const { body: created } = await callCashPeriodPayment({
-      policyId, rebillingId: null, paymentDate: "2027-06-15",
+      policyId, rebillingId: null, paymentDate: PAY_DATE,
       splits: [{ method: "transferencia", amount: 380000 }],
     });
-    const afterCharge = await callSearch({ policyId: String(policyId) });
+    const afterCharge = await callSearch({ policyId: String(policyId), paymentDate: PAY_DATE });
     expect(afterCharge.body[0].eligible).toBe(false);
     expect(afterCharge.body[0].ineligibleReasons.length).toBeGreaterThan(0);
 
@@ -1536,7 +1548,7 @@ describe("GET /policies/cash-period-search", () => {
     const installmentsAfterCancel = await getInstallments(policyId);
     expect(installmentsAfterCancel.every((i) => i.status === "pendiente")).toBe(true);
 
-    const afterCancel = await callSearch({ policyId: String(policyId) });
+    const afterCancel = await callSearch({ policyId: String(policyId), paymentDate: PAY_DATE });
     expect(afterCancel.body[0].eligible).toBe(true);
     expect(afterCancel.body[0].ineligibleReasons).toEqual([]);
     // El importe configurado se preserva sin cambios durante todo el ciclo.

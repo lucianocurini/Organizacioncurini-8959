@@ -108,6 +108,11 @@ import {
   PaymentBatchRaceConditionError, type BatchChildContextForInsert,
 } from "./payment-batch-shared-inserts";
 import {
+  evaluateInstallmentsCollectability, assertInstallmentsCollectable, InstallmentNotCollectableError,
+  installmentNotCollectableResponse, loadCollectabilityDiagnostics,
+  cashPeriodNotCollectableResponse, hasHistoricalInstallment, CASH_PERIOD_HISTORICAL_INSTALLMENT_MESSAGE,
+} from "./installment-collectability-loader";
+import {
   parseFundingRequest, AccountHolderFundingRequestError, type FundingRequestParseResult,
 } from "../lib/payments/account-holder-funding-request";
 import { FundingRequestFingerprintInputError } from "../lib/payments/account-holder-funding-fingerprint";
@@ -277,13 +282,17 @@ app.put("/insureds/:id", requireAuth(async (c: any) => {
 
 // ─── POLICIES ─────────────────────────────────────────────────────────────────
 app.get("/policies", requireAuth(async (c: any) => {
-  const { q, type, status, companyId } = c.req.query();
+  const { q, type, status, companyId, includeAccessories } = c.req.query();
+  // includeAccessories=1: también pólizas accesorias (parentPolicyId no nulo).
+  // Lo usa "Imputar pago" para ofrecer las mismas pólizas que "Cobrar en
+  // lote" (paridad de la regla de cobrabilidad) — el listado de Pólizas no
+  // lo manda y sigue mostrando solo principales, sin cambios.
   let results = await db
     .select({ policy: policies, company: companies, insured: insureds })
     .from(policies)
     .leftJoin(companies, eq(policies.companyId, companies.id))
     .leftJoin(insureds, eq(policies.insuredId, insureds.id))
-    .where(isNull(policies.parentPolicyId))
+    .where(includeAccessories === "1" ? undefined : isNull(policies.parentPolicyId))
     .orderBy(desc(policies.createdAt))
     .all();
   if (q) {
@@ -322,8 +331,16 @@ app.get("/policies", requireAuth(async (c: any) => {
 app.get("/policies/cash-period-search", requireAuth(async (c: any) => {
   const { insuredId, search, companyId, policyId } = c.req.query();
   const today = toArgentinaCalendarDay();
+  // Fecha de referencia de la regla de cobrabilidad (ver
+  // installment-collectability.ts): la fecha de pago si el caller la manda,
+  // si no hoy. Ya no se filtra por policies.status="activa" (foto nunca
+  // recalculada) — la vigencia real la decide la regla, período por período.
+  const collectabilityDate = c.req.query("paymentDate") || today;
+  if (!isValidCalendarDate(collectabilityDate)) {
+    return c.json({ error: "paymentDate inválida (YYYY-MM-DD)." }, 400);
+  }
 
-  const baseConditions = [eq(policies.status, "activa")];
+  const baseConditions: any[] = [];
   if (insuredId) baseConditions.push(eq(policies.insuredId, Number(insuredId)));
   if (companyId) baseConditions.push(eq(policies.companyId, Number(companyId)));
   if (policyId) baseConditions.push(eq(policies.id, Number(policyId)));
@@ -403,7 +420,27 @@ app.get("/policies/cash-period-search", requireAuth(async (c: any) => {
     const eligibilityRows: CashPeriodInstallmentForEligibility[] = periodInstallmentRows.map((r) => ({
       id: r.id, status: r.status, rendered: r.rendered, hasConfirmedPayment: confirmedInstallmentIds.has(r.id),
     }));
-    const { eligible, reasons } = checkCashPeriodEligibility(eligibilityRows);
+    const eligibility = checkCashPeriodEligibility(eligibilityRows);
+    let eligible = eligibility.eligible;
+    const reasons = [...eligibility.reasons];
+    // Regla única de cobrabilidad: todas las cuotas del período deben ser
+    // cobrables en la fecha de referencia (mismo criterio que POST
+    // /payment-batches/cash-period-payment, que la revalida).
+    // Una cuota anterior a la fecha operativa mínima bloquea el período
+    // completo con el mensaje explícito de período.
+    if (eligible && periodInstallmentIds.length > 0) {
+      const { results } = await evaluateInstallmentsCollectability(db, periodInstallmentIds, collectabilityDate);
+      const failed = [...results.values()].flatMap((r) => (r.collectable ? [] : [r]));
+      const historical = hasHistoricalInstallment(failed.map((r) => r.reason));
+      const messages = [...new Set([
+        ...(historical ? [CASH_PERIOD_HISTORICAL_INSTALLMENT_MESSAGE] : []),
+        ...failed.filter((r) => r.reason !== "ANTERIOR_FECHA_MINIMA").map((r) => r.message),
+      ])];
+      if (messages.length > 0) {
+        eligible = false;
+        reasons.push(...messages);
+      }
+    }
     const nominalAmountCents = periodInstallmentRows.reduce((s, r) => s + Math.round(r.amount * 100), 0);
     const deadline = calculateCashPeriodDeadline(cand.periodStartDate);
 
@@ -2248,7 +2285,28 @@ app.post("/payments", requireAuth(async (c: any) => {
     }
   }
 
-  const [payment] = await db.transaction(async (tx) => {
+  // Regla única de cobrabilidad (misma que "Cobrar en lote"): se valida acá
+  // para responder rápido y OTRA VEZ dentro de la transacción, porque la
+  // cuota/póliza pudo cambiar entre la carga de la pantalla y este POST.
+  // Solo para pagos confirmados (mismo criterio que el chequeo de importe y
+  // de "ya pagada" de arriba): un pago anulado/pendiente no cobra la cuota;
+  // si después se confirma, PUT /payments/:id aplica la misma regla.
+  const collectInstallmentId = body.installmentId && isConfirmed ? Number(body.installmentId) : null;
+  if (collectInstallmentId != null) {
+    try {
+      await assertInstallmentsCollectable(db, [collectInstallmentId], body.paymentDate);
+    } catch (e: any) {
+      if (e instanceof InstallmentNotCollectableError) {
+        const r = installmentNotCollectableResponse(e);
+        return c.json(r.body, r.status);
+      }
+      throw e;
+    }
+  }
+
+  let payment: any;
+  try {
+  [payment] = await db.transaction(async (tx) => {
     const [p] = await tx.insert(payments).values({
       policyId: hasPolicyId ? Number(body.policyId) : null,
       installmentId: body.installmentId ? Number(body.installmentId) : null,
@@ -2265,6 +2323,13 @@ app.post("/payments", requireAuth(async (c: any) => {
       dueDate: body.installmentId ? null : (body.dueDate || null),
       createdBy: user.id,
     }).returning();
+
+    // Revalidación transaccional (después del primer INSERT, mismo patrón que
+    // el re-chequeo de carrera de POST /payment-batches): si la cuota dejó de
+    // ser cobrable, el throw revierte también este insert.
+    if (collectInstallmentId != null) {
+      await assertInstallmentsCollectable(tx, [collectInstallmentId], body.paymentDate, { excludePaymentIds: [p!.id] });
+    }
 
     // Splits uno por uno (no bulk) porque un split cheque necesita su propio
     // id ya generado antes de poder insertar los cheques que cuelgan de él
@@ -2323,6 +2388,13 @@ app.post("/payments", requireAuth(async (c: any) => {
 
     return [p];
   });
+  } catch (e: any) {
+    if (e instanceof InstallmentNotCollectableError) {
+      const r = installmentNotCollectableResponse(e);
+      return c.json(r.body, r.status);
+    }
+    throw e;
+  }
 
   const splitsRows = await db.select().from(paymentSplits).where(eq(paymentSplits.paymentId, payment.id)).all();
   const splitIds = splitsRows.map((s) => s.id);
@@ -2565,13 +2637,46 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
   const newInstallmentId = "installmentId" in update ? update.installmentId : current.installmentId;
   const shouldRecalcInstallment = ("installmentId" in update) || ("status" in update) || ("amount" in update);
 
-  const [payment] = await db.transaction(async (tx) => {
+  // Regla única de cobrabilidad: el pago resultante COBRA una cuota nueva
+  // cuando queda confirmado y (a) se movió a OTRA cuota, o (b) pasa a
+  // confirmado desde otro estado — se valida igual que POST /payments (antes
+  // y dentro de la transacción). Editar otros campos de un pago ya
+  // confirmado sobre la misma cuota no es un cobro nuevo y no pasa por acá.
+  // (c) Si sigue confirmado sobre la MISMA cuota pero cambia paymentDate, la
+  // cuota se revalida con la fecha nueva (modo existingCollection: la cuota
+  // está "pagada" por este mismo pago). Notas u otros datos que no afectan la
+  // cobrabilidad no revalidan.
+  const startsCollectingInstallment = newInstallmentId != null && effectiveStatus === "confirmado"
+    && (Number(newInstallmentId) !== oldInstallmentId || current.status !== "confirmado");
+  const changesDateOfCollection = !startsCollectingInstallment && newInstallmentId != null
+    && effectiveStatus === "confirmado" && effectivePaymentDate !== current.paymentDate;
+  const collectabilityInstallmentId = startsCollectingInstallment || changesDateOfCollection ? Number(newInstallmentId) : null;
+  const collectabilityOpts = { excludePaymentIds: [id], existingCollection: changesDateOfCollection };
+  if (collectabilityInstallmentId != null) {
+    try {
+      await assertInstallmentsCollectable(db, [collectabilityInstallmentId], effectivePaymentDate, collectabilityOpts);
+    } catch (e: any) {
+      if (e instanceof InstallmentNotCollectableError) {
+        const r = installmentNotCollectableResponse(e);
+        return c.json(r.body, r.status);
+      }
+      throw e;
+    }
+  }
+
+  let payment: any;
+  try {
+  [payment] = await db.transaction(async (tx) => {
     // `update` puede quedar vacío si el body solo trae applyProntoPagoSurcharge
     // (sin ningún campo de la tabla payments) — drizzle no acepta un
     // .set({}) vacío, así que en ese caso no se toca `payments` en absoluto.
     const [p] = Object.keys(update).length > 0
       ? await tx.update(payments).set(update).where(eq(payments.id, id)).returning()
       : [current];
+
+    if (collectabilityInstallmentId != null) {
+      await assertInstallmentsCollectable(tx, [collectabilityInstallmentId], effectivePaymentDate, collectabilityOpts);
+    }
 
     if (bodyHasSplits && normalizedSplitUpdate) {
       // Etapa 3B: reemplazo completo del desglose (no diff por id) — se
@@ -2693,6 +2798,13 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
 
     return [p];
   });
+  } catch (e: any) {
+    if (e instanceof InstallmentNotCollectableError) {
+      const r = installmentNotCollectableResponse(e);
+      return c.json(r.body, r.status);
+    }
+    throw e;
+  }
 
   const splitsRows = await db.select().from(paymentSplits).where(eq(paymentSplits.paymentId, payment.id)).all();
   return c.json({ ...payment, splits: splitsRows }, 200);
@@ -2749,11 +2861,20 @@ app.delete("/payments/:id", requireAuth(async (c: any) => {
 // a validar todo desde cero antes de escribir.
 app.get("/installments/pending-for-payment", requireAuth(async (c: any) => {
   const { insuredId, search, companyId, policyId } = c.req.query();
+  // Fecha de referencia de la regla de cobrabilidad: la fecha de pago que el
+  // usuario va a usar (el modal de confirmación la reenvía al cambiarla); sin
+  // ella, hoy en Argentina. Mismo helper que valida el POST — ver
+  // installment-collectability.ts. Ya NO se filtra por policies.status: es
+  // una foto que nadie recalcula (excluía por_vencer/renovada vigentes e
+  // incluía vencidas marcadas "activa").
+  const paymentDate = c.req.query("paymentDate") || toArgentinaCalendarDay();
+  if (!isValidCalendarDate(paymentDate)) {
+    return c.json({ error: "paymentDate inválida (YYYY-MM-DD)." }, 400);
+  }
 
   const conditions = [
     inArray(policyInstallments.status, ["pendiente", "vencida"]),
     eq(policyInstallments.rendered, 0),
-    eq(policies.status, "activa"),
   ];
   if (insuredId) conditions.push(eq(policies.insuredId, Number(insuredId)));
   if (companyId) conditions.push(eq(policies.companyId, Number(companyId)));
@@ -2794,6 +2915,16 @@ app.get("/installments/pending-for-payment", requireAuth(async (c: any) => {
     rows = rows.filter((r) => !confirmedIds.has(r.installmentId));
   }
 
+  // Regla única de cobrabilidad (vigencia, cadena de renovación, fecha
+  // operativa mínima, cancelaciones) — exactamente la misma que revalidan los
+  // POST dentro de su transacción.
+  const viaByInstallmentId = new Map<number, string>();
+  if (rows.length > 0) {
+    const { results } = await evaluateInstallmentsCollectability(db, rows.map((r) => r.installmentId), paymentDate);
+    for (const [id, r] of results) if (r.collectable) viaByInstallmentId.set(id, r.via);
+    rows = rows.filter((r) => viaByInstallmentId.has(r.installmentId));
+  }
+
   if (search) {
     const needle = String(search).toLowerCase();
     rows = rows.filter((r) =>
@@ -2825,9 +2956,23 @@ app.get("/installments/pending-for-payment", requireAuth(async (c: any) => {
   const result = rows.map((r) => ({
     ...r,
     parentPolicyNumber: r.parentPolicyId != null ? (parentNumberById.get(r.parentPolicyId) ?? null) : null,
+    collectabilityVia: viaByInstallmentId.get(r.installmentId)!,
   }));
 
   return c.json(result, 200);
+}));
+
+// Diagnóstico administrativo de la regla de cobrabilidad: SOLO conteos (sin
+// nombres, números de póliza ni ids) de cuotas pendientes/vencidas no
+// rendidas que quedan fuera de Cobranzas y de anomalías de pólizas/cadenas
+// (cancelada sin fecha efectiva, renovada sin sucesor, enlaces rotos,
+// cadenas ambiguas). Separado a propósito del listado de cuotas cobrables.
+app.get("/installments/collectability-diagnostics", requireAdmin(async (c: any) => {
+  const paymentDate = c.req.query("paymentDate") || toArgentinaCalendarDay();
+  if (!isValidCalendarDate(paymentDate)) {
+    return c.json({ error: "paymentDate inválida (YYYY-MM-DD)." }, 400);
+  }
+  return c.json(await loadCollectabilityDiagnostics(db, paymentDate), 200);
 }));
 
 // ─── PAYMENT BATCHES (Etapa 4A/4B + cobro manual real) ─────────────────────────
@@ -3146,6 +3291,20 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
     throw e;
   }
 
+  // Regla única de cobrabilidad (vigencia, cadena de renovación, fecha
+  // operativa mínima, cancelaciones) — la misma que filtra
+  // GET /installments/pending-for-payment y que valida POST /payments. Se
+  // repite DENTRO de la transacción (legacy y titular), ver más abajo.
+  try {
+    await assertInstallmentsCollectable(db, installmentIds, body.paymentDate);
+  } catch (e: any) {
+    if (e instanceof InstallmentNotCollectableError) {
+      const r = installmentNotCollectableResponse(e);
+      return c.json(r.body, r.status);
+    }
+    throw e;
+  }
+
   // 6. Base = suma de las cuotas (importe exacto de cada una, sin parciales
   // — el body nunca manda un importe por cuota, ver normalizeBatchItems).
   const baseAmountCents = calculateBaseAmountCents(contexts);
@@ -3415,6 +3574,10 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
     // punto, se aborta acá — el rollback deshace también el insert del batch
     // recién hecho, así que no queda nada a medias.
     await checkInstallmentPaymentRace(tx, installmentIds);
+    // Regla única de cobrabilidad, revalidada con el estado real dentro de la
+    // transacción: si algo cambió desde la validación de arriba, el throw
+    // revierte también el insert del batch.
+    await assertInstallmentsCollectable(tx, installmentIds, body.paymentDate);
 
     // Splits uno por uno (no bulk) porque cada split cheque necesita su
     // propio id ya generado antes de poder insertar los cheques que cuelgan
@@ -3474,6 +3637,10 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
   } catch (e: any) {
     if (e instanceof PaymentBatchRaceConditionError) {
       return c.json({ error: e.message, blockingInstallmentIds: e.installmentIds }, 409);
+    }
+    if (e instanceof InstallmentNotCollectableError) {
+      const r = installmentNotCollectableResponse(e);
+      return c.json(r.body, r.status);
     }
     // Contención real de escritura (dos requests verdaderamente simultáneas
     // — no solo secuenciales, ver "LÍMITE CONOCIDO" arriba). SQLite/libsql
@@ -3625,6 +3792,20 @@ app.post("/payment-batches/cash-period-payment", requireAuth(async (c: any) => {
     }
     throw e;
   }
+  // Regla única de cobrabilidad aplicada a TODAS las cuotas del período
+  // (todo o nada, igual que la elegibilidad de arriba) — mismo criterio que
+  // el cobro individual y por lote. Se repite dentro de la transacción.
+  // Una cuota anterior a la fecha operativa mínima bloquea el período entero
+  // con un mensaje explícito (cashPeriodNotCollectableResponse).
+  try {
+    await assertInstallmentsCollectable(db, periodInstallmentIds, body.paymentDate);
+  } catch (e: any) {
+    if (e instanceof InstallmentNotCollectableError) {
+      const r = cashPeriodNotCollectableResponse(e);
+      return c.json(r.body, r.status);
+    }
+    throw e;
+  }
 
   // 4. Nominal real + snapshot (Regla 3 revalidada siempre acá, nunca solo
   // al cargar el dato — el plan pudo haberse reconstruido después).
@@ -3734,6 +3915,7 @@ app.post("/payment-batches/cash-period-payment", requireAuth(async (c: any) => {
       if (raceCheck.length > 0) {
         throw new PaymentBatchRaceConditionError(raceCheck.map((p: any) => p.installmentId));
       }
+      await assertInstallmentsCollectable(tx, periodInstallmentIds, body.paymentDate);
 
       for (const { split, checks } of splitsWithChecks) {
         const [insertedSplit] = await tx.insert(paymentBatchSplits).values({
@@ -3797,6 +3979,10 @@ app.post("/payment-batches/cash-period-payment", requireAuth(async (c: any) => {
   } catch (e: any) {
     if (e instanceof PaymentBatchRaceConditionError) {
       return c.json({ error: e.message, blockingInstallmentIds: e.installmentIds }, 409);
+    }
+    if (e instanceof InstallmentNotCollectableError) {
+      const r = cashPeriodNotCollectableResponse(e);
+      return c.json(r.body, r.status);
     }
     const code = e?.code ?? e?.cause?.code;
     if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") {
@@ -4504,7 +4690,7 @@ app.patch("/payment-batches/:id", requireAuth(async (c: any) => {
   const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, id)).get();
   if (!batch) return c.json({ error: "Cobro no encontrado" }, 404);
 
-  const childRows = await db.select({ id: payments.id, status: payments.status, rendered: payments.rendered })
+  const childRows = await db.select({ id: payments.id, status: payments.status, rendered: payments.rendered, installmentId: payments.installmentId })
     .from(payments).where(eq(payments.batchId, id)).all();
   const childPayments: BatchCancelChildPayment[] = childRows.map((r) => ({ id: r.id, status: r.status, rendered: r.rendered }));
 
@@ -4517,8 +4703,37 @@ app.patch("/payment-batches/:id", requireAuth(async (c: any) => {
   if ("paymentDate" in body) update.paymentDate = body.paymentDate;
   if ("notes" in body) update.notes = body.notes || null;
 
-  const [updated] = await db.update(paymentBatches).set(update).where(eq(paymentBatches.id, id)).returning();
-  return c.json(updated, 200);
+  // Regla única de cobrabilidad: si cambia paymentDate, TODAS las cuotas que
+  // cobran los hijos confirmados del lote se revalidan con la fecha
+  // resultante (modo existingCollection: están "pagadas" por este mismo
+  // lote), antes y dentro de la transacción. Si alguna no cumple, se rechaza
+  // todo y el lote queda intacto. Solo notas → no se revalida.
+  const changesPaymentDate = "paymentDate" in body && body.paymentDate !== batch.paymentDate;
+  const confirmedChildren = childRows.filter((r) => r.status === "confirmado");
+  const revalidateInstallmentIds = changesPaymentDate
+    ? [...new Set(confirmedChildren.flatMap((r) => (r.installmentId != null ? [r.installmentId] : [])))]
+    : [];
+  const collectabilityOpts = { excludePaymentIds: confirmedChildren.map((r) => r.id), existingCollection: true };
+
+  try {
+    if (revalidateInstallmentIds.length > 0) {
+      await assertInstallmentsCollectable(db, revalidateInstallmentIds, body.paymentDate, collectabilityOpts);
+    }
+    const updated = await db.transaction(async (tx) => {
+      const [u] = await tx.update(paymentBatches).set(update).where(eq(paymentBatches.id, id)).returning();
+      if (revalidateInstallmentIds.length > 0) {
+        await assertInstallmentsCollectable(tx, revalidateInstallmentIds, body.paymentDate, collectabilityOpts);
+      }
+      return u;
+    });
+    return c.json(updated, 200);
+  } catch (e: any) {
+    if (e instanceof InstallmentNotCollectableError) {
+      const r = installmentNotCollectableResponse(e);
+      return c.json(r.body, r.status);
+    }
+    throw e;
+  }
 }));
 
 // ─── RECEIVED CHECKS — cartera de cheques (Etapa 4B) ───────────────────────────

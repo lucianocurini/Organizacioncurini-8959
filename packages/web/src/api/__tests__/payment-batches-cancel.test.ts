@@ -359,7 +359,9 @@ describe("POST /payment-batches/:id/cancel", () => {
   });
 
   test("8. cuota con vencimiento pasado vuelve a vencida (no a pendiente)", async () => {
-    const { batchId, instId } = await createSimpleBatch("2020-01-01", 500);
+    // Vencimiento ya pasado respecto de hoy pero >= 2026-07-01 (fecha operativa
+    // mínima de la regla única de cobrabilidad — antes usaba 2020-01-01).
+    const { batchId, instId } = await createSimpleBatch("2026-08-01", 500);
     const { status } = await callCancel(batchId, { confirm: true });
     expect(status).toBe(200);
     const inst = await getInstallment(instId);

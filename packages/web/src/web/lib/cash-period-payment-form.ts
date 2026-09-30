@@ -100,6 +100,20 @@ export interface CashPeriodSearchRow {
   ineligibleReasons: string[];
 }
 
+/**
+ * URL de GET /policies/cash-period-search para la póliza elegida, evaluada
+ * con la fecha de pago elegida (regla única de cobrabilidad). Es la MISMA
+ * fecha que después viaja en el POST /payment-batches/cash-period-payment
+ * (CashPeriodPaymentModal la recibe fija), así búsqueda y cobro nunca
+ * evalúan fechas distintas.
+ */
+export function buildCashPeriodSearchQuery(params: { policyId: string | number; paymentDate: string }): string {
+  const qs = new URLSearchParams();
+  qs.set("policyId", String(params.policyId));
+  qs.set("paymentDate", params.paymentDate);
+  return `/api/policies/cash-period-search?${qs.toString()}`;
+}
+
 /** Clave estable para <select>/keys de React — nunca colisiona entre emisión y refacturaciones de la misma póliza. */
 export function cashPeriodCandidateKey(c: Pick<CashPeriodSearchRow, "policyId" | "rebillingId">): string {
   return `${c.policyId}-${c.rebillingId ?? "emision"}`;

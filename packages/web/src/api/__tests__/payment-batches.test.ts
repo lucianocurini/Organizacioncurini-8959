@@ -372,7 +372,11 @@ describe("6. Cuota ya pagada → rechazo", () => {
 });
 
 describe("7. Póliza cancelada → rechazo", () => {
-  test("policy.status='cancelada' → 409", async () => {
+  // Regla única de cobrabilidad (2026-09-25): la cancelación de la cuota ya no
+  // se decide por status en validateInstallmentsEligibility (409), sino por la
+  // regla compartida con el cobro individual — una cancelada SIN fecha
+  // efectiva válida se bloquea con 400 INSTALLMENT_NOT_COLLECTABLE.
+  test("policy.status='cancelada' sin fecha efectiva → 400 INSTALLMENT_NOT_COLLECTABLE", async () => {
     const policyId = await mkPolicy(insuredId, companyId);
     await db.update(policies).set({ status: "cancelada" }).where(eq(policies.id, policyId));
     const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
@@ -382,8 +386,9 @@ describe("7. Póliza cancelada → rechazo", () => {
       items: [{ installmentId: instId }],
       splits: [{ method: "efectivo", amount: 1000 }],
     });
-    expect(status).toBe(409);
-    expect(body.error).toContain("cancelada");
+    expect(status).toBe(400);
+    expect(body.code).toBe("INSTALLMENT_NOT_COLLECTABLE");
+    expect(body.failures).toEqual([{ installmentId: instId, reason: "CANCELADA_SIN_FECHA_EFECTIVA" }]);
   });
 });
 

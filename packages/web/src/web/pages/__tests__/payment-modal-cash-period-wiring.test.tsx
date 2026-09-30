@@ -10,8 +10,9 @@
 //
 // Monta <PaymentModal> con react-dom/client sobre un DOM jsdom aislado
 // (creado en este archivo, no global) y un `fetch` mockeado que responde a
-// los 3 endpoints reales que dispara el flujo: GET /policies,
-// GET /policies/:id/installments, GET /policies/cash-period-search.
+// los endpoints reales que dispara el flujo: GET /policies?includeAccessories=1,
+// GET /installments/pending-for-payment (cuotas cobrables de un pago nuevo),
+// GET /policies/cash-period-search.
 // Ejecutar con: bun test packages/web/src/web/pages/__tests__/payment-modal-cash-period-wiring.test.tsx
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { JSDOM } from "jsdom";
@@ -90,10 +91,17 @@ function mockFetch(cashPeriodSearchResponse: any[]) {
     if (url.startsWith("/api/policies/cash-period-search")) {
       return jsonResponse(cashPeriodSearchResponse) as any;
     }
+    // Regla única de cobrabilidad: un pago NUEVO toma las cuotas cobrables de
+    // GET /installments/pending-for-payment (misma fuente que Cobrar en lote).
+    if (url.startsWith("/api/installments/pending-for-payment")) {
+      return jsonResponse(INSTALLMENTS_RESPONSE.map((i) => ({
+        installmentId: i.id, installmentNumber: i.number, dueDate: i.dueDate, amount: i.amount, status: i.status, policyId: i.policyId,
+      }))) as any;
+    }
     if (/\/api\/policies\/\d+\/installments/.test(url)) {
       return jsonResponse(INSTALLMENTS_RESPONSE) as any;
     }
-    if (url === "/api/policies") {
+    if (url === "/api/policies" || url === "/api/policies?includeAccessories=1") {
       return jsonResponse(POLICIES_RESPONSE) as any;
     }
     throw new Error(`Unmocked fetch in test: ${url}`);

@@ -3,7 +3,6 @@ import { api } from "@/lib/api";
 import { toast } from "sonner";
 import { X, Banknote, CheckCircle2, AlertTriangle } from "lucide-react";
 import { formatCurrency, formatCurrencyCents, formatDate } from "@/lib/utils";
-import { toArgentinaCalendarDay } from "../../../lib/dates/argentina-date";
 import {
   createBatchSplitRow, addBatchSplitRow, removeBatchSplitRow, updateBatchSplitRow,
   syncSingleBatchSplitAmount, addCheckToSplit, removeCheckFromSplit, updateCheckInSplit,
@@ -21,6 +20,13 @@ import { CheckSubForm } from "@/components/payments/CheckSubForm";
 interface Props {
   policyNumber: string;
   group: CashPeriodGroup;
+  /**
+   * Fecha de pago con la que "Imputar pago" evaluó el período
+   * (GET /policies/cash-period-search?paymentDate=). Es fija acá y es la que
+   * viaja en el POST: búsqueda y cobro evalúan exactamente la misma fecha.
+   * Para cambiarla, "Volver" y elegirla en Imputar pago (que re-evalúa).
+   */
+  paymentDate: string;
   onClose: () => void;
   onSaved: () => void;
 }
@@ -33,8 +39,7 @@ const METHODS = [
   { value: "link_pago", label: "Link de pago" },
 ];
 
-export function CashPeriodPaymentModal({ policyNumber, group, onClose, onSaved }: Props) {
-  const [paymentDate, setPaymentDate] = useState(toArgentinaCalendarDay());
+export function CashPeriodPaymentModal({ policyNumber, group, paymentDate, onClose, onSaved }: Props) {
   const [splits, setSplits] = useState<BatchSplitFormRow[]>([
     syncSingleBatchSplitAmount([createBatchSplitRow("efectivo", "")], String(group.cashAmountCents / 100))[0]!,
   ]);
@@ -238,8 +243,9 @@ export function CashPeriodPaymentModal({ policyNumber, group, onClose, onSaved }
 
         <div className="px-6 pb-6 pt-3 space-y-4">
           <div>
-            <label className={lbl}>Fecha de cobro *</label>
-            <input type="date" className={inp} value={paymentDate} onChange={e => setPaymentDate(e.target.value)} required />
+            <label className={lbl}>Fecha de cobro</label>
+            <p className="text-sm text-white">{formatDate(paymentDate)}</p>
+            <p className="text-xs text-gray-500 mt-0.5">Es la fecha con la que se evaluó el período. Para cambiarla, volvé a Imputar pago.</p>
           </div>
 
           <div className="border border-[#1f2937] rounded-xl p-4 bg-[#0d1424] space-y-3">

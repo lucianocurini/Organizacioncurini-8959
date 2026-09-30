@@ -257,7 +257,9 @@ async function main(): Promise<void> {
     const dupId = await mkInstallment(policyId, "2027-06-01", 1000, "duplicada");
     const realId = await mkInstallment(policyId, "2027-07-01", 1000, "pendiente");
 
-    const res = await app.fetch(new Request(`http://localhost/api/installments/pending-for-payment?policyId=${policyId}`, { headers: authHeaders() }));
+    // paymentDate dentro de la vigencia de mkPolicy (2027): la regla única de
+    // cobrabilidad usa "hoy" si no se indica, y la póliza de fixture sería futura.
+    const res = await app.fetch(new Request(`http://localhost/api/installments/pending-for-payment?policyId=${policyId}&paymentDate=2027-06-01`, { headers: authHeaders() }));
     const body: any[] = await res.json();
     const ids = body.map((r) => r.installmentId);
     if (ids.includes(dupId)) throw new Error("la cuota duplicada aparece en pending-for-payment");

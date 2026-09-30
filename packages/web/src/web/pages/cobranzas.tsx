@@ -30,9 +30,18 @@ import {
 import {
   type CashPeriodGroup, type CashPeriodSearchRow,
   resolveCashPeriodModalityAvailability, resolveSelectedCashPeriodCandidate,
-  buildCashPeriodGroupFromCandidate, cashPeriodCandidateKey, cashPeriodCandidateLabel,
+  buildCashPeriodGroupFromCandidate, cashPeriodCandidateKey, cashPeriodCandidateLabel, buildCashPeriodSearchQuery,
 } from "@/lib/cash-period-payment-form";
 import { CashPeriodPaymentModal } from "@/components/policies/CashPeriodPaymentModal";
+import {
+  buildPendingForPaymentQuery, toInstallmentOptions, isSelectedInstallmentStillCollectable, looksLikeIsoDate,
+  detachUnavailableInstallment, INSTALLMENT_NO_LONGER_AVAILABLE_MESSAGE,
+} from "@/lib/collectable-installments";
+
+/** Póliza + fecha de pago para las que se cargaron los candidatos de contado. */
+function cashPeriodSearchKeyFor(policyId: string, paymentDate: string): string {
+  return `${policyId}|${paymentDate}`;
+}
 
 function formatCurrency(v: number, short = false) {
   if (short) {
@@ -173,6 +182,8 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
   // se reimplementa un segundo editor de medios para contado acá (Regla:
   // "única lógica de negocio y un único resultado").
   const [cashPeriodTarget, setCashPeriodTarget] = useState<CashPeriodGroup | null>(null);
+  const [cashPeriodSearchKey, setCashPeriodSearchKey] = useState<string | null>(null);
+  const [cashPeriodSearchLoading, setCashPeriodSearchLoading] = useState(false);
 
   const [form, setForm] = useState({
     policyId: "",
@@ -189,9 +200,24 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
     status: "confirmado",
   });
 
+  // Aviso cuando la cuota elegida deja de ser cobrable al cambiar la fecha de
+  // pago (se limpian cuota, vencimiento e importe; el backend igual la
+  // rechazaría con 400). Mientras esté activo, "Imputar pago" queda bloqueado:
+  // se desactiva al elegir otra cuota o al volver a escribir un importe
+  // (pago consciente sin cuota), o al cambiar de póliza.
+  const [installmentNoLongerAvailable, setInstallmentNoLongerAvailable] = useState(false);
+  // Última respuesta OK de pending-for-payment, atada a la póliza y fecha con
+  // que se pidió: la desvinculación solo se decide con la lista de la póliza
+  // y fecha actuales (nunca con una de otra fecha, ni tras un error de red).
+  const [collectableOptions, setCollectableOptions] = useState<{ policyId: string; paymentDate: string; options: { id: number }[] } | null>(null);
+
   useEffect(() => {
     if (!open) return;
-    api.get("/api/policies").then(setPolicies).catch(() => {});
+    // includeAccessories=1: mismas pólizas que "Cobrar en lote" (paridad de
+    // la regla de cobrabilidad — las accesorias también tienen cuotas).
+    api.get("/api/policies?includeAccessories=1").then(setPolicies).catch(() => {});
+    setInstallmentNoLongerAvailable(false);
+    setCollectableOptions(null);
     // Reset de modalidad: cada apertura del modal arranca en "cuota" — nunca
     // se arrastra una elección de contado de una sesión anterior del modal.
     setPaymentModality("cuota");
@@ -245,29 +271,86 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
     }
   }, [open, editing]);
 
-  // Load installments when policy changes
+  // Cuotas de la póliza elegida. Pago NUEVO: solo las cobrables según la
+  // regla única, para la fecha de pago elegida (misma fuente que "Cobrar en
+  // lote": GET /installments/pending-for-payment) — se vuelve a pedir al
+  // cambiar la fecha, y si la cuota ya elegida dejó de ser cobrable se
+  // desvincula. Edición de un pago existente: sin cambios (su cuota actual
+  // ya está pagada por este mismo pago; PUT revalida si se mueve a otra).
   useEffect(() => {
-    if (form.policyId) {
+    if (!form.policyId) { setInstallments([]); return; }
+    if (editing) {
       api.get(`/api/policies/${form.policyId}/installments`).then(setInstallments).catch(() => setInstallments([]));
-    } else {
-      setInstallments([]);
+      return;
     }
-  }, [form.policyId]);
+    if (!looksLikeIsoDate(form.paymentDate)) return;
+    let cancelled = false;
+    const policyId = form.policyId;
+    const paymentDate = form.paymentDate;
+    api.get(buildPendingForPaymentQuery({ policyId, paymentDate }))
+      .then((rows: any[]) => {
+        if (cancelled) return;
+        const options = toInstallmentOptions(rows);
+        setInstallments(options);
+        setCollectableOptions({ policyId, paymentDate, options });
+      })
+      .catch(() => { if (!cancelled) setInstallments([]); });
+    return () => { cancelled = true; };
+  }, [form.policyId, form.paymentDate, editing]);
 
-  // Modalidad de pago: se consulta al elegir póliza — solo para pagos NUEVOS
-  // vinculados a póliza (editar un pago existente, o imputación manual,
-  // nunca ofrecen contado). Cambiar de póliza siempre vuelve a "cuota": la
-  // elección de un período no puede sobrevivir a un cambio de póliza.
+  // Desvinculación de la cuota elegida si dejó de ser cobrable. Se decide con
+  // el formulario ya confirmado (no dentro de un updater de setForm) y las
+  // dos actualizaciones corren por separado. Sin bucle: tras desvincular,
+  // installmentId queda "" y la condición ya no se cumple.
+  useEffect(() => {
+    if (editing || !collectableOptions) return;
+    if (collectableOptions.policyId !== form.policyId || collectableOptions.paymentDate !== form.paymentDate) return;
+    if (isSelectedInstallmentStillCollectable(form.installmentId, collectableOptions.options)) return;
+    setInstallmentNoLongerAvailable(true);
+    setForm((f) => {
+      const detached = detachUnavailableInstallment(f);
+      return { ...detached, splits: syncSingleBatchSplitAmount(f.splits, detached.amount) };
+    });
+  }, [collectableOptions, form.policyId, form.paymentDate, form.installmentId, editing]);
+
+  // Modalidad de pago: solo para pagos NUEVOS vinculados a póliza (editar un
+  // pago existente, o imputación manual, nunca ofrecen contado). Cambiar de
+  // póliza siempre vuelve a "cuota": la elección de un período no puede
+  // sobrevivir a un cambio de póliza.
   useEffect(() => {
     setPaymentModality("cuota");
     setSelectedCashPeriodKey("");
-    if (form.policyId && !editing) {
-      api.get(`/api/policies/cash-period-search?policyId=${form.policyId}`)
-        .then(setCashPeriodCandidates).catch(() => setCashPeriodCandidates([]));
-    } else {
-      setCashPeriodCandidates([]);
-    }
+    setCashPeriodCandidates([]);
+    setCashPeriodSearchKey(null);
   }, [form.policyId, editing]);
+
+  // Candidatos de contado evaluados con la fecha de pago elegida (regla única
+  // de cobrabilidad) — se vuelven a pedir al cambiar la fecha. Esa misma
+  // fecha es la que CashPeriodPaymentModal manda en el POST, así búsqueda y
+  // cobro evalúan exactamente el mismo día. cashPeriodSearchKey marca para
+  // qué póliza+fecha son los candidatos cargados: mientras no coincida con la
+  // actual (consulta en curso, fecha inválida), "Continuar" queda bloqueado.
+  // cancelled: la respuesta de una fecha anterior nunca pisa la actual.
+  useEffect(() => {
+    if (!form.policyId || editing) { setCashPeriodSearchLoading(false); return; }
+    if (!looksLikeIsoDate(form.paymentDate)) { setCashPeriodSearchLoading(false); return; }
+    const key = cashPeriodSearchKeyFor(form.policyId, form.paymentDate);
+    let cancelled = false;
+    setCashPeriodSearchLoading(true);
+    api.get(buildCashPeriodSearchQuery({ policyId: form.policyId, paymentDate: form.paymentDate }))
+      .then((rows: unknown) => {
+        if (cancelled) return;
+        setCashPeriodCandidates(Array.isArray(rows) ? (rows as CashPeriodSearchRow[]) : []);
+        setCashPeriodSearchKey(key);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setCashPeriodCandidates([]);
+        setCashPeriodSearchKey(key);
+      })
+      .finally(() => { if (!cancelled) setCashPeriodSearchLoading(false); });
+    return () => { cancelled = true; };
+  }, [form.policyId, form.paymentDate, editing]);
 
   const filteredPolicies = policies.filter(p =>
     p.policy.policyNumber.toLowerCase().includes(policySearch.toLowerCase()) ||
@@ -282,6 +365,16 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
   const selectedCashPeriodCandidate = cashPeriodAvailability.kind === "available"
     ? resolveSelectedCashPeriodCandidate(cashPeriodAvailability.eligibleCandidates, selectedCashPeriodKey)
     : undefined;
+  // Los candidatos cargados corresponden a la póliza y fecha actuales.
+  const cashPeriodSearchIsCurrent = !cashPeriodSearchLoading
+    && cashPeriodSearchKey === cashPeriodSearchKeyFor(form.policyId, form.paymentDate);
+  // Si con la fecha nueva ya no hay período elegible, vuelve a "cuota" (si
+  // no, el formulario quedaría sin campos visibles).
+  useEffect(() => {
+    if (paymentModality === "contado" && cashPeriodSearchIsCurrent && cashPeriodAvailability.kind !== "available") {
+      setPaymentModality("cuota");
+    }
+  }, [paymentModality, cashPeriodSearchIsCurrent, cashPeriodAvailability.kind]);
   const showCuotaFields = manualMode || paymentModality === "cuota";
 
   // Etapa 3B-2: validación completa de la sección de splits — se usa tanto
@@ -295,6 +388,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
   const targetAmountCents = Math.round(Number(form.amount) * 100);
   const splitsValidation = validateBatchSplitsForm(targetAmountCents, form.splits);
   const splitTotals = computeSplitTotals(form.amount, form.splits);
+  const blockedByUnavailableInstallment = !editing && !manualMode && installmentNoLongerAvailable;
 
   // Si el grupo deja de ser "own" (ej. el usuario cambia todas las filas a
   // directo a compañía), el recargo Pronto Pago no puede seguir marcado.
@@ -312,6 +406,10 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
     }
     if (manualMode && !form.manualPayer && !form.manualPolicyNumber) {
       toast.error("Completá al menos el pagador o N° de póliza manual");
+      return;
+    }
+    if (blockedByUnavailableInstallment) {
+      toast.error(INSTALLMENT_NO_LONGER_AVAILABLE_MESSAGE);
       return;
     }
     if (!form.amount || !form.paymentDate) {
@@ -395,6 +493,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
       <CashPeriodPaymentModal
         policyNumber={selectedPolicy?.policy.policyNumber ?? ""}
         group={cashPeriodTarget}
+        paymentDate={form.paymentDate}
         onClose={() => setCashPeriodTarget(null)}
         onSaved={() => { onSaved(); onClose(); }}
       />
@@ -452,7 +551,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
                       </div>
                       {filteredPolicies.map(p => (
                         <button key={p.policy.id} type="button"
-                          onClick={() => { setForm(f => ({ ...f, policyId: String(p.policy.id), installmentId: "" })); setPolicyOpen(false); setPolicySearch(""); }}
+                          onClick={() => { setForm(f => ({ ...f, policyId: String(p.policy.id), installmentId: "" })); setInstallmentNoLongerAvailable(false); setPolicyOpen(false); setPolicySearch(""); }}
                           className="w-full text-left px-3 py-2 text-sm hover:bg-[#1a2540] transition-colors">
                           <span className="text-white">{p.policy.policyNumber}</span>
                           <span className="text-gray-400 ml-2">— {p.insured?.name}</span>
@@ -502,6 +601,18 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
 
                   {paymentModality === "contado" && (
                     <div className="space-y-3 p-3 bg-emerald-500/5 border border-emerald-500/20 rounded-lg">
+                      {/* Misma fecha de pago del formulario: con ella se
+                          evalúa el período y con ella se registra el cobro. */}
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">Fecha de pago *</label>
+                        <input type="date" value={form.paymentDate} onChange={e => setForm(f => ({ ...f, paymentDate: e.target.value }))}
+                          className="w-full px-3 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-blue-500" />
+                        {!cashPeriodSearchIsCurrent && (
+                          <p className="text-xs text-gray-500 mt-1">
+                            {looksLikeIsoDate(form.paymentDate) ? "Validando el período para esta fecha…" : "Ingresá una fecha de pago válida."}
+                          </p>
+                        )}
+                      </div>
                       {cashPeriodAvailability.eligibleCandidates.length > 1 && (
                         <div>
                           <label className="block text-xs text-gray-400 mb-1">Período / refacturación</label>
@@ -547,8 +658,9 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
                             </div>
                           </div>
                           <button type="button"
+                            disabled={!cashPeriodSearchIsCurrent}
                             onClick={() => setCashPeriodTarget(buildCashPeriodGroupFromCandidate(selectedCashPeriodCandidate))}
-                            className="w-full py-2 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition-all">
+                            className="w-full py-2 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition-all disabled:opacity-50">
                             Continuar con pago de contado
                           </button>
                         </>
@@ -567,6 +679,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
                     onChange={e => {
                       const id = e.target.value;
                       const inst = installments.find((i: any) => String(i.id) === id);
+                      setInstallmentNoLongerAvailable(false);
                       setForm(f => {
                         const amount = inst ? String(inst.amount) : f.amount;
                         return {
@@ -593,6 +706,12 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
                     <p className="text-xs text-blue-400 mt-1">Importe auto-completado desde la cuota seleccionada.</p>
                   )}
                 </div>
+              )}
+              {showCuotaFields && !editing && installmentNoLongerAvailable && (
+                <p className="text-xs text-amber-400 flex items-start gap-1.5">
+                  <Info className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                  <span>{INSTALLMENT_NO_LONGER_AVAILABLE_MESSAGE}</span>
+                </p>
               )}
             </div>
           ) : (
@@ -633,13 +752,17 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
             <div className="relative">
               <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm">$</span>
               <input type="number" value={form.amount}
-                onChange={e => setForm(f => ({
-                  ...f,
-                  amount: e.target.value,
-                  // Con un único medio de pago, su importe sigue siempre al
-                  // importe total — con 2+ splits no hace nada (reparto manual).
-                  splits: syncSingleBatchSplitAmount(f.splits, e.target.value),
-                }))}
+                onChange={e => {
+                  // Volver a escribir el importe = pago consciente sin cuota.
+                  if (e.target.value !== "") setInstallmentNoLongerAvailable(false);
+                  setForm(f => ({
+                    ...f,
+                    amount: e.target.value,
+                    // Con un único medio de pago, su importe sigue siempre al
+                    // importe total — con 2+ splits no hace nada (reparto manual).
+                    splits: syncSingleBatchSplitAmount(f.splits, e.target.value),
+                  }));
+                }}
                 placeholder="0.00"
                 className="w-full pl-7 pr-3 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white placeholder-gray-500 outline-none focus:border-blue-500" />
             </div>
@@ -833,7 +956,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
               quedaría redundante/sin función, así que se oculta en vez de
               dejarlo deshabilitado sin explicación. */}
           {showCuotaFields && (
-            <button onClick={handleSave} disabled={isImputarButtonDisabled(saving, splitsValidation.valid)}
+            <button onClick={handleSave} disabled={isImputarButtonDisabled(saving, splitsValidation.valid) || blockedByUnavailableInstallment}
               className="flex-1 py-2 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-all disabled:opacity-50">
               {saving ? "Guardando..." : editing ? "Guardar cambios" : "Imputar pago"}
             </button>

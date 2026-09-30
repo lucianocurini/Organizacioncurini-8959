@@ -13,6 +13,7 @@ import {
   insertPaymentBatchRow, checkInstallmentPaymentRace, insertBatchSplitsAndChecks, insertBatchChildren,
   type SplitWithChecksForInsert, type BatchChildContextForInsert,
 } from "./payment-batch-shared-inserts";
+import { assertInstallmentsCollectable } from "./installment-collectability-loader";
 import type { AccountHolderFundingBatchDependencies } from "./account-holder-funding-batch";
 import type { FundingDestinationInput } from "../lib/payments/account-holder-funding";
 import type { FundingPlanSplitInput } from "../lib/payments/account-holder-funding-plan";
@@ -86,6 +87,9 @@ export function buildTitularFundingDependencies(params: BuildTitularFundingDepen
     }),
     createChildRows: async (tx, batch) => {
       await checkInstallmentPaymentRace(tx, params.installmentIds);
+      // Regla única de cobrabilidad revalidada dentro de la transacción —
+      // mismo punto relativo que el camino legacy (ver index.ts).
+      await assertInstallmentsCollectable(tx, params.installmentIds, params.paymentDate);
 
       const splitIds = await insertBatchSplitsAndChecks(tx, batch.id, params.splitsWithChecks, params.createdBy);
       const splitIdByKey = new Map<string, number>(splitIds.map((id, i) => [`split-${i}`, id]));
