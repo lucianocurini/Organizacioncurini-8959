@@ -26,6 +26,8 @@ import {
   getPendingItemPaymentGroup, isBatchChildPendingPayment,
   computeDefaultRendicionMethod, attachRendicionMethod, CONTABLE_METHODS,
   RENDICION_METHOD_LABELS, getRendicionItemMethodLabel,
+  isCashPeriodPendingItem, isPendingItemSelectable, canMarkPendingItemAsDebtor, resolveRendicionItemDebtorStatus,
+  describeCashPeriodPendingItem, formatCuotasCount, countRendicionCuotas,
 } from "@/lib/rendicion-pending";
 import {
   type CashPeriodGroup, type CashPeriodSearchRow,
@@ -1562,6 +1564,45 @@ function DueDateBadge({ dueDate, showNull = false }: { dueDate: string | null; s
   );
 }
 
+// Detalle de un cobro de contado agrupado (source="payment_batch") en Nueva
+// Rendición: una sola fila por operación, con el período, cuántas cuotas
+// cancela, nominal/descuento/total y los medios REALES con que se cobró.
+function CashPeriodPendingDetail({ item }: { item: any }) {
+  const cpp = item.cashPeriodPayment ?? {};
+  const fmtCents = (cents: number | null | undefined) =>
+    ((cents ?? 0) / 100).toLocaleString("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 0, maximumFractionDigits: 2 });
+  const period = cpp.periodStart && cpp.periodEnd
+    ? `${fmtDueDate(cpp.periodStart)} al ${fmtDueDate(cpp.periodEnd)}`
+    : "período sin fechas";
+  const d = describeCashPeriodPendingItem(item);
+  return (
+    <div data-testid="cash-period-pending-detail" className="mt-1 space-y-0.5">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-[10px] px-1.5 py-0.5 rounded border bg-emerald-900/30 border-emerald-500/40 text-emerald-300 shrink-0">
+          {item.concept ?? "Pago de contado"}
+        </span>
+        <span className="text-xs text-white/40">
+          Período {period} · {formatCuotasCount(d.installmentCount)}
+        </span>
+      </div>
+      <p className="text-xs text-white/40">
+        Nominal {fmtCents(d.nominalCents)} · Descuento {fmtCents(d.discountCents)} · Total a rendir {fmtCents(d.appliedCents)}
+      </p>
+      {Array.isArray(item.splits) && item.splits.length > 0 && (
+        <p className="text-xs text-white/40">
+          Medios: {item.splits.map((s: any) => `${METHOD_LABELS[s.method] || s.method} ${fmtCents(s.amountCents)}`).join(" + ")}
+        </p>
+      )}
+      {/* Solo informativo: el ítem se rinde por lo aplicado (item.amount). */}
+      {d.roundingCents !== 0 && (
+        <p data-testid="cash-period-rounding" className="text-xs text-amber-300/80">
+          Recibido {fmtCents(d.receivedCents)} · Redondeo {d.roundingCents > 0 ? "+" : "−"}{fmtCents(Math.abs(d.roundingCents))}
+        </p>
+      )}
+    </div>
+  );
+}
+
 // ─── Constantes de canales ─────────────────────────────────────────────────────
 const CANAL_LABELS: Record<string, string> = {
   directo: "Directo a Compañía",
@@ -1575,7 +1616,8 @@ const CANAL_COLORS: Record<string, string> = {
 };
 
 // ─── Modal Nueva Rendición ─────────────────────────────────────────────────────
-function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
+// Exportado solo para tests (nueva-rendicion-modal-cash-period.test.tsx).
+export function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
   const [step, setStep] = useState<"select" | "pago">("select");
   const [pending, setPending] = useState<any[]>([]);
   const [loadingPending, setLoadingPending] = useState(true);
@@ -1644,6 +1686,8 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
   const key = (item: any) => item._uid != null ? `manual_debt:${item._uid}` : `${item.source}:${item.sourceId}`;
 
   const toggle = (item: any) => {
+    // Un ítem bloqueado (contado con datos inconsistentes) nunca se elige.
+    if (!isPendingItemSelectable(item)) return;
     const k = key(item);
     setSelected(prev => {
       const n = new Set(prev);
@@ -1688,7 +1732,7 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
   }
 
   const pendingVisible = pending.filter((i: any) => i.entryType !== "pronto_pago_surcharge");
-  const selectedCobradas = pendingVisible.filter((i: any) => selected.has(key(i)));
+  const selectedCobradas = pendingVisible.filter((i: any) => isPendingItemSelectable(i) && selected.has(key(i)));
   const selectedItems = [...selectedCobradas, ...manualItems, ...installmentItems];
   const totalSeleccionado = selectedItems.reduce((s, i) => s + i.amount, 0);
   const totalBreakdown = (Number(breakdown.efectivo) || 0) + (Number(breakdown.transferencia) || 0) +
@@ -1712,7 +1756,10 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
   // 0029) vs. standalone/manuales (por ahora solo informativo — ver
   // rendicion-pending.ts). Maneja la nota de aviso más abajo.
   const batchChildSelectedCount = selectedCobradas.filter(isBatchChildPendingPayment).length;
-  const limitedSelectedCount = selectedItems.length - batchChildSelectedCount;
+  // Pagos de contado: se rinden con sus medios reales de cobro, nunca con el
+  // medio elegido acá (ver attachRendicionMethod).
+  const cashPeriodSelectedCount = selectedCobradas.filter(isCashPeriodPendingItem).length;
+  const limitedSelectedCount = selectedItems.length - batchChildSelectedCount - cashPeriodSelectedCount;
 
   // Al entrar al paso 2 (o cambiar la selección sin haber tocado el
   // selector a mano todavía), proponer como default el medio de cobro real
@@ -1737,13 +1784,17 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
   // ("combinado" no matchea nada). getPendingItemPaymentGroup ya prioriza
   // paymentGroup si el backend lo mandó, y solo cae a paymentMethod si no
   // hay ni paymentGroup ni splits (ver rendicion-pending.ts).
-  const propios = filteredPending.filter((i: any) => getPendingItemPaymentGroup(i) === "own");
-  const directos = filteredPending.filter((i: any) => getPendingItemPaymentGroup(i) === "direct_company");
+  // Contados bloqueados por el backend (datos inconsistentes): visibles, con
+  // su aviso, en una sección propia — nunca en propios/directos.
+  const blockedPendingItems = filteredPending.filter((i: any) => !isPendingItemSelectable(i));
+  const selectablePending = filteredPending.filter((i: any) => isPendingItemSelectable(i));
+  const propios = selectablePending.filter((i: any) => getPendingItemPaymentGroup(i) === "own");
+  const directos = selectablePending.filter((i: any) => getPendingItemPaymentGroup(i) === "direct_company");
   // Defensivo: las reglas de Etapa 3B-1 ya rechazan mixed en POST/PUT
   // /payments, así que esto no debería ocurrir nunca en datos reales — pero
   // si un dato inconsistente llegara igual, no se clasifica silenciosamente
   // como propio ni como directo, se aísla y se advierte.
-  const mixedPendingItems = filteredPending.filter((i: any) => getPendingItemPaymentGroup(i) === "mixed");
+  const mixedPendingItems = selectablePending.filter((i: any) => getPendingItemPaymentGroup(i) === "mixed");
 
   async function save() {
     if (selectedItems.length === 0) { toast.error("Seleccioná al menos una cuota"); return; }
@@ -1764,22 +1815,25 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
       // migración análoga a 0029 para ese caso.
       const itemsPayload = attachRendicionMethod(
         selectedItems.map(i => ({
+          // Un contado (source='payment_batch') viaja exactamente como lo
+          // devolvió GET /remittances/pending: sourceId = payment_batches.id
+          // y amount = total del contado, lo único que POST /remittances acepta.
           source: i.source,
           sourceId: i.sourceId,
           amount: i.amount,
-          // Un payment confirmado (source='payment') NUNCA puede mandarse como
-          // adeudado, sin importar el estado de debtorItems — la UI ya no
-          // ofrece el toggle para ese source, pero esto es defensivo (no
-          // depender solo de que el checkbox esté oculto). Un source=
-          // "installment" (cuota real elegida en el buscador de abajo)
-          // siempre es adeudado — no existe otro motivo para agregar una
-          // cuota real por esa vía en vez de por selectedCobradas.
-          debtorStatus: i.source === "payment"
-            ? "pagado"
-            : (i.source === "manual_debt" || i.source === "installment" || debtorItems.has(key(i))) ? "adeudado" : "pagado",
+          // Un payment confirmado (source='payment') o un contado
+          // (source='payment_batch') NUNCA puede mandarse como adeudado, sin
+          // importar el estado de debtorItems — la UI ya no ofrece el toggle
+          // para esos sources, pero esto es defensivo (no depender solo de
+          // que el checkbox esté oculto). Un source="installment" (cuota real
+          // elegida en el buscador de abajo) siempre es adeudado — no existe
+          // otro motivo para agregar una cuota real por esa vía en vez de por
+          // selectedCobradas.
+          debtorStatus: resolveRendicionItemDebtorStatus(i, debtorItems.has(key(i))),
           clientName: i.clientName,
           policyNumber: i.policyNumber,
           companyName: i.companyName,
+          cashPeriodRealMethod: isCashPeriodPendingItem(i) ? i.paymentMethod : null,
         })),
         rendicionMethod,
       );
@@ -1810,7 +1864,7 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
             <ReceiptText size={18} className="text-blue-400" />
             <h3 className="text-white font-semibold">Nueva Rendición</h3>
             {step === "pago" && (
-              <span className="text-xs text-white/40">{selectedItems.length} cuotas — {fmt(totalSeleccionado)}</span>
+              <span className="text-xs text-white/40">{formatCuotasCount(countRendicionCuotas(selectedItems))} — {fmt(totalSeleccionado)}</span>
             )}
           </div>
           <button onClick={onClose} className="text-white/40 hover:text-white"><X size={18} /></button>
@@ -1859,6 +1913,7 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                                     <span className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {item.paymentDate}</span>
                                     <DueDateBadge dueDate={item.dueDate ?? null} />
                                   </div>
+                                  {isCashPeriodPendingItem(item) && <CashPeriodPendingDetail item={item} />}
                                 </div>
                                 <div className="text-right shrink-0">
                                   <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>
@@ -1867,11 +1922,12 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                                     <span className="block text-xs text-purple-400 mt-0.5">+$800 PP</span>
                                   )}
                                 </div>
-                                {/* Un cobro confirmado (source='payment') nunca puede rendirse como
-                                    adeudado — representa dinero ya recibido. El toggle solo tiene
-                                    sentido para cash_entry (cobro manual de Caja, mismo criterio que
-                                    ya tenía antes de esta regla). */}
-                                {sel && item.source !== "payment" && (
+                                {/* Un cobro confirmado (source='payment') o un pago de contado
+                                    (source='payment_batch') nunca puede rendirse como adeudado —
+                                    representa dinero ya recibido. El toggle solo tiene sentido para
+                                    cash_entry (cobro manual de Caja, mismo criterio que ya tenía
+                                    antes de esta regla). */}
+                                {sel && canMarkPendingItemAsDebtor(item) && (
                                   <button type="button" onClick={e => { e.stopPropagation(); toggleDebtor(item); }}
                                     className={cn("text-xs px-2 py-1 rounded border shrink-0 transition-all",
                                       isDebtor ? "bg-red-900/30 border-red-500/40 text-red-400" : "border-white/15 text-white/40 hover:border-yellow-500/40 hover:text-yellow-400")}>
@@ -1905,11 +1961,36 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                                     <span className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {item.paymentDate}</span>
                                     <DueDateBadge dueDate={item.dueDate ?? null} />
                                   </div>
+                                  {isCashPeriodPendingItem(item) && <CashPeriodPendingDetail item={item} />}
                                 </div>
                                 <div className="text-right shrink-0">
                                   <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>
                                   <PaymentMethodBadge splits={item.splits ?? []} paymentMethod={item.paymentMethod} compact />
                                 </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                    {blockedPendingItems.length > 0 && (
+                      <div data-testid="blocked-pending-section">
+                        <p className="text-xs text-red-400 uppercase tracking-wider mb-1.5 flex items-center gap-1">
+                          <AlertCircle className="w-3.5 h-3.5" /> Pagos de contado bloqueados — no seleccionables
+                        </p>
+                        <div className="space-y-1">
+                          {blockedPendingItems.map(item => {
+                            const k = key(item);
+                            return (
+                              <div key={k} data-blocked-code={item.blockedCode ?? ""} aria-disabled="true"
+                                className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-red-500/30 bg-red-900/10 cursor-not-allowed">
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-sm text-white truncate">{item.clientName}</p>
+                                  <span className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {item.paymentDate ?? "—"}</span>
+                                  {isCashPeriodPendingItem(item) && <CashPeriodPendingDetail item={item} />}
+                                  <p className="text-xs text-red-400/80 mt-1">{item.blockedReason ?? "No se puede rendir."}</p>
+                                </div>
+                                <p className="text-sm font-semibold text-white shrink-0">{fmt(item.amount)}</p>
                               </div>
                             );
                           })}
@@ -2174,6 +2255,13 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                     reemplaza su instrumento contable real.
                   </p>
                 )}
+                {cashPeriodSelectedCount > 0 && (
+                  <p className="text-xs text-emerald-300/80 mt-1">
+                    ✓ {cashPeriodSelectedCount} pago{cashPeriodSelectedCount !== 1 ? "s" : ""} de contado — se
+                    rinde{cashPeriodSelectedCount !== 1 ? "n" : ""} completo{cashPeriodSelectedCount !== 1 ? "s" : ""} con
+                    los medios reales con que se cobró; el medio elegido acá no se aplica.
+                  </p>
+                )}
                 {limitedSelectedCount > 0 && (
                   <p className="text-xs text-yellow-400/70 mt-1">
                     ⚠ {limitedSelectedCount} ítem{limitedSelectedCount !== 1 ? "s" : ""} individual{limitedSelectedCount !== 1 ? "es" : ""} o manual{limitedSelectedCount !== 1 ? "es" : ""} —
@@ -2240,10 +2328,13 @@ function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void; onSave
                 </p>
                 <div className="space-y-1 max-h-32 overflow-y-auto">
                   {selectedItems.map(i => {
-                    const isDebtor = i.source === "manual_debt" || i.source === "installment" || debtorItems.has(key(i));
+                    const isDebtor = resolveRendicionItemDebtorStatus(i, debtorItems.has(key(i))) === "adeudado";
                     return (
                       <div key={key(i)} className="flex justify-between text-xs">
-                        <span className="text-white/60 truncate mr-2">{i.clientName} · {i.companyName}</span>
+                        <span className="text-white/60 truncate mr-2">
+                          {i.clientName} · {i.companyName}
+                          {isCashPeriodPendingItem(i) && ` · ${i.concept ?? "Pago de contado"} (${formatCuotasCount(Number(i.cashPeriodPayment?.installmentCount ?? 0))})`}
+                        </span>
                         <span className={cn("shrink-0", isDebtor ? (i.source === "manual_debt" ? "text-orange-400" : "text-red-400") : "text-white/60")}>
                           {isDebtor ? "⚠ " : ""}{fmt(i.amount)}
                         </span>

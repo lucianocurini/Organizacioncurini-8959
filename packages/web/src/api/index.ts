@@ -48,6 +48,7 @@ import { classifyInstallmentsForRebuild, runInstallmentRebuildTransaction, Rebui
 import { parseRebillingPayload, RebillingPayloadError, buildRebillingInstallmentPlan, hasRebillingGroupActivity } from "../lib/installments/rebilling-plan";
 import { classifyRebillingGroupForRebuild, runRebillingRebuildTransaction, RebillingRebuildConflictError, RebillingNotFoundError } from "../lib/installments/rebilling-rebuild";
 import { validateAndNormalizeSplits, SplitValidationError, classifySplitGroup, isDirectCompanyPaymentMethod, type SplitGroup } from "../lib/payments/splits";
+import { buildCashPeriodPendingItem, excludeCashPeriodChildren, type CashPeriodPendingSource } from "../lib/payments/remittance-pending-cash-period";
 import { recalculateInstallmentPaymentStatus } from "../lib/payments/installment-status";
 import { toArgentinaCalendarDay, resolveArgentinaMonthKey, shiftArgentinaMonth } from "../lib/dates/argentina-date";
 import {
@@ -8538,6 +8539,22 @@ app.patch("/cash/payments/:id/render", requireAdmin(async (c: any) => {
   const id = Number(c.req.param("id"));
   const body = await c.req.json();
   const rendered = body.rendered ? 1 : 0;
+  // Migración 0034: un hijo de un cobro de contado solo cambia de estado de
+  // rendición junto con todo su período, vía POST/DELETE /remittances
+  // (source="payment_batch"). Marcarlo suelto dejaría el contado rendido a
+  // medias y desincronizado de cash_period_payments.rendered.
+  const target = await db.select({ batchId: payments.batchId }).from(payments).where(eq(payments.id, id)).get();
+  if (!target) return c.json({ error: "No encontrado" }, 404);
+  if (target.batchId != null) {
+    const cashPeriodOwner = await db.select({ id: cashPeriodPayments.id }).from(cashPeriodPayments)
+      .where(eq(cashPeriodPayments.paymentBatchId, target.batchId)).get();
+    if (cashPeriodOwner) {
+      return c.json({
+        error: "Este pago es una cuota de un pago de contado: se rinde junto con todo el período desde Rendiciones, nunca por separado.",
+        code: "CASH_PERIOD_CHILD_RENDER_FORBIDDEN",
+      }, 409);
+    }
+  }
   const result = await db.update(payments).set({
     rendered,
     renderedAt: rendered ? new Date() : null,
@@ -9078,10 +9095,21 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     : [];
   const expectedPaymentAmountCentsById = new Map<number, number>(expectedPaymentRows.map((p: any) => [p.id, Math.round(p.amount * 100)]));
 
+  // Un lote rendido completo (hoy solo el cobro de contado, source=
+  // "payment_batch") se rinde con sus instrumentos REALES
+  // (payment_batch_splits/received_checks), así que lo esperado es el dinero
+  // real recibido — el mismo criterio que usa POST /remittances al crear la
+  // rendición. total_received_cents (aplicado) queda solo como fallback para
+  // filas sin received_amount_cents; `??` y no `||`, porque 0 es un valor.
+  // Sin esto, un contado con ajuste de redondeo quedaba "inconsistent".
   const expectedBatchRows = distinctAllForRendido.batchIds.length
-    ? await db.select({ id: paymentBatches.id, totalReceivedCents: paymentBatches.totalReceivedCents }).from(paymentBatches).where(inArray(paymentBatches.id, distinctAllForRendido.batchIds)).all()
+    ? await db.select({
+      id: paymentBatches.id, totalReceivedCents: paymentBatches.totalReceivedCents, receivedAmountCents: paymentBatches.receivedAmountCents,
+    }).from(paymentBatches).where(inArray(paymentBatches.id, distinctAllForRendido.batchIds)).all()
     : [];
-  const expectedBatchTotalCentsById = new Map<number, number>(expectedBatchRows.map((b: any) => [b.id, b.totalReceivedCents]));
+  const expectedBatchTotalCentsById = new Map<number, number>(
+    expectedBatchRows.map((b: any) => [b.id, b.receivedAmountCents ?? b.totalReceivedCents])
+  );
 
   const expectedCashEntryRows = distinctAllForRendido.cashEntryIds.length
     ? await db.select({ id: cashEntries.id, amount: cashEntries.amount, entryType: cashEntries.entryType }).from(cashEntries).where(inArray(cashEntries.id, distinctAllForRendido.cashEntryIds)).all()
@@ -9576,6 +9604,9 @@ app.get("/cash/payments", requireAdmin(async (c: any) => {
     .select({
       id: payments.id,
       policyId: payments.policyId,
+      // Para que Caja oculte los hijos de un contado (Migración 0034) y lo
+      // muestre como una sola fila, igual que GET /remittances/pending.
+      batchId: payments.batchId,
       manualPayer: payments.manualPayer,
       manualPolicyNumber: payments.manualPolicyNumber,
       manualCompany: payments.manualCompany,
@@ -9740,6 +9771,17 @@ app.post("/remittances", requireAuth(async (c: any) => {
     );
     if (invalidDebtorPaymentItems.length > 0) {
       return c.json({ error: "Un cobro confirmado no puede registrarse como adeudado." }, 400);
+    }
+    // Mismo criterio para un cobro de contado (source='payment_batch'): es
+    // dinero ya recibido por el período completo, siempre se rinde pagado.
+    const invalidDebtorCashPeriodItems = items.filter(
+      (i: any) => i.source === "payment_batch" && i.debtorStatus != null && i.debtorStatus !== "pagado"
+    );
+    if (invalidDebtorCashPeriodItems.length > 0) {
+      return c.json({
+        error: "Un pago de contado ya cobrado no puede registrarse como adeudado.",
+        code: "CASH_PERIOD_PAYMENT_CANNOT_BE_DEBT",
+      }, 400);
     }
 
     // GUARD: reject any item that is a surcharge cash_entry (must be auto-included by backend only)
@@ -10492,10 +10534,106 @@ app.get("/remittances/uncollected", requireAuth(async (c: any) => {
   return c.json(rows);
 }));
 
+// Cobros de contado por período (Migración 0034) que GET /remittances/pending
+// debe considerar: todos los que tengan algún payment hijo pendiente en la
+// lista (para ocultar esos hijos, sea cual sea el estado del contado) más
+// todos los confirmados sin rendir (para ofrecerlos, o mostrarlos bloqueados
+// si sus hijos no acompañan — ver decideCashPeriodPending).
+async function loadCashPeriodPendingSources(pendingBatchIds: number[]): Promise<CashPeriodPendingSource[]> {
+  const unrenderedConfirmed = and(eq(cashPeriodPayments.status, "confirmado"), eq(cashPeriodPayments.rendered, 0));
+  const cppRows = await db.select().from(cashPeriodPayments)
+    .where(pendingBatchIds.length > 0 ? or(inArray(cashPeriodPayments.paymentBatchId, pendingBatchIds), unrenderedConfirmed) : unrenderedConfirmed)
+    .all();
+  if (cppRows.length === 0) return [];
+
+  const batchIds = cppRows.map((r) => r.paymentBatchId);
+  const policyIds = [...new Set(cppRows.map((r) => r.policyId))];
+  const rebillingIds = [...new Set(cppRows.map((r) => r.rebillingId).filter((id): id is number => id != null))];
+
+  const [batchRows, splitRows, childRows, policyRows, rebillingRows] = await Promise.all([
+    db.select().from(paymentBatches).where(inArray(paymentBatches.id, batchIds)).all(),
+    db.select().from(paymentBatchSplits).where(inArray(paymentBatchSplits.batchId, batchIds)).orderBy(asc(paymentBatchSplits.id)).all(),
+    db.select({ id: payments.id, batchId: payments.batchId, status: payments.status, rendered: payments.rendered })
+      .from(payments).where(inArray(payments.batchId, batchIds)).all(),
+    db.select({
+      id: policies.id, policyNumber: policies.policyNumber, startDate: policies.startDate, endDate: policies.endDate,
+      insuredName: insureds.name, companyName: companies.name,
+    }).from(policies)
+      .leftJoin(insureds, eq(policies.insuredId, insureds.id))
+      .leftJoin(companies, eq(policies.companyId, companies.id))
+      .where(inArray(policies.id, policyIds)).all(),
+    rebillingIds.length > 0
+      ? db.select({ id: rebillings.id, billingStart: rebillings.billingStart, billingEnd: rebillings.billingEnd })
+        .from(rebillings).where(inArray(rebillings.id, rebillingIds)).all()
+      : Promise.resolve([] as { id: number; billingStart: string; billingEnd: string }[]),
+  ]);
+
+  const splitIds = splitRows.map((s) => s.id);
+  const checkRows = splitIds.length > 0
+    ? await db.select({ batchSplitId: receivedChecks.batchSplitId, amountCents: receivedChecks.amountCents })
+      .from(receivedChecks).where(inArray(receivedChecks.batchSplitId, splitIds)).all()
+    : [];
+  const checksBySplitId = new Map<number, { amountCents: number }[]>();
+  for (const chk of checkRows) {
+    if (chk.batchSplitId == null) continue;
+    const arr = checksBySplitId.get(chk.batchSplitId) ?? [];
+    arr.push({ amountCents: chk.amountCents });
+    checksBySplitId.set(chk.batchSplitId, arr);
+  }
+  const splitsByBatchId = new Map<number, CashPeriodPendingSource["splits"][number][]>();
+  for (const s of splitRows) {
+    const arr = splitsByBatchId.get(s.batchId) ?? [];
+    arr.push({ method: s.method, amountCents: s.amountCents, notes: s.notes, checks: checksBySplitId.get(s.id) ?? [] });
+    splitsByBatchId.set(s.batchId, arr);
+  }
+  const childrenByBatchId = new Map<number, CashPeriodPendingSource["children"][number][]>();
+  for (const ch of childRows) {
+    if (ch.batchId == null) continue;
+    const arr = childrenByBatchId.get(ch.batchId) ?? [];
+    arr.push({ paymentId: ch.id, status: ch.status, rendered: ch.rendered });
+    childrenByBatchId.set(ch.batchId, arr);
+  }
+  const batchById = new Map(batchRows.map((b) => [b.id, b]));
+  const policyById = new Map(policyRows.map((p) => [p.id, p]));
+  const rebillingById = new Map(rebillingRows.map((r) => [r.id, r]));
+
+  return cppRows.map((cpp) => {
+    const batch = batchById.get(cpp.paymentBatchId);
+    const policy = policyById.get(cpp.policyId);
+    const rebilling = cpp.rebillingId != null ? rebillingById.get(cpp.rebillingId) : undefined;
+    return {
+      paymentBatchId: cpp.paymentBatchId,
+      cashPeriodPaymentId: cpp.id,
+      status: cpp.status,
+      rendered: cpp.rendered,
+      policyId: cpp.policyId,
+      rebillingId: cpp.rebillingId,
+      nominalAmountCents: cpp.nominalAmountCents,
+      cashAmountCents: cpp.cashAmountCents,
+      discountAmountCents: cpp.discountAmountCents,
+      batch: batch
+        ? {
+          status: batch.status, paymentDate: batch.paymentDate, totalReceivedCents: batch.totalReceivedCents,
+          receivedAmountCents: batch.receivedAmountCents, notes: batch.notes,
+        }
+        : null,
+      splits: splitsByBatchId.get(cpp.paymentBatchId) ?? [],
+      children: childrenByBatchId.get(cpp.paymentBatchId) ?? [],
+      policyNumber: policy?.policyNumber ?? null,
+      insuredName: policy?.insuredName ?? null,
+      companyName: policy?.companyName ?? null,
+      // Período del contado: la refacturación cobrada, o la vigencia de la
+      // póliza para el período de emisión (rebillingId null).
+      periodStart: cpp.rebillingId != null ? rebilling?.billingStart ?? null : policy?.startDate ?? null,
+      periodEnd: cpp.rebillingId != null ? rebilling?.billingEnd ?? null : policy?.endDate ?? null,
+    };
+  });
+}
+
 // GET /api/remittances/pending — cobros aún no rendidos (para seleccionar al crear rendición)
 app.get("/remittances/pending", requireAuth(async (c: any) => {
   // payments no rendidos y confirmados
-  const pendingPayments = await db
+  const pendingPaymentsRaw = await db
     .select({
       id: payments.id,
       amount: payments.amount,
@@ -10521,6 +10659,18 @@ app.get("/remittances/pending", requireAuth(async (c: any) => {
     .where(and(eq(payments.rendered, 0), eq(payments.status, "confirmado")))
     .orderBy(desc(payments.paymentDate))
     .all();
+
+  // Migración 0034: un cobro de contado se rinde entero, como UN ítem
+  // source="payment_batch" — sus payments hijos (nominal por cuota, sin
+  // splits propios) nunca se listan sueltos. Lotes normales y pagos
+  // standalone siguen igual que antes.
+  const pendingBatchIds = [...new Set(pendingPaymentsRaw.map((p) => p.batchId).filter((id): id is number => id != null))];
+  const cashPeriodSources = await loadCashPeriodPendingSources(pendingBatchIds);
+  const cashPeriodBatchIds = new Set(cashPeriodSources.map((s) => s.paymentBatchId));
+  const pendingPayments = excludeCashPeriodChildren(pendingPaymentsRaw, cashPeriodBatchIds);
+  const cashPeriodItems = cashPeriodSources
+    .map(buildCashPeriodPendingItem)
+    .filter((item): item is NonNullable<typeof item> => item !== null);
 
   // cashEntries no rendidas — nunca una anulada (ej. el recargo Pronto Pago
   // de un payment_batches cancelado, ver POST /payment-batches/:id/cancel).
@@ -10609,7 +10759,8 @@ app.get("/remittances/pending", requireAuth(async (c: any) => {
       splits: null as null,
       paymentGroup: (isDirectCompanyPaymentMethod(e.paymentMethod as string) ? "direct_company" : "own") as SplitGroup,
     })),
-  ].sort((a, b) => b.paymentDate.localeCompare(a.paymentDate));
+    ...cashPeriodItems,
+  ].sort((a, b) => (b.paymentDate ?? "").localeCompare(a.paymentDate ?? ""));
 
   return c.json(result);
 }));

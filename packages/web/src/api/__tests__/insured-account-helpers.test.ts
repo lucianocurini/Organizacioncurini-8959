@@ -473,4 +473,13 @@ describe("calculatePaymentAmountAdjustmentCreditInCaja", () => {
   test("lista vacía → 0", () => {
     expect(calculatePaymentAmountAdjustmentCreditInCaja([])).toBe(0);
   });
+
+  test("sobrante de un contado ya rendido entero con sus instrumentos reales → 0 (ya salió por rendido, no se duplica)", () => {
+    const adjustments: PaymentAmountAdjustmentForCaja[] = [
+      { amountCents: 300, parentActive: true, parentRenderedWithRealInstruments: true },  // no suma (ya rendido)
+      { amountCents: 200, parentActive: true, parentRenderedWithRealInstruments: false }, // suma (contado sin rendir)
+      { amountCents: 100, parentActive: true },                                           // suma (lote normal, sin el flag)
+    ];
+    expect(calculatePaymentAmountAdjustmentCreditInCaja(adjustments)).toBe(300);
+  });
 });

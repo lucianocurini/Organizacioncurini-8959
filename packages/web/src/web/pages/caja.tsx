@@ -22,7 +22,10 @@ import {
 import { useAuth } from "@/lib/auth";
 import { api } from "@/lib/api";
 import { type CashSummary, hasUnverifiedCashSummaryData } from "@/lib/caja-types";
-import { filterPendingCashItems, formatAdeudadoOrigin } from "@/lib/caja-cobrados";
+import {
+  buildCajaPendingCobranzaRows, createLatestRequestTracker, filterPendingCashItems, formatAdeudadoOrigin, loadCajaRemittancePending,
+} from "@/lib/caja-cobrados";
+import { describeCashPeriodPendingItem, formatCuotasCount } from "@/lib/rendicion-pending";
 import { toArgentinaCalendarDay } from "../../lib/dates/argentina-date";
 import {
   ComposedChart,
@@ -62,6 +65,142 @@ function methodIcon(m: string) {
 
 function fmt(n: number) {
   return n.toLocaleString("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 2 });
+}
+
+const fmtCents = (cents: number) => fmt(cents / 100);
+
+function fmtIsoDay(d: string | null | undefined) {
+  if (!d) return "—";
+  const [y, m, day] = d.slice(0, 10).split("-");
+  return `${day}/${m}/${y}`;
+}
+
+// ─── Fila de un pago de contado en "Cobros pendientes de rendición" ───────────
+// Un contado es UNA fila (ítem canónico de GET /remittances/pending), por el
+// importe aplicado; nominal, descuento, medios reales y redondeo se muestran
+// como detalle. Un contado bloqueado se ve, con su aviso, pero no como normal.
+function CajaCashPeriodRow({ item }: { item: any }) {
+  const d = describeCashPeriodPendingItem(item);
+  const cpp = item.cashPeriodPayment ?? {};
+  const blocked = item.blocked === true;
+  const splitsText = (splits: Array<{ method: string; amountCents: number }>) =>
+    splits.map((s) => `${methodLabel(s.method)} ${fmtCents(s.amountCents)}`).join(" + ");
+  return (
+    <div
+      data-testid="caja-cash-period-row"
+      data-blocked-code={item.blockedCode ?? ""}
+      className={`flex items-start gap-3 px-4 py-3 rounded-lg border transition-colors ${
+        blocked ? "border-red-500/30 bg-red-900/10" : "border-white/10 bg-white/5"
+      }`}
+    >
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-sm font-medium text-white truncate">{item.clientName || "—"}</span>
+          {item.policyNumber && item.policyNumber !== "—" && <span className="text-xs text-white/30">#{item.policyNumber}</span>}
+          {item.companyName && item.companyName !== "—" && <span className="text-xs text-white/30">· {item.companyName}</span>}
+          <span className="text-[10px] px-1.5 py-0.5 rounded border bg-emerald-900/30 border-emerald-500/40 text-emerald-300">
+            {item.concept ?? "Pago de contado"}
+          </span>
+          {blocked && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-900/30 border-red-500/40 text-red-300">Bloqueado</span>
+          )}
+        </div>
+        <div className="flex items-center gap-2 mt-0.5 flex-wrap text-xs text-white/40">
+          <span>{item.paymentDate}</span>
+          <span>Período {fmtIsoDay(cpp.periodStart)} al {fmtIsoDay(cpp.periodEnd)}</span>
+          <span>· {formatCuotasCount(d.installmentCount)}</span>
+        </div>
+        <p className="text-xs text-white/40 mt-0.5">
+          Nominal {fmtCents(d.nominalCents)} · Descuento {fmtCents(d.discountCents)} · Total del contado {fmtCents(d.appliedCents)}
+        </p>
+        {d.ownSplits.length > 0 && (
+          <p className="text-xs text-white/40">Medios propios: {splitsText(d.ownSplits)}</p>
+        )}
+        {d.directCompanySplits.length > 0 && (
+          <p className="text-xs text-orange-300/70">Directo a compañía: {splitsText(d.directCompanySplits)}</p>
+        )}
+        {d.roundingCents !== 0 && (
+          <p className="text-xs text-amber-300/80">
+            Recibido {fmtCents(d.receivedCents)} · Redondeo {d.roundingCents > 0 ? "+" : "−"}{fmtCents(Math.abs(d.roundingCents))}
+          </p>
+        )}
+        {blocked && <p className="text-xs text-red-400/80 mt-1">{item.blockedReason ?? "No se puede rendir."}</p>}
+      </div>
+      <span className={`text-sm font-bold shrink-0 ${blocked ? "text-white/40 line-through" : "text-white"}`}>
+        {fmtCents(d.appliedCents)}
+      </span>
+    </div>
+  );
+}
+
+// Lista "Desde Cobranzas" de cobros pendientes de rendición. Exportado solo
+// para tests (caja-pending-cash-period.test.tsx). remittancePending null =
+// /remittances/pending sin cargar o fallido: no se lista nada (fail-closed),
+// porque sin él no se puede saber qué cuotas son hijas de un contado.
+export function CajaPendingCobranzasList({ payments, remittancePending, loadError = false, onRetry }: {
+  payments: any[];
+  remittancePending: any[] | null;
+  loadError?: boolean;
+  onRetry?: () => void;
+}) {
+  if (remittancePending === null) {
+    if (!loadError) return <div className="text-center py-8 text-white/30 text-sm">Cargando cobros pendientes…</div>;
+    return (
+      <div data-testid="caja-pending-load-error" className="text-center py-8 text-sm space-y-2">
+        <p className="text-red-400/80">No se pudieron cargar los cobros pendientes de rendición.</p>
+        {onRetry && (
+          <button type="button" onClick={onRetry} className="text-xs px-3 py-1 rounded border border-white/15 text-white/60 hover:text-white">
+            Reintentar
+          </button>
+        )}
+      </div>
+    );
+  }
+  const { rows, totalCents, blockedCount } = buildCajaPendingCobranzaRows(payments, remittancePending);
+  if (rows.length === 0) {
+    return <div className="text-center py-8 text-white/30 text-sm">No hay cobros desde Cobranzas pendientes de rendición.</div>;
+  }
+  return (
+    <div className="space-y-2">
+      {rows.map((row) => {
+        if (row.kind === "cash_period") return <CajaCashPeriodRow key={`cp-${row.item.paymentBatchId}`} item={row.item} />;
+        const item = row.payment;
+        return (
+          <div
+            key={item.id}
+            className="flex items-center gap-3 px-4 py-3 rounded-lg border border-white/10 bg-white/5 transition-colors"
+          >
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-sm font-medium text-white truncate">{item.insuredName || item.manualPayer || "—"}</span>
+                {(item.policyNumber || item.manualPolicyNumber) && (
+                  <span className="text-xs text-white/30">#{item.policyNumber || item.manualPolicyNumber}</span>
+                )}
+                {(item.companyName || item.manualCompany) && (
+                  <span className="text-xs text-white/30">· {item.companyName || item.manualCompany}</span>
+                )}
+              </div>
+              <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                <span className="text-xs text-white/40">{item.paymentDate}</span>
+                {item.dueDate && <span className="text-xs text-white/30">Venc: {item.dueDate}</span>}
+                <span className="flex items-center gap-1 text-xs text-white/40">
+                  {methodIcon(item.paymentMethod)}
+                  {methodLabel(item.paymentMethod)}
+                </span>
+              </div>
+            </div>
+            <span className="text-sm font-bold text-white shrink-0">{fmt(item.amount)}</span>
+          </div>
+        );
+      })}
+      <div data-testid="caja-pending-total" className="flex justify-between items-center px-4 pt-2 text-xs text-white/50">
+        <span>
+          Total pendiente{blockedCount > 0 ? ` (sin ${blockedCount} contado${blockedCount === 1 ? "" : "s"} bloqueado${blockedCount === 1 ? "" : "s"})` : ""}
+        </span>
+        <span className="text-sm font-semibold text-white">{fmtCents(totalCents)}</span>
+      </div>
+    </div>
+  );
 }
 
 // ─── Modal genérico ────────────────────────────────────────────────────────────
@@ -562,6 +701,10 @@ export default function CajaPage() {
   const [summary, setSummary] = useState<CashSummary | null>(null);
   const [entries, setEntries] = useState<any[]>([]);
   const [payments, setPayments] = useState<any[]>([]);
+  // null = sin cargar o fallido (ver CajaPendingCobranzasList).
+  const [remittancePending, setRemittancePending] = useState<any[] | null>(null);
+  const [remittancePendingError, setRemittancePendingError] = useState(false);
+  const [loadTracker] = useState(createLatestRequestTracker);
   const [stats, setStats] = useState<any[]>([]);
 
   const [sections, setSections] = useState({
@@ -645,10 +788,15 @@ export default function CajaPage() {
   const [ownError, setOwnError] = useState<string | null>(null);
 
   const loadAll = useCallback(async () => {
-    const [s, e, p, st, comm, iva, comp, exp, own] = await Promise.all([
+    const request = loadTracker.begin();
+    const [s, e, p, rp, st, comm, iva, comp, exp, own] = await Promise.all([
       api.get(`/api/cash/summary?month=${periodoMes}`),
       api.get("/api/cash/entries"),
       api.get("/api/cash/payments"),
+      // Ítems canónicos de contado (los mismos de Nueva Rendición) — ver
+      // buildCajaPendingCobranzaRows en src/web/lib/caja-cobrados.ts. Nunca
+      // rechaza: si falla, solo "Desde Cobranzas" queda sin datos.
+      loadCajaRemittancePending(api.get),
       api.get("/api/cash/stats"),
       api.get("/api/cash/commissions"),
       api.get("/api/cash/iva"),
@@ -656,16 +804,20 @@ export default function CajaPage() {
       api.get("/api/cash/expenses"),
       api.get("/api/cash/own-movements"),
     ]);
+    // Una carga más nueva ya empezó: no mezclar esta respuesta con la suya.
+    if (!request.isCurrent()) return;
     setSummary(s);
     setEntries(Array.isArray(e) ? e : []);
     setPayments(Array.isArray(p) ? p : []);
+    setRemittancePending(rp.ok ? rp.items : null);
+    setRemittancePendingError(!rp.ok);
     setStats(Array.isArray(st) ? st : []);
     setCommissions(Array.isArray(comm) ? comm : []);
     setIvaList(Array.isArray(iva) ? iva : []);
     setCompaniesList(Array.isArray(comp) ? comp : []);
     setExpenses(Array.isArray(exp) ? exp : []);
     setOwnMovements(Array.isArray(own) ? own : []);
-  }, [periodoMes]);
+  }, [periodoMes, loadTracker]);
 
   useEffect(() => {
     if (user) loadAll();
@@ -847,6 +999,10 @@ export default function CajaPage() {
   const pendingEntries = filterPendingCashItems(entries);
   const pendingPayments = filterPendingCashItems(payments);
   const cobradosSource = tab === "manual" ? pendingEntries : pendingPayments;
+  // Desde Cobranzas: un contado es una sola fila (badge incluido).
+  const cobradosCount = tab === "manual"
+    ? pendingEntries.length
+    : remittancePending === null ? undefined : buildCajaPendingCobranzaRows(pendingPayments, remittancePending).rows.length;
 
   return (
     <AppLayout>
@@ -1169,7 +1325,7 @@ export default function CajaPage() {
               de summary, sin cambios — esta lista es solo lo operativo. */}
           <Section
             title="Cobros pendientes de rendición"
-            badge={summary ? cobradosSource.length : undefined}
+            badge={summary ? cobradosCount : undefined}
             open={sections.cobrados}
             onToggle={() => toggleSection("cobrados")}
             action={
@@ -1204,9 +1360,16 @@ export default function CajaPage() {
                 </div>
               </div>
 
-              {cobradosSource.length === 0 ? (
+              {tab === "cobranzas" ? (
+                <CajaPendingCobranzasList
+                  payments={pendingPayments}
+                  remittancePending={remittancePending}
+                  loadError={remittancePendingError}
+                  onRetry={loadAll}
+                />
+              ) : cobradosSource.length === 0 ? (
                 <div className="text-center py-8 text-white/30 text-sm">
-                  {tab === "manual" ? "No hay cobros manuales pendientes de rendición." : "No hay cobros desde Cobranzas pendientes de rendición."}
+                  No hay cobros manuales pendientes de rendición.
                 </div>
               ) : (
                 <div className="space-y-2">

@@ -7,7 +7,71 @@ import {
   getPendingItemPaymentGroup, isBatchChildPendingPayment,
   computeDefaultRendicionMethod, attachRendicionMethod,
   getRendicionItemMethodLabel, RENDICION_METHOD_LABELS,
+  isCashPeriodPendingItem, isPendingItemSelectable, canMarkPendingItemAsDebtor, resolveRendicionItemDebtorStatus,
+  formatCuotasCount, countRendicionCuotas, describeCashPeriodPendingItem,
 } from "../rendicion-pending";
+
+// ─── Contado: pluralización y presentación de importes ───────────────────────
+
+describe("formatCuotasCount / countRendicionCuotas", () => {
+  test("1 cuota en singular; 0, 2 y más en plural", () => {
+    expect(formatCuotasCount(1)).toBe("1 cuota");
+    expect(formatCuotasCount(2)).toBe("2 cuotas");
+    expect(formatCuotasCount(4)).toBe("4 cuotas");
+    expect(formatCuotasCount(0)).toBe("0 cuotas");
+  });
+
+  test("un contado cuenta todas sus cuotas; cualquier otro ítem cuenta 1", () => {
+    const contado = { source: "payment_batch", cashPeriodPayment: { installmentCount: 4 } };
+    expect(countRendicionCuotas([contado])).toBe(4);
+    expect(countRendicionCuotas([{ source: "payment" }])).toBe(1);
+    expect(countRendicionCuotas([contado, { source: "payment" }, { source: "cash_entry" }])).toBe(6);
+    expect(countRendicionCuotas([])).toBe(0);
+  });
+});
+
+describe("describeCashPeriodPendingItem", () => {
+  const base = {
+    amount: 165000,
+    splits: [{ method: "efectivo", amountCents: 16500300 }],
+    cashPeriodPayment: { installmentCount: 3, nominalAmountCents: 18000000, discountAmountCents: 1500000, receivedAmountCents: 16500300 },
+  };
+
+  test("nominal 180.000, contado 165.000, recibido 165.003 → redondeo +3; el importe principal es el aplicado", () => {
+    const d = describeCashPeriodPendingItem(base);
+    expect(d).toMatchObject({
+      installmentCount: 3, nominalCents: 18000000, discountCents: 1500000,
+      appliedCents: 16500000, receivedCents: 16500300, roundingCents: 300,
+    });
+  });
+
+  test("sin redondeo cuando recibido = aplicado, y recibido null cae en el aplicado", () => {
+    expect(describeCashPeriodPendingItem({ ...base, cashPeriodPayment: { ...base.cashPeriodPayment, receivedAmountCents: 16500000 } }).roundingCents).toBe(0);
+    const d = describeCashPeriodPendingItem({ ...base, cashPeriodPayment: { ...base.cashPeriodPayment, receivedAmountCents: null } });
+    expect(d.receivedCents).toBe(16500000);
+    expect(d.roundingCents).toBe(0);
+  });
+
+  test("redondeo negativo se informa con signo", () => {
+    expect(describeCashPeriodPendingItem({ ...base, cashPeriodPayment: { ...base.cashPeriodPayment, receivedAmountCents: 16499800 } }).roundingCents).toBe(-200);
+  });
+
+  test("separa medios propios y directo a compañía", () => {
+    const d = describeCashPeriodPendingItem({
+      ...base,
+      splits: [
+        { method: "efectivo", amountCents: 6500300 },
+        { method: "transferencia_compania", amountCents: 8000000 },
+        { method: "link_pago", amountCents: 2000000 },
+      ],
+    });
+    expect(d.ownSplits).toEqual([{ method: "efectivo", amountCents: 6500300 }]);
+    expect(d.directCompanySplits).toEqual([
+      { method: "transferencia_compania", amountCents: 8000000 },
+      { method: "link_pago", amountCents: 2000000 },
+    ]);
+  });
+});
 
 // ─── 1/2. paymentGroup del backend tiene prioridad ───────────────────────────
 
@@ -239,5 +303,51 @@ describe("Caso 14 — getRendicionItemMethodLabel nunca dice 'cuenta propia'", (
     for (const label of Object.values(RENDICION_METHOD_LABELS)) {
       expect(label).not.toMatch(/cuenta propia/i);
     }
+  });
+});
+
+// ─── 15. Pago de contado agrupado (source="payment_batch") ────────────────────
+
+describe("Caso 15 — pago de contado agrupado en Nueva Rendición", () => {
+  test("isCashPeriodPendingItem: solo source='payment_batch'", () => {
+    expect(isCashPeriodPendingItem({ source: "payment_batch" })).toBe(true);
+    expect(isCashPeriodPendingItem({ source: "payment" })).toBe(false);
+    expect(isCashPeriodPendingItem({ source: "cash_entry" })).toBe(false);
+  });
+
+  test("isPendingItemSelectable: un ítem bloqueado nunca se elige; sin el campo, sí", () => {
+    expect(isPendingItemSelectable({ source: "payment_batch", blocked: true })).toBe(false);
+    expect(isPendingItemSelectable({ source: "payment_batch", blocked: false })).toBe(true);
+    expect(isPendingItemSelectable({ source: "payment" })).toBe(true); // pagos normales: sin cambios
+  });
+
+  test("canMarkPendingItemAsDebtor: nunca para payment ni payment_batch; sí para cash_entry", () => {
+    expect(canMarkPendingItemAsDebtor({ source: "payment_batch" })).toBe(false);
+    expect(canMarkPendingItemAsDebtor({ source: "payment" })).toBe(false);
+    expect(canMarkPendingItemAsDebtor({ source: "cash_entry" })).toBe(true);
+  });
+
+  test("resolveRendicionItemDebtorStatus: contado y pago siempre pagado, aunque esté marcado", () => {
+    expect(resolveRendicionItemDebtorStatus({ source: "payment_batch" }, true)).toBe("pagado");
+    expect(resolveRendicionItemDebtorStatus({ source: "payment" }, true)).toBe("pagado");
+    expect(resolveRendicionItemDebtorStatus({ source: "manual_debt" }, false)).toBe("adeudado");
+    expect(resolveRendicionItemDebtorStatus({ source: "installment" }, false)).toBe("adeudado");
+    expect(resolveRendicionItemDebtorStatus({ source: "cash_entry" }, true)).toBe("adeudado");
+    expect(resolveRendicionItemDebtorStatus({ source: "cash_entry" }, false)).toBe("pagado");
+  });
+
+  test("attachRendicionMethod: el contado conserva su medio real; el resto recibe el elegido; el dato auxiliar no viaja", () => {
+    const result = attachRendicionMethod([
+      { source: "payment_batch", sourceId: 70, cashPeriodRealMethod: "transferencia_compania" },
+      { source: "payment", sourceId: 1, cashPeriodRealMethod: null },
+      { source: "cash_entry", sourceId: 2 },
+    ], "efectivo");
+    expect(result.map((i) => i.paymentMethod)).toEqual(["transferencia_compania", "efectivo", "efectivo"]);
+    expect(result.every((i) => !("cashPeriodRealMethod" in i))).toBe(true);
+  });
+
+  test("attachRendicionMethod: un contado sin medio real conocido cae al elegido (nunca undefined)", () => {
+    const [item] = attachRendicionMethod([{ source: "payment_batch", sourceId: 70 }], "cheque");
+    expect(item!.paymentMethod).toBe("cheque");
   });
 });

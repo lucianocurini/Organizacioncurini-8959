@@ -137,6 +137,22 @@ async function createSchema(c: Client): Promise<void> {
       created_at     INTEGER
     )
   `);
+  // Migración 0034 (subconjunto que lee el loader; sin FKs a policies/rebillings,
+  // que este esquema mínimo no tiene).
+  await c.execute(`
+    CREATE TABLE cash_period_payments (
+      id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+      payment_batch_id       INTEGER NOT NULL REFERENCES payment_batches(id),
+      policy_id              INTEGER NOT NULL,
+      nominal_amount_cents   INTEGER NOT NULL,
+      cash_amount_cents      INTEGER NOT NULL,
+      discount_amount_cents  INTEGER NOT NULL,
+      status                 TEXT NOT NULL DEFAULT 'confirmado',
+      rendered               INTEGER NOT NULL DEFAULT 0,
+      created_by             INTEGER NOT NULL REFERENCES users(id),
+      created_at             INTEGER NOT NULL
+    )
+  `);
 
   await applyMigration0036AccountHolderFunding(c as unknown as Sql0036Client);
 }
@@ -166,6 +182,7 @@ beforeEach(async () => {
   await client!.execute(`DELETE FROM cash_entries`);
   await client!.execute(`DELETE FROM payments`);
   await client!.execute(`DELETE FROM payment_batch_splits`);
+  await client!.execute(`DELETE FROM cash_period_payments`);
   await client!.execute(`DELETE FROM payment_batches`);
 });
 
@@ -572,6 +589,24 @@ describe("10. loadAccountMovementCajaTotals — legacy sin cambios", () => {
     const adj = await mkAdjustment({ amountCents: 300, paymentBatchId: legacyBatchId });
     const result = await loadAccountMovementCajaTotals(db, { movements: [], adjustments: [adj] });
     expect(result.roundingAdjustmentCreditCents).toBe(0);
+  });
+
+  test("ajuste de redondeo de un contado: suma mientras no se rindió; rendido entero, deja de sumar (sus allocations ya llevan el sobrante)", async () => {
+    const pendingBatchId = await mkBatch({ accountHolderInsuredId: null, status: "confirmado" });
+    const renderedBatchId = await mkBatch({ accountHolderInsuredId: null, status: "confirmado" });
+    const now = Date.now();
+    for (const [batchId, rendered] of [[pendingBatchId, 0], [renderedBatchId, 1]] as const) {
+      await client!.execute({
+        sql: `INSERT INTO cash_period_payments (payment_batch_id, policy_id, nominal_amount_cents, cash_amount_cents, discount_amount_cents, status, rendered, created_by, created_at)
+              VALUES (?, 1, 40000000, 38000000, 2000000, 'confirmado', ?, ?, ?)`,
+        args: [batchId, rendered, userId, now],
+      });
+    }
+    const pendingAdj = await mkAdjustment({ amountCents: 300, paymentBatchId: pendingBatchId });
+    const renderedAdj = await mkAdjustment({ amountCents: 500, paymentBatchId: renderedBatchId });
+
+    const result = await loadAccountMovementCajaTotals(db, { movements: [], adjustments: [pendingAdj, renderedAdj] });
+    expect(result.roundingAdjustmentCreditCents).toBe(300);
   });
 });
 

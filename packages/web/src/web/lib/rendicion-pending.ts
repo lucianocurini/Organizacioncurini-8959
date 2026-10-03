@@ -76,6 +76,125 @@ export function isBatchChildPendingPayment(item: PendingItemForBatchChildCheck):
   return item.source === "payment" && item.batchId != null;
 }
 
+// ─── Pago de contado por período (source="payment_batch") ─────────────────────
+//
+// GET /remittances/pending devuelve cada cobro de contado como UN ítem
+// source="payment_batch" (sourceId = payment_batches.id, amount = total del
+// contado), nunca sus cuotas sueltas — ver
+// src/lib/payments/remittance-pending-cash-period.ts. Se rinde siempre entero,
+// siempre como pagado, y con los medios REALES del cobro.
+
+export interface PendingItemForSelection {
+  source?: string | null;
+  blocked?: boolean | null;
+}
+
+/** true si el ítem es un cobro de contado agrupado (se rinde entero). */
+export function isCashPeriodPendingItem(item: PendingItemForSelection): boolean {
+  return item.source === "payment_batch";
+}
+
+/**
+ * false para un ítem que el backend marcó bloqueado (contado con datos
+ * inconsistentes): se muestra con su aviso, pero nunca se puede elegir.
+ */
+export function isPendingItemSelectable(item: PendingItemForSelection): boolean {
+  return item.blocked !== true;
+}
+
+/** "1 cuota" / "N cuotas". */
+export function formatCuotasCount(count: number): string {
+  return `${count} cuota${count === 1 ? "" : "s"}`;
+}
+
+/**
+ * Cuotas que cubren los ítems: un contado cuenta todas las cuotas del período
+ * (cashPeriodPayment.installmentCount); cualquier otro ítem cuenta 1.
+ */
+export function countRendicionCuotas(
+  items: ReadonlyArray<PendingItemForSelection & { cashPeriodPayment?: { installmentCount?: number | null } | null }>
+): number {
+  return items.reduce(
+    (n, i) => n + (isCashPeriodPendingItem(i) ? Number(i.cashPeriodPayment?.installmentCount ?? 0) : 1),
+    0
+  );
+}
+
+export interface CashPeriodPendingItemForPresentation {
+  amount: number;
+  splits?: ReadonlyArray<{ method: string; amountCents: number }> | null;
+  cashPeriodPayment?: {
+    installmentCount?: number | null;
+    nominalAmountCents?: number | null;
+    discountAmountCents?: number | null;
+    receivedAmountCents?: number | null;
+    periodStart?: string | null;
+    periodEnd?: string | null;
+  } | null;
+}
+
+export interface CashPeriodPendingPresentation {
+  installmentCount: number;
+  nominalCents: number;
+  discountCents: number;
+  /** Total del contado: lo aplicado, lo que se rinde (item.amount). */
+  appliedCents: number;
+  /** Dinero real recibido (medios). Igual a appliedCents si no hay dato. */
+  receivedCents: number;
+  /** receivedCents − appliedCents; 0 si no hay redondeo. */
+  roundingCents: number;
+  ownSplits: Array<{ method: string; amountCents: number }>;
+  directCompanySplits: Array<{ method: string; amountCents: number }>;
+}
+
+/**
+ * Importes de un contado agrupado para mostrar (Caja y Nueva Rendición): el
+ * importe principal es siempre el contado aplicado, nunca el nominal; el
+ * recibido y el redondeo se informan aparte. Solo presentación — no altera
+ * ningún importe del payload ni de Caja.
+ */
+export function describeCashPeriodPendingItem(item: CashPeriodPendingItemForPresentation): CashPeriodPendingPresentation {
+  const cpp = item.cashPeriodPayment ?? {};
+  const appliedCents = Math.round((item.amount ?? 0) * 100);
+  const receivedCents = cpp.receivedAmountCents ?? appliedCents;
+  const splits = (item.splits ?? []).map((s) => ({ method: s.method, amountCents: s.amountCents }));
+  return {
+    installmentCount: Number(cpp.installmentCount ?? 0),
+    nominalCents: cpp.nominalAmountCents ?? 0,
+    discountCents: cpp.discountAmountCents ?? 0,
+    appliedCents,
+    receivedCents,
+    roundingCents: receivedCents - appliedCents,
+    ownSplits: splits.filter((s) => !isDirectCompanyPaymentMethod(s.method)),
+    directCompanySplits: splits.filter((s) => isDirectCompanyPaymentMethod(s.method)),
+  };
+}
+
+/**
+ * Si el ítem admite el toggle "Adeudado/Pagado". Un cobro confirmado
+ * (source='payment') o un contado (source='payment_batch') es dinero ya
+ * recibido — nunca puede rendirse como adeudado (POST /remittances también lo
+ * rechaza).
+ */
+export function canMarkPendingItemAsDebtor(item: PendingItemForSelection): boolean {
+  return item.source !== "payment" && item.source !== "payment_batch";
+}
+
+/**
+ * debtorStatus que se manda en POST /remittances para cada ítem elegido.
+ * manual_debt/installment siempre son deuda; payment/payment_batch siempre
+ * pagado, sin importar lo que diga `markedAsDebtor`; el resto (cash_entry)
+ * respeta el toggle del usuario.
+ */
+export function resolveRendicionItemDebtorStatus(
+  item: PendingItemForSelection,
+  markedAsDebtor: boolean
+): "pagado" | "adeudado" {
+  if (item.source === "payment" || item.source === "payment_batch") return "pagado";
+  if (item.source === "manual_debt" || item.source === "installment") return "adeudado";
+  return markedAsDebtor ? "adeudado" : "pagado";
+}
+
 /**
  * Default del selector "Medio de rendición": si todos los ítems seleccionados
  * comparten un único medio de cobro real (efectivo/transferencia/cheque/
@@ -105,12 +224,22 @@ export { CONTABLE_METHODS };
  * del ítem (que podría colarse si algún día alguien vuelve a leer i.paymentMethod
  * por error). Así un pago cobrado en efectivo pero rendido por transferencia
  * nunca "recae" silenciosamente en efectivo en el payload.
+ *
+ * Única excepción: un cobro de contado (source="payment_batch") se rinde con
+ * sus instrumentos REALES (payment_batch_splits/received_checks) — el backend
+ * nunca usa el medio elegido para sus allocations. Se conserva el medio real
+ * que trae el ítem (`cashPeriodRealMethod`), para que remittance_items no
+ * registre un medio que no es el que efectivamente se rindió.
+ * `cashPeriodRealMethod` es solo un dato de entrada: nunca viaja en el payload.
  */
-export function attachRendicionMethod<T extends { source: string }>(
+export function attachRendicionMethod<T extends { source: string; cashPeriodRealMethod?: string | null }>(
   items: ReadonlyArray<T>,
   rendicionMethod: string
-): Array<T & { paymentMethod: string }> {
-  return items.map((i) => ({ ...i, paymentMethod: rendicionMethod }));
+): Array<Omit<T, "cashPeriodRealMethod"> & { paymentMethod: string }> {
+  return items.map(({ cashPeriodRealMethod, ...rest }) => ({
+    ...rest,
+    paymentMethod: rest.source === "payment_batch" && cashPeriodRealMethod ? cashPeriodRealMethod : rendicionMethod,
+  }));
 }
 
 // ─── Labels de medio de rendición (contexto Rendición, NO Cobro) ──────────────

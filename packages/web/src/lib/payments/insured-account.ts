@@ -283,6 +283,15 @@ export interface PaymentAmountAdjustmentForCaja {
   amountCents: number;
   /** true si el payment/payment_batch al que pertenece este ajuste sigue "confirmado" (no anulado). */
   parentActive: boolean;
+  /**
+   * true si el batch padre ya se rindió ENTERO con sus instrumentos reales
+   * (cobro de contado por período rendido, source="payment_batch"): esas
+   * allocations llevan el dinero real completo, sobrante de redondeo
+   * incluido, así que ese sobrante ya salió de Caja por rendido. undefined/
+   * false = el sobrante sigue en la oficina (todo lote normal, que se rinde
+   * por cuota por el importe aplicado, o un contado todavía sin rendir).
+   */
+  parentRenderedWithRealInstruments?: boolean;
 }
 
 /**
@@ -295,12 +304,16 @@ export interface PaymentAmountAdjustmentForCaja {
  * false) no contribuye nada — se excluye entero, sin escribir ni anular la
  * fila histórica de payment_amount_adjustments (ver POST
  * /payment-batches/:id/cancel: no la toca, la exclusión es 100% de lectura).
+ * Tampoco contribuye un ajuste cuyo batch ya se rindió entero con sus
+ * instrumentos reales (parentRenderedWithRealInstruments): ese sobrante ya
+ * está dentro de lo rendido — contarlo acá además lo duplicaría. Anular esa
+ * rendición lo devuelve a Caja (también 100% de lectura).
  */
 export function calculatePaymentAmountAdjustmentCreditInCaja(
   adjustments: ReadonlyArray<PaymentAmountAdjustmentForCaja>
 ): number {
   return adjustments
-    .filter((a) => a.parentActive && a.amountCents > 0)
+    .filter((a) => a.parentActive && a.parentRenderedWithRealInstruments !== true && a.amountCents > 0)
     .reduce((sum, a) => sum + a.amountCents, 0);
 }
 

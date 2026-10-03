@@ -300,7 +300,9 @@ export function applyManualCashEntryToCartera(
 // significa "este batch se rindió completo". Solo una allocation con
 // paymentBatchId SIN paymentId (batch_split/batch_split_check reales, ver
 // resolveBatchInstruments) representa de verdad el instrumento de cobranza
-// del batch entero, y debe sumar su totalReceivedCents completo. Antes de
+// del batch entero, y debe sumar su dinero real recibido completo
+// (receivedAmountCents, con totalReceivedCents solo como fallback si es NULL
+// — mismo criterio que POST /remittances; ver GET /cash/summary). Antes de
 // este fix, cualquier paymentBatchId no nulo (con o sin paymentId) se trataba
 // como batch completo — eso hacía que una rendición con solo algunos hijos de
 // un batch (el resto siguen sin rendir, en cartera) comparara la suma real de

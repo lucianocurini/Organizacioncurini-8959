@@ -62,8 +62,8 @@
 // index.ts) — aunque hoy esa invariante se sostiene, no hace falta apoyarse
 // en ella acá.
 
-import { inArray, or } from "drizzle-orm";
-import { paymentBatches, paymentBatchFundingAllocations, payments, cashEntries } from "./database/schema";
+import { and, eq, inArray, or } from "drizzle-orm";
+import { paymentBatches, paymentBatchFundingAllocations, payments, cashEntries, cashPeriodPayments } from "./database/schema";
 import {
   calculateAllocationRenderedCajaImpact,
   type FundingAllocationRenderStatus,
@@ -362,9 +362,23 @@ export async function loadAccountMovementCajaTotals(
     const rows = await dbClient.select({ id: paymentBatches.id, status: paymentBatches.status }).from(paymentBatches).where(inArray(paymentBatches.id, legacyAdjustmentBatchIds)).all();
     for (const r of rows as any[]) legacyAdjustmentBatchStatusById.set(r.id as number, r.status as string);
   }
+  // Cobro de contado por período ya rendido entero (source="payment_batch"):
+  // sus allocations llevan el dinero real completo, sobrante de redondeo
+  // incluido — ver PaymentAmountAdjustmentForCaja.parentRenderedWithRealInstruments.
+  const renderedCashPeriodBatchIds = new Set<number>();
+  if (legacyAdjustmentBatchIds.length > 0) {
+    const rows = await dbClient.select({ paymentBatchId: cashPeriodPayments.paymentBatchId }).from(cashPeriodPayments)
+      .where(and(
+        inArray(cashPeriodPayments.paymentBatchId, legacyAdjustmentBatchIds),
+        eq(cashPeriodPayments.status, "confirmado"),
+        eq(cashPeriodPayments.rendered, 1),
+      )).all();
+    for (const r of rows as any[]) renderedCashPeriodBatchIds.add(r.paymentBatchId as number);
+  }
   const legacyAdjustmentsForCaja: PaymentAmountAdjustmentForCaja[] = partitioned.legacyAdjustments.map((a) => ({
     amountCents: a.amountCents,
     parentActive: a.paymentBatchId != null && legacyAdjustmentBatchStatusById.get(a.paymentBatchId) === "confirmado",
+    parentRenderedWithRealInstruments: a.paymentBatchId != null && renderedCashPeriodBatchIds.has(a.paymentBatchId),
   }));
 
   return {
