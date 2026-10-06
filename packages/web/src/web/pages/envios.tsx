@@ -24,11 +24,13 @@ import {
 import {
   createDeliveriesTableScrollControl,
   DELIVERIES_TABLE_MIN_WIDTH_CLASS,
-  DELIVERIES_TABLE_SCROLL_CONTAINER_CLASS,
+  deliveriesTableScrollContainerClass,
   DELIVERIES_STICKY_ACTIONS_HEADER_CLASS, DELIVERIES_STICKY_ACTIONS_CELL_CLASS,
   DELIVERIES_SCROLL_CONTROL_LABEL,
   DELIVERIES_SCROLL_CONTROL_WRAPPER_VISIBLE_CLASS, DELIVERIES_SCROLL_CONTROL_WRAPPER_HIDDEN_CLASS,
-  DELIVERIES_SCROLL_RANGE_CLASS,
+  DELIVERIES_SCROLL_RANGE_CLASS, DELIVERIES_SCROLL_CONTROL_FLOATING_CLASS,
+  createFloatingScrollBarTracker, HIDDEN_FLOATING_SCROLL_BAR_LAYOUT,
+  type FloatingScrollBarLayout, type FloatingScrollBarTrackerHandle,
 } from "@/lib/table-scroll-sync";
 
 const CHANNEL_LABELS: Record<string, string> = {
@@ -545,15 +547,24 @@ function TransitionConfirmDialog({ kind, onConfirm, onCancel, submitting }: {
 // overflow real, scrollWidth pegado a 0). Con callback refs → estado, el
 // efecto se re-dispara automáticamente en cuanto los tres nodos existen,
 // sin importar cuándo se monta cada uno.
-function useDeliveriesTableScrollControl() {
+//
+// Además el control flota arriba de la pantalla mientras la tabla sigue
+// visible (createFloatingScrollBarTracker): mismo <input>, sin remontarlo,
+// así que nunca hay dos barras ni se pierde el foco al cambiar de modo.
+export function useDeliveriesTableScrollControl() {
   const [tableScrollEl, setTableScrollEl] = useState<HTMLDivElement | null>(null);
   const [tableEl, setTableEl] = useState<HTMLTableElement | null>(null);
   const [rangeEl, setRangeEl] = useState<HTMLInputElement | null>(null);
+  const [slotEl, setSlotEl] = useState<HTMLDivElement | null>(null);
+  const [barEl, setBarEl] = useState<HTMLDivElement | null>(null);
   const [maxScrollLeft, setMaxScrollLeft] = useState(0);
+  const [floatingLayout, setFloatingLayout] = useState<FloatingScrollBarLayout>(HIDDEN_FLOATING_SCROLL_BAR_LAYOUT);
 
   const tableScrollRef = useCallback((node: HTMLDivElement | null) => setTableScrollEl(node), []);
   const tableRef = useCallback((node: HTMLTableElement | null) => setTableEl(node), []);
   const rangeRef = useCallback((node: HTMLInputElement | null) => setRangeEl(node), []);
+  const slotRef = useCallback((node: HTMLDivElement | null) => setSlotEl(node), []);
+  const barRef = useCallback((node: HTMLDivElement | null) => setBarEl(node), []);
 
   // useLayoutEffect (no useEffect): mide/aplica el ancho ANTES del paint
   // para que el control no parpadee oculto→visible en el primer render.
@@ -563,12 +574,89 @@ function useDeliveriesTableScrollControl() {
     return () => handle.destroy();
   }, [tableScrollEl, tableEl, rangeEl]);
 
-  return { tableScrollRef, tableRef, rangeRef, maxScrollLeft };
+  // El tracker lee el desborde por ref (no por closure) para no recrearse en
+  // cada cambio de maxScrollLeft; el efecto de abajo le pide un recálculo.
+  const hasOverflowRef = useRef(false);
+  hasOverflowRef.current = maxScrollLeft > 0;
+  const trackerRef = useRef<FloatingScrollBarTrackerHandle | null>(null);
+
+  useLayoutEffect(() => {
+    if (!slotEl || !barEl || !tableScrollEl || !tableEl || typeof ResizeObserver === "undefined") return;
+    const handle = createFloatingScrollBarTracker({
+      slotEl, barEl, scrollEl: tableScrollEl, contentEl: tableEl,
+      hasOverflow: () => hasOverflowRef.current,
+      onLayoutChange: setFloatingLayout,
+      win: window,
+      ResizeObserverImpl: ResizeObserver,
+    });
+    trackerRef.current = handle;
+    return () => {
+      trackerRef.current = null;
+      handle.destroy();
+      setFloatingLayout(HIDDEN_FLOATING_SCROLL_BAR_LAYOUT);
+    };
+  }, [slotEl, barEl, tableScrollEl, tableEl]);
+
+  useLayoutEffect(() => {
+    trackerRef.current?.refresh();
+  }, [maxScrollLeft]);
+
+  // Mientras flota, el foco por teclado (Tab) nunca queda debajo del control:
+  // el navegador deja ese margen al desplazar hasta el elemento enfocado.
+  const floatingHeight = floatingLayout.mode === "floating" ? floatingLayout.barHeight : 0;
+  useEffect(() => {
+    if (!floatingHeight) return;
+    const root = document.documentElement;
+    const previous = root.style.scrollPaddingTop;
+    root.style.scrollPaddingTop = `${floatingHeight}px`;
+    return () => { root.style.scrollPaddingTop = previous; };
+  }, [floatingHeight]);
+
+  return { tableScrollRef, tableRef, rangeRef, slotRef, barRef, maxScrollLeft, floatingLayout };
+}
+
+// Control "Desplazar tabla" (ver useDeliveriesTableScrollControl). Exportado
+// solo para tests (deliveries-floating-scroll-control.test.tsx).
+export function DeliveriesTableScrollControl({ control }: { control: ReturnType<typeof useDeliveriesTableScrollControl> }) {
+  const { slotRef, barRef, rangeRef, maxScrollLeft, floatingLayout } = control;
+  const floating = floatingLayout.mode === "floating";
+  return (
+    <div
+      ref={slotRef}
+      data-testid="deliveries-table-scroll-slot"
+      style={floating ? { height: floatingLayout.barHeight } : undefined}
+    >
+      <div
+        ref={barRef}
+        className={cn(
+          maxScrollLeft > 0 ? DELIVERIES_SCROLL_CONTROL_WRAPPER_VISIBLE_CLASS : DELIVERIES_SCROLL_CONTROL_WRAPPER_HIDDEN_CLASS,
+          floating && DELIVERIES_SCROLL_CONTROL_FLOATING_CLASS,
+        )}
+        style={floating ? { top: floatingLayout.top, left: floatingLayout.left, width: floatingLayout.width } : undefined}
+        data-testid="deliveries-table-scroll-control"
+        data-mode={floatingLayout.mode}
+      >
+        <span className="text-xs text-gray-500 whitespace-nowrap flex-shrink-0">{DELIVERIES_SCROLL_CONTROL_LABEL}</span>
+        <input
+          ref={rangeRef}
+          type="range"
+          min={0}
+          max={maxScrollLeft}
+          defaultValue={0}
+          aria-label={DELIVERIES_SCROLL_CONTROL_LABEL}
+          title={DELIVERIES_SCROLL_CONTROL_LABEL}
+          data-testid="deliveries-table-scroll-range"
+          className={DELIVERIES_SCROLL_RANGE_CLASS}
+        />
+      </div>
+    </div>
+  );
 }
 
 export default function Envios() {
   const [, navigate] = useLocation();
-  const { tableScrollRef, tableRef, rangeRef, maxScrollLeft } = useDeliveriesTableScrollControl();
+  const scrollControl = useDeliveriesTableScrollControl();
+  const { tableScrollRef, tableRef } = scrollControl;
 
   // Se lee UNA sola vez al montar (mismo patrón que initialFiltersRef en
   // reporte-mes.tsx). El alta rápida desde la póliza ya no navega acá con
@@ -846,26 +934,11 @@ export default function Envios() {
                 página. El control es un <input type="range"> estilizado a
                 mano (no un scrollbar nativo) para que sea siempre visible en
                 Chrome/Windows — ver table-scroll-sync.ts. Solo se muestra
-                cuando hay overflow real (maxScrollLeft > 0). */}
+                cuando hay overflow real (maxScrollLeft > 0). Sin
+                ResizeObserver vuelve el scrollbar nativo del contenedor. */}
             <div className="hidden lg:block">
-              <div
-                className={maxScrollLeft > 0 ? DELIVERIES_SCROLL_CONTROL_WRAPPER_VISIBLE_CLASS : DELIVERIES_SCROLL_CONTROL_WRAPPER_HIDDEN_CLASS}
-                data-testid="deliveries-table-scroll-control"
-              >
-                <span className="text-xs text-gray-500 whitespace-nowrap flex-shrink-0">{DELIVERIES_SCROLL_CONTROL_LABEL}</span>
-                <input
-                  ref={rangeRef}
-                  type="range"
-                  min={0}
-                  max={maxScrollLeft}
-                  defaultValue={0}
-                  aria-label={DELIVERIES_SCROLL_CONTROL_LABEL}
-                  title={DELIVERIES_SCROLL_CONTROL_LABEL}
-                  data-testid="deliveries-table-scroll-range"
-                  className={DELIVERIES_SCROLL_RANGE_CLASS}
-                />
-              </div>
-              <div ref={tableScrollRef} data-testid="deliveries-table-scroll" className={DELIVERIES_TABLE_SCROLL_CONTAINER_CLASS}>
+              <DeliveriesTableScrollControl control={scrollControl} />
+              <div ref={tableScrollRef} data-testid="deliveries-table-scroll" className={deliveriesTableScrollContainerClass(typeof ResizeObserver !== "undefined")}>
                 <table ref={tableRef} className={DELIVERIES_TABLE_MIN_WIDTH_CLASS}>
                   <thead>
                     <tr className="text-xs text-gray-500 border-b border-[#1f2937]">

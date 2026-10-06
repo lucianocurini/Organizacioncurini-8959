@@ -17,10 +17,11 @@ import { join } from "node:path";
 import {
   DELIVERIES_TABLE_MIN_WIDTH_CLASS,
   DELIVERIES_TABLE_SCROLL_CONTAINER_CLASS,
+  DELIVERIES_TABLE_SCROLL_CONTAINER_FALLBACK_CLASS, deliveriesTableScrollContainerClass,
   DELIVERIES_STICKY_ACTIONS_HEADER_CLASS, DELIVERIES_STICKY_ACTIONS_CELL_CLASS,
   DELIVERIES_SCROLL_CONTROL_LABEL,
   DELIVERIES_SCROLL_CONTROL_WRAPPER_VISIBLE_CLASS, DELIVERIES_SCROLL_CONTROL_WRAPPER_HIDDEN_CLASS,
-  DELIVERIES_SCROLL_RANGE_CLASS,
+  DELIVERIES_SCROLL_RANGE_CLASS, DELIVERIES_SCROLL_CONTROL_FLOATING_CLASS,
 } from "../table-scroll-sync";
 
 const envíosSource = readFileSync(join(import.meta.dir, "../../pages/envios.tsx"), "utf-8");
@@ -70,6 +71,31 @@ describe("control de scroll: visible con overflow real, oculto sin overflow", ()
     expect(envíosSource).toMatch(
       /maxScrollLeft > 0 \? DELIVERIES_SCROLL_CONTROL_WRAPPER_VISIBLE_CLASS : DELIVERIES_SCROLL_CONTROL_WRAPPER_HIDDEN_CLASS/,
     );
+  });
+});
+
+describe("control de scroll: modo flotante", () => {
+  test("flota fijo, con fondo opaco, por encima de la tabla y por debajo de modales/drawer (z-50)", () => {
+    expect(DELIVERIES_SCROLL_CONTROL_FLOATING_CLASS).toMatch(/\bfixed\b/);
+    expect(DELIVERIES_SCROLL_CONTROL_FLOATING_CLASS).toMatch(/bg-\[#0d1424\]/);
+    const z = DELIVERIES_SCROLL_CONTROL_FLOATING_CLASS.match(/\bz-(\d+)\b/);
+    expect(z).not.toBeNull();
+    expect(Number(z![1])).toBeGreaterThan(10); // columna Acciones fija (z-10)
+    expect(Number(z![1])).toBeLessThan(50); // modales y drawer mobile
+  });
+
+  test("flotando mide lo mismo que en línea: no agrega bordes ni padding verticales (el slot reserva ese alto)", () => {
+    const tokens = DELIVERIES_SCROLL_CONTROL_FLOATING_CLASS.split(/\s+/);
+    for (const t of tokens) {
+      expect(t).not.toMatch(/^(border|border-t|border-y|border-b)$/);
+      expect(t).not.toMatch(/^(border-t|border-y|border-b)-\d/);
+      expect(t).not.toMatch(/^(p|py|pt|pb|h|min-h|max-h)-/);
+    }
+  });
+
+  test("envios.tsx no duplica el control: un solo <input type=range> en la página", () => {
+    expect(envíosSource.match(/<input\s+ref=\{rangeRef\}/g)?.length).toBe(1);
+    expect(envíosSource.match(/ref=\{rangeRef\}/g)?.length).toBe(1);
   });
 });
 
@@ -126,6 +152,14 @@ describe("control de scroll: no depende de scrollbar nativo autooculto", () => {
     expect(stylesSource).toMatch(/\.deliveries-table-scroll-container::-webkit-scrollbar\s*\{[^}]*display:\s*none/);
   });
 
+  test("sin ResizeObserver (control oculto) el contenedor conserva su scrollbar nativo y sigue desplazable", () => {
+    expect(deliveriesTableScrollContainerClass(true)).toBe(DELIVERIES_TABLE_SCROLL_CONTAINER_CLASS);
+    expect(deliveriesTableScrollContainerClass(false)).toBe(DELIVERIES_TABLE_SCROLL_CONTAINER_FALLBACK_CLASS);
+    expect(DELIVERIES_TABLE_SCROLL_CONTAINER_FALLBACK_CLASS).toContain("overflow-x-auto");
+    expect(DELIVERIES_TABLE_SCROLL_CONTAINER_FALLBACK_CLASS).not.toContain("deliveries-table-scroll-container");
+    expect(envíosSource).toContain('deliveriesTableScrollContainerClass(typeof ResizeObserver !== "undefined")');
+  });
+
   test("el thumb y el track del control tienen estilos propios definidos (no heredan la apariencia por defecto del SO/navegador)", () => {
     expect(stylesSource).toMatch(/\.deliveries-scroll-range\s*\{[^}]*appearance:\s*none/);
     expect(stylesSource).toMatch(/::-webkit-slider-runnable-track/);
@@ -153,7 +187,7 @@ describe("contención del scroll horizontal al listado (nunca a toda la página)
 
   test("la clase centralizada del contenedor de la tabla es la única con overflow-x-auto", () => {
     expect(DELIVERIES_TABLE_SCROLL_CONTAINER_CLASS).toContain("overflow-x-auto");
-    for (const cls of [DELIVERIES_TABLE_MIN_WIDTH_CLASS, DELIVERIES_STICKY_ACTIONS_HEADER_CLASS, DELIVERIES_STICKY_ACTIONS_CELL_CLASS, DELIVERIES_SCROLL_RANGE_CLASS]) {
+    for (const cls of [DELIVERIES_TABLE_MIN_WIDTH_CLASS, DELIVERIES_STICKY_ACTIONS_HEADER_CLASS, DELIVERIES_STICKY_ACTIONS_CELL_CLASS, DELIVERIES_SCROLL_RANGE_CLASS, DELIVERIES_SCROLL_CONTROL_FLOATING_CLASS]) {
       expect(cls).not.toMatch(/overflow-x/);
     }
   });
@@ -165,7 +199,7 @@ describe("contención del scroll horizontal al listado (nunca a toda la página)
   });
 
   test("envios.tsx efectivamente usa las clases centralizadas del control y de la columna fija", () => {
-    expect(envíosSource).toContain("DELIVERIES_TABLE_SCROLL_CONTAINER_CLASS");
+    expect(envíosSource).toContain("deliveriesTableScrollContainerClass(");
     expect(envíosSource).toContain("DELIVERIES_STICKY_ACTIONS_HEADER_CLASS");
     expect(envíosSource).toContain("DELIVERIES_STICKY_ACTIONS_CELL_CLASS");
     expect(envíosSource).toContain("DELIVERIES_TABLE_MIN_WIDTH_CLASS");
