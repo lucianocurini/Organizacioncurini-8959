@@ -462,6 +462,11 @@ describe("GET /api/payment-batches — listado", () => {
   });
 
   test("batch con faltante: receivedAmountCents < totalReceivedCents en el listado", async () => {
+    // Regla "crédito antes que deuda": Asegurado A ya tiene saldo a favor del
+    // test de sobrante anterior, así que el faltante se registra sobre un
+    // asegurado nuevo, sin saldo (con saldo, el backend responde 409).
+    const [freshInsured] = await db.insert(insureds).values({ name: `${PREFIX} Asegurado sin saldo`, createdBy: userId }).returning({ id: insureds.id });
+    const insuredId = freshInsured!.id;
     const policyId = await mkPolicy(insuredId, companyId);
     const instId = await mkInstallment(policyId, 1, "2027-06-01", 1000);
     const created = await callPost({

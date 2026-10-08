@@ -1348,7 +1348,7 @@ export function BatchPaymentModal({
                   titularPreview.ok ? (
                     <div className="bg-white/5 border border-white/10 rounded-lg p-3 space-y-1">
                       <p className="text-[11px] text-white/40 uppercase tracking-wider mb-1">Resumen del cierre</p>
-                      {buildTitularSummaryLines(titularPreview.plan).map((line) => (
+                      {buildTitularSummaryLines(titularPreview.plan, titularBalance?.balanceCents).map((line) => (
                         <div key={line.label} className="flex justify-between text-xs">
                           <span className="text-white/60">{line.label}</span>
                           <span className={cn(

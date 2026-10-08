@@ -61,6 +61,9 @@ import {
   type FundingAllocationRow,
 } from "../lib/payments/account-holder-funding-allocations";
 import { isValidCalendarDate } from "../lib/installments/plan";
+import {
+  FUNDING_REQUEST_ENDPOINTS, PAYMENT_BATCHES_ENDPOINT, type FundingRequestEndpoint,
+} from "../lib/payments/account-holder-funding-fingerprint";
 
 export class AccountHolderFundingBatchError extends Error {}
 export class FundingPlanRaceConditionError extends Error {}
@@ -602,21 +605,17 @@ export async function persistAccountHolderFundingArtifacts(
 // (coherente con NOT NULL y con "sin placeholders") — nunca se exige que sea
 // JSON válido, esa responsabilidad es de quien lo arma.
 //
-// ─── endpoint: constante duplicada a propósito ─────────────────────────────
-// FUNDING_REQUEST_FINGERPRINT_ENDPOINT (account-holder-funding-fingerprint.
-// ts) tiene el mismo valor "POST /payment-batches" pero no está exportada
-// (ese módulo la trata como un detalle interno de su propia forma canónica,
-// no como una constante pública) — mismo criterio que el resto de este
-// archivo (assertPlainObject/assertSafePositiveInt duplicados en vez de
-// importados): este módulo es dueño de su propio contrato de idempotencia y
-// no depende de un símbolo interno de otro módulo. Si algún día divergieran,
-// sería un bug real detectable (un idempotencyKey nunca podría resolverse
-// porque el fingerprint canónico usa un endpoint y esta tabla otro) — no un
-// caso silencioso.
+// ─── endpoint: misma fuente que el fingerprint ─────────────────────────────
+// Los valores válidos de `endpoint` son exactamente los de
+// FUNDING_REQUEST_ENDPOINTS (account-holder-funding-fingerprint.ts): POST
+// /payment-batches (lote con titular) y POST /payments/account-funded (pago
+// individual con saldo, persistido como lote de un ítem). El fingerprint
+// canónico embebe el mismo endpoint, así que una idempotencyKey registrada en
+// uno nunca resuelve una fila del otro. Cualquier otro valor se rechaza acá.
 
 export class FundingIdempotencyConflictError extends Error {}
 
-const ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT = "POST /payment-batches";
+const ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT = PAYMENT_BATCHES_ENDPOINT;
 const HTTP_STATUS_MIN = 100;
 const HTTP_STATUS_MAX = 599;
 
@@ -635,11 +634,11 @@ function assertHttpStatus(label: string, value: unknown): asserts value is numbe
   }
 }
 
-/** Este módulo maneja exclusivamente la idempotencia de POST /payment-batches — cualquier otro valor se rechaza acá, aunque el esquema (UNIQUE compuesto) permitiría conviver con otro endpoint real. */
-function assertIdempotencyEndpoint(label: string, value: unknown): asserts value is string {
-  if (value !== ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT) {
+/** Solo los endpoints de FUNDING_REQUEST_ENDPOINTS — cualquier otro valor se rechaza acá, aunque el esquema (UNIQUE compuesto) permitiría conviver con otro endpoint. */
+function assertIdempotencyEndpoint(label: string, value: unknown): asserts value is FundingRequestEndpoint {
+  if (typeof value !== "string" || !FUNDING_REQUEST_ENDPOINTS.has(value)) {
     throw new AccountHolderFundingBatchError(
-      `${label} debe ser exactamente "${ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT}" (recibido: ${
+      `${label} debe ser uno de ${[...FUNDING_REQUEST_ENDPOINTS].map((e) => `"${e}"`).join(", ")} (recibido: ${
         value === null ? "null" : typeof value === "string" ? `"${value}"` : typeof value
       }).`
     );
@@ -912,6 +911,8 @@ export interface AccountHolderFundingIdempotencyReconciliationParams {
   createdBy: number;
   idempotencyKey: string;
   requestFingerprint: string;
+  /** Default POST /payment-batches. */
+  endpoint?: FundingRequestEndpoint;
 }
 
 /**
@@ -930,7 +931,7 @@ export async function reconcileAccountHolderFundingIdempotencyConflict(
 ): Promise<RunAccountHolderFundingBatchResult> {
   const existingRow = await findAccountHolderFundingIdempotencyRow(dbClient, {
     createdBy: params.createdBy,
-    endpoint: ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT,
+    endpoint: params.endpoint ?? ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT,
     idempotencyKey: params.idempotencyKey,
   });
   if (!existingRow) {
@@ -1014,6 +1015,8 @@ export interface RunAccountHolderFundingBatchParams {
   debtAuthorized: boolean;
   debtReason: string | null;
   dependencies: AccountHolderFundingBatchDependencies;
+  /** Endpoint que registra el cobro (idempotencia). Default POST /payment-batches. */
+  endpoint?: FundingRequestEndpoint;
 }
 
 export interface RunAccountHolderFundingBatchResult {
@@ -1049,6 +1052,26 @@ export async function runAccountHolderFundingTransaction(
   }
 }
 
+// ─── Serialización en proceso de las transacciones de financiación ─────────
+// Dos requests simultáneos (doble clic, dos pestañas) que abren su
+// transacción de escritura a la vez colisionan con SQLITE_BUSY. Con
+// @libsql/client en modo archivo local eso además deja la conexión compartida
+// del cliente con un BEGIN fallido "en progreso" (reproducido aislado contra
+// el driver): las escrituras siguientes de TODO el proceso fallan con BUSY.
+// Encolando acá las transacciones de financiación (lote con titular y pago
+// individual con saldo) dentro del mismo proceso, nunca colisionan entre sí:
+// la segunda espera a la primera y, si es el mismo request, su revalidación
+// interna de idempotencia devuelve la respuesta ya guardada. No reemplaza a
+// la base como autoridad entre procesos distintos (UNIQUE de idempotencia +
+// relectura del saldo dentro de la transacción siguen siendo la garantía).
+let fundingTransactionQueue: Promise<unknown> = Promise.resolve();
+
+export function runSerializedFundingTransaction<T>(fn: () => Promise<T>): Promise<T> {
+  const run = fundingTransactionQueue.then(fn, fn);
+  fundingTransactionQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 /**
  * Orquesta el flujo COMPLETO del modo titular de POST /payment-batches —
  * todavía sin conectar (index.ts no llama a esta función). Ver cabecera de
@@ -1077,6 +1100,8 @@ export async function runAccountHolderFundingBatch(
   if (!params.db || typeof (params.db as Record<string, unknown>).transaction !== "function") {
     throw new AccountHolderFundingBatchError("db debe ser un cliente Drizzle con .transaction() (recibido inválido).");
   }
+  const endpoint = params.endpoint ?? ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT;
+  assertIdempotencyEndpoint("endpoint", endpoint);
 
   const planParams: PlanFundingWithFreshBalanceParams = {
     insuredId: params.accountHolderInsuredId,
@@ -1088,7 +1113,7 @@ export async function runAccountHolderFundingBatch(
   };
   const idempotencyLookupParams: FindAccountHolderFundingIdempotencyRowParams = {
     createdBy: params.createdBy,
-    endpoint: ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT,
+    endpoint,
     idempotencyKey,
   };
 
@@ -1100,7 +1125,7 @@ export async function runAccountHolderFundingBatch(
   const preliminary = await planFundingWithFreshBalance(params.db, planParams);
 
   // ─── 3. Transacción única ───────────────────────────────────────────────
-  const runTransaction = (): Promise<RunAccountHolderFundingBatchResult> =>
+  const runTransaction = (): Promise<RunAccountHolderFundingBatchResult> => runSerializedFundingTransaction(() =>
     params.db.transaction(async (tx: AccountHolderFundingDbClient) => {
       // Revalidación de idempotencia — primera operación de la transacción,
       // antes de cualquier escritura (ver cabecera de la sección).
@@ -1147,7 +1172,7 @@ export async function runAccountHolderFundingBatch(
       // Última escritura de la transacción — ver cabecera de la sección.
       await insertAccountHolderFundingIdempotencyRow(tx, {
         createdBy: params.createdBy,
-        endpoint: ACCOUNT_HOLDER_FUNDING_IDEMPOTENCY_ENDPOINT,
+        endpoint,
         idempotencyKey,
         requestFingerprint: params.requestFingerprint,
         paymentBatchId: batch.id,
@@ -1156,12 +1181,13 @@ export async function runAccountHolderFundingBatch(
       });
 
       return { paymentBatchId: batch.id, responseStatus, responseSnapshot };
-    });
+    }));
 
   // ─── 4. Carrera UNIQUE — reconciliación fuera de la transacción ────────
   return runAccountHolderFundingTransaction(params.db, runTransaction, {
     createdBy: params.createdBy,
     idempotencyKey,
     requestFingerprint: params.requestFingerprint,
+    endpoint,
   });
 }

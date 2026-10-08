@@ -87,7 +87,8 @@ describe("summarizeTitularBatchFunding", () => {
     expect(s.appliedTotalCents).toBe(100000);
     expect(s.differenceCents).toBe(0);
     const labels = buildTitularBatchFundingLines(s).map((l) => l.label);
-    expect(labels).toContain("Saldo a favor nuevo");
+    expect(labels).toContain("Sobrante a cuenta corriente");
+    expect(labels).not.toContain("Saldo a favor nuevo");
     expect(labels).not.toContain("Deuda nueva del titular");
   });
 

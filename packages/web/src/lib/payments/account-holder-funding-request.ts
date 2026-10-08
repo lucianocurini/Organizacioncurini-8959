@@ -52,7 +52,8 @@ import {
 import { normalizeReceivedCheck, validateChecksMatchSplit, type NormalizedReceivedCheck, type ReceivedCheckInput } from "./received-checks";
 import { ROUNDING_ADJUSTMENT_REASON } from "./insured-account";
 import {
-  canonicalizeFundingRequest,
+  canonicalizeFundingRequest, PAYMENT_BATCHES_ENDPOINT,
+  type FundingRequestEndpoint,
   type FundingRequestFingerprintInput,
   type FingerprintSplitInput,
   type FingerprintCheckInput,
@@ -237,17 +238,34 @@ export interface FundingRequestParseResult {
   confirmPossibleDuplicates: boolean;
 }
 
+export interface ParseFundingRequestOptions {
+  /** Endpoint que recibe el request — entra al fingerprint. Default: POST /payment-batches. */
+  endpoint?: FundingRequestEndpoint;
+  /**
+   * Solo POST /payments/account-funded: admite `splits: []` (cero medios
+   * reales) en modo titular, siempre que se aplique saldo a favor — el plan
+   * después exige que saldo (+ redondeo/deuda autorizada) cubra el total.
+   * Ningún otro flujo lo habilita: sin esta opción, cero medios se rechaza
+   * igual que siempre (normalizeBatchSplits).
+   */
+  allowZeroRealSplits?: boolean;
+}
+
 /**
  * Parsea, normaliza y detecta el modo de un request de POST /payment-batches
- * — o lanza sin devolver nada parcial. No escribe nada, no conoce DB. No
- * muta `body` ni ninguna de sus propiedades anidadas.
+ * (o de POST /payments/account-funded, ya traducido a la misma forma) — o
+ * lanza sin devolver nada parcial. No escribe nada, no conoce DB. No muta
+ * `body` ni ninguna de sus propiedades anidadas.
  */
-export function parseFundingRequest(body: unknown): FundingRequestParseResult {
+export function parseFundingRequest(body: unknown, options: ParseFundingRequestOptions = {}): FundingRequestParseResult {
   assertPlainObject("body", body);
+  const endpoint = options.endpoint ?? PAYMENT_BATCHES_ENDPOINT;
+  const allowZeroRealSplits = options.allowZeroRealSplits === true;
 
   // ─── 1. Normalización reutilizada — items, splits, cheques ─────────────
   const normalizedItems = normalizeBatchItems(body.items as PaymentBatchItemInput[]);
-  const normalizedSplits = normalizeBatchSplits(body.splits as PaymentBatchSplitInput[]);
+  const hasZeroRealSplits = allowZeroRealSplits && Array.isArray(body.splits) && body.splits.length === 0;
+  const normalizedSplits = hasZeroRealSplits ? [] : normalizeBatchSplits(body.splits as PaymentBatchSplitInput[]);
   const rawSplits: unknown[] = Array.isArray(body.splits) ? body.splits : [];
 
   const splitsWithChecks: NormalizedSplitWithChecks[] = normalizedSplits.map((split, i) => {
@@ -331,6 +349,15 @@ export function parseFundingRequest(body: unknown): FundingRequestParseResult {
     accountDifferenceResolution = normalizeAccountDifferenceResolution(body.accountDifferenceResolution);
   }
 
+  if (hasZeroRealSplits) {
+    if (mode !== "titular") {
+      throw new AccountHolderFundingRequestError("Un cobro sin medios reales solo es posible con titular de cuenta y saldo a favor aplicado.");
+    }
+    if (creditAppliedCents === 0) {
+      throw new AccountHolderFundingRequestError("Sin medios reales, el cobro debe aplicar saldo a favor del asegurado.");
+    }
+  }
+
   // ─── 4. DTO + fingerprint — canonicalizeFundingRequest es la autoridad
   // final: cualquier chequeo que ya hace (paymentDate, exclusión mutua,
   // signos, XOR) no se duplica acá.
@@ -348,7 +375,7 @@ export function parseFundingRequest(body: unknown): FundingRequestParseResult {
     debtReason,
   };
 
-  const fingerprint = canonicalizeFundingRequest(dto);
+  const fingerprint = canonicalizeFundingRequest(dto, { endpoint });
 
   return { mode, normalizedItems, splitsWithChecks, dto, fingerprint, idempotencyKey, confirmPossibleDuplicates };
 }

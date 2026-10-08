@@ -2405,8 +2405,19 @@ describe("72. Cheque mayor al aplicado → saldo a favor", () => {
   });
 });
 
+// Regla "crédito antes que deuda": un asegurado con saldo a favor activo no
+// puede generar saldo deudor por el camino legacy (409
+// CREDIT_AVAILABLE_BEFORE_DEBT). Asegurado A acumula saldo a favor de los
+// tests de sobrante anteriores, así que los tests de faltante usan un
+// asegurado nuevo, sin saldo.
+async function mkInsuredWithoutCredit(): Promise<number> {
+  const [ins] = await db.insert(insureds).values({ name: `${PREFIX} Asegurado sin saldo ${Date.now()}`, createdBy: userId }).returning({ id: insureds.id });
+  return ins!.id;
+}
+
 describe("73. Cheque menor al aplicado (mismas cuotas) → saldo deudor", () => {
   test("split cheque $900 contra 1 cuota de $1000 con accountDifferenceResolution saldo_deudor → 201, -10000 saldo_deudor", async () => {
+    const insuredId = await mkInsuredWithoutCredit();
     const policyId = await mkPolicy(insuredId, companyId);
     const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
     const checkNumber = `CHK-73-${Date.now()}`;
@@ -2632,6 +2643,7 @@ describe("78. GET /payment-batches/:id — datos para el comprobante (Fase 2F)",
   });
 
   test("faltante: receivedAmountCents < totalReceivedCents, accountMovements incluye el saldo_deudor con su motivo obligatorio", async () => {
+    const insuredId = await mkInsuredWithoutCredit();
     const policyId = await mkPolicy(insuredId, companyId);
     const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
     const { body: created } = await callPost({
@@ -2652,6 +2664,7 @@ describe("78. GET /payment-batches/:id — datos para el comprobante (Fase 2F)",
   });
 
   test("anular el batch anula también el movimiento — accountMovements refleja status='anulado'", async () => {
+    const insuredId = await mkInsuredWithoutCredit();
     const policyId = await mkPolicy(insuredId, companyId);
     const instId = await mkInstallment(policyId, 1, "2027-01-01", 1000);
     const { body: created } = await callPost({

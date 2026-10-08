@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { api } from "@/lib/api";
 import { useAuth } from "../lib/auth";
@@ -39,6 +39,16 @@ import {
   buildPendingForPaymentQuery, toInstallmentOptions, isSelectedInstallmentStillCollectable, looksLikeIsoDate,
   detachUnavailableInstallment, INSTALLMENT_NO_LONGER_AVAILABLE_MESSAGE,
 } from "@/lib/collectable-installments";
+import {
+  type IndividualFundingFormState, type IndividualAccountFundingRowData,
+  emptyIndividualFundingState, resetFundingForPolicyChange, resetFundingForInstallmentChange, invalidateFundingKey,
+  setFundingDebtAuthorized, isIndividualFundingEligible, individualFundingSurchargeCents, individualFundingTargetCents,
+  validateIndividualFundingSplits, removeFundingSplitRow, realSplitsTotalCents, parseIndividualFundingAmounts, validateIndividualFundingFields,
+  computeIndividualFundingPreview, suggestedCreditCents, shortfallAfterAllCreditCents, buildIndividualFundingSummary,
+  buildAccountFundedPaymentPayload, computeIndividualFundingFingerprint, resolveIdempotencyKey,
+  describeIndividualAccountFundingRow, INDIVIDUAL_FUNDED_CANCEL_CONFIRM, MAX_ROUNDING_ADJUSTMENT_CENTS,
+} from "@/lib/individual-account-funding-form";
+import { generateIdempotencyKey, type AccountHolderBalance } from "@/lib/payment-batch-titular-form";
 
 /** Póliza + fecha de pago para las que se cargaron los candidatos de contado. */
 function cashPeriodSearchKeyFor(policyId: string, paymentDate: string): string {
@@ -65,6 +75,9 @@ const METHOD_LABELS: Record<string, string> = {
   // (ver isBatchChildPendingPayment). Se etiqueta distinto para que se note
   // en el paso 1 del modal que ese ítem no tiene un medio de cobro propio.
   lote: "Cobro por lote",
+  // Solo presentación de un pago individual cubierto 100% con saldo a favor
+  // (GET /payments, accountFunding) — nunca un medio de cobro seleccionable.
+  saldo_a_favor: "Saldo a favor",
 };
 
 // RENDICION_METHOD_LABELS (medios de rendición seleccionables, mismo set que
@@ -88,6 +101,7 @@ const METHOD_COLORS: Record<string, string> = {
   link_pago: "bg-purple-500/20 text-purple-400 border-purple-500/30",
   transferencia_compania: "bg-orange-500/20 text-orange-400 border-orange-500/30",
   lote: "bg-indigo-500/20 text-indigo-300 border-indigo-500/30",
+  saldo_a_favor: "bg-emerald-500/20 text-emerald-300 border-emerald-500/30",
 };
 
 // Métodos que van directo a la compañía
@@ -134,6 +148,9 @@ interface PaymentRow {
       cashAmountCents: number;
       discountAmountCents: number;
     } | null;
+    // Presente solo en un pago individual con saldo (POST /payments/account-funded):
+    // hijo único de un lote con titular — se corrige anulando el cobro.
+    accountFunding?: IndividualAccountFundingRowData;
   };
   policy: { id: number; policyNumber: string } | null;
   insured: { id: number; name: string } | null;
@@ -150,7 +167,7 @@ function paymentRowKey(r: PaymentRow): number {
 
 interface PolicyOption {
   policy: { id: number; policyNumber: string };
-  insured: { name: string } | null;
+  insured: { id?: number; name: string } | null;
   company: { id: number; name: string } | null;
 }
 
@@ -213,8 +230,23 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
   // y fecha actuales (nunca con una de otra fecha, ni tras un error de red).
   const [collectableOptions, setCollectableOptions] = useState<{ policyId: string; paymentDate: string; options: { id: number }[] } | null>(null);
 
+  // Cuenta corriente del asegurado (pago individual con saldo / deuda /
+  // sobrante) — ver individual-account-funding-form.ts. Desactivada, el
+  // modal funciona exactamente como siempre (POST /payments).
+  const [funding, setFunding] = useState<IndividualFundingFormState>(emptyIndividualFundingState());
+  const [fundingBalance, setFundingBalance] = useState<AccountHolderBalance | null>(null);
+  const [fundingBalanceLoading, setFundingBalanceLoading] = useState(false);
+  const [fundingBalanceError, setFundingBalanceError] = useState(false);
+  const [fundingBalanceNonce, setFundingBalanceNonce] = useState(0);
+  const [fundingDuplicateWarning, setFundingDuplicateWarning] = useState(false);
+  // Guard sincrónico contra doble clic (el estado `saving` llega un render tarde).
+  const submitLockRef = useRef(false);
+
   useEffect(() => {
     if (!open) return;
+    setFunding(emptyIndividualFundingState());
+    setFundingBalance(null);
+    setFundingDuplicateWarning(false);
     // includeAccessories=1: mismas pólizas que "Cobrar en lote" (paridad de
     // la regla de cobrabilidad — las accesorias también tienen cuotas).
     api.get("/api/policies?includeAccessories=1").then(setPolicies).catch(() => {});
@@ -392,16 +424,163 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
   const splitTotals = computeSplitTotals(form.amount, form.splits);
   const blockedByUnavailableInstallment = !editing && !manualMode && installmentNoLongerAvailable;
 
+  // ─── Cuenta corriente del asegurado (pago individual con saldo) ─────────
+  const policyInsuredId = selectedPolicy?.insured?.id ?? null;
+  const fundingEligible = isIndividualFundingEligible({
+    editing: !!editing, manualMode, showCuotaFields, installmentId: form.installmentId, status: form.status, policyInsuredId,
+  });
+  const fundingActive = fundingEligible && funding.enabled;
+  const fundingIsRivadavia = selectedPolicy?.company?.name?.toLowerCase().includes("rivadavia") ?? false;
+  const installmentAmountCents = selectedInstallment ? Math.round(Number(selectedInstallment.amount) * 100) : 0;
+  const fundingSurchargeCents = individualFundingSurchargeCents({
+    isRivadavia: fundingIsRivadavia, applyProntoPagoSurcharge, splits: form.splits,
+  });
+  const fundingTargetCents = individualFundingTargetCents(installmentAmountCents, fundingSurchargeCents);
+  const fundingAmounts = parseIndividualFundingAmounts(funding) ?? { creditAppliedCents: 0, roundingCoverageCents: 0 };
+  const fundingRealCents = realSplitsTotalCents(form.splits);
+  const fundingAvailableCreditCents = fundingBalance?.availableCreditCents ?? 0;
+  const fundingSplitsValidation = validateIndividualFundingSplits(fundingTargetCents, form.splits, fundingAmounts.creditAppliedCents);
+  const fundingFieldsValidation = validateIndividualFundingFields(funding, fundingAvailableCreditCents);
+  const fundingPreview = fundingActive && fundingBalance
+    ? computeIndividualFundingPreview({
+        targetCents: fundingTargetCents, splits: form.splits,
+        creditAppliedCents: fundingAmounts.creditAppliedCents, roundingCoverageCents: fundingAmounts.roundingCoverageCents,
+        availableCreditCents: fundingAvailableCreditCents, debtAuthorized: funding.debtAuthorized,
+      })
+    : null;
+  const fundingShortfallAfterCredit = shortfallAfterAllCreditCents({
+    targetCents: fundingTargetCents, realCents: fundingRealCents,
+    availableCreditCents: fundingAvailableCreditCents, roundingCoverageCents: fundingAmounts.roundingCoverageCents,
+  });
+  const showFundingDebtOption = fundingActive && fundingBalance != null && (fundingShortfallAfterCredit > 0 || funding.debtAuthorized);
+  // Validación de medios efectiva: con cuenta corriente, los medios pueden
+  // diferir del total (y ser cero con saldo); sin ella, regla de siempre.
+  const effectiveSplitsValidation = fundingActive ? fundingSplitsValidation : splitsValidation;
+  const fundingReady = !fundingActive || (
+    fundingBalance != null && fundingSplitsValidation.valid && fundingFieldsValidation.valid && fundingPreview?.ok === true
+  );
+
+  // Fuera de alcance (edición, manual, sin cuota, contado, no confirmado,
+  // póliza sin asegurado) la cuenta corriente se apaga y se limpia.
+  useEffect(() => {
+    if (!fundingEligible && funding.enabled) setFunding(emptyIndividualFundingState());
+  }, [fundingEligible, funding.enabled]);
+
+  // Sin cuenta corriente el pago tradicional exige al menos un medio real:
+  // si se habían quitado todos (cobro 100% con saldo), se restaura uno.
+  useEffect(() => {
+    if (!fundingActive && form.splits.length === 0) {
+      setForm((f) => ({ ...f, splits: syncSingleBatchSplitAmount([createBatchSplitRow("efectivo")], f.amount) }));
+    }
+  }, [fundingActive, form.splits.length]);
+
+  // Cambiar póliza reinicia toda la financiación (otro titular).
+  useEffect(() => {
+    setFunding(resetFundingForPolicyChange());
+    setFundingBalance(null);
+    setFundingDuplicateWarning(false);
+  }, [form.policyId]);
+
+  // Cambiar cuota (o el importe, que la sigue) reinicia saldo, redondeo, deuda y clave.
+  useEffect(() => {
+    setFunding((f) => resetFundingForInstallmentChange(f));
+    setFundingDuplicateWarning(false);
+  }, [form.installmentId, form.amount]);
+
+  // Cambiar la fecha invalida la clave (la cobrabilidad se revalida en el efecto de cuotas).
+  useEffect(() => {
+    setFunding((f) => invalidateFundingKey(f));
+  }, [form.paymentDate]);
+
+  // Saldo del asegurado de la póliza — se relee al activar, al cambiar de
+  // asegurado y después de un rechazo del backend (el saldo pudo cambiar).
+  useEffect(() => {
+    if (!fundingActive || policyInsuredId == null) { setFundingBalanceError(false); return; }
+    let cancelled = false;
+    setFundingBalanceLoading(true);
+    setFundingBalanceError(false);
+    api.get(`/api/insureds/${policyInsuredId}/account-holder-balance`)
+      .then((data: AccountHolderBalance) => { if (!cancelled) setFundingBalance(data); })
+      .catch(() => { if (!cancelled) { setFundingBalance(null); setFundingBalanceError(true); } })
+      .finally(() => { if (!cancelled) setFundingBalanceLoading(false); });
+    return () => { cancelled = true; };
+  }, [fundingActive, policyInsuredId, fundingBalanceNonce]);
+
   // Si el grupo deja de ser "own" (ej. el usuario cambia todas las filas a
   // directo a compañía), el recargo Pronto Pago no puede seguir marcado.
   useEffect(() => {
-    if (splitsValidation.group !== "own" && applyProntoPagoSurcharge) {
+    // Con cuenta corriente y cero medios el grupo es "own" (sin medio real que lo cambie).
+    if (effectiveSplitsValidation.group !== "own" && applyProntoPagoSurcharge) {
       setApplyProntoPagoSurcharge(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [splitsValidation.group]);
+  }, [effectiveSplitsValidation.group]);
 
   async function handleSave() {
+    if (submitLockRef.current || saving) return;
+    submitLockRef.current = true;
+    try {
+      if (fundingActive) await handleFundedSave();
+      else await handleTraditionalSave();
+    } finally {
+      submitLockRef.current = false;
+    }
+  }
+
+  // Pago individual con cuenta corriente — POST /api/payments/account-funded.
+  // La clave de idempotencia se reutiliza mientras el request no cambie
+  // (reintento de red, doble clic, confirmación de cheque duplicado).
+  async function handleFundedSave() {
+    if (blockedByUnavailableInstallment) { toast.error(INSTALLMENT_NO_LONGER_AVAILABLE_MESSAGE); return; }
+    if (!form.policyId || !form.installmentId) { toast.error("Elegí la póliza y la cuota a cancelar."); return; }
+    if (!form.paymentDate) { toast.error("Completá la fecha de pago."); return; }
+    if (!fundingBalance) { toast.error("Todavía no se pudo leer el saldo del asegurado."); return; }
+    if (!fundingFieldsValidation.valid) { toast.error(fundingFieldsValidation.errorMessage ?? "Revisá saldo, redondeo y deuda."); return; }
+    if (!fundingSplitsValidation.valid) { toast.error(fundingSplitsValidation.errorMessage ?? "Revisá los medios de pago."); return; }
+    if (!fundingPreview?.ok) { toast.error(fundingPreview?.errorMessage ?? "El cobro no cierra con los importes cargados."); return; }
+
+    const payloadBase = buildAccountFundedPaymentPayload({
+      policyId: Number(form.policyId),
+      installmentId: Number(form.installmentId),
+      paymentDate: form.paymentDate,
+      splits: form.splits,
+      notes: form.notes || null,
+      applyProntoPagoSurcharge: fundingIsRivadavia ? applyProntoPagoSurcharge : true,
+      creditAppliedCents: fundingAmounts.creditAppliedCents,
+      roundingCoverageCents: fundingAmounts.roundingCoverageCents,
+      debtAuthorized: funding.debtAuthorized,
+      debtReason: funding.debtReason,
+      idempotencyKey: "pending",
+    });
+    const { key, state: nextFunding } = resolveIdempotencyKey(funding, computeIndividualFundingFingerprint(payloadBase), generateIdempotencyKey);
+    setFunding(nextFunding);
+    const payload = { ...payloadBase, idempotencyKey: key, ...(fundingDuplicateWarning ? { confirmPossibleDuplicates: true } : {}) };
+
+    setSaving(true);
+    try {
+      await api.post("/api/payments/account-funded", payload);
+      toast.success("Pago imputado con cuenta corriente");
+      setFunding(emptyIndividualFundingState());
+      setFundingDuplicateWarning(false);
+      onSaved(); onClose();
+    } catch (err: any) {
+      const msg = err?.message || "";
+      const status = err?.status;
+      if (err?.body?.code === "CHECK_POSSIBLE_DUPLICATE") {
+        setFundingDuplicateWarning(true);
+        toast.error("Se detectaron posibles cheques duplicados. Verificá y confirmá de nuevo para continuar.");
+      } else if (msg && status && status < 500) {
+        toast.error(msg);
+        // El saldo pudo cambiar entre la carga y la confirmación — se relee.
+        setFundingBalanceNonce((n) => n + 1);
+      } else {
+        toast.error("Error al guardar el pago (podés reintentar: no se duplica)");
+      }
+    }
+    setSaving(false);
+  }
+
+  async function handleTraditionalSave() {
     if (!manualMode && !form.policyId) {
       toast.error("Seleccioná una póliza o usá imputación manual");
       return;
@@ -480,7 +659,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
   // Etapa 3B-2: el grupo se decide por los splits reales, no por un único
   // form.paymentMethod (que ya no existe en el estado). Con grupo "mixed" el
   // checkbox tampoco se muestra — nunca puede considerarse válido.
-  const showSurchargeCheckbox = isRivadaviaSrc && splitsValidation.group === "own";
+  const showSurchargeCheckbox = isRivadaviaSrc && effectiveSplitsValidation.group === "own";
 
   if (!open) return null;
 
@@ -825,8 +1004,8 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
                     </div>
 
                     <button type="button"
-                      onClick={() => setForm(f => ({ ...f, splits: removeBatchSplitRow(f.splits, split.uid) }))}
-                      disabled={isRendered || form.splits.length <= 1}
+                      onClick={() => setForm(f => ({ ...f, splits: fundingActive ? removeFundingSplitRow(f.splits, split.uid) : removeBatchSplitRow(f.splits, split.uid) }))}
+                      disabled={isRendered || (!fundingActive && form.splits.length <= 1)}
                       aria-label={`Eliminar medio de pago ${idx + 1} (${METHOD_LABELS[split.method] || split.method})`}
                       className="p-2 text-gray-400 hover:text-red-400 disabled:opacity-30 disabled:cursor-not-allowed transition-colors shrink-0">
                       <Trash2 className="w-4 h-4" />
@@ -847,6 +1026,13 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
             </div>
 
             {/* Totales / diferencia — todo en centavos, nunca suma directa de floats */}
+            {fundingActive ? (
+              <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-400" data-testid="funding-splits-totals">
+                <span>Importe a cancelar: <span className="text-white font-medium">{formatCurrencyCents(fundingTargetCents)}</span></span>
+                <span>Dinero real: <span className="text-white font-medium">{formatCurrencyCents(fundingRealCents)}</span></span>
+                {form.splits.length === 0 && <span className="text-emerald-300">Sin medios reales — se cubre con saldo a favor</span>}
+              </div>
+            ) : (
             <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-400">
               <span>Total del cobro: <span className="text-white font-medium">
                 {splitTotals.totalCents != null ? formatCurrencyCents(splitTotals.totalCents) : "—"}
@@ -864,13 +1050,14 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
                 </span>
               )}
             </div>
+            )}
 
             {/* Migración 0028: además de "mixed", cubre los errores propios de
                 cheque (número/banco/vencimiento faltante, suma de cheques
                 distinta al importe del split) que validateBatchSplitsForm ya
                 valida y que el bloque de diferencia de arriba no muestra. */}
-            {splitsValidation.errorMessage && (
-              <p className="mt-2 text-xs text-red-400" role="alert">{splitsValidation.errorMessage}</p>
+            {effectiveSplitsValidation.errorMessage && (
+              <p className="mt-2 text-xs text-red-400" role="alert">{effectiveSplitsValidation.errorMessage}</p>
             )}
           </div>
 
@@ -893,6 +1080,27 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
                 </label>
               </div>
             )
+          )}
+
+          {fundingEligible && (
+            <IndividualAccountFundingSection
+              insuredName={selectedPolicy?.insured?.name ?? ""}
+              funding={funding}
+              onChange={setFunding}
+              balance={fundingBalance}
+              balanceLoading={fundingBalanceLoading}
+              balanceError={fundingBalanceError}
+              onRetryBalance={() => setFundingBalanceNonce((n) => n + 1)}
+              targetCents={fundingTargetCents}
+              installmentAmountCents={installmentAmountCents}
+              surchargeCents={fundingSurchargeCents}
+              realCents={fundingRealCents}
+              preview={fundingPreview}
+              fieldsErrorMessage={fundingFieldsValidation.valid ? null : fundingFieldsValidation.errorMessage}
+              showDebtOption={showFundingDebtOption}
+              shortfallAfterCreditCents={fundingShortfallAfterCredit}
+              duplicateWarning={fundingDuplicateWarning}
+            />
           )}
 
           {/* Fechas */}
@@ -958,7 +1166,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
               quedaría redundante/sin función, así que se oculta en vez de
               dejarlo deshabilitado sin explicación. */}
           {showCuotaFields && (
-            <button onClick={handleSave} disabled={isImputarButtonDisabled(saving, splitsValidation.valid) || blockedByUnavailableInstallment}
+            <button onClick={handleSave} disabled={isImputarButtonDisabled(saving, effectiveSplitsValidation.valid) || blockedByUnavailableInstallment || !fundingReady}
               className="flex-1 py-2 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-all disabled:opacity-50">
               {saving ? "Guardando..." : editing ? "Guardar cambios" : "Imputar pago"}
             </button>
@@ -966,6 +1174,193 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
         </div>
       </div>
     </div>
+  );
+}
+
+// ─── Cuenta corriente del asegurado en "Imputar pago" ───────────────────────
+// Presentacional: todo el cálculo vive en individual-account-funding-form.ts
+// (mismo plan que valida el backend). Exportado para tests.
+export function IndividualAccountFundingSection(props: {
+  insuredName: string;
+  funding: IndividualFundingFormState;
+  onChange: (updater: (f: IndividualFundingFormState) => IndividualFundingFormState) => void;
+  balance: AccountHolderBalance | null;
+  balanceLoading: boolean;
+  balanceError: boolean;
+  onRetryBalance: () => void;
+  targetCents: number;
+  installmentAmountCents: number;
+  surchargeCents: number;
+  realCents: number;
+  preview: ReturnType<typeof computeIndividualFundingPreview> | null;
+  fieldsErrorMessage: string | null;
+  showDebtOption: boolean;
+  shortfallAfterCreditCents: number;
+  duplicateWarning: boolean;
+}) {
+  const { funding, onChange, balance } = props;
+  const availableCents = balance?.availableCreditCents ?? 0;
+  const maxCredit = suggestedCreditCents({ availableCreditCents: availableCents, targetCents: props.targetCents, realCents: props.realCents });
+  const errorMessage = props.fieldsErrorMessage ?? (props.preview && !props.preview.ok ? props.preview.errorMessage : null);
+  const summary = props.preview?.ok
+    ? buildIndividualFundingSummary({
+        installmentAmountCents: props.installmentAmountCents, surchargeCents: props.surchargeCents, plan: props.preview.plan,
+        priorBalanceCents: balance?.balanceCents,
+      })
+    : null;
+
+  return (
+    <div className="space-y-3 p-3 bg-emerald-500/5 border border-emerald-500/20 rounded-lg" data-testid="individual-account-funding">
+      <label className="flex items-start gap-2 cursor-pointer">
+        <input type="checkbox" checked={funding.enabled}
+          onChange={(e) => { const enabled = e.target.checked; onChange(() => ({ ...emptyIndividualFundingState(), enabled })); }}
+          className="w-4 h-4 mt-0.5 accent-emerald-500" />
+        <span className="text-xs text-emerald-200">
+          Usar cuenta corriente de <span className="font-medium text-white">{props.insuredName || "el asegurado"}</span>
+          <span className="block text-gray-400">Saldo a favor, saldo deudor autorizado o sobrante como nuevo saldo a favor.</span>
+        </span>
+      </label>
+
+      {funding.enabled && (
+        <>
+          <div className="text-xs" aria-live="polite">
+            {props.balanceLoading && <span className="text-gray-400">Leyendo saldo del asegurado…</span>}
+            {!props.balanceLoading && props.balanceError && (
+              <span className="text-red-400">
+                No se pudo leer el saldo.{" "}
+                <button type="button" onClick={props.onRetryBalance} className="underline hover:text-red-300">Reintentar</button>
+              </span>
+            )}
+            {!props.balanceLoading && !props.balanceError && balance && (
+              balance.balanceCents < 0 ? (
+                <span className="text-amber-300" data-testid="funding-balance">Saldo deudor actual: {formatCurrencyCents(-balance.balanceCents)} — sin saldo a favor disponible</span>
+              ) : (
+                <span className="text-gray-300" data-testid="funding-balance">Saldo a favor disponible: <span className="text-white font-medium">{formatCurrencyCents(availableCents)}</span></span>
+              )
+            )}
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="funding-credit" className="block text-xs text-gray-400 mb-1">Saldo a favor a aplicar</label>
+              <div className="flex gap-1">
+                <input id="funding-credit" type="number" step="0.01" min="0" value={funding.creditAppliedInput}
+                  disabled={!balance || availableCents === 0}
+                  onChange={(e) => { const v = e.target.value; onChange((f) => ({ ...f, creditAppliedInput: v })); }}
+                  placeholder="0.00"
+                  className="w-full min-w-0 px-2 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-emerald-500 disabled:opacity-50" />
+                <button type="button" disabled={!balance || maxCredit === 0}
+                  onClick={() => onChange((f) => ({ ...f, creditAppliedInput: String(maxCredit / 100) }))}
+                  className="shrink-0 px-2 text-xs rounded-lg border border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40">
+                  Usar máximo
+                </button>
+              </div>
+            </div>
+            <div>
+              <label htmlFor="funding-rounding" className="block text-xs text-gray-400 mb-1">Redondeo oficina (máx. {formatCurrencyCents(MAX_ROUNDING_ADJUSTMENT_CENTS)})</label>
+              <input id="funding-rounding" type="number" step="0.01" min="0" value={funding.roundingCoverageInput}
+                onChange={(e) => { const v = e.target.value; onChange((f) => ({ ...f, roundingCoverageInput: v })); }}
+                placeholder="0.00"
+                className="w-full px-2 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-emerald-500" />
+            </div>
+          </div>
+
+          {props.showDebtOption && (
+            <div className="space-y-2 p-2 bg-amber-500/5 border border-amber-500/20 rounded-lg">
+              <label className="flex items-start gap-2 cursor-pointer">
+                <input type="checkbox" checked={funding.debtAuthorized}
+                  onChange={(e) => { const v = e.target.checked; onChange((f) => setFundingDebtAuthorized(f, v)); }}
+                  className="w-4 h-4 mt-0.5 accent-amber-500" />
+                <span className="text-xs text-amber-200">
+                  Autorizar saldo deudor por el faltante ({formatCurrencyCents(props.shortfallAfterCreditCents)})
+                </span>
+              </label>
+              {funding.debtAuthorized && (
+                <input type="text" value={funding.debtReason} aria-label="Motivo del saldo deudor"
+                  onChange={(e) => { const v = e.target.value; onChange((f) => ({ ...f, debtReason: v })); }}
+                  placeholder="Motivo (obligatorio)"
+                  className="w-full px-2 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white placeholder-gray-500 outline-none focus:border-amber-500" />
+              )}
+            </div>
+          )}
+
+          {summary && (
+            <div className="text-xs space-y-1 border-t border-emerald-500/20 pt-2" data-testid="funding-summary">
+              {summary.map((line) => (
+                <div key={line.key} className={cn("flex justify-between",
+                  line.kind === "total" ? "text-gray-200 font-medium" : "text-gray-400")}>
+                  <span>{line.label}</span>
+                  <span className={cn(
+                    line.kind === "credit" ? "text-emerald-300" : line.kind === "debt" ? "text-amber-300" : "text-white")}>
+                    {formatCurrencyCents(line.amountCents)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+          {errorMessage && <p className="text-xs text-red-400" role="alert">{errorMessage}</p>}
+          {props.duplicateWarning && (
+            <p className="text-xs text-amber-300">Posible cheque duplicado: revisá los datos y volvé a confirmar para registrarlo igual.</p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── Pago individual con saldo en el listado ────────────────────────────────
+// Identificado por payment.accountFunding (relación estructurada del cobro,
+// ver GET /payments) — nunca por texto. No se edita ni elimina como un pago
+// suelto: solo notas, o "Anular cobro" (restituye saldo) y volver a cargarlo.
+
+export function IndividualFundedBadge() {
+  return (
+    <span className="px-1.5 py-0.5 rounded text-[10px] border border-sky-500/30 bg-sky-500/10 text-sky-300 whitespace-nowrap" data-testid="individual-funded-badge">
+      Pago individual
+    </span>
+  );
+}
+
+export function IndividualFundedRowDetails({ funding }: { funding: IndividualAccountFundingRowData }) {
+  return (
+    <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px]" data-testid="individual-funded-details">
+      {describeIndividualAccountFundingRow(funding).map((line) => (
+        <span key={line.label} className={cn(
+          line.kind === "credit" ? "text-emerald-300" : line.kind === "debt" ? "text-amber-300" : "text-gray-400")}>
+          {line.label} {formatCurrencyCents(line.amountCents)}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+export function IndividualFundedRowActions({ status, rendered, onCancel, onEditNotes, compact = false }: {
+  status: string;
+  rendered: boolean;
+  onCancel: () => void;
+  onEditNotes: () => void;
+  compact?: boolean;
+}) {
+  if (status === "anulado") return null;
+  return (
+    <>
+      <button onClick={onEditNotes} title="Editar notas"
+        className={compact
+          ? "flex items-center gap-1 px-2 py-1 rounded text-xs border border-[#2d3748] text-gray-300 hover:text-blue-400 transition-colors"
+          : "text-gray-400 hover:text-blue-400 transition-colors"}>
+        <Edit2 className={compact ? "w-3 h-3" : "w-4 h-4"} />{compact && " Notas"}
+      </button>
+      {rendered ? (
+        <span className="text-[11px] text-gray-500" title="Para anular el cobro, primero anulá la rendición.">Rendido</span>
+      ) : (
+        <button onClick={onCancel} title="Anular cobro (restituye el saldo)"
+          className={compact
+            ? "flex items-center gap-1 px-2 py-1 rounded text-xs border border-red-500/30 text-red-400 hover:bg-red-500/10 transition-colors"
+            : "text-red-400 hover:text-red-300 transition-colors"}>
+          <Ban className={compact ? "w-3 h-3" : "w-4 h-4"} />{compact && " Anular cobro"}
+        </button>
+      )}
+    </>
   );
 }
 
@@ -1110,6 +1505,40 @@ function CobranzasTab() {
   // separado) — la única corrección posible es anular el cobro completo,
   // mismo endpoint y mismo efecto (cuotas revierten a su estado anterior)
   // que "Anular cobro" en Cobrar en lote.
+  // Pago individual con saldo: se anula el cobro completo (lote de un ítem) —
+  // el backend restituye el saldo aplicado y anula la deuda / saldo a favor
+  // generados, o responde 409 si un movimiento posterior ya los consumió.
+  async function handleAnularIndividualFunded(batchId: number) {
+    if (!confirm(INDIVIDUAL_FUNDED_CANCEL_CONFIRM)) return;
+    try {
+      await api.post(`/api/payment-batches/${batchId}/cancel`, { confirm: true, reason: null });
+      toast.success("Cobro anulado — saldo restituido");
+      load();
+    } catch (err: any) {
+      const msg = err?.message || "";
+      const status = err?.status;
+      if (err?.body?.code === "ACCOUNT_MOVEMENT_REQUIRES_MANUAL_REVIEW") {
+        toast.error("No se puede anular automáticamente: el saldo de este cobro ya fue usado en otra operación. Requiere revisión manual.");
+      } else if (msg && status && status < 500) toast.error(msg);
+      else toast.error("Error al anular el cobro");
+    }
+  }
+
+  async function handleEditIndividualFundedNotes(batchId: number, currentNotes: string | null) {
+    const next = window.prompt("Notas del cobro", currentNotes ?? "");
+    if (next === null) return;
+    try {
+      await api.patch(`/api/payment-batches/${batchId}`, { notes: next });
+      toast.success("Notas actualizadas");
+      load();
+    } catch (err: any) {
+      const msg = err?.message || "";
+      const status = err?.status;
+      if (msg && status && status < 500) toast.error(msg);
+      else toast.error("Error al actualizar las notas");
+    }
+  }
+
   async function handleAnularBatch(batchId: number) {
     if (!confirm(
       "¿Anular este cobro de período de contado? Las cuotas del período vuelven a su estado anterior — no se puede deshacer."
@@ -1307,6 +1736,7 @@ function CobranzasTab() {
               {filtered.map(r => {
                 const isManual = r.payment.policyId == null;
                 const isCashPeriod = r.payment.isCashPeriodPayment === true;
+                const funded = r.payment.accountFunding;
                 const displayPolicyNum = r.policy?.policyNumber || r.payment.manualPolicyNumber || "—";
                 const displayInsured = r.insured?.name || r.payment.manualPayer || "—";
                 const rowKey = paymentRowKey(r);
@@ -1324,11 +1754,15 @@ function CobranzasTab() {
                               {r.payment.concept || "Pago de contado"}
                             </span>
                           )}
+                          {funded && <IndividualFundedBadge />}
                         </div>
                         <p className="text-xs text-gray-400 truncate">{displayInsured}</p>
                       </div>
-                      <p className="text-white font-semibold flex-shrink-0">{formatCurrency(r.payment.amount)}</p>
+                      <p className="text-white font-semibold flex-shrink-0">
+                        {formatCurrency(funded ? funded.totalCancelledCents / 100 : r.payment.amount)}
+                      </p>
                     </div>
+                    {funded && <IndividualFundedRowDetails funding={funded} />}
                     <div className="flex items-center gap-2 flex-wrap text-xs">
                       <PaymentMethodBadge splits={r.payment.splits} paymentMethod={r.payment.paymentMethod} compact />
                       {r.payment.splits.length > 1 && (
@@ -1363,7 +1797,11 @@ function CobranzasTab() {
                     </div>
                     {r.payment.notes && <p className="text-xs text-gray-400">{r.payment.notes}</p>}
                     <div className="flex items-center gap-2 pt-1">
-                      {isCashPeriod ? (
+                      {funded ? (
+                        <IndividualFundedRowActions compact status={r.payment.status} rendered={r.payment.rendered === 1}
+                          onCancel={() => handleAnularIndividualFunded(funded.batchId)}
+                          onEditNotes={() => handleEditIndividualFundedNotes(funded.batchId, r.payment.notes)} />
+                      ) : isCashPeriod ? (
                         r.payment.status !== "anulado" && (
                           <button onClick={() => handleAnularBatch(r.payment.batchId!)}
                             className="flex items-center gap-1 px-2 py-1 rounded text-xs border border-red-500/30 text-red-400 hover:bg-red-500/10 transition-colors">
@@ -1414,6 +1852,7 @@ function CobranzasTab() {
                   {filtered.map(r => {
                     const isManual = r.payment.policyId == null;
                     const isCashPeriod = r.payment.isCashPeriodPayment === true;
+                    const funded = r.payment.accountFunding;
                     const displayPolicyNum = r.policy?.policyNumber || r.payment.manualPolicyNumber || "—";
                     const displayInsured = r.insured?.name || r.payment.manualPayer || "—";
                     const rowKey = paymentRowKey(r);
@@ -1426,7 +1865,9 @@ function CobranzasTab() {
                             <div>
                               <p className="text-white font-medium">{displayPolicyNum}</p>
                               <p className="text-xs text-gray-400">{displayInsured}</p>
+                              {funded && <IndividualFundedRowDetails funding={funded} />}
                             </div>
+                            {funded && <IndividualFundedBadge />}
                             {isManual && !isCashPeriod && (
                               <span className="px-1.5 py-0.5 rounded text-[10px] border border-orange-500/30 bg-orange-500/10 text-orange-400">
                                 manual
@@ -1457,7 +1898,7 @@ function CobranzasTab() {
                             )}
                           </div>
                         </td>
-                        <td className="px-3 py-3 text-right text-white font-semibold">{formatCurrency(r.payment.amount)}</td>
+                        <td className="px-3 py-3 text-right text-white font-semibold">{formatCurrency(funded ? funded.totalCancelledCents / 100 : r.payment.amount)}</td>
                         <td className="px-3 py-3 text-gray-300 text-xs">
                           {new Date(r.payment.paymentDate + "T12:00:00").toLocaleDateString("es-AR")}
                         </td>
@@ -1472,7 +1913,11 @@ function CobranzasTab() {
                         <td className="px-2 py-3 text-gray-400 text-xs max-w-[90px] truncate">{r.payment.notes || "—"}</td>
                         <td className="px-5 py-3">
                           <div className="flex items-center gap-2 justify-end">
-                            {isCashPeriod ? (
+                            {funded ? (
+                              <IndividualFundedRowActions status={r.payment.status} rendered={r.payment.rendered === 1}
+                                onCancel={() => handleAnularIndividualFunded(funded.batchId)}
+                                onEditNotes={() => handleEditIndividualFundedNotes(funded.batchId, r.payment.notes)} />
+                            ) : isCashPeriod ? (
                               r.payment.status !== "anulado" && (
                                 <button onClick={() => handleAnularBatch(r.payment.batchId!)}
                                   className="text-red-400 hover:text-red-300 transition-colors" title="Anular lote de contado">

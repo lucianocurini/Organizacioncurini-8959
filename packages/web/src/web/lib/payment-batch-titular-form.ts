@@ -306,8 +306,11 @@ export interface TitularSummaryLine {
   kind: "neutral" | "debt" | "credit";
 }
 
-/** Siempre en el mismo orden; omite crédito/redondeo/deuda/sobrante cuando son 0 — nunca muestra una línea en $0,00 sin sentido. */
-export function buildTitularSummaryLines(plan: AccountHolderFundingPlanResult): TitularSummaryLine[] {
+/**
+ * Siempre en el mismo orden; omite crédito/redondeo/deuda/sobrante cuando son 0 — nunca muestra una línea en $0,00 sin sentido.
+ * priorBalanceCents: saldo del titular ANTES del cobro (con signo) — ver computeAccountOutcome.
+ */
+export function buildTitularSummaryLines(plan: AccountHolderFundingPlanResult, priorBalanceCents?: number): TitularSummaryLine[] {
   const lines: TitularSummaryLine[] = [
     { label: "Total a cancelar", amountCents: plan.nominalTotalCents, kind: "neutral" },
     { label: "Medios reales ingresados", amountCents: plan.realSplitsTotalCents, kind: "neutral" },
@@ -315,6 +318,59 @@ export function buildTitularSummaryLines(plan: AccountHolderFundingPlanResult): 
   if (plan.creditAppliedCents > 0) lines.push({ label: "Crédito aplicado", amountCents: plan.creditAppliedCents, kind: "credit" });
   if (plan.roundingCoverageCents > 0) lines.push({ label: "Redondeo cubierto por oficina", amountCents: plan.roundingCoverageCents, kind: "neutral" });
   if (plan.newSaldoDeudorCents > 0) lines.push({ label: "Deuda nueva del titular", amountCents: plan.newSaldoDeudorCents, kind: "debt" });
-  if (plan.newSaldoAFavorCents > 0) lines.push({ label: "Saldo a favor nuevo", amountCents: plan.newSaldoAFavorCents, kind: "credit" });
+  const outcome = computeAccountOutcome(plan, priorBalanceCents);
+  if (outcome.cancelsDebtCents > 0) lines.push({ label: "Cancela deuda anterior", amountCents: outcome.cancelsDebtCents, kind: "credit" });
+  if (outcome.newCreditCents > 0) lines.push({ label: "Saldo a favor nuevo", amountCents: outcome.newCreditCents, kind: "credit" });
+  if (outcome.unclassifiedSurplusCents > 0) lines.push({ label: "Sobrante a cuenta corriente", amountCents: outcome.unclassifiedSurplusCents, kind: "credit" });
+  if (outcome.finalBalanceCents != null) lines.push(describeFinalAccountBalance(outcome.finalBalanceCents));
   return lines;
+}
+
+// ─── 10. Efecto del cobro sobre la cuenta corriente (solo presentación) ────
+
+export interface AccountOutcome {
+  /** Parte del sobrante (plan.newSaldoAFavorCents) que cancela deuda previa del titular. */
+  cancelsDebtCents: number;
+  /** Excedente del sobrante después de cancelar toda la deuda previa — el único "saldo a favor nuevo". */
+  newCreditCents: number;
+  /** Sobrante sin clasificar: el saldo previo no se conoce (cargando o error) — se presenta neutral, "Sobrante a cuenta corriente". */
+  unclassifiedSurplusCents: number;
+  /** Saldo de la cuenta después del cobro (con signo); null si no se conoce el saldo previo o el cobro no mueve la cuenta. */
+  finalBalanceCents: number | null;
+}
+
+/**
+ * Compartido por "Imputar pago" y "Cobrar en lote" con titular. Solo
+ * reinterpreta el plan para mostrarlo: si el titular ya debía, el sobrante
+ * primero cancela esa deuda y solo el excedente es saldo a favor nuevo.
+ * No toca el plan ni lo que se persiste (allocations/movimientos son los
+ * mismos: el sobrante sigue siendo un único movimiento saldo_a_favor).
+ * Sin saldo previo conocido (undefined) el sobrante no se clasifica —
+ * nunca se afirma "saldo a favor nuevo" sin saber si había deuda — y no hay
+ * saldo final.
+ */
+export function computeAccountOutcome(plan: AccountHolderFundingPlanResult, priorBalanceCents?: number): AccountOutcome {
+  if (priorBalanceCents === undefined) {
+    return { cancelsDebtCents: 0, newCreditCents: 0, unclassifiedSurplusCents: plan.newSaldoAFavorCents, finalBalanceCents: null };
+  }
+  const priorDebtCents = Math.max(0, -priorBalanceCents);
+  const cancelsDebtCents = Math.min(plan.newSaldoAFavorCents, priorDebtCents);
+  const movesAccount = plan.creditAppliedCents > 0 || plan.newSaldoDeudorCents > 0 || plan.newSaldoAFavorCents > 0;
+  return {
+    cancelsDebtCents,
+    newCreditCents: plan.newSaldoAFavorCents - cancelsDebtCents,
+    unclassifiedSurplusCents: 0,
+    finalBalanceCents: movesAccount
+      ? priorBalanceCents - plan.creditAppliedCents - plan.newSaldoDeudorCents + plan.newSaldoAFavorCents
+      : null,
+  };
+}
+
+/** Línea "Saldo final de la cuenta" — deudor, cero o a favor; el importe siempre en valor absoluto. */
+export function describeFinalAccountBalance(finalCents: number): { label: string; amountCents: number; kind: "neutral" | "credit" | "debt" } {
+  return {
+    label: finalCents < 0 ? "Saldo final de la cuenta (deudor)" : finalCents > 0 ? "Saldo final de la cuenta (a favor)" : "Saldo final de la cuenta",
+    amountCents: Math.abs(finalCents),
+    kind: finalCents < 0 ? "debt" : finalCents > 0 ? "credit" : "neutral",
+  };
 }

@@ -221,10 +221,11 @@ describe("computeTitularPreview — reutiliza planAccountHolderBatchFunding", ()
     // Sin medios reales ni crédito, el total completo queda como faltante —
     // se autoriza deuda solo para poder inspeccionar realSplitsTotalCents del
     // plan resultante (el punto del test es la exclusión de importes
-    // inválidos/0, no el cierre económico en sí).
+    // inválidos/0, no el cierre económico en sí). Sin saldo disponible: con
+    // saldo sin aplicar, la regla "crédito antes que deuda" lo rechazaría.
     const result = computeTitularPreview({
       targetCents: 100000, splits, creditAppliedCents: 0, roundingCoverageCents: 0,
-      availableCreditCents: 100000, debtAuthorized: true,
+      availableCreditCents: 0, debtAuthorized: true,
     });
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -358,13 +359,13 @@ describe("buildTitularSummaryLines", () => {
     expect(debtLine!.amountCents).toBe(50000);
   });
 
-  test("con saldo a favor nuevo: incluye la línea de sobrante, marcada kind='credit'", () => {
+  test("con saldo a favor nuevo (titular sin deuda previa): incluye la línea de sobrante, marcada kind='credit'", () => {
     const result = computeTitularPreview({
       targetCents: 100000, splits: [createBatchSplitRow("efectivo", "1200")],
       creditAppliedCents: 0, roundingCoverageCents: 0, availableCreditCents: 0, debtAuthorized: false,
     });
     if (!result.ok) throw new Error("expected ok plan");
-    const lines = buildTitularSummaryLines(result.plan);
+    const lines = buildTitularSummaryLines(result.plan, 0);
     const favorLine = lines.find((l) => l.label === "Saldo a favor nuevo");
     expect(favorLine).toBeDefined();
     expect(favorLine!.amountCents).toBe(20000);
@@ -394,5 +395,118 @@ describe("modo titular no restringe el carrito (multiasegurado / manual)", () =>
       availableCreditCents: 0, debtAuthorized: false,
     });
     expect(preview.ok).toBe(true);
+  });
+});
+
+// Resumen del lote con titular que ya debía — misma interpretación que
+// "Imputar pago" (computeAccountOutcome compartido): el sobrante primero
+// cancela la deuda anterior; solo el excedente es saldo a favor nuevo.
+describe("buildTitularSummaryLines — saldo previo del titular", () => {
+  const CART = 10000000; // $100.000
+  function surplusPlan(realPesos: string) {
+    const r = computeTitularPreview({
+      targetCents: CART, splits: [createBatchSplitRow("efectivo", realPesos)],
+      creditAppliedCents: 0, roundingCoverageCents: 0, availableCreditCents: 0, debtAuthorized: false,
+    });
+    if (!r.ok) throw new Error("expected ok plan");
+    return r.plan;
+  }
+  const accountLines = (lines: ReturnType<typeof buildTitularSummaryLines>) =>
+    lines.filter((l) => !["Total a cancelar", "Medios reales ingresados"].includes(l.label)).map((l) => [l.label, l.amountCents, l.kind]);
+
+  test("1. deuda previa $30.000 + sobrante $10.000 → cancela $10.000, saldo final deudor $20.000, sin saldo a favor nuevo", () => {
+    expect(accountLines(buildTitularSummaryLines(surplusPlan("110000"), -3000000))).toEqual([
+      ["Cancela deuda anterior", 1000000, "credit"],
+      ["Saldo final de la cuenta (deudor)", 2000000, "debt"],
+    ]);
+  });
+
+  test("2. deuda previa $30.000 + sobrante $30.000 → cancela toda la deuda, saldo final cero", () => {
+    expect(accountLines(buildTitularSummaryLines(surplusPlan("130000"), -3000000))).toEqual([
+      ["Cancela deuda anterior", 3000000, "credit"],
+      ["Saldo final de la cuenta", 0, "neutral"],
+    ]);
+  });
+
+  test("3. deuda previa $20.000 + sobrante $30.000 → cancela $20.000 y saldo a favor nuevo $10.000", () => {
+    expect(accountLines(buildTitularSummaryLines(surplusPlan("130000"), -2000000))).toEqual([
+      ["Cancela deuda anterior", 2000000, "credit"],
+      ["Saldo a favor nuevo", 1000000, "credit"],
+      ["Saldo final de la cuenta (a favor)", 1000000, "credit"],
+    ]);
+  });
+
+  test("4a. saldo previo cero: el sobrante entero es saldo a favor nuevo (presentación existente) + saldo final", () => {
+    expect(accountLines(buildTitularSummaryLines(surplusPlan("110000"), 0))).toEqual([
+      ["Saldo a favor nuevo", 1000000, "credit"],
+      ["Saldo final de la cuenta (a favor)", 1000000, "credit"],
+    ]);
+  });
+
+  test("4b. saldo previo positivo: crédito aplicado y sobrante se reflejan en el saldo final, sin 'Cancela deuda anterior'", () => {
+    const r = computeTitularPreview({
+      targetCents: CART, splits: [createBatchSplitRow("efectivo", "90000")],
+      creditAppliedCents: 1000000, roundingCoverageCents: 0, availableCreditCents: 5000000, debtAuthorized: false,
+    });
+    if (!r.ok) throw new Error("expected ok plan");
+    expect(accountLines(buildTitularSummaryLines(r.plan, 5000000))).toEqual([
+      ["Crédito aplicado", 1000000, "credit"],
+      ["Saldo final de la cuenta (a favor)", 4000000, "credit"],
+    ]);
+    expect(accountLines(buildTitularSummaryLines(surplusPlan("110000"), 500000))).toEqual([
+      ["Saldo a favor nuevo", 1000000, "credit"],
+      ["Saldo final de la cuenta (a favor)", 1500000, "credit"],
+    ]);
+  });
+
+  test("4c. cobro que no mueve la cuenta: sin saldo final ni líneas de cuenta, aun con deuda previa", () => {
+    expect(accountLines(buildTitularSummaryLines(surplusPlan("100000"), -3000000))).toEqual([]);
+  });
+
+  test("4d. deuda previa + deuda nueva autorizada: no hay 'Cancela deuda anterior' y el saldo final las suma", () => {
+    const r = computeTitularPreview({
+      targetCents: CART, splits: [createBatchSplitRow("efectivo", "70000")],
+      creditAppliedCents: 0, roundingCoverageCents: 0, availableCreditCents: 0, debtAuthorized: true,
+    });
+    if (!r.ok) throw new Error("expected ok plan");
+    expect(accountLines(buildTitularSummaryLines(r.plan, -1000000))).toEqual([
+      ["Deuda nueva del titular", 3000000, "debt"],
+      ["Saldo final de la cuenta (deudor)", 4000000, "debt"],
+    ]);
+  });
+
+  test("saldo previo desconocido (cargando/error): sobrante neutral, nunca 'Saldo a favor nuevo' ni saldo final", () => {
+    expect(accountLines(buildTitularSummaryLines(surplusPlan("110000")))).toEqual([
+      ["Sobrante a cuenta corriente", 1000000, "credit"],
+    ]);
+  });
+
+  test("5. solo presentación: no muta el plan, y payload/huella no dependen del saldo previo", () => {
+    const plan = surplusPlan("110000");
+    const snapshot = structuredClone(plan);
+    buildTitularSummaryLines(plan, -3000000);
+    buildTitularSummaryLines(plan, 0);
+    buildTitularSummaryLines(plan);
+    expect(plan).toEqual(snapshot);
+    // El sobrante sigue entero en el plan (un único destino new_credit_movement de $10.000):
+    // "Cancela deuda anterior" es solo una lectura del resumen, nunca otra allocation.
+    expect(plan.newSaldoAFavorCents).toBe(1000000);
+    expect(plan.allocations.filter((a) => a.destinationKind === "new_credit_movement").map((a) => a.amountCents)).toEqual([1000000]);
+
+    expect(buildTitularPayloadInput({
+      accountHolderInsuredId: 55, creditAppliedCents: 0, roundingCoverageCents: 0,
+      debtAuthorized: false, debtReason: "", idempotencyKey: "k-1",
+    })).toEqual({
+      accountHolderInsuredId: 55, creditAppliedCents: 0, roundingCoverageCents: 0,
+      debtAuthorized: false, debtReason: null, idempotencyKey: "k-1",
+    });
+    const fp = JSON.parse(computeTitularEconomicFingerprint({
+      paymentDate: "2027-06-01", cart: [installmentCartItem({ amount: 100000 })], splits: [createBatchSplitRow("efectivo", "110000")],
+      accountHolderInsuredId: 55, creditAppliedCents: 0, roundingCoverageCents: 0, debtAuthorized: false, debtReason: "",
+    }));
+    expect(Object.keys(fp).sort()).toEqual([
+      "accountHolderInsuredId", "creditAppliedCents", "debtAuthorized", "debtReason", "items", "notes",
+      "paymentDate", "roundingCoverageCents", "splits",
+    ]);
   });
 });

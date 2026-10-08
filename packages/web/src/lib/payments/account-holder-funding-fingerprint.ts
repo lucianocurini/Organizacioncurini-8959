@@ -80,7 +80,17 @@ export class FundingRequestFingerprintInputError extends Error {}
 // input) es lo que evita que un cambio futuro de formato colisione en
 // silencio con fingerprints ya calculados bajo una versión anterior.
 const FUNDING_REQUEST_FINGERPRINT_VERSION = "account-holder-funding-request.v1";
-const FUNDING_REQUEST_FINGERPRINT_ENDPOINT = "POST /payment-batches";
+
+// Endpoints que registran un cobro con titular — el endpoint forma parte del
+// fingerprint y de la clave UNIQUE de idempotencia, así que la misma
+// idempotencyKey usada en uno nunca resuelve una fila del otro.
+// ACCOUNT_FUNDED_PAYMENT_ENDPOINT es además la marca ESTRUCTURADA de un "pago
+// individual" con saldo (account_holder_funding_idempotency_keys.endpoint ->
+// payment_batch_id), nunca un texto libre.
+export const PAYMENT_BATCHES_ENDPOINT = "POST /payment-batches";
+export const ACCOUNT_FUNDED_PAYMENT_ENDPOINT = "POST /payments/account-funded";
+export type FundingRequestEndpoint = typeof PAYMENT_BATCHES_ENDPOINT | typeof ACCOUNT_FUNDED_PAYMENT_ENDPOINT;
+export const FUNDING_REQUEST_ENDPOINTS: ReadonlySet<string> = new Set([PAYMENT_BATCHES_ENDPOINT, ACCOUNT_FUNDED_PAYMENT_ENDPOINT]);
 
 // ─── Validación de forma — mismo criterio que el resto de
 // src/lib/payments/*.ts: nunca debe escapar un TypeError crudo por acceder
@@ -410,7 +420,14 @@ function validateResolution(raw: unknown): FingerprintAccountDifferenceResolutio
  * entrada. No hashea (eso es 1B-3): esta es solo la forma canónica que se
  * va a hashear. No muta `input` ni ninguno de sus arrays anidados.
  */
-export function canonicalizeFundingRequest(input: FundingRequestFingerprintInput): string {
+export function canonicalizeFundingRequest(
+  input: FundingRequestFingerprintInput,
+  options: { endpoint?: FundingRequestEndpoint } = {}
+): string {
+  const endpoint = options.endpoint ?? PAYMENT_BATCHES_ENDPOINT;
+  if (!FUNDING_REQUEST_ENDPOINTS.has(endpoint)) {
+    throw new FundingRequestFingerprintInputError(`endpoint de financiación no soportado: "${String(endpoint)}".`);
+  }
   assertPlainObject("input", input);
   assertExactKeys("input", input, TOP_LEVEL_KEYS);
 
@@ -479,7 +496,7 @@ export function canonicalizeFundingRequest(input: FundingRequestFingerprintInput
 
   const canonical = {
     version: FUNDING_REQUEST_FINGERPRINT_VERSION,
-    endpoint: FUNDING_REQUEST_FINGERPRINT_ENDPOINT,
+    endpoint,
     paymentDate,
     accountHolderInsuredId,
     items,

@@ -238,6 +238,19 @@ export function planAccountHolderBatchFunding(input: PlanAccountHolderBatchFundi
   assertSafeAggregateCents("realSplitsTotalCents + creditAppliedCents", fundedBeforeRounding);
   const shortfallAfterCredit = nominalTotalCents - fundedBeforeRounding;
 
+  // Crédito antes que redondeo/deuda: mientras quede saldo a favor disponible
+  // sin aplicar, ningún faltante puede cubrirse con redondeo absorbido por la
+  // oficina ni con saldo deudor nuevo — el titular nunca conserva crédito y
+  // genera deuda (o redondeo) en el mismo cobro. Rige igual para "Cobrar en
+  // lote" con titular y para el pago individual con saldo.
+  if (shortfallAfterCredit > 0 && input.creditAppliedCents < input.availableCreditCents) {
+    const unusedCreditCents = Math.min(input.availableCreditCents - input.creditAppliedCents, shortfallAfterCredit);
+    throw new AccountHolderFundingPlanError(
+      `Queda saldo a favor disponible sin aplicar ($${(unusedCreditCents / 100).toFixed(2)}): aplicalo antes de cubrir el faltante ` +
+      `($${(shortfallAfterCredit / 100).toFixed(2)}) con redondeo o saldo deudor.`
+    );
+  }
+
   if (input.roundingCoverageCents > 0) {
     if (shortfallAfterCredit <= 0) {
       throw new AccountHolderFundingPlanError(
@@ -272,8 +285,12 @@ export function planAccountHolderBatchFunding(input: PlanAccountHolderBatchFundi
   } else if (remainingAfterRounding < 0) {
     const excessCents = -remainingAfterRounding;
     if (input.creditAppliedCents > 0) {
+      // Nunca se consume saldo y se genera un saldo a favor nuevo en el mismo
+      // cobro (sobre-fondeo con crédito aplicado).
+      const maxCreditCents = Math.max(0, input.creditAppliedCents - excessCents);
       throw new AccountHolderFundingPlanError(
-        `Sobre-fondeo con crédito aplicado: dinero real + crédito superan el nominal por $${(excessCents / 100).toFixed(2)} y creditAppliedCents > 0.`
+        `Los medios reales y el saldo aplicado superan el total por $${(excessCents / 100).toFixed(2)}: reducí el saldo aplicado ` +
+        `a $${(maxCreditCents / 100).toFixed(2)} como máximo — no se puede consumir saldo a favor y generar uno nuevo en el mismo cobro.`
       );
     }
     if (input.roundingCoverageCents > 0) {

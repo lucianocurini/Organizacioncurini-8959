@@ -116,10 +116,18 @@ import {
 import {
   parseFundingRequest, AccountHolderFundingRequestError, type FundingRequestParseResult,
 } from "../lib/payments/account-holder-funding-request";
-import { FundingRequestFingerprintInputError } from "../lib/payments/account-holder-funding-fingerprint";
+import {
+  FundingRequestFingerprintInputError, PAYMENT_BATCHES_ENDPOINT, ACCOUNT_FUNDED_PAYMENT_ENDPOINT, type FundingRequestEndpoint,
+} from "../lib/payments/account-holder-funding-fingerprint";
 import {
   runAccountHolderFundingBatch, findAccountHolderFundingIdempotencyRow, resolveExistingIdempotentFundingRow,
+  loadActiveAccountHolderBalanceCents,
 } from "./account-holder-funding-batch";
+import {
+  parseIndividualAccountFundedRequest, buildIndividualAccountFundedBatchBody, findAccountFundingFields,
+  IndividualAccountFundingRequestError, type IndividualAccountFundedRequest,
+} from "../lib/payments/individual-account-funding-request";
+import { loadIndividualAccountFundingSummaries } from "./individual-account-funding-summary";
 import { formatAccountHolderFundingBatchSuccess, mapAccountHolderFundingBatchError } from "./payment-batch-titular-response";
 import { buildTitularFundingInput, buildTitularFundingDependencies } from "./payment-batch-titular-dependencies";
 import { loadAccountHolderBalanceSummary } from "./account-holder-balance";
@@ -2093,12 +2101,23 @@ app.get("/payments", requireAuth(async (c: any) => {
       }
     }
   }
+  // Pago individual con saldo (POST /payments/account-funded): hijo único de
+  // un lote con titular, identificado por la fila de idempotencia de ese
+  // endpoint (nunca por texto libre). Sus medios reales viven en
+  // payment_batch_splits — se exponen como `splits` del pago, junto con el
+  // resumen de cuenta corriente (accountFunding).
+  const individualFundingByBatchId = await loadIndividualAccountFundingSummaries(
+    db, results.map((r) => r.payment.batchId).filter((id): id is number => id != null)
+  );
+  const individualSplitsOf = (r: (typeof results)[number]) =>
+    r.payment.batchId != null ? individualFundingByBatchId.get(r.payment.batchId)?.splits : undefined;
+
   // Etapa 3B: el filtro `method` matchea si CUALQUIER split del payment usa
   // ese método — payments.paymentMethod puede valer "combinado" y no
   // representa ningún método real por sí solo. Se filtra recién acá (con los
   // splits ya cargados en el query de arriba) para no hacer N+1 consultas.
   if (method) {
-    results = results.filter((r) => (splitsByPayment.get(r.payment.id) ?? []).some((s) => s.method === method));
+    results = results.filter((r) => (individualSplitsOf(r) ?? splitsByPayment.get(r.payment.id) ?? []).some((s) => s.method === method));
     // Los hijos de contado nunca tienen payment_splits propios (sus medios
     // reales viven en payment_batch_splits, ya resueltos en `splits` de la
     // fila sintética) — se filtra por ahí, nunca por r.payment.paymentMethod.
@@ -2107,16 +2126,31 @@ app.get("/payments", requireAuth(async (c: any) => {
     );
   }
   const combined = [
-    ...results.map(r => ({
-      ...r,
-      payment: {
+    ...results.map(r => {
+      const funding = r.payment.batchId != null ? individualFundingByBatchId.get(r.payment.batchId) : undefined;
+      const base = {
         ...r.payment,
         hasSurcharge: surchargeSet.has(r.payment.id),
         hasChecks: paymentIdsWithChecks.has(r.payment.id),
         dueDate: (r.installment?.dueDate ?? r.payment.dueDate ?? null) as string | null,
         splits: splitsByPayment.get(r.payment.id) ?? [],
-      },
-    })),
+      };
+      if (!funding) return { ...r, payment: base };
+      const { splits: fundingSplits, hasChecks: fundingHasChecks, ...accountFunding } = funding;
+      return {
+        ...r,
+        payment: {
+          ...base,
+          // Solo presentación (la fila real conserva paymentMethod="lote"):
+          // método real del cobro, o "saldo_a_favor" si no hubo medio real.
+          paymentMethod: fundingSplits.length === 0 ? "saldo_a_favor" : fundingSplits.length === 1 ? fundingSplits[0]!.method : "combinado",
+          notes: funding.notes,
+          hasChecks: fundingHasChecks,
+          splits: fundingSplits,
+          accountFunding,
+        },
+      };
+    }),
     ...cashPeriodSyntheticRows,
   ];
   // orderBy(desc(createdAt)) del query original se pierde al mezclar las
@@ -2135,6 +2169,15 @@ app.get("/payments", requireAuth(async (c: any) => {
 app.post("/payments", requireAuth(async (c: any) => {
   const user = c.get("user");
   const body = await c.req.json();
+  // El pago tradicional nunca aplica saldo, deuda ni titular — si llegan esos
+  // campos se rechaza en vez de ignorarlos (el cliente creería que se usaron).
+  const fundingFields = findAccountFundingFields(body);
+  if (fundingFields.length > 0) {
+    return c.json({
+      error: `Este endpoint no admite financiación con saldo (${fundingFields.join(", ")}). Usá POST /payments/account-funded.`,
+      code: "ACCOUNT_FUNDING_FIELDS_NOT_ALLOWED",
+    }, 400);
+  }
   const hasPolicyId = body.policyId != null && body.policyId !== "";
   const paymentStatus = body.status || "confirmado";
   const isConfirmed = paymentStatus === "confirmado";
@@ -2415,6 +2458,13 @@ app.post("/payments", requireAuth(async (c: any) => {
 app.put("/payments/:id", requireAuth(async (c: any) => {
   const body = await c.req.json();
   const id = Number(c.req.param("id"));
+  const fundingFields = findAccountFundingFields(body);
+  if (fundingFields.length > 0) {
+    return c.json({
+      error: `La edición de pagos no admite financiación con saldo (${fundingFields.join(", ")}). Para corregir un cobro con saldo, anulalo y volvé a cargarlo.`,
+      code: "ACCOUNT_FUNDING_FIELDS_NOT_ALLOWED",
+    }, 400);
+  }
 
   const current = await db.select().from(payments).where(eq(payments.id, id)).get();
   if (!current) return c.json({ error: "Pago no encontrado" }, 404);
@@ -3033,7 +3083,20 @@ app.get("/installments/collectability-diagnostics", requireAdmin(async (c: any) 
 app.post("/payment-batches", requireAuth(async (c: any) => {
   const user = c.get("user");
   const body = await c.req.json();
+  return createPaymentBatchFromBody(c, user, body, { endpoint: PAYMENT_BATCHES_ENDPOINT, allowZeroRealSplits: false });
+}));
 
+// Opciones del flujo compartido de creación de cobros por lote — POST
+// /payment-batches (sin cambios de comportamiento: allowZeroRealSplits=false)
+// y POST /payments/account-funded (pago individual con saldo, siempre modo
+// titular, persistido como lote de un ítem y registrado con su propio
+// endpoint de idempotencia).
+interface CreatePaymentBatchOptions {
+  endpoint: FundingRequestEndpoint;
+  allowZeroRealSplits: boolean;
+}
+
+async function createPaymentBatchFromBody(c: any, user: any, body: any, options: CreatePaymentBatchOptions): Promise<Response> {
   if (!body.paymentDate || !/^\d{4}-\d{2}-\d{2}$/.test(body.paymentDate)) {
     return c.json({ error: "Falta o es inválida la fecha de pago (YYYY-MM-DD)." }, 400);
   }
@@ -3056,7 +3119,7 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
   // de account-holder-funding-request.ts).
   let parsed: FundingRequestParseResult;
   try {
-    parsed = parseFundingRequest(body);
+    parsed = parseFundingRequest(body, { endpoint: options.endpoint, allowZeroRealSplits: options.allowZeroRealSplits });
   } catch (e: any) {
     if (
       e instanceof PaymentBatchValidationError || e instanceof ReceivedCheckValidationError ||
@@ -3072,6 +3135,12 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
   // exactamente los mismos valores que ya validó parseFundingRequest, sin
   // volver a normalizar nada.
   const normalizedSplits = splitsWithChecks.map((s) => s.split);
+
+  // El pago individual con saldo solo existe en modo titular (el endpoint
+  // siempre resuelve el titular desde la póliza) — defensivo.
+  if (options.endpoint === ACCOUNT_FUNDED_PAYMENT_ENDPOINT && mode !== "titular") {
+    return c.json({ error: "El pago individual con saldo requiere el titular de la póliza." }, 400);
+  }
 
   // Etapa 1B-3-E — replay temprano (ANTES de "el titular debe existir", de
   // "cuotas ya pagadas", de "elegibilidad" y de "cheque posible duplicado"):
@@ -3089,7 +3158,7 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
   if (mode === "titular") {
     const earlyIdempotencyRow = await findAccountHolderFundingIdempotencyRow(db, {
       createdBy: user.id,
-      endpoint: "POST /payment-batches",
+      endpoint: options.endpoint,
       idempotencyKey: parsed.idempotencyKey!,
     });
     if (earlyIdempotencyRow) {
@@ -3419,6 +3488,12 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
               "un asegurado, o es una imputación 100% manual sin asegurado real). Separá este cobro para poder generar el saldo.",
           }, 400);
         }
+        if (resolution.action === "saldo_deudor") {
+          const balanceCents = await loadActiveAccountHolderBalanceCents(db, derivedInsuredId);
+          if (balanceCents > 0) {
+            return c.json({ error: creditAvailableBeforeDebtMessage(balanceCents), code: "CREDIT_AVAILABLE_BEFORE_DEBT" }, 409);
+          }
+        }
         const reason = typeof resolution.reason === "string" && resolution.reason.trim() ? resolution.reason.trim() : null;
         try {
           validateInsuredAccountMovement({
@@ -3518,6 +3593,7 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
         debtAuthorized: parsed.dto.debtAuthorized,
         debtReason: parsed.dto.debtReason,
         dependencies,
+        endpoint: options.endpoint,
       });
 
       // responseSnapshot es un string opaco (ver account-holder-funding-batch.ts)
@@ -3600,6 +3676,13 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
     // transacción (derivedInsuredId real único + accountDifferenceResolution
     // consistente) — acá solo se escribe.
     if (accountMovementToCreate) {
+      // Revalidación de "crédito antes que deuda" con el saldo leído dentro de
+      // la transacción (ya en modo escritura) — si entró crédito mientras
+      // tanto, se revierte todo.
+      if (accountMovementToCreate.type === "saldo_deudor") {
+        const balanceCents = await loadActiveAccountHolderBalanceCents(tx, derivedInsuredId!);
+        if (balanceCents > 0) throw new CreditAvailableBeforeDebtError(creditAvailableBeforeDebtMessage(balanceCents));
+      }
       const singleItem = contexts.length === 1 ? contexts[0]! : null;
       await tx.insert(insuredAccountMovements).values({
         insuredId: derivedInsuredId!,
@@ -3648,6 +3731,9 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
     // puede rechazar la segunda transacción con SQLITE_BUSY en vez de
     // encolarla — se mapea a 409 en vez de dejar escapar un 500 crudo, para
     // que el frontend lo trate igual que cualquier otro conflicto de lote.
+    if (e instanceof CreditAvailableBeforeDebtError) {
+      return c.json({ error: e.message, code: "CREDIT_AVAILABLE_BEFORE_DEBT" }, 409);
+    }
     const code = e?.code ?? e?.cause?.code;
     if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") {
       return c.json({ error: "Otra operación está en curso sobre estas cuotas — reintentá en unos segundos." }, 409);
@@ -3656,6 +3742,62 @@ app.post("/payment-batches", requireAuth(async (c: any) => {
   }
 
   return c.json({ id: batchId }, 201);
+}
+
+// Regla "crédito antes que deuda" en el camino legacy de "Cobrar en lote"
+// (accountDifferenceResolution=saldo_deudor): ese camino nunca aplica saldo a
+// favor, así que si el asegurado TIENE saldo disponible no puede generarse
+// deuda nueva — hay que usar el modo titular para aplicarlo primero. Se
+// chequea antes y otra vez dentro de la transacción.
+class CreditAvailableBeforeDebtError extends Error {}
+
+function creditAvailableBeforeDebtMessage(balanceCents: number): string {
+  return `El asegurado tiene saldo a favor disponible ($${(balanceCents / 100).toFixed(2)}): aplicalo con "Titular de cuenta" antes de generar un saldo deudor.`;
+}
+
+// ─── PAGO INDIVIDUAL CON SALDO (POST /payments/account-funded) ───────────────
+// "Imputar pago" con saldo a favor / deuda autorizada / sobrante: se persiste
+// como lote con titular de UN ítem reutilizando createPaymentBatchFromBody
+// (mismo plan, idempotencia, Caja, rendición y anulación que "Cobrar en
+// lote"). El titular SIEMPRE es el asegurado de la póliza, resuelto acá desde
+// la base — el body nunca lo aporta (ver individual-account-funding-request.ts).
+// Se identifica como pago individual por la fila de idempotencia con endpoint
+// ACCOUNT_FUNDED_PAYMENT_ENDPOINT, nunca por texto libre.
+app.post("/payments/account-funded", requireAuth(async (c: any) => {
+  const user = c.get("user");
+  const rawBody = await c.req.json().catch(() => null);
+
+  let request: IndividualAccountFundedRequest;
+  try {
+    request = parseIndividualAccountFundedRequest(rawBody);
+  } catch (e: any) {
+    if (e instanceof IndividualAccountFundingRequestError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+
+  const row = await db.select({
+    installmentPolicyId: policyInstallments.policyId,
+    policyInsuredId: policies.insuredId,
+  }).from(policyInstallments)
+    .innerJoin(policies, eq(policyInstallments.policyId, policies.id))
+    .where(eq(policyInstallments.id, request.installmentId))
+    .get();
+  if (!row) return c.json({ error: "La cuota indicada no existe." }, 404);
+  if (row.installmentPolicyId !== request.policyId) {
+    return c.json({ error: "La cuota indicada no pertenece a la póliza indicada." }, 400);
+  }
+  if (row.policyInsuredId == null) {
+    return c.json({ error: "La póliza no tiene asegurado: no hay titular de cuenta para aplicar saldo." }, 400);
+  }
+
+  let batchBody: Record<string, unknown>;
+  try {
+    batchBody = buildIndividualAccountFundedBatchBody(request, row.policyInsuredId);
+  } catch (e: any) {
+    if (e instanceof AccountHolderFundingRequestError) return c.json({ error: e.message }, 400);
+    throw e;
+  }
+  return createPaymentBatchFromBody(c, user, batchBody, { endpoint: ACCOUNT_FUNDED_PAYMENT_ENDPOINT, allowZeroRealSplits: true });
 }));
 
 // ─── PAGO DE CONTADO POR PERÍODO DE FACTURACIÓN (Migración 0034) ──────────
@@ -4710,6 +4852,14 @@ app.patch("/payment-batches/:id", requireAuth(async (c: any) => {
   // lote), antes y dentro de la transacción. Si alguna no cumple, se rechaza
   // todo y el lote queda intacto. Solo notas → no se revalida.
   const changesPaymentDate = "paymentDate" in body && body.paymentDate !== batch.paymentDate;
+
+  // Un lote con movimientos de cuenta corriente o ajustes de redondeo no
+  // puede cambiar de fecha: su effective_date quedaría desincronizada (este
+  // PATCH nunca la reescribe). Las notas sí pueden editarse — no afectan
+  // saldos. Para corregir la fecha: anular el cobro y volver a cargarlo.
+  if (changesPaymentDate && await batchHasAccountArtifacts(db, id, childRows.map((r) => r.id))) {
+    return c.json({ error: BATCH_DATE_LOCKED_MESSAGE, code: "BATCH_DATE_LOCKED_BY_ACCOUNT_MOVEMENTS" }, 409);
+  }
   const confirmedChildren = childRows.filter((r) => r.status === "confirmado");
   const revalidateInstallmentIds = changesPaymentDate
     ? [...new Set(confirmedChildren.flatMap((r) => (r.installmentId != null ? [r.installmentId] : [])))]
@@ -4722,6 +4872,9 @@ app.patch("/payment-batches/:id", requireAuth(async (c: any) => {
     }
     const updated = await db.transaction(async (tx) => {
       const [u] = await tx.update(paymentBatches).set(update).where(eq(paymentBatches.id, id)).returning();
+      if (changesPaymentDate && await batchHasAccountArtifacts(tx, id, childRows.map((r) => r.id))) {
+        throw new BatchDateLockedError(BATCH_DATE_LOCKED_MESSAGE);
+      }
       if (revalidateInstallmentIds.length > 0) {
         await assertInstallmentsCollectable(tx, revalidateInstallmentIds, body.paymentDate, collectabilityOpts);
       }
@@ -4733,9 +4886,29 @@ app.patch("/payment-batches/:id", requireAuth(async (c: any) => {
       const r = installmentNotCollectableResponse(e);
       return c.json(r.body, r.status);
     }
+    if (e instanceof BatchDateLockedError) {
+      return c.json({ error: e.message, code: "BATCH_DATE_LOCKED_BY_ACCOUNT_MOVEMENTS" }, 409);
+    }
     throw e;
   }
 }));
+
+const BATCH_DATE_LOCKED_MESSAGE =
+  "No se puede cambiar la fecha de un cobro con movimientos de cuenta corriente o ajustes de redondeo (su fecha efectiva quedaría desincronizada). Anulá el cobro y volvé a cargarlo; las notas sí se pueden editar.";
+
+class BatchDateLockedError extends Error {}
+
+/** true si el lote (o algún hijo) originó movimientos de cuenta corriente, o tiene ajustes de redondeo — cualquier estado (un historial anulado tampoco debe quedar con fecha distinta a su cobro). */
+async function batchHasAccountArtifacts(dbOrTx: any, batchId: number, childIds: number[]): Promise<boolean> {
+  const movementConditions = [eq(insuredAccountMovements.originBatchId, batchId)];
+  if (childIds.length > 0) movementConditions.push(inArray(insuredAccountMovements.originPaymentId, childIds));
+  const movement = await dbOrTx.select({ id: insuredAccountMovements.id }).from(insuredAccountMovements)
+    .where(or(...movementConditions)).limit(1).all();
+  if (movement.length > 0) return true;
+  const adjustment = await dbOrTx.select({ id: paymentAmountAdjustments.id }).from(paymentAmountAdjustments)
+    .where(eq(paymentAmountAdjustments.paymentBatchId, batchId)).limit(1).all();
+  return adjustment.length > 0;
+}
 
 // ─── RECEIVED CHECKS — cartera de cheques (Etapa 4B) ───────────────────────────
 // Lectura de solo lectura sobre received_checks. No implementa todavía
@@ -9976,10 +10149,23 @@ app.post("/remittances", requireAuth(async (c: any) => {
       const installmentRows = installmentIds2.length
         ? await tx.select().from(policyInstallments).where(inArray(policyInstallments.id, installmentIds2)).all()
         : [];
+      // Una cuota con un cobro registrado (pagada, p.ej. por un pago con saldo
+      // deudor autorizado) se rinde desde su pago — nunca como cuota sin
+      // cobrar/adeudada: la misma cuota no puede quedar a la vez adeudada y
+      // con un saldo deudor originado en un pago. /remittances/uncollected ya
+      // las excluye; esto cierra el mismo caso para un request armado a mano.
+      const installmentIdsWithConfirmedPayment = new Set<number>(installmentIds2.length
+        ? (await tx.select({ installmentId: payments.installmentId }).from(payments)
+          .where(and(inArray(payments.installmentId, installmentIds2), eq(payments.status, "confirmado"))).all())
+          .map((p: any) => p.installmentId as number)
+        : []);
       for (const item of installmentSourceItems) {
         const inst = installmentRows.find((r: any) => r.id === item.sourceId);
         if (!inst) throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} no existe.`);
         if (inst.rendered) throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} ya fue rendida.`);
+        if (inst.status === "pagada" || installmentIdsWithConfirmedPayment.has(inst.id)) {
+          throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} ya tiene un cobro registrado: se rinde desde su pago, no como cuota sin cobrar.`);
+        }
         if (inst.status === "no_exigible") throw new RemittanceAllocationValidationError(`La cuota ${item.sourceId} no es exigible y no puede rendirse.`);
         // Migración 0035: una cuota duplicada no puede declararse adeudada ni
         // rendirse por ninguna vía.

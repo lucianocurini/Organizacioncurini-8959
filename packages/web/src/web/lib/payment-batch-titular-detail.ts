@@ -103,7 +103,9 @@ export function buildTitularBatchFundingLines(display: TitularBatchFundingActive
     { label: "Redondeo cubierto por oficina", amountCents: display.roundingCoverageCents, kind: "neutral" },
   ];
   if (display.newDebtCents > 0) lines.push({ label: "Deuda nueva del titular", amountCents: display.newDebtCents, kind: "debt" });
-  if (display.newSaldoAFavorCents > 0) lines.push({ label: "Saldo a favor nuevo", amountCents: display.newSaldoAFavorCents, kind: "credit" });
+  // Neutral a propósito: el detalle no conoce el saldo previo del titular — si
+  // ya debía, este sobrante canceló deuda anterior antes de quedar a favor.
+  if (display.newSaldoAFavorCents > 0) lines.push({ label: "Sobrante a cuenta corriente", amountCents: display.newSaldoAFavorCents, kind: "credit" });
   lines.push({ label: "Total aplicado a cuotas", amountCents: display.appliedTotalCents, kind: "total" });
   lines.push({ label: "Diferencia final", amountCents: display.differenceCents, kind: "difference" });
   return lines;
