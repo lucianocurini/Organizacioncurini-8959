@@ -7,7 +7,17 @@ import {
   DollarSign, Plus, Search, TrendingUp, CreditCard,
   Banknote, ArrowRightLeft, Trash2, Edit2, X, ChevronDown, Link, CheckSquare,
   ClipboardList, AlertCircle, ChevronRight, ReceiptText, Building2, Check, ShoppingCart, Save, Layers, Ban, Info,
+  ChevronLeft,
 } from "lucide-react";
+import { useLocation, useSearch } from "wouter";
+import {
+  EXPENSES_ALL_MONTHS, formatExpensesMonthLabel, isValidExpensesMonth, shiftExpensesMonth,
+  type ExpensesMonthSelection,
+} from "../../lib/expenses-month";
+import {
+  buildExpensesListUrl, buildGastosPath, describeSavedOutsideSelection, expensesEmptyLabel,
+  expensesTotalLabel, isGastosTabInSearch, resolveGastosMonthFromSearch, sumExpensesCents,
+} from "@/lib/gastos-month-filter";
 import { PendingInstallmentsBatchTab } from "@/components/payments/PendingInstallmentsBatchTab";
 import { cn, formatCurrency as _fc, formatCurrencyCents } from "@/lib/utils";
 import { toArgentinaCalendarDay, shiftArgentinaMonth } from "../../lib/dates/argentina-date";
@@ -3357,26 +3367,78 @@ interface Gasto {
   notes: string | null;
 }
 
-function GastosTab() {
+// Selector mensual del listado de Gastos: anterior / siguiente, mes directo
+// y "Todos los meses" (histórico).
+export function GastosMonthSelector({ selection, onChange }: {
+  selection: ExpensesMonthSelection;
+  onChange: (selection: ExpensesMonthSelection) => void;
+}) {
+  const isAll = selection === EXPENSES_ALL_MONTHS;
+  const navBtn = "p-2 rounded-lg bg-white/5 border border-white/10 text-gray-300 hover:text-white hover:bg-white/10 transition-colors disabled:opacity-30 disabled:pointer-events-none";
+  return (
+    <div data-testid="gastos-month-selector" className="flex flex-wrap items-center gap-2">
+      <div className="flex items-center gap-1">
+        <button type="button" aria-label="Mes anterior" title="Mes anterior" disabled={isAll}
+          onClick={() => !isAll && onChange(shiftExpensesMonth(selection, -1))} className={navBtn}>
+          <ChevronLeft size={15} />
+        </button>
+        <p data-testid="gastos-month-label" className="min-w-[9.5rem] text-center text-sm font-semibold text-white">
+          {formatExpensesMonthLabel(selection)}
+        </p>
+        <button type="button" aria-label="Mes siguiente" title="Mes siguiente" disabled={isAll}
+          onClick={() => !isAll && onChange(shiftExpensesMonth(selection, 1))} className={navBtn}>
+          <ChevronRight size={15} />
+        </button>
+      </div>
+      <input type="month" aria-label="Elegir mes" value={isAll ? "" : selection}
+        onChange={e => { if (isValidExpensesMonth(e.target.value)) onChange(e.target.value); }}
+        className="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-white focus:outline-none focus:border-blue-500/50 [color-scheme:dark]" />
+      <button type="button" aria-pressed={isAll}
+        onClick={() => onChange(isAll ? shiftArgentinaMonth(0) : EXPENSES_ALL_MONTHS)}
+        className={cn("px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors",
+          isAll ? "bg-blue-600 border-blue-500 text-white" : "bg-white/5 border-white/10 text-gray-300 hover:text-white hover:bg-white/10")}>
+        Todos los meses
+      </button>
+    </div>
+  );
+}
+
+export function GastosTab({ selection, onSelectionChange }: {
+  selection: ExpensesMonthSelection;
+  onSelectionChange: (selection: ExpensesMonthSelection) => void;
+}) {
   const [gastos, setGastos] = useState<Gasto[]>([]);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [form, setForm] = useState({ date: toArgentinaCalendarDay(), description: "", amount: "", category: "", notes: "" });
   const [saving, setSaving] = useState(false);
+  // Gasto guardado con fecha fuera del mes visible: no desaparece sin
+  // explicación — se avisa dónde quedó y se ofrece ir a ese mes.
+  const [savedElsewhere, setSavedElsewhere] = useState<{ month: string; label: string; edited: boolean } | null>(null);
+  const loadSeq = useRef(0);
 
   const fmt = (v: number) => formatCurrency(v);
 
-  async function load() {
+  async function load(target: ExpensesMonthSelection = selection) {
+    const seq = ++loadSeq.current;
     setLoading(true);
     try {
-      const data = await api.get("/api/cash/expenses") as Gasto[];
-      setGastos(data);
-    } catch { toast.error("Error cargando gastos"); }
-    finally { setLoading(false); }
+      const data = await api.get(buildExpensesListUrl(target)) as Gasto[];
+      // Una carga más nueva (otro mes) ya empezó: no pisar su resultado.
+      if (seq !== loadSeq.current) return;
+      setGastos(Array.isArray(data) ? data : []);
+    } catch {
+      if (seq === loadSeq.current) toast.error("Error cargando gastos");
+    } finally {
+      if (seq === loadSeq.current) setLoading(false);
+    }
   }
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    setSavedElsewhere(null);
+    load(selection);
+  }, [selection]);
 
   function openNew() {
     setEditingId(null);
@@ -3401,9 +3463,13 @@ function GastosTab() {
       } else {
         await api.post("/api/cash/expenses", payload);
       }
-      toast.success(editingId ? "Gasto actualizado" : "Gasto registrado");
+      const outside = describeSavedOutsideSelection(payload.date, selection);
+      setSavedElsewhere(outside ? { ...outside, edited: !!editingId } : null);
+      toast.success(outside
+        ? `${editingId ? "Gasto actualizado" : "Gasto registrado"} — guardado en ${outside.label}`
+        : (editingId ? "Gasto actualizado" : "Gasto registrado"));
       setShowForm(false);
-      load();
+      await load();
     } catch { toast.error("Error guardando gasto"); }
     finally { setSaving(false); }
   }
@@ -3417,34 +3483,57 @@ function GastosTab() {
     } catch (e: any) { toast.error(e?.message || "Error al anular el gasto"); }
   }
 
-  const total = gastos.reduce((s, g) => s + g.amount, 0);
+  // Total = suma de exactamente las filas listadas (todas las del mes o del
+  // histórico: el endpoint no pagina).
+  const totalCents = sumExpensesCents(gastos);
 
   return (
     <div className="space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-3">
         <div>
           <h2 className="text-white font-semibold text-base">Gastos registrados</h2>
           <p className="text-gray-400 text-xs mt-0.5">Gastos operativos registrados</p>
         </div>
-        <button onClick={openNew} className="flex items-center gap-2 px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded-lg text-sm font-medium transition-colors">
+        <button onClick={openNew} className="flex items-center gap-2 px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded-lg text-sm font-medium transition-colors shrink-0">
           <Plus size={15} /> Nuevo gasto
         </button>
       </div>
 
-      {/* Resumen total */}
-      {gastos.length > 0 && (
-        <div className="bg-orange-500/10 border border-orange-500/30 rounded-xl p-4 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg bg-orange-500/20 flex items-center justify-center">
+      <GastosMonthSelector selection={selection} onChange={onSelectionChange} />
+
+      {/* Resumen total (del mes seleccionado o histórico) */}
+      {!loading && (
+        <div data-testid="gastos-total" className="bg-orange-500/10 border border-orange-500/30 rounded-xl p-4 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-9 h-9 rounded-lg bg-orange-500/20 flex items-center justify-center shrink-0">
               <ShoppingCart size={18} className="text-orange-400" />
             </div>
-            <div>
-              <p className="text-xs text-gray-400">Total gastos</p>
-              <p className="text-lg font-bold text-orange-400">{fmt(total)}</p>
+            <div className="min-w-0">
+              <p className="text-xs text-gray-400">{expensesTotalLabel(selection)}</p>
+              <p className="text-lg font-bold text-orange-400">{fmt(totalCents / 100)}</p>
             </div>
           </div>
-          <p className="text-xs text-gray-500">{gastos.length} {gastos.length === 1 ? "registro" : "registros"}</p>
+          <p className="text-xs text-gray-500 shrink-0">{gastos.length} {gastos.length === 1 ? "registro" : "registros"}</p>
+        </div>
+      )}
+
+      {savedElsewhere && (
+        <div data-testid="gastos-saved-elsewhere" role="status"
+          className="bg-blue-500/10 border border-blue-500/30 rounded-xl px-4 py-3 flex flex-wrap items-center gap-3">
+          <Info size={16} className="text-blue-400 shrink-0" />
+          <p className="text-sm text-blue-100 flex-1 min-w-[12rem]">
+            {savedElsewhere.edited ? "Gasto actualizado. " : "Gasto registrado. "}
+            Guardado en <span className="font-semibold">{savedElsewhere.label}</span>, por eso no aparece en este mes.
+          </p>
+          <button type="button" onClick={() => onSelectionChange(savedElsewhere.month)}
+            className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-colors">
+            Ir a {savedElsewhere.label}
+          </button>
+          <button type="button" aria-label="Cerrar aviso" onClick={() => setSavedElsewhere(null)}
+            className="p-1.5 rounded-lg text-blue-200/70 hover:text-white hover:bg-white/10 transition-colors">
+            <X size={14} />
+          </button>
         </div>
       )}
 
@@ -3502,7 +3591,7 @@ function GastosTab() {
       ) : gastos.length === 0 ? (
         <div className="text-center py-16">
           <ShoppingCart size={32} className="mx-auto text-gray-600 mb-3" />
-          <p className="text-gray-400 text-sm font-medium">Sin gastos registrados</p>
+          <p className="text-gray-400 text-sm font-medium">{expensesEmptyLabel(selection)}</p>
           <p className="text-gray-600 text-xs mt-1">Los gastos se descuentan del saldo en caja</p>
         </div>
       ) : (
@@ -3542,9 +3631,38 @@ function GastosTab() {
 }
 
 // ─── Contenedor principal con tabs ───────────────────────────────────────────
+type CobranzasTabKey = "cobranzas" | "lote" | "rendiciones" | "adeudados" | "transferencias" | "gastos";
+
 export default function Cobranzas() {
   const { user } = useAuth();
-  const [tab, setTab] = useState<"cobranzas" | "lote" | "rendiciones" | "adeudados" | "transferencias" | "gastos">("cobranzas");
+  // Solo la pestaña Gastos vive en la URL (?tab=gastos&gastosMes=YYYY-MM|all)
+  // para que recarga y atrás/adelante conserven el mes; las demás pestañas
+  // siguen siendo estado local, como antes.
+  const search = useSearch();
+  const [, navigate] = useLocation();
+  const gastosInUrl = isGastosTabInSearch(search);
+  const gastosMonth = resolveGastosMonthFromSearch(search, shiftArgentinaMonth(0));
+  const [tab, setTabState] = useState<CobranzasTabKey>(gastosInUrl ? "gastos" : "cobranzas");
+
+  useEffect(() => {
+    if (gastosInUrl) setTabState("gastos");
+    else setTabState(t => (t === "gastos" ? "cobranzas" : t));
+  }, [gastosInUrl]);
+
+  // ?gastosMes ausente o inválido → mes actual de Argentina, reescrito sin
+  // sumar una entrada al historial.
+  useEffect(() => {
+    if (gastosInUrl && !gastosMonth.isCanonical) navigate(buildGastosPath(gastosMonth.selection), { replace: true });
+  }, [gastosInUrl, gastosMonth.isCanonical, gastosMonth.selection]);
+
+  function setTab(key: CobranzasTabKey) {
+    setTabState(key);
+    if (key === "gastos") {
+      if (!gastosInUrl) navigate(buildGastosPath(shiftArgentinaMonth(0)), { replace: true });
+    } else if (gastosInUrl) {
+      navigate("/cobranzas", { replace: true });
+    }
+  }
 
   return (
     <AppLayout>
@@ -3583,7 +3701,9 @@ export default function Cobranzas() {
         {tab === "transferencias" && <TransferenciasTab />}
         {tab === "rendiciones" && <RendicionesTab />}
         {tab === "adeudados" && <AdeudadosTab />}
-        {tab === "gastos" && <GastosTab />}
+        {tab === "gastos" && (
+          <GastosTab selection={gastosMonth.selection} onSelectionChange={s => navigate(buildGastosPath(s))} />
+        )}
       </div>
     </AppLayout>
   );

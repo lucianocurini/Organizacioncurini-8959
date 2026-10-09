@@ -51,6 +51,7 @@ import { validateAndNormalizeSplits, SplitValidationError, classifySplitGroup, i
 import { buildCashPeriodPendingItem, excludeCashPeriodChildren, type CashPeriodPendingSource } from "../lib/payments/remittance-pending-cash-period";
 import { recalculateInstallmentPaymentStatus } from "../lib/payments/installment-status";
 import { toArgentinaCalendarDay, resolveArgentinaMonthKey, shiftArgentinaMonth } from "../lib/dates/argentina-date";
+import { parseExpensesMonthQuery, expensesMonthRange } from "../lib/expenses-month";
 import {
   validateCancellationEffectiveDate, validatePolicyCancellationState, classifyInstallmentsForCancellation,
   appendCancellationNote, isInstallmentNonCollectible, PolicyCancellationValidationError, PolicyAlreadyCancelledError,
@@ -10984,12 +10985,23 @@ app.get("/remittances/adeudados", requireAuth(async (c: any) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // GET /api/cash/expenses
+// ?month=YYYY-MM → solo los gastos con `date` en [1.º del mes, 1.º del mes
+// siguiente) — listado de Cobranzas → Gastos. Sin parámetro o ?month=all →
+// histórico completo (lo que lee Caja; sus totales salen de /cash/summary,
+// que no pasa por acá). Cualquier otro valor → 400.
 app.get("/cash/expenses", requireAuth(async (c: any) => {
   const user = c.get("user");
   const isAdmin = user?.role === "admin";
-  const rows = isAdmin
-    ? await db.select().from(cashExpenses).where(ne(cashExpenses.status, "anulado")).orderBy(desc(cashExpenses.date)).all()
-    : await db.select().from(cashExpenses).where(and(eq(cashExpenses.type, "gasto_operativo"), ne(cashExpenses.status, "anulado"))).orderBy(desc(cashExpenses.date)).all();
+  const monthQuery = parseExpensesMonthQuery(c.req.query("month"));
+  if (!monthQuery.ok)
+    return c.json({ error: "month inválido. Formato esperado: YYYY-MM o all" }, 400);
+  const conditions = [ne(cashExpenses.status, "anulado")];
+  if (!isAdmin) conditions.push(eq(cashExpenses.type, "gasto_operativo"));
+  if (monthQuery.month) {
+    const { from, toExclusive } = expensesMonthRange(monthQuery.month);
+    conditions.push(gte(cashExpenses.date, from), lt(cashExpenses.date, toExclusive));
+  }
+  const rows = await db.select().from(cashExpenses).where(and(...conditions)).orderBy(desc(cashExpenses.date)).all();
   return c.json(rows);
 }));
 
