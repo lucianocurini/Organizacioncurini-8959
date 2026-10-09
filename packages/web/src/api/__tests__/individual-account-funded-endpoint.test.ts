@@ -40,6 +40,7 @@ const EXPECTED_CHECKS = [
   "C2. redondeo con saldo disponible sin aplicar → 400",
   "C3. redondeo hasta $5 con saldo agotado → 201; más de $5 → 400",
   "C4. sobrante real con saldo aplicado → 400 claro (no se consume saldo y se crea saldo nuevo a la vez)",
+  "C4b. caso del smoke test (cuota 143.014,24 + efectivo 143.014,24 + saldo 13.845,60) armado a mano → 400 sin artefactos; con el efectivo reducido → 201",
   "C5. lote con titular: misma regla (saldo sin agotar + deuda → 400)",
   "C6. lote legacy: saldo_deudor con saldo a favor disponible → 409 CREDIT_AVAILABLE_BEFORE_DEBT; sin saldo → 201",
   "Z1. cero medios sin saldo aplicado → 400",

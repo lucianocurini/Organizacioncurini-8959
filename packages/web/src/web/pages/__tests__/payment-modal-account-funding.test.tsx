@@ -19,6 +19,9 @@ const POLICIES_RESPONSE = [
 ];
 const INST = { installmentId: 82001, installmentNumber: 1, dueDate: "2026-09-15", amount: 100000, status: "pendiente", policyId: POLICY_ID };
 const INST2 = { installmentId: 82002, installmentNumber: 2, dueDate: "2026-10-15", amount: 100000, status: "pendiente", policyId: POLICY_ID };
+// Importes exactos del smoke test de producción.
+const INST_PROD = { installmentId: 82003, installmentNumber: 3, dueDate: "2026-11-15", amount: 143014.24, status: "pendiente", policyId: POLICY_ID };
+const SALDO_PROD_CENTS = 1384560;
 
 let dom: JSDOM;
 const originalGlobals: Record<string, any> = {};
@@ -53,7 +56,7 @@ function mockFetch(opts: { balanceCents?: number; fundedResponses?: Array<"ok" |
     const json = (body: any, status = 200) => ({ ok: status < 400, status, json: async () => body }) as any;
     if (url.startsWith("/api/installments/pending-for-payment")) {
       const policyId = Number(new URL(url, "http://localhost").searchParams.get("policyId"));
-      return json(policyId === POLICY_ID ? [INST, INST2] : []);
+      return json(policyId === POLICY_ID ? [INST, INST2, INST_PROD] : []);
     }
     if (url.startsWith("/api/policies/cash-period-search")) return json([]);
     if (url === "/api/policies?includeAccessories=1") return json(POLICIES_RESPONSE);
@@ -256,12 +259,12 @@ describe("PaymentModal — cuenta corriente del asegurado (pago individual con s
     try {
       await ui.selectInstallment(String(INST.installmentId));
       await ui.click(fundingToggle(ui.container));
-      // El medio único ya cubre la cuota: no hay saldo que aplicar todavía.
-      expect(buttonByText(ui.container, "Usar máximo")!.disabled).toBe(true);
+      // Con un único medio, el saldo máximo se ofrece aunque el medio ya cubra la cuota.
+      expect(buttonByText(ui.container, "Aplicar saldo máximo")!.disabled).toBe(false);
       const removeButton = ui.container.querySelector('button[aria-label^="Eliminar medio de pago 1"]') as HTMLButtonElement;
       expect(removeButton.disabled).toBe(false);
       await ui.click(removeButton);
-      await ui.click(buttonByText(ui.container, "Usar máximo")!);
+      await ui.click(buttonByText(ui.container, "Aplicar saldo máximo")!);
       expect(creditInput(ui.container).value).toBe("100000");
       expect(ui.container.textContent).toContain("Sin medios reales");
       await ui.click(imputarButton(ui.container));
@@ -311,9 +314,11 @@ describe("PaymentModal — cuenta corriente del asegurado (pago individual con s
       await ui.selectInstallment(String(INST.installmentId));
       await ui.click(fundingToggle(ui.container));
       await ui.setInput(creditInput(ui.container), "30000");
+      // El medio se redujo solo a 70.000; el usuario lo vuelve a subir a mano.
+      expect(firstSplitAmount(ui.container).value).toBe("70000.00");
       await ui.setInput(firstSplitAmount(ui.container), "100000");
       expect(imputarButton(ui.container).disabled).toBe(true);
-      expect(ui.container.textContent).toContain("reducí el saldo aplicado");
+      expect(ui.container.textContent!.replace(/ /g, " ")).toContain("El medio de pago debe ser $ 70.000,00");
     } finally {
       await ui.unmount();
     }
@@ -332,6 +337,176 @@ describe("PaymentModal — cuenta corriente del asegurado (pago individual con s
       expect(summary).toContain("Saldo final de la cuenta (deudor)$ 20.000,00");
       expect(summary).not.toContain("Nuevo saldo a favor");
       expect(imputarButton(ui.container).disabled).toBe(false);
+    } finally {
+      await ui.unmount();
+    }
+  }, TEST_TIMEOUT_MS);
+
+  // ─── Caso del smoke test: cuota $143.014,24, efectivo por el total, saldo $13.845,60 ───
+  const INVALID_TEXT = /--|NaN|Infinity|-\s?\$|\$\s?-/;
+  const text = (c: Element) => c.textContent!.replace(/ /g, " ");
+  const splitAmounts = (c: Element) => Array.from(c.querySelectorAll('input[id^="split-amount-"]')).map((i) => (i as HTMLInputElement).value);
+
+  test("caso producción, saldo escrito a mano: el único efectivo baja a 129.168,64 y el payload cierra exacto", async () => {
+    const m = mockFetch({ balanceCents: SALDO_PROD_CENTS });
+    const ui = await renderModal();
+    try {
+      await ui.selectInstallment(String(INST_PROD.installmentId));
+      await ui.click(fundingToggle(ui.container));
+      // Activar la cuenta corriente no crea sobrepago por sí solo.
+      expect(firstSplitAmount(ui.container).value).toBe("143014.24");
+      expect(ui.container.querySelector('[role="alert"]')).toBeNull();
+      await ui.setInput(creditInput(ui.container), "13845.60");
+      expect(firstSplitAmount(ui.container).value).toBe("129168.64");
+      expect(text(ui.container)).not.toContain("superan");
+      expect(imputarButton(ui.container).disabled).toBe(false);
+      const summary = text(ui.container.querySelector('[data-testid="funding-summary"]')!);
+      expect(summary).toContain("Importe a cancelar$ 143.014,24");
+      expect(summary).toContain("Saldo a favor utilizado$ 13.845,60");
+      expect(summary).toContain("Dinero real ingresado$ 129.168,64");
+      expect(summary).not.toContain("Nuevo saldo a favor");
+      await ui.click(imputarButton(ui.container));
+      const body = m.fundedPosts()[0]!.body;
+      expect(body.creditAppliedCents).toBe(SALDO_PROD_CENTS);
+      expect(body.splits).toEqual([{ method: "efectivo", amount: 129168.64 }]);
+      expect(body.creditAppliedCents + Math.round(body.splits[0].amount * 100)).toBe(14301424);
+    } finally {
+      await ui.unmount();
+    }
+  }, TEST_TIMEOUT_MS);
+
+  test("caso producción, 'Aplicar saldo máximo': aplica 13.845,60 y reduce el efectivo", async () => {
+    const m = mockFetch({ balanceCents: SALDO_PROD_CENTS });
+    const ui = await renderModal();
+    try {
+      await ui.selectInstallment(String(INST_PROD.installmentId));
+      await ui.click(fundingToggle(ui.container));
+      const maxButton = buttonByText(ui.container, "Aplicar saldo máximo")!;
+      expect(maxButton.disabled).toBe(false);
+      expect(text(ui.container.querySelector('[data-testid="funding-credit-help"]')!)).toContain("Máximo aplicable: $ 13.845,60");
+      await ui.click(maxButton);
+      expect(Number(creditInput(ui.container).value)).toBe(13845.6);
+      expect(firstSplitAmount(ui.container).value).toBe("129168.64");
+      expect(imputarButton(ui.container).disabled).toBe(false);
+      await ui.click(imputarButton(ui.container));
+      expect(m.fundedPosts()[0]!.body.splits).toEqual([{ method: "efectivo", amount: 129168.64 }]);
+    } finally {
+      await ui.unmount();
+    }
+  }, TEST_TIMEOUT_MS);
+
+  test("saldo que cubre todo: el medio queda en $0 y se envían cero splits", async () => {
+    const m = mockFetch({ balanceCents: 20000000 });
+    const ui = await renderModal();
+    try {
+      await ui.selectInstallment(String(INST_PROD.installmentId));
+      await ui.click(fundingToggle(ui.container));
+      await ui.click(buttonByText(ui.container, "Aplicar saldo máximo")!);
+      expect(creditInput(ui.container).value).toBe("143014.24");
+      expect(firstSplitAmount(ui.container).value).toBe("0.00");
+      expect(text(ui.container)).toContain("Sin medios reales");
+      expect(imputarButton(ui.container).disabled).toBe(false);
+      await ui.click(imputarButton(ui.container));
+      const body = m.fundedPosts()[0]!.body;
+      expect(body.splits).toEqual([]);
+      expect(body.creditAppliedCents).toBe(14301424);
+    } finally {
+      await ui.unmount();
+    }
+  }, TEST_TIMEOUT_MS);
+
+  test("desactivar la cuenta corriente quita el saldo y el efectivo vuelve a cubrir el total (pago tradicional válido)", async () => {
+    const m = mockFetch({ balanceCents: SALDO_PROD_CENTS });
+    const ui = await renderModal();
+    try {
+      await ui.selectInstallment(String(INST_PROD.installmentId));
+      await ui.click(fundingToggle(ui.container));
+      await ui.setInput(creditInput(ui.container), "13845.60");
+      expect(firstSplitAmount(ui.container).value).toBe("129168.64");
+      await ui.click(fundingToggle(ui.container));
+      expect(creditInput(ui.container)).toBeNull();
+      expect(firstSplitAmount(ui.container).value).toBe("143014.24");
+      expect(imputarButton(ui.container).disabled).toBe(false);
+      // Reactivar arranca sin saldo aplicado.
+      await ui.click(fundingToggle(ui.container));
+      expect(creditInput(ui.container).value).toBe("");
+      expect(firstSplitAmount(ui.container).value).toBe("143014.24");
+      await ui.click(fundingToggle(ui.container));
+      await ui.click(imputarButton(ui.container));
+      expect(m.fundedPosts().length).toBe(0);
+      const body = m.paymentPosts()[0]!.body;
+      expect("creditAppliedCents" in body).toBe(false);
+      expect(body.splits).toEqual([{ method: "efectivo", amount: 143014.24 }]);
+    } finally {
+      await ui.unmount();
+    }
+  }, TEST_TIMEOUT_MS);
+
+  test("cheque único: ni el saldo ni activar/desactivar modifican su importe; editar el efectivo a mano no se pisa", async () => {
+    mockFetch({ balanceCents: SALDO_PROD_CENTS });
+    const ui = await renderModal();
+    try {
+      await ui.selectInstallment(String(INST_PROD.installmentId));
+      const methodSelect = ui.container.querySelector('select[id^="split-method-"]') as HTMLSelectElement;
+      const selectSetter = Object.getOwnPropertyDescriptor(dom.window.HTMLSelectElement.prototype, "value")!.set!;
+      await ui.act(async () => {
+        selectSetter.call(methodSelect, "cheque");
+        methodSelect.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+        await flush();
+      });
+      await ui.click(fundingToggle(ui.container));
+      // Cheque por un importe propio (distinto de la cuota): nada lo reajusta.
+      await ui.setInput(firstSplitAmount(ui.container), "150000");
+      await ui.setInput(creditInput(ui.container), "13845.60");
+      expect(firstSplitAmount(ui.container).value).toBe("150000");
+      await ui.setInput(creditInput(ui.container), "");
+      await ui.click(fundingToggle(ui.container));
+      expect(firstSplitAmount(ui.container).value).toBe("150000");
+      // Volver a efectivo, activar y editar el medio a mano: cambiar otra cosa (notas) no lo pisa.
+      await ui.act(async () => {
+        selectSetter.call(methodSelect, "efectivo");
+        methodSelect.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+        await flush();
+      });
+      await ui.click(fundingToggle(ui.container));
+      await ui.setInput(creditInput(ui.container), "13845.60");
+      await ui.setInput(firstSplitAmount(ui.container), "130000");
+      const notes = ui.container.querySelector('textarea[placeholder="Observaciones opcionales..."]') as HTMLTextAreaElement;
+      const taSetter = Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, "value")!.set!;
+      await ui.act(async () => { taSetter.call(notes, "nota"); notes.dispatchEvent(new dom.window.Event("input", { bubbles: true })); await flush(); });
+      expect(firstSplitAmount(ui.container).value).toBe("130000");
+    } finally {
+      await ui.unmount();
+    }
+  }, TEST_TIMEOUT_MS);
+
+  test("varios medios: no se alteran, se indica cuánto redistribuir y se bloquea hasta que cierre", async () => {
+    const m = mockFetch({ balanceCents: SALDO_PROD_CENTS });
+    const ui = await renderModal();
+    try {
+      await ui.selectInstallment(String(INST_PROD.installmentId));
+      await ui.click(fundingToggle(ui.container));
+      await ui.click(buttonByText(ui.container, "+ Agregar medio")!);
+      const inputs = () => Array.from(ui.container.querySelectorAll('input[id^="split-amount-"]')) as HTMLInputElement[];
+      await ui.setInput(inputs()[0]!, "100000");
+      await ui.setInput(inputs()[1]!, "43014.24");
+      // Cubren todo: el máximo aplicable sin tocarlos es $0 (nunca negativo).
+      expect(buttonByText(ui.container, "Aplicar saldo máximo")!.disabled).toBe(true);
+      expect(text(ui.container.querySelector('[data-testid="funding-credit-help"]')!)).toContain("Con varios medios");
+      await ui.setInput(creditInput(ui.container), "13845.60");
+      expect(splitAmounts(ui.container)).toEqual(["100000", "43014.24"]);
+      expect(imputarButton(ui.container).disabled).toBe(true);
+      const alert = text(ui.container.querySelector('[data-testid="individual-account-funding"] [role="alert"]')!);
+      expect(alert).toContain("Redistribuí los medios reales para que sumen $ 129.168,64");
+      expect(alert).toContain("reducilos en $ 13.845,60");
+      expect(text(ui.container.querySelector('[data-testid="individual-account-funding"]')!)).not.toMatch(INVALID_TEXT);
+      // El usuario redistribuye a mano: ahora cierra.
+      await ui.setInput(inputs()[0]!, "86154.40");
+      expect(imputarButton(ui.container).disabled).toBe(false);
+      await ui.click(imputarButton(ui.container));
+      const body = m.fundedPosts()[0]!.body;
+      const realCents = body.splits.reduce((s: number, x: any) => s + Math.round(x.amount * 100), 0);
+      expect(body.creditAppliedCents + realCents).toBe(14301424);
     } finally {
       await ui.unmount();
     }

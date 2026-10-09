@@ -44,11 +44,12 @@ import {
   emptyIndividualFundingState, resetFundingForPolicyChange, resetFundingForInstallmentChange, invalidateFundingKey,
   setFundingDebtAuthorized, isIndividualFundingEligible, individualFundingSurchargeCents, individualFundingTargetCents,
   validateIndividualFundingSplits, removeFundingSplitRow, realSplitsTotalCents, parseIndividualFundingAmounts, validateIndividualFundingFields,
-  computeIndividualFundingPreview, suggestedCreditCents, shortfallAfterAllCreditCents, buildIndividualFundingSummary,
+  computeIndividualFundingPreview, shortfallAfterAllCreditCents, buildIndividualFundingSummary,
+  effectiveFundingSplits, maxApplicableCreditCents, shouldRebalanceSingleFundingSplit, rebalanceSingleSplitForCredit,
   buildAccountFundedPaymentPayload, computeIndividualFundingFingerprint, resolveIdempotencyKey,
   describeIndividualAccountFundingRow, INDIVIDUAL_FUNDED_CANCEL_CONFIRM, MAX_ROUNDING_ADJUSTMENT_CENTS,
 } from "@/lib/individual-account-funding-form";
-import { generateIdempotencyKey, type AccountHolderBalance } from "@/lib/payment-batch-titular-form";
+import { generateIdempotencyKey, isRebalanceableSingleSplit, type AccountHolderBalance } from "@/lib/payment-batch-titular-form";
 
 /** Póliza + fecha de pago para las que se cargaron los candidatos de contado. */
 function cashPeriodSearchKeyFor(policyId: string, paymentDate: string): string {
@@ -432,18 +433,23 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
   const fundingActive = fundingEligible && funding.enabled;
   const fundingIsRivadavia = selectedPolicy?.company?.name?.toLowerCase().includes("rivadavia") ?? false;
   const installmentAmountCents = selectedInstallment ? Math.round(Number(selectedInstallment.amount) * 100) : 0;
+  // El único medio rebalanceado a $0 (el saldo cubre todo) cuenta como "sin medios reales".
+  const fundingSplits = effectiveFundingSplits(form.splits);
   const fundingSurchargeCents = individualFundingSurchargeCents({
-    isRivadavia: fundingIsRivadavia, applyProntoPagoSurcharge, splits: form.splits,
+    isRivadavia: fundingIsRivadavia, applyProntoPagoSurcharge, splits: fundingSplits,
   });
   const fundingTargetCents = individualFundingTargetCents(installmentAmountCents, fundingSurchargeCents);
   const fundingAmounts = parseIndividualFundingAmounts(funding) ?? { creditAppliedCents: 0, roundingCoverageCents: 0 };
-  const fundingRealCents = realSplitsTotalCents(form.splits);
+  const fundingRealCents = realSplitsTotalCents(fundingSplits);
   const fundingAvailableCreditCents = fundingBalance?.availableCreditCents ?? 0;
-  const fundingSplitsValidation = validateIndividualFundingSplits(fundingTargetCents, form.splits, fundingAmounts.creditAppliedCents);
+  const fundingMaxCreditCents = maxApplicableCreditCents({
+    availableCreditCents: fundingAvailableCreditCents, targetCents: fundingTargetCents, splits: form.splits,
+  });
+  const fundingSplitsValidation = validateIndividualFundingSplits(fundingTargetCents, fundingSplits, fundingAmounts.creditAppliedCents);
   const fundingFieldsValidation = validateIndividualFundingFields(funding, fundingAvailableCreditCents);
   const fundingPreview = fundingActive && fundingBalance
     ? computeIndividualFundingPreview({
-        targetCents: fundingTargetCents, splits: form.splits,
+        targetCents: fundingTargetCents, splits: fundingSplits,
         creditAppliedCents: fundingAmounts.creditAppliedCents, roundingCoverageCents: fundingAmounts.roundingCoverageCents,
         availableCreditCents: fundingAvailableCreditCents, debtAuthorized: funding.debtAuthorized,
       })
@@ -465,6 +471,30 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
   useEffect(() => {
     if (!fundingEligible && funding.enabled) setFunding(emptyIndividualFundingState());
   }, [fundingEligible, funding.enabled]);
+
+  // Con un único medio real, el saldo aplicado reemplaza parte de ese medio:
+  // al activar la cuenta corriente, al cambiar el saldo (a mano o con
+  // "Aplicar saldo máximo") o el total (recargo), el medio pasa a ser
+  // total − saldo. Editar el importe del medio a mano no dispara esto.
+  useEffect(() => {
+    if (!fundingActive || !shouldRebalanceSingleFundingSplit(funding, form.splits)) return;
+    setForm((f) => {
+      const splits = rebalanceSingleSplitForCredit(f.splits, fundingTargetCents, fundingAmounts.creditAppliedCents);
+      return splits === f.splits ? f : { ...f, splits };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fundingActive, fundingTargetCents, fundingAmounts.creditAppliedCents]);
+
+  // Al desactivar la cuenta corriente, el único medio vuelve a cubrir el
+  // importe del pago tradicional (sin saldo aplicado). Un cheque no se toca:
+  // su importe lo fijan los cheques cargados.
+  const fundingWasActiveRef = useRef(false);
+  useEffect(() => {
+    if (fundingWasActiveRef.current && !fundingActive) {
+      setForm((f) => (isRebalanceableSingleSplit(f.splits) ? { ...f, splits: syncSingleBatchSplitAmount(f.splits, f.amount) } : f));
+    }
+    fundingWasActiveRef.current = fundingActive;
+  }, [fundingActive]);
 
   // Sin cuenta corriente el pago tradicional exige al menos un medio real:
   // si se habían quitado todos (cobro 100% con saldo), se restaura uno.
@@ -543,7 +573,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
       policyId: Number(form.policyId),
       installmentId: Number(form.installmentId),
       paymentDate: form.paymentDate,
-      splits: form.splits,
+      splits: fundingSplits,
       notes: form.notes || null,
       applyProntoPagoSurcharge: fundingIsRivadavia ? applyProntoPagoSurcharge : true,
       creditAppliedCents: fundingAmounts.creditAppliedCents,
@@ -1030,7 +1060,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
               <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-400" data-testid="funding-splits-totals">
                 <span>Importe a cancelar: <span className="text-white font-medium">{formatCurrencyCents(fundingTargetCents)}</span></span>
                 <span>Dinero real: <span className="text-white font-medium">{formatCurrencyCents(fundingRealCents)}</span></span>
-                {form.splits.length === 0 && <span className="text-emerald-300">Sin medios reales — se cubre con saldo a favor</span>}
+                {fundingSplits.length === 0 && <span className="text-emerald-300">Sin medios reales: se cubre con saldo a favor</span>}
               </div>
             ) : (
             <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-400">
@@ -1095,6 +1125,8 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
               installmentAmountCents={installmentAmountCents}
               surchargeCents={fundingSurchargeCents}
               realCents={fundingRealCents}
+              maxCreditCents={fundingMaxCreditCents}
+              multipleRealSplits={fundingSplits.length > 1}
               preview={fundingPreview}
               fieldsErrorMessage={fundingFieldsValidation.valid ? null : fundingFieldsValidation.errorMessage}
               showDebtOption={showFundingDebtOption}
@@ -1192,6 +1224,10 @@ export function IndividualAccountFundingSection(props: {
   installmentAmountCents: number;
   surchargeCents: number;
   realCents: number;
+  /** Saldo de "Aplicar saldo máximo" (maxApplicableCreditCents), siempre entre $0 y el disponible. */
+  maxCreditCents: number;
+  /** Con varios medios el saldo no los reduce solo: se avisa cuánto redistribuir. */
+  multipleRealSplits: boolean;
   preview: ReturnType<typeof computeIndividualFundingPreview> | null;
   fieldsErrorMessage: string | null;
   showDebtOption: boolean;
@@ -1200,7 +1236,7 @@ export function IndividualAccountFundingSection(props: {
 }) {
   const { funding, onChange, balance } = props;
   const availableCents = balance?.availableCreditCents ?? 0;
-  const maxCredit = suggestedCreditCents({ availableCreditCents: availableCents, targetCents: props.targetCents, realCents: props.realCents });
+  const maxCredit = props.maxCreditCents;
   const errorMessage = props.fieldsErrorMessage ?? (props.preview && !props.preview.ok ? props.preview.errorMessage : null);
   const summary = props.preview?.ok
     ? buildIndividualFundingSummary({
@@ -1243,7 +1279,7 @@ export function IndividualAccountFundingSection(props: {
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label htmlFor="funding-credit" className="block text-xs text-gray-400 mb-1">Saldo a favor a aplicar</label>
-              <div className="flex gap-1">
+              <div className="flex flex-col gap-1">
                 <input id="funding-credit" type="number" step="0.01" min="0" value={funding.creditAppliedInput}
                   disabled={!balance || availableCents === 0}
                   onChange={(e) => { const v = e.target.value; onChange((f) => ({ ...f, creditAppliedInput: v })); }}
@@ -1251,10 +1287,16 @@ export function IndividualAccountFundingSection(props: {
                   className="w-full min-w-0 px-2 py-2 bg-[#0a0f1e] border border-[#2d3748] rounded-lg text-sm text-white outline-none focus:border-emerald-500 disabled:opacity-50" />
                 <button type="button" disabled={!balance || maxCredit === 0}
                   onClick={() => onChange((f) => ({ ...f, creditAppliedInput: String(maxCredit / 100) }))}
-                  className="shrink-0 px-2 text-xs rounded-lg border border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40">
-                  Usar máximo
+                  title={`Aplica ${formatCurrencyCents(maxCredit)} de saldo a favor`}
+                  className="self-start px-2 py-1 text-xs rounded-lg border border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40">
+                  Aplicar saldo máximo
                 </button>
               </div>
+              <p className="text-[11px] text-gray-500 mt-1" data-testid="funding-credit-help">
+                {props.multipleRealSplits
+                  ? `Con varios medios, el saldo no los reduce solo: ajustalos para que saldo + medios = ${formatCurrencyCents(props.targetCents)}.`
+                  : `Máximo aplicable: ${formatCurrencyCents(maxCredit)}. El medio de pago se reduce solo.`}
+              </p>
             </div>
             <div>
               <label htmlFor="funding-rounding" className="block text-xs text-gray-400 mb-1">Redondeo oficina (máx. {formatCurrencyCents(MAX_ROUNDING_ADJUSTMENT_CENTS)})</label>

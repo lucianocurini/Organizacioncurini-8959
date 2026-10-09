@@ -458,6 +458,22 @@ async function main(): Promise<void> {
     assertMatch(res.body.error, /reducí el saldo aplicado/, "mensaje");
   });
 
+  await check("C4b. caso del smoke test (cuota 143.014,24 + efectivo 143.014,24 + saldo 13.845,60) armado a mano → 400 sin artefactos; con el efectivo reducido → 201", async () => {
+    const s = await scenario({ credit: 1384560, amount: 143014.24 });
+    const batches0 = await countAll(schema.paymentBatches);
+    const movements0 = await countAll(schema.insuredAccountMovements);
+    const res = await postFunded(funded(s, { creditAppliedCents: 1384560, splits: [{ method: "efectivo", amount: 143014.24 }] }));
+    assertEqual(res.status, 400, "sobre-fondeo manual");
+    assertEqual(await countAll(schema.paymentBatches), batches0, "sin lote");
+    assertEqual(await countAll(schema.insuredAccountMovements), movements0, "sin movimientos");
+    assertEqual(await installmentStatus(s.installmentId), "pendiente", "cuota intacta");
+    assertEqual(await balance(s.insuredId), 1384560, "saldo intacto");
+    const ok = await postFunded(funded(s, { creditAppliedCents: 1384560, splits: [{ method: "efectivo", amount: 129168.64 }] }));
+    assertEqual(ok.status, 201, `status (${JSON.stringify(ok.body)})`);
+    assertEqual(await balance(s.insuredId), 0, "saldo consumido exacto, sin sobrante");
+    assertEqual(await installmentStatus(s.installmentId), "pagada", "cuota pagada");
+  });
+
   await check("C5. lote con titular: misma regla (saldo sin agotar + deuda → 400)", async () => {
     const s = await scenario({ credit: 2000000 });
     const res = await call("POST", "/payment-batches", {
@@ -506,6 +522,12 @@ async function main(): Promise<void> {
       items: [{ source: "installment", installmentId: s.installmentId }], splits: [], creditAppliedCents: 10000000,
     });
     assertEqual(titular.status, 400, "lote con titular");
+    // Mismo lote con titular y el único medio en $0 (saldo que cubre el 100%): también 400.
+    const zeroSplit = await call("POST", "/payment-batches", {
+      paymentDate: PAYMENT_DATE, accountHolderInsuredId: s.insuredId, idempotencyKey: newKey(),
+      items: [{ source: "installment", installmentId: s.installmentId }], splits: [{ method: "efectivo", amount: 0 }], creditAppliedCents: 10000000,
+    });
+    assertEqual(zeroSplit.status, 400, "lote con titular y medio en $0");
     assertEqual(await installmentStatus(s.installmentId), "pendiente", "nada se cobró");
   });
 

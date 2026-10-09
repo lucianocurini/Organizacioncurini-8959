@@ -32,6 +32,7 @@ import { FundingValidationError, type FundingDestinationInput } from "../../lib/
 import { MAX_ROUNDING_ADJUSTMENT_CENTS } from "../../lib/payments/insured-account";
 import { isMultipleOfCent } from "../../lib/payments/splits";
 import { amountStringToCentsStrict } from "./payment-splits-form";
+import { formatCurrencyCents } from "./utils";
 import {
   type BatchCartItem, type BatchSplitFormRow, type PaymentBatchTitularPayloadInput,
   buildPaymentBatchPayload,
@@ -204,6 +205,10 @@ export function computeTitularPreview(params: {
   if (params.targetCents <= 0) {
     return { ok: false, errorMessage: "El carrito debe tener un total mayor a cero para calcular el resumen." };
   }
+  // Sobre-fondeo con saldo aplicado: el plan lo rechaza igual, pero su
+  // mensaje habla solo del saldo — acá se explica qué medio corregir.
+  const overFunding = describeCreditOverFunding(params);
+  if (overFunding) return { ok: false, errorMessage: overFunding };
   try {
     const plan = planAccountHolderBatchFunding({
       destinations: buildPreviewDestinations(params.targetCents),
@@ -220,6 +225,78 @@ export function computeTitularPreview(params: {
     }
     throw e;
   }
+}
+
+// ─── 6b. Saldo aplicado y único medio real ───────────────────────────────
+// Con UN medio real (no cheque: su importe lo fijan los cheques), el saldo
+// aplicado reemplaza parte de ese medio — saldo + medio = total a cancelar.
+// Con varios medios nunca se elige en silencio cuál reducir: se informa
+// cuánto redistribuir (describeCreditOverFunding).
+
+export function isRebalanceableSingleSplit(splits: ReadonlyArray<Pick<BatchSplitFormRow, "method">>): boolean {
+  return splits.length === 1 && splits[0]!.method !== "cheque";
+}
+
+function safeCents(n: number): number {
+  return Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0;
+}
+
+/** Único medio = max(0, total − saldo aplicado). Devuelve el mismo array si no aplica o no cambia. */
+export function rebalanceSingleSplitForCredit(
+  splits: BatchSplitFormRow[],
+  targetCents: number,
+  creditAppliedCents: number,
+): BatchSplitFormRow[] {
+  if (!isRebalanceableSingleSplit(splits)) return splits;
+  const amount = (Math.max(0, safeCents(targetCents) - safeCents(creditAppliedCents)) / 100).toFixed(2);
+  const current = splits[0]!;
+  if (current.amount.trim() !== "" && Number(current.amount) === Number(amount)) return splits;
+  return [{ ...current, amount }];
+}
+
+/**
+ * "Cobrar en lote" exige al menos un medio real (POST /payment-batches
+ * rechaza cero medios): si el crédito dejó el único medio en $0, se explica
+ * eso en vez del error genérico de importe. Solo presentación.
+ */
+export const BATCH_REQUIRES_REAL_SPLIT_MESSAGE =
+  "El cobro en lote necesita al menos un medio real mayor a $ 0,00. Para cubrir la cuota completa con saldo a favor, usá \"Imputar pago\".";
+
+export function describeBatchZeroRealSplit(splits: ReadonlyArray<Pick<BatchSplitFormRow, "method" | "amount">>): string | null {
+  if (!isRebalanceableSingleSplit(splits)) return null;
+  const amount = splits[0]!.amount.trim();
+  return amount !== "" && Number(amount) === 0 ? BATCH_REQUIRES_REAL_SPLIT_MESSAGE : null;
+}
+
+function realSplitsCents(splits: ReadonlyArray<Pick<BatchSplitFormRow, "amount">>): number {
+  return splits.reduce((s, x) => s + Math.max(0, amountStringToCentsStrict(x.amount) ?? 0), 0);
+}
+
+/**
+ * Mensaje para saldo aplicado + medios reales > total, o null si no hay
+ * sobre-fondeo con saldo. Importes siempre >= 0 y formateados.
+ */
+export function describeCreditOverFunding(params: {
+  targetCents: number;
+  splits: ReadonlyArray<BatchSplitFormRow>;
+  creditAppliedCents: number;
+  availableCreditCents: number;
+}): string | null {
+  const target = safeCents(params.targetCents);
+  const credit = safeCents(params.creditAppliedCents);
+  if (credit === 0) return null;
+  const real = realSplitsCents(params.splits);
+  const excess = real + credit - target;
+  if (excess <= 0) return null;
+  const fmt = formatCurrencyCents;
+  if (credit > target) {
+    return `El saldo aplicado (${fmt(credit)}) supera el importe a cancelar (${fmt(target)}). Aplicá como máximo ${fmt(Math.min(safeCents(params.availableCreditCents), target))}.`;
+  }
+  const head = `El saldo aplicado (${fmt(credit)}) más el dinero real (${fmt(real)}) superan el importe a cancelar (${fmt(target)}) por ${fmt(excess)}.`;
+  if (isRebalanceableSingleSplit(params.splits)) {
+    return `${head} El medio de pago debe ser ${fmt(target - credit)}.`;
+  }
+  return `${head} Redistribuí los medios reales para que sumen ${fmt(target - credit)} (reducilos en ${fmt(excess)} en total).`;
 }
 
 // ─── 7. Payload final — campos exclusivos del modo titular ────────────────

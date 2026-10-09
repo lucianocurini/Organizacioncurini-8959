@@ -23,10 +23,11 @@ import {
 } from "./payment-batch-form";
 import {
   computeTitularPreview, parseNonNegativeCentsInput, computeAccountOutcome, describeFinalAccountBalance,
+  isRebalanceableSingleSplit, rebalanceSingleSplitForCredit,
   MAX_ROUNDING_ADJUSTMENT_CENTS, type TitularPreviewResult,
 } from "./payment-batch-titular-form";
 
-export { MAX_ROUNDING_ADJUSTMENT_CENTS };
+export { MAX_ROUNDING_ADJUSTMENT_CENTS, rebalanceSingleSplitForCredit };
 
 // ─── 1. Estado ───────────────────────────────────────────────────────────
 
@@ -181,9 +182,42 @@ export function computeIndividualFundingPreview(params: {
   return computeTitularPreview(params);
 }
 
-/** Saldo sugerido por "Usar máximo": todo lo que haga falta para cubrir el total después de los medios reales, sin superar el disponible. */
-export function suggestedCreditCents(params: { availableCreditCents: number; targetCents: number; realCents: number }): number {
-  return Math.max(0, Math.min(Math.max(0, params.availableCreditCents), params.targetCents - params.realCents));
+/**
+ * Medios que cuentan con la cuenta corriente activa: el único medio
+ * rebalanceado a $0 (el saldo cubre todo) equivale a "sin medios reales" —
+ * nunca se valida ni se envía un split de importe cero.
+ */
+export function effectiveFundingSplits(splits: BatchSplitFormRow[]): BatchSplitFormRow[] {
+  if (isRebalanceableSingleSplit(splits) && splits[0]!.amount.trim() !== "" && Number(splits[0]!.amount) === 0) return [];
+  return splits;
+}
+
+/**
+ * Saldo de "Aplicar saldo máximo", siempre entre $0 y el disponible:
+ * - sin medios o con un único medio (que se reduce solo): min(disponible, total);
+ * - con varios medios (no se tocan): min(disponible, lo no cubierto por ellos).
+ */
+export function maxApplicableCreditCents(params: {
+  availableCreditCents: number;
+  targetCents: number;
+  splits: BatchSplitFormRow[];
+}): number {
+  const finite = (n: number) => (Number.isFinite(n) ? Math.max(0, n) : 0);
+  const available = finite(params.availableCreditCents);
+  const target = finite(params.targetCents);
+  const splits = effectiveFundingSplits(params.splits);
+  if (splits.length === 0 || isRebalanceableSingleSplit(splits)) return Math.min(available, target);
+  return Math.min(available, finite(target - realSplitsTotalCents(splits)));
+}
+
+/**
+ * El único medio se reajusta al saldo aplicado salvo que el usuario esté
+ * armando a propósito un redondeo o una deuda (ahí los importes son suyos).
+ */
+export function shouldRebalanceSingleFundingSplit(state: IndividualFundingFormState, splits: BatchSplitFormRow[]): boolean {
+  const amounts = parseIndividualFundingAmounts(state);
+  return state.enabled && amounts != null && !state.debtAuthorized && amounts.roundingCoverageCents === 0
+    && isRebalanceableSingleSplit(splits);
 }
 
 /**

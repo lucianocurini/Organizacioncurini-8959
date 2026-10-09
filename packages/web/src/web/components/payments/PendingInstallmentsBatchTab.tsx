@@ -36,6 +36,7 @@ import {
   emptyTitularFormState, selectAccountHolder, clearAccountHolder, setDebtAuthorized,
   parseNonNegativeCentsInput, validateTitularEconomicFields, computeTitularPreview, buildTitularPayloadInput,
   computeTitularEconomicFingerprint, generateIdempotencyKey, buildTitularSummaryLines,
+  isRebalanceableSingleSplit, rebalanceSingleSplitForCredit, describeBatchZeroRealSplit,
   MAX_ROUNDING_ADJUSTMENT_CENTS,
 } from "@/lib/payment-batch-titular-form";
 import { summarizeTitularBatchFunding, buildTitularBatchFundingLines } from "../../lib/payment-batch-titular-detail";
@@ -857,6 +858,10 @@ export function BatchPaymentModal({
   }
 
   function handleClearTitular() {
+    // Sin titular no hay crédito: el único medio que lo descontaba vuelve a cubrir el total.
+    if (titularCreditAppliedCents > 0 && isRebalanceableSingleSplit(splits)) {
+      setSplits((prev) => rebalanceSingleSplitForCredit(prev, calculateBatchTargetAmountCents(cart, prev), 0));
+    }
     setTitular(clearAccountHolder());
     setTitularBalance(null);
     setTitularKeyFingerprint(null);
@@ -864,9 +869,25 @@ export function BatchPaymentModal({
     setTitularDuplicateWarning(false);
   }
 
+  // Modo titular con un único medio (no cheque): el crédito aplicado reemplaza
+  // parte de ese medio (medio = total − crédito), salvo que el usuario esté
+  // armando a propósito un redondeo o una deuda.
+  const titularRebalancesSingleSplit = isTitularMode && !titular.debtAuthorized
+    && parseNonNegativeCentsInput(titular.roundingCoverageInput) === 0;
+
+  function handleTitularCreditInput(value: string) {
+    setTitular((t) => ({ ...t, creditAppliedInput: value }));
+    const creditCents = parseNonNegativeCentsInput(value);
+    if (creditCents == null || !titularRebalancesSingleSplit || !isRebalanceableSingleSplit(splits)) return;
+    setSplits((prev) => rebalanceSingleSplitForCredit(prev, calculateBatchTargetAmountCents(cart, prev), creditCents));
+  }
+
   function setSplitsAndSync(next: BatchSplitFormRow[]) {
     const target = calculateBatchTargetAmountCents(cart, next);
-    const synced = next.length === 1 ? syncSingleBatchSplitAmount(next, String(target / 100)) : next;
+    const synced = next.length !== 1 ? next
+      : titularRebalancesSingleSplit && isRebalanceableSingleSplit(next)
+        ? rebalanceSingleSplitForCredit(next, target, titularCreditAppliedCents)
+        : syncSingleBatchSplitAmount(next, String(target / 100));
     // syncChequeSplitAmounts SIEMPRE corre al final — un split "cheque" nunca
     // se queda con el importe sincronizado al target: su importe real es la
     // suma de sus propios cheques (0 si todavía no cargó ninguno).
@@ -1151,7 +1172,9 @@ export function BatchPaymentModal({
               )}
             </div>
             {validation.errorMessage && (
-              <p className="mt-2 text-xs text-red-400">{validation.errorMessage}</p>
+              <p className="mt-2 text-xs text-red-400">
+                {(isTitularMode ? describeBatchZeroRealSplit(splits) : null) ?? validation.errorMessage}
+              </p>
             )}
 
             {/* Fase 2E: sobrante/faltante — dinero real (SUM(splits)) distinto
@@ -1310,7 +1333,7 @@ export function BatchPaymentModal({
                   <div>
                     <label className="block text-xs text-white/50 mb-1">Crédito aplicado</label>
                     <input type="number" value={titular.creditAppliedInput}
-                      onChange={(e) => setTitular((t) => ({ ...t, creditAppliedInput: e.target.value }))}
+                      onChange={(e) => handleTitularCreditInput(e.target.value)}
                       placeholder="0.00" max={titularAvailableCreditCents / 100}
                       className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white text-sm outline-none focus:border-blue-500" />
                     <p className="text-[10px] text-white/30 mt-0.5">Máximo disponible: {formatCurrencyCents(Math.max(0, titularAvailableCreditCents))}</p>

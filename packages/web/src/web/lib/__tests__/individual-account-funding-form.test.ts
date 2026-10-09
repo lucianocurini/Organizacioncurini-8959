@@ -3,7 +3,8 @@ import {
   emptyIndividualFundingState, resetFundingForPolicyChange, resetFundingForInstallmentChange, invalidateFundingKey,
   setFundingDebtAuthorized, isIndividualFundingEligible, individualFundingSurchargeCents, individualFundingTargetCents,
   validateIndividualFundingSplits, removeFundingSplitRow, realSplitsTotalCents, validateIndividualFundingFields,
-  computeIndividualFundingPreview, suggestedCreditCents, shortfallAfterAllCreditCents, buildIndividualFundingSummary,
+  computeIndividualFundingPreview, shortfallAfterAllCreditCents, buildIndividualFundingSummary,
+  maxApplicableCreditCents, effectiveFundingSplits, shouldRebalanceSingleFundingSplit, rebalanceSingleSplitForCredit,
   buildAccountFundedPaymentPayload, computeIndividualFundingFingerprint, resolveIdempotencyKey,
   describeIndividualAccountFundingRow, type IndividualFundingFormState,
 } from "../individual-account-funding-form";
@@ -90,11 +91,20 @@ describe("campos económicos", () => {
     expect(validateIndividualFundingFields(state({ creditAppliedInput: "abc" }), 0).valid).toBe(false);
     expect(validateIndividualFundingFields(state({ creditAppliedInput: "300", roundingCoverageInput: "5", debtAuthorized: true, debtReason: "x" }), 30000).valid).toBe(true);
   });
-  test("saldo sugerido y faltante después de agotar el saldo", () => {
-    expect(suggestedCreditCents({ availableCreditCents: 3000000, targetCents: CUOTA, realCents: 7000000 })).toBe(3000000);
-    expect(suggestedCreditCents({ availableCreditCents: 20000000, targetCents: CUOTA, realCents: 0 })).toBe(CUOTA);
-    expect(suggestedCreditCents({ availableCreditCents: -500, targetCents: CUOTA, realCents: 0 })).toBe(0);
-    expect(suggestedCreditCents({ availableCreditCents: 100, targetCents: CUOTA, realCents: 11000000 })).toBe(0);
+  test("saldo máximo aplicable y faltante después de agotar el saldo", () => {
+    const one = (amount: string) => [createBatchSplitRow("efectivo", amount)];
+    const two = (a: string, b: string) => [createBatchSplitRow("efectivo", a), createBatchSplitRow("transferencia", b)];
+    // Un único medio (se reduce solo): min(disponible, total), aunque el medio ya cubra todo.
+    expect(maxApplicableCreditCents({ availableCreditCents: 3000000, targetCents: CUOTA, splits: one("100000") })).toBe(3000000);
+    expect(maxApplicableCreditCents({ availableCreditCents: 20000000, targetCents: CUOTA, splits: one("100000") })).toBe(CUOTA);
+    expect(maxApplicableCreditCents({ availableCreditCents: 20000000, targetCents: CUOTA, splits: [] })).toBe(CUOTA);
+    // Varios medios (no se tocan): solo lo no cubierto, nunca negativo.
+    expect(maxApplicableCreditCents({ availableCreditCents: 3000000, targetCents: CUOTA, splits: two("40000", "30000") })).toBe(3000000);
+    expect(maxApplicableCreditCents({ availableCreditCents: 100, targetCents: CUOTA, splits: two("60000", "50000") })).toBe(0);
+    // Disponible negativo / no finito → 0.
+    expect(maxApplicableCreditCents({ availableCreditCents: -500, targetCents: CUOTA, splits: one("100000") })).toBe(0);
+    expect(maxApplicableCreditCents({ availableCreditCents: Number.NaN, targetCents: CUOTA, splits: one("100000") })).toBe(0);
+    expect(maxApplicableCreditCents({ availableCreditCents: Number.POSITIVE_INFINITY, targetCents: CUOTA, splits: one("100000") })).toBe(0);
     expect(shortfallAfterAllCreditCents({ targetCents: CUOTA, realCents: 5000000, availableCreditCents: 2000000, roundingCoverageCents: 0 })).toBe(3000000);
     expect(shortfallAfterAllCreditCents({ targetCents: CUOTA, realCents: 5000000, availableCreditCents: 9000000, roundingCoverageCents: 0 })).toBe(0);
   });
@@ -223,5 +233,106 @@ describe("presentación en el listado", () => {
   test("saldo aplicado sin medios reales", () => {
     expect(describeIndividualAccountFundingRow({ ...row, creditAppliedCents: CUOTA, newDebtCents: 0, realReceivedCents: 0 }).map((l) => l.label))
       .toEqual(["Saldo aplicado", "Medios reales", "Total cancelado"]);
+  });
+});
+
+// Caso del smoke test de producción: cuota $143.014,24, un único medio
+// (efectivo por el total) y $13.845,60 de saldo a favor.
+describe("saldo aplicado con un único medio real (rebalanceo)", () => {
+  const TOTAL = 14301424;
+  const SALDO = 1384560;
+  const efectivo = (amount: string) => [createBatchSplitRow("efectivo", amount)];
+  const INVALID_TEXT = /--|—|NaN|Infinity|-\s?\$|\$\s?-/;
+
+  test("143.014,24 de cuota y 13.845,60 de saldo: el efectivo queda en 129.168,64 y el plan cierra sin sobrante", () => {
+    const splits = rebalanceSingleSplitForCredit(efectivo("143014.24"), TOTAL, SALDO);
+    expect(splits[0]!.amount).toBe("129168.64");
+    const p = computeIndividualFundingPreview({
+      targetCents: TOTAL, splits, creditAppliedCents: SALDO, roundingCoverageCents: 0, availableCreditCents: SALDO, debtAuthorized: false,
+    });
+    expect(p.ok).toBe(true);
+    if (!p.ok) return;
+    expect(p.plan.creditAppliedCents + p.plan.realSplitsTotalCents).toBe(TOTAL);
+    expect(p.plan.newSaldoAFavorCents).toBe(0);
+    expect(p.plan.newSaldoDeudorCents).toBe(0);
+  });
+
+  test("'Aplicar saldo máximo' con el efectivo cubriendo todo ofrece el saldo disponible (antes daba 0)", () => {
+    expect(maxApplicableCreditCents({ availableCreditCents: SALDO, targetCents: TOTAL, splits: efectivo("143014.24") })).toBe(SALDO);
+  });
+
+  test("saldo mayor que la cuota: saldo aplicado = cuota y el medio queda en 0 (cuenta como cero medios reales)", () => {
+    const credit = maxApplicableCreditCents({ availableCreditCents: 20000000, targetCents: TOTAL, splits: efectivo("143014.24") });
+    expect(credit).toBe(TOTAL);
+    const splits = rebalanceSingleSplitForCredit(efectivo("143014.24"), TOTAL, credit);
+    expect(splits[0]!.amount).toBe("0.00");
+    expect(effectiveFundingSplits(splits)).toEqual([]);
+    expect(validateIndividualFundingSplits(TOTAL, effectiveFundingSplits(splits), credit).valid).toBe(true);
+    const payload = buildAccountFundedPaymentPayload({
+      policyId: 1, installmentId: 2, paymentDate: "2026-10-08", splits: effectiveFundingSplits(splits), notes: null,
+      applyProntoPagoSurcharge: true, creditAppliedCents: credit, roundingCoverageCents: 0, debtAuthorized: false, debtReason: "", idempotencyKey: "k",
+    });
+    expect(payload.splits).toEqual([]);
+    expect(payload.creditAppliedCents).toBe(TOTAL);
+  });
+
+  test("Pronto Pago con saldo parcial: el medio cubre cuota + recargo − saldo", () => {
+    const target = individualFundingTargetCents(TOTAL, individualFundingSurchargeCents({ isRivadavia: true, applyProntoPagoSurcharge: true, splits: efectivo("143014.24") }));
+    expect(target).toBe(TOTAL + 80000);
+    const splits = rebalanceSingleSplitForCredit(efectivo("143014.24"), target, SALDO);
+    expect(splits[0]!.amount).toBe("129968.64");
+    const p = computeIndividualFundingPreview({ targetCents: target, splits, creditAppliedCents: SALDO, roundingCoverageCents: 0, availableCreditCents: SALDO, debtAuthorized: false });
+    expect(p.ok && p.plan.creditAppliedCents + p.plan.realSplitsTotalCents).toBe(target);
+  });
+
+  test("escritura manual progresiva del saldo mantiene saldo + medio = total en cada paso", () => {
+    let splits = efectivo("143014.24");
+    for (const input of ["1", "13", "138", "1384", "13845", "13845.6"]) {
+      const credit = Math.round(Number(input) * 100);
+      splits = rebalanceSingleSplitForCredit(splits, TOTAL, credit);
+      expect(Math.round(Number(splits[0]!.amount) * 100) + credit).toBe(TOTAL);
+    }
+    // Borrar el saldo vuelve a cubrir el total con el medio.
+    expect(rebalanceSingleSplitForCredit(splits, TOTAL, 0)[0]!.amount).toBe("143014.24");
+  });
+
+  test("nunca produce importes negativos; sin cambios devuelve el mismo array", () => {
+    expect(rebalanceSingleSplitForCredit(efectivo("1"), TOTAL, TOTAL + 5000)[0]!.amount).toBe("0.00");
+    const same = efectivo("129168.64");
+    expect(rebalanceSingleSplitForCredit(same, TOTAL, SALDO)).toBe(same);
+  });
+
+  test("varios medios o un cheque: nunca se alteran", () => {
+    const multi = [createBatchSplitRow("efectivo", "100000"), createBatchSplitRow("transferencia", "43014.24")];
+    expect(rebalanceSingleSplitForCredit(multi, TOTAL, SALDO)).toBe(multi);
+    const cheque = [createBatchSplitRow("cheque", "143014.24")];
+    expect(rebalanceSingleSplitForCredit(cheque, TOTAL, SALDO)).toBe(cheque);
+  });
+
+  test("varios medios con sobrepago: indica cuánto redistribuir, sin '--', NaN, Infinity ni máximos negativos", () => {
+    const multi = [createBatchSplitRow("efectivo", "100000"), createBatchSplitRow("transferencia", "43014.24")];
+    const p = computeIndividualFundingPreview({ targetCents: TOTAL, splits: multi, creditAppliedCents: SALDO, roundingCoverageCents: 0, availableCreditCents: SALDO, debtAuthorized: false });
+    expect(p.ok).toBe(false);
+    if (p.ok) return;
+    const msg = p.errorMessage.replace(/ /g, " ");
+    expect(msg).toContain("Redistribuí los medios reales para que sumen $ 129.168,64");
+    expect(msg).toContain("reducilos en $ 13.845,60");
+    expect(msg).not.toMatch(INVALID_TEXT);
+  });
+
+  test("un medio sin rebalancear (editado a mano después) o saldo > total: mensajes claros y sin texto inválido", () => {
+    const single = computeIndividualFundingPreview({ targetCents: TOTAL, splits: efectivo("143014.24"), creditAppliedCents: SALDO, roundingCoverageCents: 0, availableCreditCents: SALDO, debtAuthorized: false });
+    expect(!single.ok && single.errorMessage.replace(/ /g, " ")).toContain("El medio de pago debe ser $ 129.168,64");
+    const over = computeIndividualFundingPreview({ targetCents: TOTAL, splits: [], creditAppliedCents: TOTAL + 100, roundingCoverageCents: 0, availableCreditCents: 20000000, debtAuthorized: false });
+    expect(!over.ok && over.errorMessage.replace(/ /g, " ")).toContain("Aplicá como máximo $ 143.014,24");
+    for (const r of [single, over]) expect(!r.ok && r.errorMessage).not.toMatch(INVALID_TEXT);
+  });
+
+  test("redondeo o deuda armados a propósito: no se rebalancea", () => {
+    expect(shouldRebalanceSingleFundingSplit(state({ creditAppliedInput: "13845.60" }), efectivo("143014.24"))).toBe(true);
+    expect(shouldRebalanceSingleFundingSplit(state({ creditAppliedInput: "13845.60", roundingCoverageInput: "2" }), efectivo("1"))).toBe(false);
+    expect(shouldRebalanceSingleFundingSplit(state({ debtAuthorized: true, debtReason: "x" }), efectivo("1"))).toBe(false);
+    expect(shouldRebalanceSingleFundingSplit(state({ creditAppliedInput: "abc" }), efectivo("1"))).toBe(false);
+    expect(shouldRebalanceSingleFundingSplit({ ...state(), enabled: false }, efectivo("1"))).toBe(false);
   });
 });
