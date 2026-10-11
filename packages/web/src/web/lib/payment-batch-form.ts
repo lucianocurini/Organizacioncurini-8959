@@ -33,7 +33,7 @@
 //     compañía en texto, sin ninguna fila real detrás) — insuredId SIEMPRE
 //     null, nunca inferido de ningún otro ítem del carrito.
 
-import { formatCurrencyCents } from "./utils";
+import { formatCurrencyCents, formatDate } from "./utils";
 import {
   type PaymentSplitFormRow, type SplitGroup,
   createSplitRow, computeSplitTotals, validateSplitsForm,
@@ -1216,7 +1216,7 @@ export function batchDetailItemInsuredLabel(item: PaymentBatchDetailItem): strin
 export function describeBatchDetailItem(item: PaymentBatchDetailItem): string {
   if (!isManualBatchDetailItem(item)) {
     const policyLabel = item.policy?.policyNumber ?? "—";
-    return `Cuota ${item.installment!.number} — vence ${item.installment!.dueDate} — póliza ${policyLabel}`;
+    return `Cuota ${item.installment!.number} — vence ${formatDate(item.installment!.dueDate)} — póliza ${policyLabel}`;
   }
   const description = item.payment.notes?.trim();
   if (!isFreeformManualBatchDetailItem(item)) {

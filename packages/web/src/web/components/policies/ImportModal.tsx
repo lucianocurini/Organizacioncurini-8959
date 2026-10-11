@@ -7,6 +7,7 @@ import {
 import { toast } from "sonner";
 import * as XLSX from "xlsx";
 import { cn } from "@/lib/utils";
+import { formatPreviewDate } from "../../../lib/dates/display-date";
 
 interface Props {
   onClose: () => void;
@@ -554,8 +555,8 @@ export function ImportModal({ onClose, onImported }: Props) {
                           </td>
                           <td className="py-2 px-3 text-white">{r.data.insured || <span className="text-red-400">—</span>}</td>
                           <td className="py-2 px-3 text-gray-300">{r.data.company || <span className="text-red-400">—</span>}</td>
-                          <td className="py-2 px-3 text-gray-400">{r.data.startDate || <span className="text-red-400">—</span>}</td>
-                          <td className="py-2 px-3 text-gray-400">{r.data.endDate || <span className="text-red-400">—</span>}</td>
+                          <td className="py-2 px-3 text-gray-400">{r.data.startDate ? formatPreviewDate(r.data.startDate) : <span className="text-red-400">—</span>}</td>
+                          <td className="py-2 px-3 text-gray-400">{r.data.endDate ? formatPreviewDate(r.data.endDate) : <span className="text-red-400">—</span>}</td>
                           <td className="py-2 px-3">
                             {ok ? (
                               <span className="text-emerald-400 flex items-center gap-1"><CheckCircle2 className="w-3 h-3"/>OK</span>

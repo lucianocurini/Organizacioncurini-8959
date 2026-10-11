@@ -1,6 +1,7 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { toArgentinaCalendarDay, diffCalendarDays } from "../../lib/dates/argentina-date";
+import { formatDisplayDate } from "../../lib/dates/display-date";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -25,10 +26,10 @@ export function formatCurrencyCents(cents: number | null | undefined): string {
   return new Intl.NumberFormat("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(cents / 100);
 }
 
+// Fecha pura "YYYY-MM-DD" → "DD/MM/YYYY" ("—" si falta o es inválida). Para
+// timestamps usar formatDisplayDateTime / formatDisplayTimestampDate.
 export function formatDate(dateStr: string | null | undefined): string {
-  if (!dateStr) return "—";
-  const [y, m, d] = dateStr.split("-");
-  return `${d}/${m}/${y}`;
+  return formatDisplayDate(dateStr);
 }
 
 // Rutas internas a las que un botón "volver" puede redirigir. Cualquier otro

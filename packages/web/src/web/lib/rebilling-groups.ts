@@ -9,6 +9,8 @@
 // refacturaciones por billingStart ascendente — nunca se oculta ni se
 // reemplaza un grupo anterior.
 
+import { formatDisplayDateRange } from "../../lib/dates/display-date";
+
 export interface GroupableInstallment {
   id: number;
   number: number;
@@ -97,7 +99,7 @@ export function groupInstallmentsByRebilling(
     // pueda ver y completar desde la UI, no queda oculta.
     groups.push({
       key: String(r.id),
-      label: `Refacturación ${n} — ${r.billingStart} a ${r.billingEnd}`,
+      label: `Refacturación ${n} — ${formatDisplayDateRange(r.billingStart, r.billingEnd)}`,
       rebillingId: r.id,
       billingStart: r.billingStart,
       billingEnd: r.billingEnd,

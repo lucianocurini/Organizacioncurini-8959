@@ -27,6 +27,7 @@ import {
 } from "@/lib/caja-cobrados";
 import { describeCashPeriodPendingItem, formatCuotasCount } from "@/lib/rendicion-pending";
 import { toArgentinaCalendarDay } from "../../lib/dates/argentina-date";
+import { formatDisplayDate, formatDisplayDateRange, formatDisplayMonth } from "../../lib/dates/display-date";
 import {
   ComposedChart,
   Bar,
@@ -69,12 +70,6 @@ function fmt(n: number) {
 
 const fmtCents = (cents: number) => fmt(cents / 100);
 
-function fmtIsoDay(d: string | null | undefined) {
-  if (!d) return "—";
-  const [y, m, day] = d.slice(0, 10).split("-");
-  return `${day}/${m}/${y}`;
-}
-
 // ─── Fila de un pago de contado en "Cobros pendientes de rendición" ───────────
 // Un contado es UNA fila (ítem canónico de GET /remittances/pending), por el
 // importe aplicado; nominal, descuento, medios reales y redondeo se muestran
@@ -106,8 +101,8 @@ function CajaCashPeriodRow({ item }: { item: any }) {
           )}
         </div>
         <div className="flex items-center gap-2 mt-0.5 flex-wrap text-xs text-white/40">
-          <span>{item.paymentDate}</span>
-          <span>Período {fmtIsoDay(cpp.periodStart)} al {fmtIsoDay(cpp.periodEnd)}</span>
+          <span>{formatDisplayDate(item.paymentDate)}</span>
+          <span>Período {formatDisplayDateRange(cpp.periodStart, cpp.periodEnd)}</span>
           <span>· {formatCuotasCount(d.installmentCount)}</span>
         </div>
         <p className="text-xs text-white/40 mt-0.5">
@@ -181,8 +176,8 @@ export function CajaPendingCobranzasList({ payments, remittancePending, loadErro
                 )}
               </div>
               <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                <span className="text-xs text-white/40">{item.paymentDate}</span>
-                {item.dueDate && <span className="text-xs text-white/30">Venc: {item.dueDate}</span>}
+                <span className="text-xs text-white/40">{formatDisplayDate(item.paymentDate)}</span>
+                {item.dueDate && <span className="text-xs text-white/30">Venc: {formatDisplayDate(item.dueDate)}</span>}
                 <span className="flex items-center gap-1 text-xs text-white/40">
                   {methodIcon(item.paymentMethod)}
                   {methodLabel(item.paymentMethod)}
@@ -513,15 +508,8 @@ function StatsSection({ stats, view }: { stats: any[]; view: "mensual" | "histor
     );
   }
 
-  // Formato de etiqueta mes
-  const fmtMes = (m: string) => {
-    const [y, mo] = m.split("-");
-    const meses = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
-    return `${meses[parseInt(mo) - 1]} ${y}`;
-  };
-
   const chartData = displayData.map((r: any) => ({
-    mes: fmtMes(r.mes),
+    mes: formatDisplayMonth(r.mes),
     Cobrado: r.cobrado,
     Rendido: r.rendido,
     "Acum. Cobrado": r.acumuladoCobrado,
@@ -640,7 +628,7 @@ function StatsSection({ stats, view }: { stats: any[]; view: "mensual" | "histor
             <tbody>
               {[...displayData].reverse().map((row: any) => (
                 <tr key={row.mes} className="border-b border-white/5 hover:bg-white/3">
-                  <td className="py-2 pr-4 text-white font-medium">{fmtMes(row.mes)}</td>
+                  <td className="py-2 pr-4 text-white font-medium">{formatDisplayMonth(row.mes)}</td>
                   <td className="py-2 pr-4 text-right text-white">{row.cobrado.toLocaleString("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 0 })}</td>
                   <td className="py-2 pr-4 text-right text-orange-400">{row.rendido.toLocaleString("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 0 })}</td>
                   <td className="py-2 pr-4 text-right text-blue-400">{(row.cobrado - row.rendido).toLocaleString("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 0 })}</td>
@@ -1072,7 +1060,7 @@ export default function CajaPage() {
                         <ul className="mt-2 space-y-1">
                           {summary.allocationsModel.inconsistencias.map((i) => (
                             <li key={`ra-${i.remittanceId}`}>
-                              Rendición #{i.remittanceId} ({i.date}): {i.reason}
+                              Rendición #{i.remittanceId} ({formatDisplayDate(i.date)}): {i.reason}
                             </li>
                           ))}
                           {summary.carteraInconsistencias.map((i, idx) => (
@@ -1188,7 +1176,7 @@ export default function CajaPage() {
                 {summary.periodo && (
                   <div className="mt-5 border-t border-white/10 pt-5">
                     <p className="text-xs text-white/30 uppercase tracking-wider mb-3 font-medium">
-                      Período: {summary.periodo.from} → {summary.periodo.to}
+                      Período: {formatDisplayDateRange(summary.periodo.from, summary.periodo.to)}
                     </p>
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                       <div className="bg-white/5 rounded-xl p-4">
@@ -1227,7 +1215,7 @@ export default function CajaPage() {
             open={sections.cajaPropia}
             onToggle={() => toggleSection("cajaPropia")}
             action={
-              <span className="text-xs text-white/30 font-normal">período: {periodoMes}</span>
+              <span className="text-xs text-white/30 font-normal">período: {formatDisplayMonth(periodoMes)}</span>
             }
           >
             {summary?.cajaPropia ? (
@@ -1276,7 +1264,7 @@ export default function CajaPage() {
                 {summary.cajaPropia.periodo && (
                   <div className="border-t border-white/10 pt-4">
                     <p className="text-xs text-white/30 uppercase tracking-wider mb-2 font-medium">
-                      Período: {summary.cajaPropia.periodo.from} → {summary.cajaPropia.periodo.to}
+                      Período: {formatDisplayDateRange(summary.cajaPropia.periodo.from, summary.cajaPropia.periodo.to)}
                     </p>
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                       <div className="bg-white/5 rounded-xl p-4">
@@ -1398,8 +1386,8 @@ export default function CajaPage() {
                           )}
                         </div>
                         <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                          <span className="text-xs text-white/40">{item.paymentDate}</span>
-                          {item.dueDate && <span className="text-xs text-white/30">Venc: {item.dueDate}</span>}
+                          <span className="text-xs text-white/40">{formatDisplayDate(item.paymentDate)}</span>
+                          {item.dueDate && <span className="text-xs text-white/30">Venc: {formatDisplayDate(item.dueDate)}</span>}
                           <span className="flex items-center gap-1 text-xs text-white/40">
                             {methodIcon(item.paymentMethod)}
                             {methodLabel(item.paymentMethod)}
@@ -1578,9 +1566,9 @@ export default function CajaPage() {
                     <tbody>
                       {commissions.map((c: any) => (
                         <tr key={c.id} className={`border-b border-white/5 hover:bg-white/3 ${c.status === "anulado" ? "opacity-50" : ""}`}>
-                          <td className="py-2 pr-3 text-white/70">{c.date}</td>
+                          <td className="py-2 pr-3 text-white/70">{formatDisplayDate(c.date)}</td>
                           <td className="py-2 pr-3 text-white/70">{c.companyName || "—"}</td>
-                          <td className="py-2 pr-3 text-white/50">{c.periodMonth || "—"}</td>
+                          <td className="py-2 pr-3 text-white/50">{formatDisplayMonth(c.periodMonth)}</td>
                           <td className="py-2 pr-3 text-white/50 capitalize">{c.paymentMethod || "—"}</td>
                           <td className="py-2 pr-3">
                             {c.status === "anulado"
@@ -1796,11 +1784,11 @@ export default function CajaPage() {
                               : <span className="bg-orange-900/40 text-orange-400 text-xs px-2 py-0.5 rounded-full">Gasto</span>
                             }
                           </td>
-                          <td className="py-2 pr-3 text-white/70">{e.date}</td>
+                          <td className="py-2 pr-3 text-white/70">{formatDisplayDate(e.date)}</td>
                           <td className="py-2 pr-3 text-white/70">
                             {e.description}
                             {e.payeeName && <span className="text-white/40 ml-1">· {e.payeeName}</span>}
-                            {e.salaryPeriod && <span className="text-white/40 ml-1">({e.salaryPeriod})</span>}
+                            {e.salaryPeriod && <span className="text-white/40 ml-1">({formatDisplayMonth(e.salaryPeriod)})</span>}
                           </td>
                           <td className="py-2 pr-3 text-white/50">{e.category || "—"}</td>
                           <td className="py-2 pr-3 text-white/50 capitalize">{e.paymentMethod}</td>
@@ -1932,7 +1920,7 @@ export default function CajaPage() {
                     <tbody>
                       {ivaList.map((iv: any) => (
                         <tr key={iv.id} className="border-b border-white/5 hover:bg-white/3">
-                          <td className="py-2 pr-4 text-white/70">{iv.date}</td>
+                          <td className="py-2 pr-4 text-white/70">{formatDisplayDate(iv.date)}</td>
                           <td className="py-2 pr-4 text-white/70">{iv.companyName || "—"}</td>
                           <td className="py-2 pr-4 text-white/50">{iv.notes || "—"}</td>
                           <td className="py-2 pr-4 text-right font-bold text-violet-400">{fmt(iv.amount)}</td>
@@ -1997,7 +1985,7 @@ export default function CajaPage() {
                           )}
                         </div>
                         <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                          <span className="text-xs text-white/40">{item.fecha}</span>
+                          <span className="text-xs text-white/40">{formatDisplayDate(item.fecha)}</span>
                           <span className="text-xs text-white/30">{formatAdeudadoOrigin(item.origen)}</span>
                           <span className="text-xs text-red-400/70">Pendiente</span>
                         </div>
@@ -2250,7 +2238,7 @@ export default function CajaPage() {
                               : <span className="bg-red-900/40 text-red-400 text-xs px-2 py-0.5 rounded-full">Reintegro</span>
                             }
                           </td>
-                          <td className="py-2 pr-3 text-white/70">{m.date}</td>
+                          <td className="py-2 pr-3 text-white/70">{formatDisplayDate(m.date)}</td>
                           <td className="py-2 pr-3 text-white/50 capitalize">{m.paymentMethod}</td>
                           <td className="py-2 pr-3">
                             {m.status === "anulado"

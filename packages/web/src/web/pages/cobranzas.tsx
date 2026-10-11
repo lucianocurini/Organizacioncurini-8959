@@ -21,6 +21,7 @@ import {
 import { PendingInstallmentsBatchTab } from "@/components/payments/PendingInstallmentsBatchTab";
 import { cn, formatCurrency as _fc, formatCurrencyCents } from "@/lib/utils";
 import { toArgentinaCalendarDay, shiftArgentinaMonth } from "../../lib/dates/argentina-date";
+import { formatDisplayDate, formatDisplayDateRange, formatDisplayMonth, formatDisplayTimestampDate } from "../../lib/dates/display-date";
 import {
   splitsFromPayment, computeSplitTotals, groupSplitsByMethod,
   SINGLE_SPLIT_MISMATCH_MESSAGE, isImputarButtonDisabled,
@@ -873,7 +874,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
                             <div className="flex justify-between text-gray-400">
                               <span>Fecha límite</span>
                               <span className={selectedCashPeriodCandidate.deadlineStatus === "vigente" ? "text-emerald-400" : "text-amber-400"}>
-                                {new Date(selectedCashPeriodCandidate.deadline + "T12:00:00").toLocaleDateString("es-AR")}
+                                {formatDisplayDate(selectedCashPeriodCandidate.deadline)}
                                 {" "}({selectedCashPeriodCandidate.deadlineStatus === "vigente" ? "Vigente" : "Vencido"})
                               </span>
                             </div>
@@ -919,7 +920,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
                     <option value="">Sin vincular cuota específica</option>
                     {pendingInstallments.map((inst: any) => (
                       <option key={inst.id} value={inst.id}>
-                        Cuota #{inst.number} — vence {inst.dueDate} — {"$"}{inst.amount.toLocaleString("es-AR")}
+                        Cuota #{inst.number} — vence {formatDisplayDate(inst.dueDate)} — {"$"}{inst.amount.toLocaleString("es-AR")}
                       </option>
                     ))}
                   </select>
@@ -1648,9 +1649,7 @@ function CobranzasTab() {
     if (!stats) return [];
     return Array.from({ length: 6 }, (_, i) => {
       const key = shiftArgentinaMonth(-(5 - i));
-      const [y, m] = key.split("-").map(Number);
-      const label = new Date(y!, m! - 1, 1).toLocaleDateString("es-AR", { month: "short", year: "2-digit" });
-      return { key, label, amount: stats.byMonth[key] || 0 };
+      return { key, label: formatDisplayMonth(key), amount: stats.byMonth[key] || 0 };
     });
   })();
   const maxMonthly = Math.max(...monthlyData.map(m => m.amount), 1);
@@ -1831,11 +1830,11 @@ function CobranzasTab() {
                       <SplitsDetailPanel splits={r.payment.splits} />
                     )}
                     <div className="flex items-center gap-4 text-xs text-gray-400">
-                      <span>Cobrado: {new Date(r.payment.paymentDate + "T12:00:00").toLocaleDateString("es-AR")}</span>
+                      <span>Cobrado: {formatDisplayDate(r.payment.paymentDate)}</span>
                       {isCashPeriod ? (
                         <span>Período: {r.payment.cashPeriodPayment?.rebillingId == null ? "Emisión/renovación" : `Refacturación #${r.payment.cashPeriodPayment.rebillingId}`}</span>
                       ) : r.payment.periodMonth && (
-                        <span>Período: {new Date(r.payment.periodMonth + "-02").toLocaleDateString("es-AR", { month: "short", year: "numeric" })}</span>
+                        <span>Período: {formatDisplayMonth(r.payment.periodMonth)}</span>
                       )}
                     </div>
                     {isCashPeriod && r.payment.cashPeriodPayment && (
@@ -1936,7 +1935,7 @@ function CobranzasTab() {
                           {isCashPeriod
                             ? (r.payment.cashPeriodPayment?.rebillingId == null ? "Emisión/renovación" : `Refacturación #${r.payment.cashPeriodPayment.rebillingId}`)
                             : r.payment.periodMonth
-                              ? new Date(r.payment.periodMonth + "-02").toLocaleDateString("es-AR", { month: "short", year: "numeric" })
+                              ? formatDisplayMonth(r.payment.periodMonth)
                               : "—"}
                         </td>
                         <td className="px-3 py-3">
@@ -1952,7 +1951,7 @@ function CobranzasTab() {
                         </td>
                         <td className="px-3 py-3 text-right text-white font-semibold">{formatCurrency(funded ? funded.totalCancelledCents / 100 : r.payment.amount)}</td>
                         <td className="px-3 py-3 text-gray-300 text-xs">
-                          {new Date(r.payment.paymentDate + "T12:00:00").toLocaleDateString("es-AR")}
+                          {formatDisplayDate(r.payment.paymentDate)}
                         </td>
                         <td className="px-3 py-3">
                           <DueDateBadge dueDate={r.payment.dueDate} showNull />
@@ -2031,11 +2030,6 @@ function localTodayYMD(): string {
   return `${y}-${m}-${day}`;
 }
 
-function fmtDueDate(iso: string): string {
-  const [y, m, d] = iso.split("-");
-  return `${d}/${m}/${y}`;
-}
-
 function DueDateBadge({ dueDate, showNull = false }: { dueDate: string | null; showNull?: boolean }) {
   if (!dueDate) {
     if (showNull) return <span className="text-[10px] text-white/25">Sin vencimiento</span>;
@@ -2057,7 +2051,7 @@ function DueDateBadge({ dueDate, showNull = false }: { dueDate: string | null; s
     );
   }
   return (
-    <span className="text-[10px] text-white/30 shrink-0">Vence: {fmtDueDate(dueDate)}</span>
+    <span className="text-[10px] text-white/30 shrink-0">Vence: {formatDisplayDate(dueDate)}</span>
   );
 }
 
@@ -2069,7 +2063,7 @@ function CashPeriodPendingDetail({ item }: { item: any }) {
   const fmtCents = (cents: number | null | undefined) =>
     ((cents ?? 0) / 100).toLocaleString("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 0, maximumFractionDigits: 2 });
   const period = cpp.periodStart && cpp.periodEnd
-    ? `${fmtDueDate(cpp.periodStart)} al ${fmtDueDate(cpp.periodEnd)}`
+    ? formatDisplayDateRange(cpp.periodStart, cpp.periodEnd)
     : "período sin fechas";
   const d = describeCashPeriodPendingItem(item);
   return (
@@ -2407,7 +2401,7 @@ export function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void;
                                 <div className="flex-1 min-w-0">
                                   <p className="text-sm text-white truncate">{item.clientName}</p>
                                   <div className="flex items-center gap-2 flex-wrap mt-0.5">
-                                    <span className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {item.paymentDate}</span>
+                                    <span className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {formatDisplayDate(item.paymentDate)}</span>
                                     <DueDateBadge dueDate={item.dueDate ?? null} />
                                   </div>
                                   {isCashPeriodPendingItem(item) && <CashPeriodPendingDetail item={item} />}
@@ -2455,7 +2449,7 @@ export function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void;
                                 <div className="flex-1 min-w-0">
                                   <p className="text-sm text-white truncate">{item.clientName}</p>
                                   <div className="flex items-center gap-2 flex-wrap mt-0.5">
-                                    <span className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {item.paymentDate}</span>
+                                    <span className="text-xs text-white/40">{item.companyName} · {item.policyNumber} · {formatDisplayDate(item.paymentDate)}</span>
                                     <DueDateBadge dueDate={item.dueDate ?? null} />
                                   </div>
                                   {isCashPeriodPendingItem(item) && <CashPeriodPendingDetail item={item} />}
@@ -2653,7 +2647,7 @@ export function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void;
                             >
                               <div className="min-w-0">
                                 <p className="text-sm text-white truncate">{r.insuredName}</p>
-                                <p className="text-xs text-white/40">{r.companyName} · Póliza {r.policyNumber} · Cuota #{r.number} · vence {r.dueDate}</p>
+                                <p className="text-xs text-white/40">{r.companyName} · Póliza {r.policyNumber} · Cuota #{r.number} · vence {formatDisplayDate(r.dueDate)}</p>
                               </div>
                               <span className="text-sm font-semibold text-white shrink-0">{fmt(r.amount)}</span>
                             </button>
@@ -2976,7 +2970,7 @@ function RendicionesTab() {
                   <div className="flex-1 min-w-0 grid grid-cols-2 lg:grid-cols-4 gap-2">
                     <div>
                       <p className="text-xs text-white/40">Fecha</p>
-                      <p className="text-sm text-white">{r.date}</p>
+                      <p className="text-sm text-white">{formatDisplayDate(r.date)}</p>
                     </div>
                     <div>
                       <p className="text-xs text-white/40">Canal</p>
@@ -3154,7 +3148,7 @@ function AdeudadosTab() {
                     </div>
                     <p className="text-xs text-white/40">{item.companyName} · Póliza {item.policyNumber}</p>
                     <p className="text-xs text-white/30 mt-0.5">
-                      Rendición del {item.remittanceDate} ·{" "}
+                      Rendición del {formatDisplayDate(item.remittanceDate)} ·{" "}
                       <span className={cn("", CANAL_COLORS[item.remittanceCanal]?.replace("bg-", "text-").split(" ")[0])}>
                         {CANAL_LABELS[item.remittanceCanal] || item.remittanceCanal}
                       </span>
@@ -3301,10 +3295,7 @@ function TransferenciasTab() {
             const clientName = item.insuredName || item.manualPayer || "—";
             const policyNum = item.policyNumber || item.manualPolicyNumber || "—";
             const company = item.companyName || item.manualCompany || "—";
-            const rendDate = item.renderedAt
-              ? new Date(typeof item.renderedAt === "number" ? item.renderedAt * 1000 : item.renderedAt)
-                  .toLocaleDateString("es-AR")
-              : null;
+            const rendDate = item.renderedAt ? formatDisplayTimestampDate(item.renderedAt) : null;
             return (
               <div key={item.id}
                 className={cn("bg-[#0d1424] border rounded-xl px-4 py-3 flex items-center gap-4",
@@ -3322,11 +3313,11 @@ function TransferenciasTab() {
                     <p className="text-xs text-white/30">Póliza {policyNum}</p>
                     {item.periodMonth && (
                       <p className="text-xs text-white/30">
-                        Período {new Date(item.periodMonth + "-02").toLocaleDateString("es-AR", { month: "short", year: "numeric" })}
+                        Período {formatDisplayMonth(item.periodMonth)}
                       </p>
                     )}
                     <p className="text-xs text-white/30">
-                      Cobrado {new Date(item.paymentDate + "T12:00:00").toLocaleDateString("es-AR")}
+                      Cobrado {formatDisplayDate(item.paymentDate)}
                     </p>
                     {item.rendered && rendDate && (
                       <span className="text-xs text-green-400/70">Rendida el {rendDate}</span>
@@ -3609,7 +3600,7 @@ export function GastosTab({ selection, onSelectionChange }: {
                   )}
                 </div>
                 <div className="flex items-center gap-2 mt-0.5">
-                  <p className="text-xs text-gray-500">{g.date}</p>
+                  <p className="text-xs text-gray-500">{formatDisplayDate(g.date)}</p>
                   {g.notes && <p className="text-xs text-gray-600 truncate">— {g.notes}</p>}
                 </div>
               </div>

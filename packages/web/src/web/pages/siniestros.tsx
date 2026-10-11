@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { cn, formatDate, POLICY_TYPES } from "@/lib/utils";
+import { formatDisplayDateTime } from "../../lib/dates/display-date";
 import { toArgentinaCalendarDay } from "../../lib/dates/argentina-date";
 import { toast } from "sonner";
 import {
@@ -1016,7 +1017,7 @@ export default function Siniestros() {
                         {c.manualNotes && (
                           <span className="text-xs text-gray-600 truncate max-w-[200px]">{c.manualNotes}</span>
                         )}
-                        <span className="text-xs text-gray-600">Cargado {formatDate(c.createdAt)}</span>
+                        <span className="text-xs text-gray-600">Cargado {formatDisplayDateTime(c.createdAt)}</span>
                       </div>
                     </div>
                     <div className="flex items-center gap-2 flex-shrink-0">

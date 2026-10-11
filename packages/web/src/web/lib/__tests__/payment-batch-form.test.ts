@@ -1116,7 +1116,7 @@ describe("comprobante — descripción de ítems (cuota / cobro manual con póli
 
   test("describeBatchDetailItem de una cuota existente", () => {
     const label = describeBatchDetailItem(detailItem());
-    expect(label).toBe("Cuota 1 — vence 2027-06-01 — póliza POL-1");
+    expect(label).toBe("Cuota 1 — vence 01/06/2027 — póliza POL-1");
   });
 
   test("describeBatchDetailItem de un cobro manual con póliza real y descripción", () => {

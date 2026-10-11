@@ -3,6 +3,7 @@ import { useLocation } from "wouter";
 import { api } from "@/lib/api";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { formatCurrency, formatDate, POLICY_TYPES, COVERAGE_LABELS, cn } from "@/lib/utils";
+import { formatDisplayDateTime, formatDisplayMonth } from "../../lib/dates/display-date";
 import { buildReportQuery, buildReportPath, parseReportFilters } from "@/lib/report-filters";
 import {
   ChevronLeft, ChevronRight, Download, Printer, Search, X, RefreshCw,
@@ -149,6 +150,8 @@ function addMonths(month: string, delta: number): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
 
+// Solo para el contenido del Excel descargable (hoja Resumen), que se
+// actualiza en una etapa posterior. En pantalla e impresión: formatDisplayMonth.
 function monthLabel(month: string): string {
   if (!month) return "";
   const [y, m] = month.split("-");
@@ -764,7 +767,7 @@ export default function ReporteMes() {
             <h1 className="text-xl lg:text-2xl font-bold text-white" style={{ fontFamily: "Syne, sans-serif" }}>
               Renovaciones y Refacturaciones
             </h1>
-            <p className="text-gray-400 text-sm mt-1 capitalize">{monthLabel(month)}</p>
+            <p className="text-gray-400 text-sm mt-1">{formatDisplayMonth(month)}</p>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -798,9 +801,9 @@ export default function ReporteMes() {
         {/* Print header (visible only in print) */}
         <div className="hidden print:block mb-6">
           <h1 className="text-2xl font-bold">Renovaciones y Refacturaciones del mes</h1>
-          <p className="text-lg capitalize mt-1">{monthLabel(month)}</p>
+          <p className="text-lg mt-1">{formatDisplayMonth(month)}</p>
           {activeFiltersLabel && <p className="text-sm mt-1">Filtros: {activeFiltersLabel}</p>}
-          <p className="text-sm mt-1">Emitido: {new Date().toLocaleString("es-AR")}</p>
+          <p className="text-sm mt-1">Emitido: {formatDisplayDateTime(new Date())}</p>
           {data?.isFutureMonth && (
             <p className="text-sm mt-1">
               Mes futuro: Renovaciones y Refacturaciones son una proyección a partir de las

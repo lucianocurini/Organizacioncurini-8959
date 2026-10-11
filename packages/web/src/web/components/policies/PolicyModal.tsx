@@ -628,7 +628,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
                   <div className="flex-1 min-w-0">
                     <p className="text-sm text-white font-medium truncate">{renewedFrom.policy.policyNumber}</p>
                     <p className="text-xs text-gray-400 truncate">
-                      {renewedFrom.insured?.name} · {renewedFrom.company?.name} · vencía {renewedFrom.policy.endDate}
+                      {renewedFrom.insured?.name} · {renewedFrom.company?.name} · vencía {formatDate(renewedFrom.policy.endDate)}
                     </p>
                   </div>
                   <ChevronRight className="w-4 h-4 text-blue-400 flex-shrink-0" />
@@ -665,7 +665,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
                           </div>
                           <div className="text-right flex-shrink-0">
                             <p className="text-xs text-gray-500">{item.policy.type}</p>
-                            <p className="text-xs text-gray-600">vence {item.policy.endDate}</p>
+                            <p className="text-xs text-gray-600">vence {formatDate(item.policy.endDate)}</p>
                           </div>
                         </button>
                       ))}
@@ -1168,7 +1168,7 @@ export function PolicyModal({ initial, onClose, onSaved }: Props) {
                         <p className="text-xs text-gray-400">
                           {person.relationship && <span className="capitalize">{person.relationship}</span>}
                           {person.dni && <span> · DNI {person.dni}</span>}
-                          {person.birthDate && <span> · {person.birthDate}</span>}
+                          {person.birthDate && <span> · {formatDate(person.birthDate)}</span>}
                         </p>
                         {(person.phone || person.email) && (
                           <p className="text-xs text-gray-500">{person.phone}{person.phone && person.email ? " · " : ""}{person.email}</p>

@@ -216,8 +216,8 @@ describe("Caja — Cobros pendientes de rendición con pagos de contado", () => 
     try {
       expect(ui.container.querySelectorAll('[data-testid="caja-cash-period-row"]').length).toBe(0);
       const text = norm(ui.container.textContent ?? "");
-      expect(text).toContain("QA Pago Normal#POL-1· Compañía QA2027-06-10Efectivo$ 1.000,00");
-      expect(text).toContain("QA Hijo Lote#POL-2· Compañía QA2027-06-10lote$ 2.000,00");
+      expect(text).toContain("QA Pago Normal#POL-1· Compañía QA10/06/2027Efectivo$ 1.000,00");
+      expect(text).toContain("QA Hijo Lote#POL-2· Compañía QA10/06/2027lote$ 2.000,00");
       expect(norm(totalText(ui.container))).toContain("$ 3.000,00");
       expect(totalText(ui.container)).not.toContain("bloqueado");
     } finally {

@@ -4,6 +4,7 @@ import { api } from "@/lib/api";
 import { Upload, FileText, CheckCircle, AlertTriangle, Loader2, ChevronDown, ChevronUp, Edit2, X } from "lucide-react";
 import { toast } from "sonner";
 import { toArgentinaCalendarDay } from "../../lib/dates/argentina-date";
+import { formatDisplayMonth, formatPreviewDate } from "../../lib/dates/display-date";
 
 interface ParsedPolicy {
   policyNumber: string;
@@ -808,7 +809,7 @@ export default function Importar() {
       const lastDay = new Date(year, month + 1, 1); // primer día del mes siguiente = before
       const fromStr = firstDay.toISOString().split("T")[0];
       const toStr = lastDay.toISOString().split("T")[0];
-      const label = firstDay.toLocaleString("es-AR", { month: "long", year: "numeric" });
+      const label = formatDisplayMonth(`${year}-${String(month + 1).padStart(2, "0")}`);
       ranges.push({ desde: fromStr, hasta: toStr, label });
       cur = lastDay; // avanzar al mes siguiente
     }
@@ -1389,7 +1390,7 @@ export default function Importar() {
                         </div>
                         <div className="flex items-center gap-3">
                           <span className="text-sm text-gray-300 hidden md:block">{formatCurrency(p.premium)}</span>
-                          <span className="text-xs text-gray-500">{p.endDate}</span>
+                          <span className="text-xs text-gray-500">{formatPreviewDate(p.endDate)}</span>
                           {isExpanded ? <ChevronUp className="w-4 h-4 text-gray-500" /> : <ChevronDown className="w-4 h-4 text-gray-500" />}
                         </div>
                       </div>
@@ -1403,7 +1404,7 @@ export default function Importar() {
                             <div><p className="text-xs text-gray-500">DNI</p><p className="text-sm text-white">{p.insuredDni || "-"}</p></div>
                             <div><p className="text-xs text-gray-500">Email</p><p className="text-sm text-white">{p.insuredEmail || "-"}</p></div>
                             <div><p className="text-xs text-gray-500">Teléfono</p><p className="text-sm text-white">{p.insuredPhone || "-"}</p></div>
-                            <div><p className="text-xs text-gray-500">Vigencia</p><p className="text-sm text-white">{p.startDate} → {p.endDate}</p></div>
+                            <div><p className="text-xs text-gray-500">Vigencia</p><p className="text-sm text-white">{formatPreviewDate(p.startDate)} → {formatPreviewDate(p.endDate)}</p></div>
                             <div><p className="text-xs text-gray-500">Prima</p><p className="text-sm text-white">{formatCurrency(p.premium)}</p></div>
                             <div><p className="text-xs text-gray-500">Suma asegurada</p><p className="text-sm text-white">{formatCurrency(p.sumInsured)}</p></div>
                             <div><p className="text-xs text-gray-500">Cobertura</p><p className="text-sm text-white">{p.coverageLabel || "-"}</p></div>
@@ -1419,7 +1420,7 @@ export default function Importar() {
                               <div><p className="text-xs text-gray-500">Movimiento SSN</p><p className="text-sm text-white font-mono">{(p as any)._ssnMovimientos}</p></div>
                               <div><p className="text-xs text-gray-500">Observación SSN</p><p className="text-sm text-white font-mono">{(p as any)._ssnObservacion}</p></div>
                               <div><p className="text-xs text-gray-500">Período</p><p className="text-sm text-white">{(p as any)._ssnMes}</p></div>
-                              <div><p className="text-xs text-gray-500">Fecha emisión</p><p className="text-sm text-white">{(p as any)._ssnFechaEmision || "—"}</p></div>
+                              <div><p className="text-xs text-gray-500">Fecha emisión</p><p className="text-sm text-white">{formatPreviewDate((p as any)._ssnFechaEmision)}</p></div>
                               <div><p className="text-xs text-gray-500">Orden</p><p className="text-sm text-white">{(p as any)._ssnOrden}</p></div>
                               <div><p className="text-xs text-gray-500">Suplemento</p><p className="text-sm text-white">{(p as any)._ssnSuplemento || "—"}</p></div>
                             </div>
@@ -1432,7 +1433,7 @@ export default function Importar() {
                               <div className="flex flex-wrap gap-2">
                                 {p.installments.map((inst) => (
                                   <span key={inst.number} className="text-xs bg-[#1a2540] text-gray-300 px-2 py-1 rounded">
-                                    #{inst.number} · {inst.dueDate} · {formatCurrency(inst.amount)}
+                                    #{inst.number} · {formatPreviewDate(inst.dueDate)} · {formatCurrency(inst.amount)}
                                   </span>
                                 ))}
                               </div>
@@ -1501,8 +1502,8 @@ export default function Importar() {
                                 </div>
                               ) : (
                                 <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
-                                  <div><p className="text-xs text-gray-500">Inicio original</p><p className="text-sm text-white">{p._baseStartDate || <span className="text-gray-600 italic">no definido</span>}</p></div>
-                                  <div><p className="text-xs text-gray-500">Fin original</p><p className="text-sm text-white">{p._baseEndDate || <span className="text-gray-600 italic">no definido</span>}</p></div>
+                                  <div><p className="text-xs text-gray-500">Inicio original</p><p className="text-sm text-white">{p._baseStartDate ? formatPreviewDate(p._baseStartDate) : <span className="text-gray-600 italic">no definido</span>}</p></div>
+                                  <div><p className="text-xs text-gray-500">Fin original</p><p className="text-sm text-white">{p._baseEndDate ? formatPreviewDate(p._baseEndDate) : <span className="text-gray-600 italic">no definido</span>}</p></div>
                                   <div><p className="text-xs text-gray-500">Prima original</p><p className="text-sm text-white">{p._basePremium ? formatCurrency(p._basePremium) : <span className="text-gray-600 italic">igual a prórroga</span>}</p></div>
                                 </div>
                               )}

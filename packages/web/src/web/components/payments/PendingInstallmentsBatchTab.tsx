@@ -5,7 +5,8 @@ import {
   Search, Loader2, X, Plus, Trash2, ReceiptText, Layers, RefreshCw, Info, ChevronDown, ShoppingCart, FileEdit, Users,
   Pencil, Ban, AlertTriangle, Wallet, UserCheck,
 } from "lucide-react";
-import { cn, formatCurrency, formatCurrencyCents } from "@/lib/utils";
+import { cn, formatCurrency, formatCurrencyCents, formatDate } from "@/lib/utils";
+import { formatDisplayDateTime } from "../../../lib/dates/display-date";
 import { toArgentinaCalendarDay } from "../../../lib/dates/argentina-date";
 import {
   buildPendingForPaymentQuery, looksLikeIsoDate, parseCollectableInstallmentIds, resolveCartCollectability,
@@ -57,12 +58,6 @@ interface PolicyOption {
   company: { id: number; name: string } | null;
 }
 
-function fmtDate(iso: string): string {
-  if (!iso) return "—";
-  const [y, m, d] = iso.split("-");
-  return `${d}/${m}/${y}`;
-}
-
 /** Asegurado/pagador de un ítem de carrito, para mostrar en cada fila. */
 function cartItemInsuredLabel(item: BatchCartItem): string {
   if (item.insuredId != null) return item.insuredName!;
@@ -89,7 +84,7 @@ function cartItemAccessoryHint(item: BatchCartItem): string | null {
 
 function cartItemSubtitle(item: BatchCartItem): string {
   const hint = cartItemAccessoryHint(item) ?? "";
-  if (item.kind === "installment") return `${item.companyName} · vence ${fmtDate(item.dueDate)}${hint}`;
+  if (item.kind === "installment") return `${item.companyName} · vence ${formatDate(item.dueDate)}${hint}`;
   if (item.kind === "policy_manual_payment") return `${item.companyName}${item.description ? ` · ${item.description}` : ""}${hint}`;
   const company = item.manualCompany ? `Compañía: ${item.manualCompany}` : "Sin compañía";
   return `${company}${item.description ? ` · ${item.description}` : ""}`;
@@ -320,7 +315,7 @@ export function PendingInstallmentsBatchTab() {
                         </td>
                         <td className="px-3 py-2.5 text-white/70">{item.companyName}</td>
                         <td className="px-3 py-2.5 text-white/50 font-mono text-xs">#{item.installmentNumber}</td>
-                        <td className="px-3 py-2.5 text-white/70">{fmtDate(item.dueDate)}</td>
+                        <td className="px-3 py-2.5 text-white/70">{formatDate(item.dueDate)}</td>
                         <td className="px-3 py-2.5 text-right text-white font-mono">{formatCurrency(item.amount)}</td>
                         <td className="px-3 py-2.5 text-right">
                           <button
@@ -566,7 +561,7 @@ export function PendingInstallmentsBatchTab() {
                 <div className="flex items-center gap-3">
                   <span className="text-white/40">#{b.id}</span>
                   <span className="text-white">{b.insuredDisplay}</span>
-                  <span className="text-white/40">{fmtDate(b.paymentDate)}</span>
+                  <span className="text-white/40">{formatDate(b.paymentDate)}</span>
                   <span className="text-white/40">{b.itemCount} ítem{b.itemCount === 1 ? "" : "s"}</span>
                   {b.checkCount > 0 && <span className="text-yellow-400">{b.checkCount} cheque{b.checkCount === 1 ? "" : "s"}</span>}
                   {b.status === "anulado" && (
@@ -1057,7 +1052,7 @@ export function BatchPaymentModal({
                         <span className="mr-1.5 text-[10px] px-1.5 py-0.5 rounded border border-amber-500/30 bg-amber-500/10 text-amber-400">no disponible</span>
                       )}
                       {item.kind === "installment"
-                        ? `Cuota #${item.installmentNumber} — ${item.policyNumber} — vence ${fmtDate(item.dueDate)}`
+                        ? `Cuota #${item.installmentNumber} — ${item.policyNumber} — vence ${formatDate(item.dueDate)}`
                         : item.kind === "policy_manual_payment"
                           ? `Cobro manual — ${item.policyNumber}${item.description ? ` — ${item.description}` : ""}`
                           : `Cobro manual — ${[item.manualPayer, item.manualPolicyNumber].filter(Boolean).join(" / ") || "imputación libre"}${item.description ? ` — ${item.description}` : ""}`}
@@ -1460,14 +1455,14 @@ function BatchReceiptModal({
             <div className="flex items-start gap-2 px-3 py-2 bg-red-500/10 border border-red-500/20 rounded-xl text-xs text-red-300">
               <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
               <span>
-                Este cobro fue anulado{detail.batch.cancelledAt ? ` el ${fmtDate(detail.batch.cancelledAt.slice(0, 10))}` : ""}
+                Este cobro fue anulado{detail.batch.cancelledAt ? ` el ${formatDisplayDateTime(detail.batch.cancelledAt)}` : ""}
                 {detail.batch.cancellationReason ? ` — motivo: ${detail.batch.cancellationReason}` : ""}.
               </span>
             </div>
           )}
 
           <div className="grid grid-cols-2 gap-3 text-xs">
-            <div><span className="text-white/40">Fecha:</span> <span className="text-white">{fmtDate(detail.batch.paymentDate)}</span></div>
+            <div><span className="text-white/40">Fecha:</span> <span className="text-white">{formatDate(detail.batch.paymentDate)}</span></div>
             <div><span className="text-white/40">Estado:</span> <span className="text-white">{detail.batch.status}</span></div>
             <div><span className="text-white/40">Asegurado:</span> <span className="text-white">{detail.insuredSummary.insuredDisplay}</span></div>
             <div><span className="text-white/40">Ítems:</span> <span className="text-white">{detail.items.length}</span></div>
@@ -1501,7 +1496,7 @@ function BatchReceiptModal({
               <p className="text-xs text-white/40 uppercase tracking-wider mb-2">Cheques</p>
               {detail.splits.flatMap((s) => s.checks).map((c) => (
                 <div key={c.id} className="flex justify-between text-xs py-0.5">
-                  <span className="text-white/70">{c.bankName} #{c.checkNumber} — vence {fmtDate(c.dueDate)}</span>
+                  <span className="text-white/70">{c.bankName} #{c.checkNumber} — vence {formatDate(c.dueDate)}</span>
                   <span className="text-white font-mono">{formatCurrencyCents(c.amountCents)}</span>
                 </div>
               ))}

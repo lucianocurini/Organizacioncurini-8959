@@ -4,6 +4,8 @@ import { CheckCircle2, Circle, Plus, Trash2, Settings, X, ChevronLeft, ChevronRi
 import { toast } from "sonner";
 import { useAuth } from "@/lib/auth";
 import { optimisticallyRemoveTask, reconcileTaskRemoval, taskDeleteConfirmMessage } from "@/lib/task-removal";
+import { formatDate } from "@/lib/utils";
+import { formatDisplayMonth } from "../../lib/dates/display-date";
 
 interface TaskTemplate {
   id: number;
@@ -32,19 +34,6 @@ function sessionId() {
 
 function headers() {
   return { "Content-Type": "application/json", "x-session-id": sessionId() };
-}
-
-const MONTHS = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
-
-function fmtMonth(ym: string) {
-  const parts = ym.split("-");
-  return MONTHS[parseInt(parts[1], 10) - 1] + " " + parts[0];
-}
-
-function fmtDate(d: string) {
-  if (!d) return "";
-  const parts = d.split("-");
-  return parts[2] + "/" + parts[1] + "/" + parts[0];
 }
 
 function prevMonth(ym: string) {
@@ -254,7 +243,7 @@ export default function Tareas() {
             <ChevronLeft size={16} />
           </button>
           <div style={{ flex: 1, textAlign: "center" }}>
-            <span style={{ color: "white", fontWeight: 600, fontSize: "15px" }}>{fmtMonth(month)}</span>
+            <span style={{ color: "white", fontWeight: 600, fontSize: "15px" }}>{formatDisplayMonth(month)}</span>
             {month !== todayYM() && (
               <button onClick={() => setMonth(todayYM())} style={{ marginLeft: "8px", background: "none", border: "none", color: "#60a5fa", fontSize: "12px", cursor: "pointer" }}>
                 Hoy
@@ -540,12 +529,6 @@ function TaskRow({ task, onToggle, onDelete }: { task: Task; onToggle: (t: Task)
   const done = task.status === "realizada";
   const isUnique = task.isRecurring === 0;
 
-  function fmtDate(d: string | null) {
-    if (!d) return "";
-    const p = d.split("-");
-    return p[2] + "/" + p[1] + "/" + p[0];
-  }
-
   return (
     <div style={{
       display: "flex", alignItems: "flex-start", gap: "10px", padding: "10px 12px",
@@ -569,7 +552,7 @@ function TaskRow({ task, onToggle, onDelete }: { task: Task; onToggle: (t: Task)
         )}
         {task.dueDate && (
           <p style={{ color: done ? "#4b5563" : "#f59e0b", fontSize: "11px", margin: "3px 0 0 0", fontWeight: 500 }}>
-            📅 {fmtDate(task.dueDate)}
+            📅 {formatDate(task.dueDate)}
           </p>
         )}
         {!!task.isAdminOnly && (
