@@ -24,6 +24,7 @@ import {
 import { groupInstallmentsByRebilling, countLinkedInstallments, extractDuplicateInstallments, extractDuplicateRebillings } from "@/lib/rebilling-groups";
 import { buildQuickAddDeliveryPayload, normalizeDeliveryError } from "@/lib/deliveries-form";
 import { calculateCashPeriodDeadline, getCashPeriodDeadlineStatus } from "@/lib/cash-period-payment-form";
+import { nextRebillingSyncNotice } from "@/lib/next-rebilling-notice";
 
 const typeIcons: Record<string, any> = {
   automotor: Car, motovehiculo: Bike, ecomovilidad: Zap, hogar: Home, accidentes: ShieldCheck, art: HeartPulse, comercial: Briefcase, responsabilidad_civil: Scale, cascos: HardHat, incendio: Flame,
@@ -36,6 +37,9 @@ export default function PolizaDetail() {
   const [showEdit, setShowEdit] = useState(false);
   const [showRebilling, setShowRebilling] = useState(false);
   const [editingRebilling, setEditingRebilling] = useState<any>(null);
+  // Aviso persistente cuando una alta/edición/rebuild/borrado de refacturación
+  // deja la próxima refacturación sin fecha segura (ver next-rebilling-notice.ts).
+  const [nextRebillingNotice, setNextRebillingNotice] = useState<string | null>(null);
   const [editingInstallment, setEditingInstallment] = useState<number | null>(null);
   const [instEdit, setInstEdit] = useState<Record<number, { dueDate: string; amount: number; notes: string; status: string }>>({});
   const [showGenForm, setShowGenForm] = useState(false);
@@ -208,6 +212,7 @@ export default function PolizaDetail() {
     if (!confirm("¿Eliminar esta refacturación y sus cuotas pendientes asociadas?")) return;
     try {
       const result = await api.delete(`/api/rebillings/${id}`);
+      setNextRebillingNotice(nextRebillingSyncNotice(result?.nextRebillingDateSync));
       const n = result?.deleted?.installments ?? 0;
       toast.success(`Refacturación eliminada. Se eliminaron ${n} cuota${n === 1 ? "" : "s"} pendiente${n === 1 ? "" : "s"}.`);
       load();
@@ -304,6 +309,7 @@ export default function PolizaDetail() {
         notes: rebillingRebuildForm.notes || null,
       };
       const result = await api.post(`/api/rebillings/${rebillingRebuildTarget.id}/installments/rebuild`, body);
+      setNextRebillingNotice(nextRebillingSyncNotice(result?.nextRebillingDateSync));
       toast.success(`Plan de cuotas corregido (${result.previousCount} → ${result.insertedCount} cuotas).`);
       setShowRebillingRebuildForm(false);
       setRebillingRebuildCheck(null);
@@ -1327,6 +1333,16 @@ export default function PolizaDetail() {
 
         {hasRebilling && (
           <div className="mt-5">
+            {nextRebillingNotice && (
+              <div role="alert" data-testid="next-rebilling-notice"
+                className="flex items-start gap-2 mb-3 px-3 py-2.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-300 text-sm">
+                <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+                <p className="flex-1">{nextRebillingNotice}</p>
+                <button onClick={() => setNextRebillingNotice(null)} aria-label="Cerrar aviso" className="text-amber-300/70 hover:text-white">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
                 <RefreshCw className="w-4 h-4 text-violet-400" />
@@ -1508,7 +1524,11 @@ export default function PolizaDetail() {
           policy={{ ...p, _nextStart: nextStart }}
           initial={editingRebilling}
           onClose={() => { setShowRebilling(false); setEditingRebilling(null); }}
-          onSaved={() => { setShowRebilling(false); setEditingRebilling(null); load(); }}
+          onSaved={(result?: any) => {
+            setShowRebilling(false); setEditingRebilling(null);
+            setNextRebillingNotice(nextRebillingSyncNotice(result?.nextRebillingDateSync));
+            load();
+          }}
         />
       )}
 

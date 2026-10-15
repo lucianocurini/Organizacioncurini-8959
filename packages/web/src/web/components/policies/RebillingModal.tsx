@@ -13,7 +13,8 @@ interface Props {
   policy: any;
   initial?: any;
   onClose: () => void;
-  onSaved: () => void;
+  /** Recibe la respuesta del backend (incluye nextRebillingDateSync). */
+  onSaved: (result?: any) => void;
 }
 
 // Sugiere el fin de período como (inicio + N meses) - 1 día, en fechas
@@ -94,14 +95,15 @@ export function RebillingModal({ policy, initial, onClose, onSaved }: Props) {
     }
     setLoading(true);
     try {
+      let result: any;
       if (isEditMode) {
-        await api.put(`/api/rebillings/${initial.id}`, buildRebillingEditPayload(form));
+        result = await api.put(`/api/rebillings/${initial.id}`, buildRebillingEditPayload(form));
         toast.success("Refacturación actualizada");
       } else {
-        await api.post(`/api/policies/${policy.id}/rebillings`, buildRebillingCreatePayload(form));
+        result = await api.post(`/api/policies/${policy.id}/rebillings`, buildRebillingCreatePayload(form));
         toast.success("Refacturación registrada");
       }
-      onSaved();
+      onSaved(result);
     } catch (e: any) {
       toast.error(e.message);
     } finally {

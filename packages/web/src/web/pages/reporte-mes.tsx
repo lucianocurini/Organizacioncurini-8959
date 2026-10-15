@@ -39,6 +39,21 @@ interface RebillingRow {
   projected: boolean;
 }
 
+// Póliza vigente sin fecha segura para la próxima refacturación (cola global
+// "A revisar" — llega solo con el mes actual).
+interface RebillingReviewRow {
+  policyId: number;
+  policyNumber: string;
+  insuredName: string;
+  companyName: string;
+  type: string;
+  billingCycle: string | null;
+  endDate: string | null;
+  nextRebillingDate: string | null;
+  reviewReason: string | null;
+  reviewReasonLabel: string | null;
+}
+
 interface RenovationConfirmedRow {
   policyId: number;
   policyNumber: string;
@@ -133,6 +148,10 @@ interface ReportData {
   renovationsImported: RenovationImportedRow[];
   newPolicies: NewPolicyRow[];
   pendingInstallments: PendingInstallmentRow[];
+  // Cola global "A revisar": no es un movimiento del mes ni entra en totals.
+  // Las filas llegan solo con el mes actual; el tamaño, en el actual y los futuros.
+  rebillingReview?: RebillingReviewRow[];
+  rebillingReviewQueueCount?: number;
   totals: ReportTotals;
 }
 
@@ -213,6 +232,15 @@ function ProjectedBadge() {
       Proyectada
     </span>
   );
+}
+
+const BILLING_CYCLE_LABELS: Record<string, string> = {
+  mensual: "Mensual", bimestral: "Bimestral", trimestral: "Trimestral",
+  cuatrimestral: "Cuatrimestral", semestral: "Semestral", anual: "Anual",
+};
+
+function billingCycleLabel(cycle: string | null): string {
+  return cycle ? (BILLING_CYCLE_LABELS[cycle] ?? cycle) : "";
 }
 
 function CoverageCell({ value }: { value: string | null }) {
@@ -428,6 +456,25 @@ function exportExcel(data: ReportData, activeFilters: string) {
   rebSheet["!cols"] = autoSizeColumns(rebRows);
   XLSX.utils.book_append_sheet(wb, rebSheet, "Refacturaciones");
 
+  // Cola global "A revisar" (pólizas vigentes sin fecha segura): hoja propia,
+  // fuera del Resumen y de las hojas de movimientos del mes.
+  const reviewCases = data.rebillingReview ?? [];
+  if (reviewCases.length > 0) {
+    const reviewRows = reviewCases.map((r) => ({
+      "N° Póliza": r.policyNumber,
+      "Asegurado": r.insuredName,
+      "Compañía": r.companyName,
+      "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
+      "Frecuencia": billingCycleLabel(r.billingCycle),
+      "Fin vigencia": r.endDate ?? "",
+      "Próx. refact. guardada": r.nextRebillingDate ?? "",
+      "Motivo revisión": r.reviewReasonLabel ?? "",
+    }));
+    const reviewSheet = XLSX.utils.json_to_sheet(reviewRows);
+    reviewSheet["!cols"] = autoSizeColumns(reviewRows);
+    XLSX.utils.book_append_sheet(wb, reviewSheet, "A revisar (cola global)");
+  }
+
   // Renovaciones sheet (confirmed + imported merged)
   const renRows = [
     ...data.renovationsConfirmed.map((r) => ({
@@ -628,12 +675,30 @@ function exportCSV(data: ReportData) {
     })),
   ];
 
-  const csv = buildCSV(all);
+  downloadCSV(buildCSV(all), `renovaciones_refacturaciones_${data.month}.csv`);
+
+  // Cola global "A revisar": archivo aparte — no es un movimiento del mes.
+  const reviewCases = data.rebillingReview ?? [];
+  if (reviewCases.length > 0) {
+    downloadCSV(buildCSV(reviewCases.map((r) => ({
+      "N° Póliza": r.policyNumber,
+      "Asegurado": r.insuredName,
+      "Compañía": r.companyName,
+      "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
+      "Frecuencia": billingCycleLabel(r.billingCycle),
+      "Fin vigencia": r.endDate ?? "",
+      "Próx. refact. guardada": r.nextRebillingDate ?? "",
+      "Motivo revisión": r.reviewReasonLabel ?? "",
+    }))), `refacturaciones_a_revisar_cola_global_${data.month}.csv`);
+  }
+}
+
+function downloadCSV(csv: string, filename: string) {
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `renovaciones_refacturaciones_${data.month}.csv`;
+  a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
 }
@@ -851,6 +916,18 @@ export default function ReporteMes() {
           </div>
         )}
 
+        {/* Cola global "A revisar": se lista con el mes actual; en meses futuros solo se avisa */}
+        {data && (data.rebillingReview?.length ?? 0) === 0 && (data.rebillingReviewQueueCount ?? 0) > 0 && (
+          <div className="flex items-start gap-2 mb-5 px-3 py-2.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-300 text-sm no-print">
+            <Info className="w-4 h-4 mt-0.5 shrink-0" />
+            <p>
+              Hay {data.rebillingReviewQueueCount} pólizas vigentes sin fecha segura de próxima refacturación
+              (cola "A revisar"). No se proyectan en ningún mes; se listan con el motivo al consultar el{" "}
+              <button onClick={() => setMonth(currentMonth())} className="underline hover:text-white">mes actual</button>.
+            </p>
+          </div>
+        )}
+
         {/* Filters */}
         <div className="flex flex-wrap gap-3 mb-5 no-print">
           <div className="relative flex-1 min-w-[160px] sm:max-w-xs">
@@ -1041,6 +1118,58 @@ export default function ReporteMes() {
                 </tbody>
               </table>
             </Section>
+
+            {/* 1b. Cola global "A revisar" — vigentes sin fecha segura */}
+            {(data.rebillingReview?.length ?? 0) > 0 && (
+              <Section
+                title="Refacturaciones a revisar (cola global)"
+                count={data.rebillingReview!.length}
+              >
+                <table className="w-full table-fixed" style={{ minWidth: 1300 }}>
+                  <colgroup>
+                    <col style={{ width: 110 }} />
+                    <col style={{ width: 150 }} />
+                    <col style={{ width: 160 }} />
+                    <col style={{ width: 90 }} />
+                    <col style={{ width: 110 }} />
+                    <col style={{ width: 100 }} />
+                    <col style={{ width: 110 }} />
+                    <col style={{ width: 360 }} />
+                    <col style={{ width: 110 }} />
+                  </colgroup>
+                  <thead className="border-b border-[#1f2937] bg-[#0d1424]">
+                    <tr>
+                      <Th>Compañía</Th>
+                      <Th>N° Póliza</Th>
+                      <Th>Asegurado</Th>
+                      <Th>Tipo</Th>
+                      <Th>Frecuencia</Th>
+                      <Th>Fin vigencia</Th>
+                      <Th>Próx. refact. guardada</Th>
+                      <Th>Motivo</Th>
+                      <Th className="col-actions text-right sticky right-0 bg-[#0d1424]">Acciones</Th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#1f2937]">
+                    {data.rebillingReview!.map((r) => (
+                      <tr key={r.policyId} className="hover:bg-[#0d1424]/50 transition-colors">
+                        <Td className="text-gray-400">{r.companyName}</Td>
+                        <Td><span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span></Td>
+                        <Td>{r.insuredName}</Td>
+                        <Td><TypeBadge type={r.type} /></Td>
+                        <Td>{r.billingCycle ? billingCycleLabel(r.billingCycle) : <span className="text-gray-600 text-xs">—</span>}</Td>
+                        <Td className="font-mono text-xs">{formatDate(r.endDate)}</Td>
+                        <Td className="font-mono text-xs">{formatDate(r.nextRebillingDate)}</Td>
+                        <Td className="whitespace-normal break-words text-amber-300">{r.reviewReasonLabel}</Td>
+                        <Td className="col-actions sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
+                          <PolicyActions policyId={r.policyId} onChanged={load} returnTo={currentReportPath} />
+                        </Td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </Section>
+            )}
 
             {/* 2. Renovaciones confirmadas */}
             <Section

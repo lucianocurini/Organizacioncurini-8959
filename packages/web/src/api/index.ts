@@ -57,6 +57,10 @@ import {
   appendCancellationNote, isInstallmentNonCollectible, PolicyCancellationValidationError, PolicyAlreadyCancelledError,
   type InstallmentForCancellation,
 } from "../lib/policies/cancellation";
+import {
+  resolveNextRebilling, nextRebillingReviewLabel, type NextRebillingRebillingInput,
+} from "../lib/policies/next-rebilling";
+import { captureNextRebillingBaseline, syncPolicyNextRebillingDate, NextRebillingSyncConflictError } from "../lib/policies/next-rebilling-sync";
 import { isInstallmentDuplicate, isRebillingDuplicate, excludeDuplicateInstallments, excludeDuplicateRebillings } from "../lib/installments/duplicate-status";
 import {
   normalizeBatchItems, normalizeBatchSplits, validateInstallmentsEligibility,
@@ -671,6 +675,10 @@ app.post("/policies/:id/rebillings", requireAuth(async (c: any) => {
 
   try {
     const result = await db.transaction(async (tx) => {
+      // Próxima refacturación derivada ANTES del alta (ver next-rebilling-sync.ts).
+      const today = toArgentinaCalendarDay();
+      const nextRebillingBaseline = await captureNextRebillingBaseline(tx, policyId, today);
+
       // 3. comprobar duplicado (dentro de la transacción — check-then-insert atómico)
       const duplicate = await checkDuplicateRebilling(policyId, payload.billingStart, payload.billingEnd, payload.premium, tx);
       if (duplicate) {
@@ -718,12 +726,16 @@ app.post("/policies/:id/rebillings", requireAuth(async (c: any) => {
         await tx.update(policies).set({ deductible: payload.deductible }).where(eq(policies.id, policyId));
       }
 
-      return { rebilling, installments: insertedInstallments };
+      // 9. próxima refacturación — misma transacción (ver next-rebilling-sync.ts)
+      const nextRebillingDateSync = await syncPolicyNextRebillingDate(tx, policyId, { today, baseline: nextRebillingBaseline });
+
+      return { rebilling, installments: insertedInstallments, nextRebillingDateSync };
     });
 
-    return c.json({ ...result.rebilling, installments: result.installments }, 201);
+    return c.json({ ...result.rebilling, installments: result.installments, nextRebillingDateSync: result.nextRebillingDateSync }, 201);
   } catch (e: any) {
     if (e instanceof RebillingDuplicateError) return c.json({ error: e.message }, 409);
+    if (e instanceof NextRebillingSyncConflictError) return c.json({ error: e.message }, 409);
     throw e;
   }
 }));
@@ -812,24 +824,40 @@ app.put("/rebillings/:id", requireAuth(async (c: any) => {
         }
       }
     }
-    const [row] = await db.update(rebillings).set({
-      billingStart: body.billingStart ?? existing.billingStart,
-      billingEnd: body.billingEnd ?? existing.billingEnd,
-      premium: body.premium !== undefined ? (body.premium ? Number(body.premium) : null) : existing.premium,
-      monthlyFee: body.monthlyFee !== undefined ? (body.monthlyFee ? Number(body.monthlyFee) : null) : existing.monthlyFee,
-      sumInsured: body.sumInsured !== undefined ? (body.sumInsured ? Number(body.sumInsured) : null) : existing.sumInsured,
-      deductible: body.deductible !== undefined ? (body.deductible ? Number(body.deductible) : null) : existing.deductible,
-      notes: body.notes !== undefined ? (body.notes || null) : existing.notes,
-      cashPaymentAmountCents: cashPaymentAmountCents !== undefined ? cashPaymentAmountCents : existing.cashPaymentAmountCents,
-    }).where(eq(rebillings.id, id)).returning();
+    try {
+      const { row, nextRebillingDateSync } = await db.transaction(async (tx) => {
+        const today = toArgentinaCalendarDay();
+        const nextRebillingBaseline = await captureNextRebillingBaseline(tx, existing.policyId, today);
+        const [row] = await tx.update(rebillings).set({
+          billingStart: body.billingStart ?? existing.billingStart,
+          billingEnd: body.billingEnd ?? existing.billingEnd,
+          premium: body.premium !== undefined ? (body.premium ? Number(body.premium) : null) : existing.premium,
+          monthlyFee: body.monthlyFee !== undefined ? (body.monthlyFee ? Number(body.monthlyFee) : null) : existing.monthlyFee,
+          sumInsured: body.sumInsured !== undefined ? (body.sumInsured ? Number(body.sumInsured) : null) : existing.sumInsured,
+          deductible: body.deductible !== undefined ? (body.deductible ? Number(body.deductible) : null) : existing.deductible,
+          notes: body.notes !== undefined ? (body.notes || null) : existing.notes,
+          cashPaymentAmountCents: cashPaymentAmountCents !== undefined ? cashPaymentAmountCents : existing.cashPaymentAmountCents,
+        }).where(eq(rebillings.id, id)).returning();
 
-    // Igual que en el alta y en la corrección de plan: si se informó
-    // franquicia, también actualiza la vigente de la póliza. Nunca toca
-    // cuotas — esta rama es puramente metadata.
-    if (body.deductible !== undefined && body.deductible) {
-      await db.update(policies).set({ deductible: Number(body.deductible) }).where(eq(policies.id, existing.policyId));
+        // Igual que en el alta y en la corrección de plan: si se informó
+        // franquicia, también actualiza la vigente de la póliza. Nunca toca
+        // cuotas — esta rama es puramente metadata.
+        if (body.deductible !== undefined && body.deductible) {
+          await tx.update(policies).set({ deductible: Number(body.deductible) }).where(eq(policies.id, existing.policyId));
+        }
+        // La regla solo depende de las fechas del período: si no cambiaron
+        // (premio, notas, franquicia, contado…), no se recalcula nada.
+        const periodChanged = row!.billingStart !== existing.billingStart || row!.billingEnd !== existing.billingEnd;
+        const nextRebillingDateSync = periodChanged
+          ? await syncPolicyNextRebillingDate(tx, existing.policyId, { today, baseline: nextRebillingBaseline })
+          : null;
+        return { row, nextRebillingDateSync };
+      });
+      return c.json({ ...row, nextRebillingDateSync }, 200);
+    } catch (e: any) {
+      if (e instanceof NextRebillingSyncConflictError) return c.json({ error: e.message }, 409);
+      throw e;
     }
-    return c.json(row, 200);
   }
 
   // ── CAMINO LEGACY (regenera el plan a través de PUT) ──────────────────────
@@ -868,8 +896,15 @@ app.put("/rebillings/:id", requireAuth(async (c: any) => {
 
   let result;
   try {
-    result = await db.transaction(async (tx) => runRebillingRebuildTransaction(tx, id, plan, payload));
+    result = await db.transaction(async (tx) => {
+      const today = toArgentinaCalendarDay();
+      const nextRebillingBaseline = await captureNextRebillingBaseline(tx, existing.policyId, today);
+      const rebuilt = await runRebillingRebuildTransaction(tx, id, plan, payload);
+      const nextRebillingDateSync = await syncPolicyNextRebillingDate(tx, rebuilt.policyId, { today, baseline: nextRebillingBaseline });
+      return { ...rebuilt, nextRebillingDateSync };
+    });
   } catch (e: any) {
+    if (e instanceof NextRebillingSyncConflictError) return c.json({ error: e.message }, 409);
     if (e instanceof RebillingRebuildConflictError) return c.json({ error: REB_EDIT_BLOCK_MSG }, 409);
     // Migración 0034: el importe contado de esta refacturación quedó mayor
     // al nuevo nominal del plan reconstruido — mismo camino de fondo que
@@ -877,7 +912,7 @@ app.put("/rebillings/:id", requireAuth(async (c: any) => {
     if (e instanceof CashPeriodPaymentValidationError) return c.json({ error: e.message }, 409);
     throw e;
   }
-  return c.json({ ...result.rebilling, installments: result.insertedRows }, 200);
+  return c.json({ ...result.rebilling, installments: result.insertedRows, nextRebillingDateSync: result.nextRebillingDateSync }, 200);
 }));
 
 // Consulta de solo lectura: ¿se puede corregir el plan de cuotas de ESTA
@@ -962,7 +997,13 @@ app.post("/rebillings/:id/installments/rebuild", requireAuth(async (c: any) => {
   }
 
   try {
-    const result = await db.transaction(async (tx) => runRebillingRebuildTransaction(tx, id, plan, payload));
+    const result = await db.transaction(async (tx) => {
+      const today = toArgentinaCalendarDay();
+      const nextRebillingBaseline = await captureNextRebillingBaseline(tx, existing.policyId, today);
+      const rebuilt = await runRebillingRebuildTransaction(tx, id, plan, payload);
+      const nextRebillingDateSync = await syncPolicyNextRebillingDate(tx, rebuilt.policyId, { today, baseline: nextRebillingBaseline });
+      return { ...rebuilt, nextRebillingDateSync };
+    });
     return c.json({
       rebuilt: true,
       rebillingId: id,
@@ -971,8 +1012,10 @@ app.post("/rebillings/:id/installments/rebuild", requireAuth(async (c: any) => {
       insertedCount: result.insertedRows.length,
       rebilling: result.rebilling,
       installments: result.insertedRows,
+      nextRebillingDateSync: result.nextRebillingDateSync,
     }, 200);
   } catch (e: any) {
+    if (e instanceof NextRebillingSyncConflictError) return c.json({ error: e.message }, 409);
     if (e instanceof RebillingRebuildConflictError) {
       return c.json({ error: e.message, blockingInstallments: e.blockingInstallments }, 409);
     }
@@ -1020,22 +1063,31 @@ app.delete("/rebillings/:id", requireAuth(async (c: any) => {
     return c.json({ error: REB_DELETE_BLOCK_MSG }, 409);
   }
 
-  const deletedInstallments = await db.transaction(async (tx) => {
-    if (installmentIds.length > 0) {
-      await tx.delete(policyInstallments).where(eq(policyInstallments.rebillingId, id));
-    }
-    await tx.delete(rebillings).where(eq(rebillings.id, id));
-    // Nunca por debajo de 0 — refacturaciones históricas sin cuotas (o con
-    // policies.installments ya desincronizado) no deben producir un valor negativo.
-    if (installmentIds.length > 0) {
-      await tx.update(policies)
-        .set({ installments: sql`MAX(0, COALESCE(${policies.installments}, 0) - ${installmentIds.length})` })
-        .where(eq(policies.id, rebilling.policyId));
-    }
-    return installmentIds.length;
-  });
+  let deletion;
+  try {
+    deletion = await db.transaction(async (tx) => {
+      const today = toArgentinaCalendarDay();
+      const nextRebillingBaseline = await captureNextRebillingBaseline(tx, rebilling.policyId, today);
+      if (installmentIds.length > 0) {
+        await tx.delete(policyInstallments).where(eq(policyInstallments.rebillingId, id));
+      }
+      await tx.delete(rebillings).where(eq(rebillings.id, id));
+      // Nunca por debajo de 0 — refacturaciones históricas sin cuotas (o con
+      // policies.installments ya desincronizado) no deben producir un valor negativo.
+      if (installmentIds.length > 0) {
+        await tx.update(policies)
+          .set({ installments: sql`MAX(0, COALESCE(${policies.installments}, 0) - ${installmentIds.length})` })
+          .where(eq(policies.id, rebilling.policyId));
+      }
+      const nextRebillingDateSync = await syncPolicyNextRebillingDate(tx, rebilling.policyId, { today, baseline: nextRebillingBaseline });
+      return { deletedInstallments: installmentIds.length, nextRebillingDateSync };
+    });
+  } catch (e: any) {
+    if (e instanceof NextRebillingSyncConflictError) return c.json({ error: e.message }, 409);
+    throw e;
+  }
 
-  return c.json({ ok: true, deleted: { rebilling: 1, installments: deletedInstallments } }, 200);
+  return c.json({ ok: true, deleted: { rebilling: 1, installments: deletion.deletedInstallments }, nextRebillingDateSync: deletion.nextRebillingDateSync }, 200);
 }));
 
 // ─── INSTALLMENTS ─────────────────────────────────────────────────────────────
@@ -8251,7 +8303,9 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
   const isFutureMonth = month > currentArgentinaMonth;
 
   let projRenewalRaw: typeof polRaw = [];
-  let projRebillingRaw: typeof polRaw = [];
+  type ResolvedPolicyRow = (typeof polRaw)[number] & { resolution: ReturnType<typeof resolveNextRebilling> };
+  const projRebillingRaw: ResolvedPolicyRow[] = [];
+  const rebillingReviewRaw: ResolvedPolicyRow[] = [];
 
   if (isFutureMonth) {
     // Renovación proyectada: pólizas vigentes cuyo endDate cae en el mes
@@ -8291,31 +8345,64 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
       );
     }
     projRenewalRaw = renewalCandidates.filter((r) => !alreadyRenewedIds.has(r.policyId));
+  }
 
-    // Refacturación proyectada: pólizas vigentes con nextRebillingDate
-    // informado (nunca inferido) dentro del mes seleccionado.
-    const projRebillingConditions: any[] = [
-      inArray(policies.status, VIGENTE_STATUSES),
-      isNotNull(policies.nextRebillingDate),
-      gte(policies.nextRebillingDate, startDate),
-      lt(policies.nextRebillingDate, endDateExclusive),
-    ];
-    if (companyId) projRebillingConditions.push(eq(policies.companyId, companyId));
-    if (validType) projRebillingConditions.push(eq(policies.type, validType));
+  // Próxima refacturación de cada póliza vigente — regla central
+  // (lib/policies/next-rebilling.ts): next_rebilling_date explícita contrastada
+  // con el último período activo no duplicado (interpretado por su forma
+  // matemática, nunca por las notas), billing_cycle y la vigencia. En meses
+  // futuros, las fechas seguras del mes se proyectan. Las que no tienen fecha
+  // segura forman la cola global "A revisar": no depende del mes, así que se
+  // entrega una sola vez (con el mes actual) y los meses futuros solo informan
+  // cuántas hay — ninguna póliza vigente queda omitida en silencio.
+  const isCurrentMonth = month === currentArgentinaMonth;
+  let rebillingReviewQueueCount = 0;
+  if (month >= currentArgentinaMonth) {
+    const resolutionConditions: any[] = [inArray(policies.status, VIGENTE_STATUSES)];
+    if (companyId) resolutionConditions.push(eq(policies.companyId, companyId));
+    if (validType) resolutionConditions.push(eq(policies.type, validType));
 
-    const rebillingCandidates = await db
-      .select(POLICY_REPORT_COLUMNS)
+    const vigentePolicies = await db
+      .select({ ...POLICY_REPORT_COLUMNS, status: policies.status })
       .from(policies)
       .innerJoin(insureds, eq(policies.insuredId, insureds.id))
       .innerJoin(companies, eq(policies.companyId, companies.id))
-      .where(and(...projRebillingConditions))
+      .where(and(...resolutionConditions))
       .all();
+    const vigenteRebillings = await db
+      .select({
+        policyId: rebillings.policyId,
+        id: rebillings.id,
+        billingStart: rebillings.billingStart,
+        billingEnd: rebillings.billingEnd,
+        status: rebillings.status,
+      })
+      .from(rebillings)
+      .innerJoin(policies, eq(rebillings.policyId, policies.id))
+      .where(and(...resolutionConditions))
+      .all();
+    const rebillingsByPolicy = new Map<number, NextRebillingRebillingInput[]>();
+    for (const r of vigenteRebillings) {
+      const list = rebillingsByPolicy.get(Number(r.policyId)) ?? [];
+      list.push(r);
+      rebillingsByPolicy.set(Number(r.policyId), list);
+    }
 
     // Dedupe con dato real: si ya existe una refacturación real de esta
     // póliza en este mismo mes (rebRaw, ya consultado arriba), el dato real
     // manda — no duplicar con una proyección.
     const realRebillingPolicyIds = new Set(rebRaw.map((r) => Number(r.policyId)));
-    projRebillingRaw = rebillingCandidates.filter((r) => !realRebillingPolicyIds.has(r.policyId));
+    const today = toArgentinaCalendarDay();
+    for (const { status: _status, ...p } of vigentePolicies) {
+      const resolution = resolveNextRebilling({ ...p, status: _status }, rebillingsByPolicy.get(p.policyId) ?? [], today);
+      if (resolution.kind === "safe") {
+        if (isFutureMonth && resolution.date!.slice(0, 7) === month && !realRebillingPolicyIds.has(p.policyId)) {
+          projRebillingRaw.push({ ...p, resolution });
+        }
+      } else if (resolution.kind === "review") {
+        rebillingReviewRaw.push({ ...p, resolution });
+      }
+    }
   }
 
   // ── Bien asegurado: conteo de flota en un solo query batched (sin N+1) ──
@@ -8376,7 +8463,8 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     insuredName: String(p.insuredName),
     companyName: String(p.companyName),
     type: String(p.type),
-    billingStart: String(p.nextRebillingDate),
+    // Fecha segura de la regla central (explícita vigente o derivada del historial).
+    billingStart: p.resolution.date!,
     // Fin de período todavía no existe (no hay refacturación real) — no se inventa.
     billingEnd: null,
     premium: p.premium != null ? Number(p.premium) : null,
@@ -8393,6 +8481,24 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     projected: true as const,
   }));
   rebillingRows = [...rebillingRows, ...projectedRebillingRows];
+
+  // "A revisar": pólizas vigentes sin fecha segura para la próxima
+  // refacturación, con el motivo (mismo texto en pantalla, Excel y CSV).
+  const rebillingReviewRows = rebillingReviewRaw
+    .map((p) => ({
+      policyId: Number(p.policyId),
+      policyNumber: String(p.policyNumber),
+      insuredName: String(p.insuredName),
+      companyName: String(p.companyName),
+      type: String(p.type),
+      billingCycle: p.billingCycle ? String(p.billingCycle) : null,
+      endDate: p.endDate ? String(p.endDate) : null,
+      nextRebillingDate: p.nextRebillingDate ? String(p.nextRebillingDate) : null,
+      reviewState: p.resolution.state,
+      reviewReason: p.resolution.reason,
+      reviewReasonLabel: nextRebillingReviewLabel(p.resolution),
+    }))
+    .sort((a, b) => a.policyNumber.localeCompare(b.policyNumber) || a.policyId - b.policyId);
 
   let pendingInstallmentRows = instRaw.map((r) => ({
     installmentId: Number(r.installmentId),
@@ -8535,6 +8641,13 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
   let filteredConfirmed     = validMovementType && validMovementType !== "renovation_confirmed"  ? [] : renovationsConfirmed.filter(matchesQ);
   let filteredImported      = validMovementType && validMovementType !== "renovation_imported"   ? [] : renovationsImported.filter(matchesQ);
   let filteredNew           = validMovementType && validMovementType !== "new_policy"            ? [] : newPolicies.filter(matchesQ);
+  // "A revisar" pertenece a refacturaciones: mismo filtro de movimiento, y
+  // como sus filas no tienen subtipo, un filtro de subtipo las excluye (igual
+  // que a las proyectadas).
+  const matchingRebillingReview =
+    (validMovementType && validMovementType !== "rebilling") || validRebillingType ? [] : rebillingReviewRows.filter(matchesQ);
+  rebillingReviewQueueCount = matchingRebillingReview.length;
+  const filteredRebillingReview = isCurrentMonth ? matchingRebillingReview : [];
   let filteredPending       = validMovementType && validMovementType !== "pending_installment"    ? [] : pendingInstallmentRows.filter(matchesQ);
 
   // ── 4. Sort ──
@@ -8597,6 +8710,12 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     // Proyección de cartera — no se suma a totalMovements (concepto distinto:
     // cuotas por vencer, no eventos de póliza ya registrados).
     pendingInstallments:   filteredPending,
+    // Cola global "A revisar": pólizas vigentes sin fecha segura para la
+    // próxima refacturación. No es un movimiento del mes: solo viaja con el
+    // mes actual y queda fuera de `totals`. rebillingReviewQueueCount = su
+    // tamaño (mismos filtros) en el mes actual y los futuros; 0 en pasados.
+    rebillingReview:       filteredRebillingReview,
+    rebillingReviewQueueCount,
     totals: {
       rebillingsCount:           filteredRebillings.length,
       rebillingsDuplicateGroups,
