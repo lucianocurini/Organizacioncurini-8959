@@ -15,6 +15,29 @@ export interface PolicySortRow {
   };
   company?: { name: string } | null;
   insured?: { name: string } | null;
+  // Estado efectivo que calcula GET /policies (por fecha final); el orden por
+  // estado usa este, no el guardado.
+  effectiveStatus?: string | null;
+}
+
+/** Estado a mostrar/ordenar/exportar: el efectivo si llegó, si no el guardado. */
+export function displayPolicyStatus(row: { policy: { status: string }; effectiveStatus?: string | null }): string {
+  return row.effectiveStatus ?? row.policy.status;
+}
+
+export const POLIZAS_PAGE_SIZE = 50;
+
+/**
+ * Página del listado sobre el conjunto COMPLETO ya filtrado (por estado
+ * efectivo, server-side) y ordenado: total y cantidad de páginas salen del
+ * mismo conjunto que se recorta.
+ */
+export function paginatePolicyRows<T>(rows: T[], page: number, pageSize = POLIZAS_PAGE_SIZE): { pageRows: T[]; total: number; totalPages: number } {
+  return {
+    pageRows: rows.slice((page - 1) * pageSize, page * pageSize),
+    total: rows.length,
+    totalPages: Math.max(1, Math.ceil(rows.length / pageSize)),
+  };
 }
 
 const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -73,7 +96,7 @@ export function sortPolicyRows<T extends PolicySortRow>(
       case "insured": va = a.insured?.name || ""; vb = b.insured?.name || ""; break;
       case "company": va = a.company?.name || ""; vb = b.company?.name || ""; break;
       case "type": va = a.policy.type; vb = b.policy.type; break;
-      case "status": va = a.policy.status; vb = b.policy.status; break;
+      case "status": va = displayPolicyStatus(a); vb = displayPolicyStatus(b); break;
       case "endDate": va = a.policy.endDate; vb = b.policy.endDate; break;
       case "premium": va = a.policy.premium || 0; vb = b.policy.premium || 0; break;
       default: va = ""; vb = "";

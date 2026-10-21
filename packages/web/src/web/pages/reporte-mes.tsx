@@ -37,6 +37,8 @@ interface RebillingRow {
   // true = proyección (póliza vigente sin refacturación real todavía),
   // no un evento ya registrado.
   projected: boolean;
+  // Solo proyectadas: accesorias válidas que siguen a esta principal.
+  accessoryCount?: number;
 }
 
 // Póliza vigente sin fecha segura para la próxima refacturación (cola global
@@ -52,6 +54,23 @@ interface RebillingReviewRow {
   nextRebillingDate: string | null;
   reviewReason: string | null;
   reviewReasonLabel: string | null;
+  // Accesorias válidas que se revisan junto con esta principal.
+  accessoryCount?: number;
+}
+
+// Accesoria vigente cuyo vínculo con la principal no es válido (cola global
+// "Vínculos a revisar" — llega solo con el mes actual, como "A revisar").
+interface LinkReviewRow {
+  policyId: number;
+  policyNumber: string;
+  insuredName: string;
+  companyName: string;
+  type: string;
+  startDate: string | null;
+  endDate: string | null;
+  parentPolicyNumber: string | null;
+  linkReason: string;
+  linkReasonLabel: string | null;
 }
 
 interface RenovationConfirmedRow {
@@ -71,6 +90,9 @@ interface RenovationConfirmedRow {
   coverageType: string | null;
   sumInsured: number | null;
   projected: boolean;
+  // Solo proyectadas: accesorias válidas agrupadas en esta fila (su prima ya
+  // está sumada en `premium`, una sola vez).
+  accessoryCount?: number;
 }
 
 interface RenovationImportedRow {
@@ -152,6 +174,9 @@ interface ReportData {
   // Las filas llegan solo con el mes actual; el tamaño, en el actual y los futuros.
   rebillingReview?: RebillingReviewRow[];
   rebillingReviewQueueCount?: number;
+  // Cola global "Vínculos a revisar": mismas reglas que rebillingReview.
+  linkReview?: LinkReviewRow[];
+  linkReviewQueueCount?: number;
   totals: ReportTotals;
 }
 
@@ -230,6 +255,17 @@ function ProjectedBadge() {
   return (
     <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-violet-500/15 text-violet-400 border border-violet-500/20">
       Proyectada
+    </span>
+  );
+}
+
+// Principal que agrupa accesorias válidas (proyecciones y colas): una sola
+// fila/movimiento.
+function AccessoryBadge({ count }: { count?: number }) {
+  if (!count) return null;
+  return (
+    <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-amber-500/15 text-amber-400 border border-amber-500/20">
+      +{count} accesoria{count !== 1 ? "s" : ""}
     </span>
   );
 }
@@ -408,6 +444,20 @@ function autoSizeColumns(rows: Record<string, unknown>[]): { wch: number }[] {
   });
 }
 
+// Mismas columnas en la hoja de Excel y en el CSV aparte de "Vínculos a revisar".
+function linkReviewExportRows(rows: LinkReviewRow[]): Record<string, unknown>[] {
+  return rows.map((r) => ({
+    "N° Póliza": r.policyNumber,
+    "Asegurado": r.insuredName,
+    "Compañía": r.companyName,
+    "Ramo": POLICY_TYPES[r.type]?.label ?? r.type,
+    "Inicio vigencia": r.startDate ?? "",
+    "Fin vigencia": r.endDate ?? "",
+    "Póliza principal": r.parentPolicyNumber ?? "",
+    "Motivo": r.linkReasonLabel ?? "",
+  }));
+}
+
 function exportExcel(data: ReportData, activeFilters: string) {
   const wb = XLSX.utils.book_new();
 
@@ -469,10 +519,20 @@ function exportExcel(data: ReportData, activeFilters: string) {
       "Fin vigencia": r.endDate ?? "",
       "Próx. refact. guardada": r.nextRebillingDate ?? "",
       "Motivo revisión": r.reviewReasonLabel ?? "",
+      "Accesorias agrupadas": r.accessoryCount ? r.accessoryCount : "",
     }));
     const reviewSheet = XLSX.utils.json_to_sheet(reviewRows);
     reviewSheet["!cols"] = autoSizeColumns(reviewRows);
     XLSX.utils.book_append_sheet(wb, reviewSheet, "A revisar (cola global)");
+  }
+
+  // Cola global "Vínculos a revisar": hoja propia, fuera del Resumen.
+  const linkCases = data.linkReview ?? [];
+  if (linkCases.length > 0) {
+    const linkRows = linkReviewExportRows(linkCases);
+    const linkSheet = XLSX.utils.json_to_sheet(linkRows);
+    linkSheet["!cols"] = autoSizeColumns(linkRows);
+    XLSX.utils.book_append_sheet(wb, linkSheet, "Vínculos a revisar");
   }
 
   // Renovaciones sheet (confirmed + imported merged)
@@ -493,6 +553,7 @@ function exportExcel(data: ReportData, activeFilters: string) {
       "Vto. anterior": r.renewedFromEndDate ?? "",
       "Importador": "",
       "Proyectada": r.projected ? "Sí" : "",
+      "Accesorias agrupadas": r.accessoryCount ? r.accessoryCount : "",
     })),
     ...data.renovationsImported.map((r) => ({
       "Tipo renovación": "Importada",
@@ -510,6 +571,7 @@ function exportExcel(data: ReportData, activeFilters: string) {
       "Vto. anterior": "",
       "Importador": importerLabel(r.sourceImporter),
       "Proyectada": "",
+      "Accesorias agrupadas": "",
     })),
   ];
   const renSheet = XLSX.utils.json_to_sheet(renRows);
@@ -690,6 +752,12 @@ function exportCSV(data: ReportData) {
       "Próx. refact. guardada": r.nextRebillingDate ?? "",
       "Motivo revisión": r.reviewReasonLabel ?? "",
     }))), `refacturaciones_a_revisar_cola_global_${data.month}.csv`);
+  }
+
+  // Cola global "Vínculos a revisar": otro archivo aparte.
+  const linkCases = data.linkReview ?? [];
+  if (linkCases.length > 0) {
+    downloadCSV(buildCSV(linkReviewExportRows(linkCases)), `vinculos_a_revisar_${data.month}.csv`);
   }
 }
 
@@ -928,6 +996,18 @@ export default function ReporteMes() {
           </div>
         )}
 
+        {/* Cola global "Vínculos a revisar": misma regla que "A revisar" */}
+        {data && (data.linkReview?.length ?? 0) === 0 && (data.linkReviewQueueCount ?? 0) > 0 && (
+          <div className="flex items-start gap-2 mb-5 px-3 py-2.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-300 text-sm no-print">
+            <Info className="w-4 h-4 mt-0.5 shrink-0" />
+            <p>
+              Hay {data.linkReviewQueueCount} pólizas accesorias vigentes con el vínculo a su principal inválido
+              (cola "Vínculos a revisar"). Se listan con el motivo al consultar el{" "}
+              <button onClick={() => setMonth(currentMonth())} className="underline hover:text-white">mes actual</button>.
+            </p>
+          </div>
+        )}
+
         {/* Filters */}
         <div className="flex flex-wrap gap-3 mb-5 no-print">
           <div className="relative flex-1 min-w-[160px] sm:max-w-xs">
@@ -1098,6 +1178,7 @@ export default function ReporteMes() {
                         <div className="flex items-center gap-1.5 flex-wrap">
                           <span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span>
                           {r.projected && <ProjectedBadge />}
+                          <AccessoryBadge count={r.accessoryCount} />
                         </div>
                       </Td>
                       <Td>{r.insuredName}</Td>
@@ -1154,13 +1235,70 @@ export default function ReporteMes() {
                     {data.rebillingReview!.map((r) => (
                       <tr key={r.policyId} className="hover:bg-[#0d1424]/50 transition-colors">
                         <Td className="text-gray-400">{r.companyName}</Td>
-                        <Td><span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span></Td>
+                        <Td>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span>
+                            <AccessoryBadge count={r.accessoryCount} />
+                          </div>
+                        </Td>
                         <Td>{r.insuredName}</Td>
                         <Td><TypeBadge type={r.type} /></Td>
                         <Td>{r.billingCycle ? billingCycleLabel(r.billingCycle) : <span className="text-gray-600 text-xs">—</span>}</Td>
                         <Td className="font-mono text-xs">{formatDate(r.endDate)}</Td>
                         <Td className="font-mono text-xs">{formatDate(r.nextRebillingDate)}</Td>
                         <Td className="whitespace-normal break-words text-amber-300">{r.reviewReasonLabel}</Td>
+                        <Td className="col-actions sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
+                          <PolicyActions policyId={r.policyId} onChanged={load} returnTo={currentReportPath} />
+                        </Td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </Section>
+            )}
+
+            {/* 1c. Cola global "Vínculos a revisar" — accesorias con vínculo inválido */}
+            {(data.linkReview?.length ?? 0) > 0 && (
+              <Section
+                title="Vínculos a revisar"
+                count={data.linkReview!.length}
+              >
+                <table className="w-full table-fixed" style={{ minWidth: 1230 }}>
+                  <colgroup>
+                    <col style={{ width: 110 }} />
+                    <col style={{ width: 150 }} />
+                    <col style={{ width: 160 }} />
+                    <col style={{ width: 90 }} />
+                    <col style={{ width: 100 }} />
+                    <col style={{ width: 100 }} />
+                    <col style={{ width: 150 }} />
+                    <col style={{ width: 260 }} />
+                    <col style={{ width: 110 }} />
+                  </colgroup>
+                  <thead className="border-b border-[#1f2937] bg-[#0d1424]">
+                    <tr>
+                      <Th>Compañía</Th>
+                      <Th>N° Póliza</Th>
+                      <Th>Asegurado</Th>
+                      <Th>Tipo</Th>
+                      <Th>Inicio vigencia</Th>
+                      <Th>Fin vigencia</Th>
+                      <Th>Póliza principal</Th>
+                      <Th>Motivo</Th>
+                      <Th className="col-actions text-right sticky right-0 bg-[#0d1424]">Acciones</Th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#1f2937]">
+                    {data.linkReview!.map((r) => (
+                      <tr key={r.policyId} className="hover:bg-[#0d1424]/50 transition-colors">
+                        <Td className="text-gray-400">{r.companyName}</Td>
+                        <Td><span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span></Td>
+                        <Td>{r.insuredName}</Td>
+                        <Td><TypeBadge type={r.type} /></Td>
+                        <Td className="font-mono text-xs">{formatDate(r.startDate)}</Td>
+                        <Td className="font-mono text-xs">{formatDate(r.endDate)}</Td>
+                        <Td>{r.parentPolicyNumber ? <span className="font-mono text-xs text-gray-400">{r.parentPolicyNumber}</span> : <span className="text-gray-600 text-xs">—</span>}</Td>
+                        <Td className="whitespace-normal break-words text-amber-300">{r.linkReasonLabel}</Td>
                         <Td className="col-actions sticky right-0 bg-[#0d1520]" style={{ boxShadow: "-4px 0 12px rgba(0,0,0,0.4)" }}>
                           <PolicyActions policyId={r.policyId} onChanged={load} returnTo={currentReportPath} />
                         </Td>
@@ -1219,6 +1357,7 @@ export default function ReporteMes() {
                         <div className="flex items-center gap-1.5 flex-wrap">
                           <span className="font-mono text-blue-400 text-xs">{r.policyNumber}</span>
                           {r.projected && <ProjectedBadge />}
+                          <AccessoryBadge count={r.accessoryCount} />
                         </div>
                       </Td>
                       <Td>{r.insuredName}</Td>

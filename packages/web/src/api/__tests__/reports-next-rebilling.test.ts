@@ -108,8 +108,9 @@ beforeAll(async () => {
   ids.renewal = await mkPolicy("REN", { billingCycle: "cuatrimestral", nextRebillingDate: d(-3), endDate: d(1) });
   await mkReb(ids.renewal, d(-3), d(1), "Importado de El Norte v2. Prórroga endoso 2");
 
-  // No vigente: mismo caso que El Norte pero vencida → en ningún lado.
-  ids.noVigente = await mkPolicy("NOVIG", { status: "vencida", billingCycle: "cuatrimestral", nextRebillingDate: d(-3) });
+  // No vigente: mismo caso que El Norte pero vencida (fin de vigencia ya
+  // pasado: el estado efectivo se recalcula por fecha final) → en ningún lado.
+  ids.noVigente = await mkPolicy("NOVIG", { status: "vencida", billingCycle: "cuatrimestral", nextRebillingDate: d(-3), endDate: d(-1) });
   await mkReb(ids.noVigente, d(-3), d(1), "Importado de El Norte v2. Prórroga endoso 3");
 
   // Otra compañía: no debe aparecer con filtro de compañía.

@@ -11,12 +11,14 @@ import { PolicyActions } from "@/components/policies/PolicyActions";
 import { ImportModal } from "@/components/policies/ImportModal";
 import { toast } from "sonner";
 import { buildPoliziasQuery, buildPoliziasPath, parsePoliziasFilters, type PoliziasSortKey } from "@/lib/polizas-filters";
-import { sortPolicyRows } from "@/lib/polizas-sort";
+import { sortPolicyRows, paginatePolicyRows, displayPolicyStatus, POLIZAS_PAGE_SIZE } from "@/lib/polizas-sort";
 
 interface PolicyRow {
   policy: any;
   company: any;
   insured: any;
+  // Estado efectivo calculado por GET /policies (por fecha final).
+  effectiveStatus?: string | null;
 }
 
 const typeIcons: Record<string, any> = {
@@ -25,7 +27,7 @@ const typeIcons: Record<string, any> = {
 
 type SortKey = PoliziasSortKey;
 
-const PAGE_SIZE = 50;
+const PAGE_SIZE = POLIZAS_PAGE_SIZE;
 
 export default function Polizas() {
   // El estado inicial se lee una sola vez de la URL actual (query string),
@@ -98,8 +100,7 @@ export default function Polizas() {
 
   const sorted = sortPolicyRows(rows, sortKey, sortDir);
 
-  const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
-  const paged = sorted.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  const { pageRows: paged, totalPages } = paginatePolicyRows(sorted, page, PAGE_SIZE);
 
   const handleBulkDelete = async () => {
     setDeleting(true);
@@ -125,7 +126,7 @@ export default function Polizas() {
   const exportToCSV = () => {
     const headers = ["N° Póliza", "Tipo", "Estado", "Cobertura", "Asegurado", "Compañía", "Cuota Mensual", "Prima", "Suma Asegurada", "Vigencia Desde", "Vigencia Hasta"];
     const csvRows = sorted.map(r => [
-      r.policy.policyNumber, r.policy.type, r.policy.status,
+      r.policy.policyNumber, r.policy.type, displayPolicyStatus(r),
       r.policy.coverageType ? (COVERAGE_LABELS[r.policy.coverageType] || r.policy.coverageType) : "",
       r.insured?.name || "", r.company?.name || "",
       r.policy.monthlyFee || "", r.policy.premium || "", r.policy.sumInsured || "",
@@ -254,7 +255,8 @@ export default function Polizas() {
           ) : paged.map((row) => {
             const days = daysUntil(row.policy.endDate);
             const typeInfo = POLICY_TYPES[row.policy.type];
-            const statusInfo = STATUS_TYPES[row.policy.status];
+            const status = displayPolicyStatus(row);
+            const statusInfo = STATUS_TYPES[status];
             const Icon = typeIcons[row.policy.type] || FileText;
             const isSelected = selected.has(row.policy.id);
             return (
@@ -270,7 +272,7 @@ export default function Polizas() {
                     </div>
                   </div>
                   <span className={cn("inline-flex px-2 py-0.5 rounded-md text-xs font-medium border whitespace-nowrap shrink-0", statusInfo?.color)}>
-                    {statusInfo?.label || row.policy.status}
+                    {statusInfo?.label || status}
                   </span>
                 </div>
 
@@ -363,7 +365,8 @@ export default function Polizas() {
                 ) : paged.map((row) => {
                   const days = daysUntil(row.policy.endDate);
                   const typeInfo = POLICY_TYPES[row.policy.type];
-                  const statusInfo = STATUS_TYPES[row.policy.status];
+                  const status = displayPolicyStatus(row);
+                  const statusInfo = STATUS_TYPES[status];
                   const Icon = typeIcons[row.policy.type] || FileText;
                   const isSelected = selected.has(row.policy.id);
                   return (
@@ -391,7 +394,7 @@ export default function Polizas() {
                       </td>
                       <td className="py-2.5 px-3">
                         <span className={cn("inline-flex px-2 py-0.5 rounded-md text-xs font-medium border whitespace-nowrap", statusInfo?.color)}>
-                          {statusInfo?.label || row.policy.status}
+                          {statusInfo?.label || status}
                         </span>
                       </td>
                       <td className="py-2.5 px-3 overflow-hidden">

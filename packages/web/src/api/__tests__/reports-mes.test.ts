@@ -1030,7 +1030,8 @@ describe("Caso P — Renovaciones proyectadas", () => {
       num: "TEST-RM-P003",
       companyId: coElNorteId,
       startDate: "2026-01-01",
-      endDate: `${F}-10`,
+      // Fin de vigencia ya pasado: el estado efectivo se recalcula por fecha final.
+      endDate: "2026-06-30",
       status: "vencida",
     });
     const body = await (await callReport(F)).json();
@@ -1188,7 +1189,8 @@ describe("Caso R — Refacturaciones proyectadas", () => {
       num: "TEST-RM-R003",
       companyId: coRivadaviaId,
       startDate: "2026-01-01",
-      endDate: `${FUTURE_YEAR + 2}-12-31`,
+      // Fin de vigencia ya pasado: el estado efectivo se recalcula por fecha final.
+      endDate: "2026-06-30",
       status: "vencida",
       nextRebillingDate: `${F}-08`,
     });

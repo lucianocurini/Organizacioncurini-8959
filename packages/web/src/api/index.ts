@@ -61,6 +61,10 @@ import {
   resolveNextRebilling, nextRebillingReviewLabel, type NextRebillingRebillingInput,
 } from "../lib/policies/next-rebilling";
 import { captureNextRebillingBaseline, syncPolicyNextRebillingDate, NextRebillingSyncConflictError } from "../lib/policies/next-rebilling-sync";
+import { effectivePolicyStatus, isEffectivelyVigente, RECALCULABLE_POLICY_STATUSES } from "../lib/policies/effective-status";
+import { evaluateAccessoryLink, accessoryLinkReasonLabel, type AccessoryLinkPolicy, type AccessoryLinkReason } from "../lib/policies/accessory-link";
+import { classifyAccessoryLinks, groupAccessoriesUnderPrincipals, type GroupedRow } from "../lib/policies/accessory-grouping";
+import { applyPolicyListFilters } from "../lib/policies/policy-list";
 import { isInstallmentDuplicate, isRebillingDuplicate, excludeDuplicateInstallments, excludeDuplicateRebillings } from "../lib/installments/duplicate-status";
 import {
   normalizeBatchItems, normalizeBatchSplits, validateInstallmentsEligibility,
@@ -301,7 +305,7 @@ app.get("/policies", requireAuth(async (c: any) => {
   // Lo usa "Imputar pago" para ofrecer las mismas pólizas que "Cobrar en
   // lote" (paridad de la regla de cobrabilidad) — el listado de Pólizas no
   // lo manda y sigue mostrando solo principales, sin cambios.
-  let results = await db
+  const results = await db
     .select({ policy: policies, company: companies, insured: insureds })
     .from(policies)
     .leftJoin(companies, eq(policies.companyId, companies.id))
@@ -309,19 +313,10 @@ app.get("/policies", requireAuth(async (c: any) => {
     .where(includeAccessories === "1" ? undefined : isNull(policies.parentPolicyId))
     .orderBy(desc(policies.createdAt))
     .all();
-  if (q) {
-    const lower = q.toLowerCase();
-    results = results.filter(
-      (r) =>
-        r.insured?.name.toLowerCase().includes(lower) ||
-        r.company?.name.toLowerCase().includes(lower) ||
-        r.policy.policyNumber.toLowerCase().includes(lower)
-    );
-  }
-  if (type) results = results.filter((r) => r.policy.type === type);
-  if (status) results = results.filter((r) => r.policy.status === status);
-  if (companyId) results = results.filter((r) => r.policy.companyId === Number(companyId));
-  return c.json(results, 200);
+  // Estado efectivo (por fecha final, día de Argentina) resuelto ANTES del
+  // filtro: el filtro de estado, el conteo y la paginación del listado usan
+  // el mismo conjunto. policy.status sigue siendo el dato guardado.
+  return c.json(applyPolicyListFilters(results, { q, type, status, companyId }, toArgentinaCalendarDay()), 200);
 }));
 
 // ─── Búsqueda de períodos con contado disponible (rediseño Pago de contado) ────
@@ -548,8 +543,28 @@ app.get("/policies/:id", requireAuth(async (c: any) => {
     .leftJoin(insureds, eq(policies.insuredId, insureds.id))
     .where(eq(policies.parentPolicyId, id));
 
+  // Estado efectivo (solo lectura, ver lib/policies/effective-status.ts) de
+  // la póliza y de sus accesorias; si esta póliza es accesoria, su principal
+  // y si el vínculo es válido (lib/policies/accessory-link.ts).
+  const effectiveStatus = effectivePolicyStatus(result.policy.status, result.policy.endDate, today);
+  let parentPolicy: Record<string, unknown> | null = null;
+  let accessoryLink: { valid: boolean; reason: string | null; reasonLabel: string | null } | null = null;
+  if (result.policy.parentPolicyId != null) {
+    const parent = await db.select().from(policies).where(eq(policies.id, result.policy.parentPolicyId)).get();
+    const link = evaluateAccessoryLink(result.policy, parent ?? null, today);
+    accessoryLink = { valid: link.valid, reason: link.reason, reasonLabel: accessoryLinkReasonLabel(link.reason) };
+    parentPolicy = parent && parent.id !== result.policy.id ? {
+      id: parent.id, policyNumber: parent.policyNumber, type: parent.type, status: parent.status,
+      effectiveStatus: effectivePolicyStatus(parent.status, parent.endDate, today),
+      startDate: parent.startDate, endDate: parent.endDate,
+    } : null;
+  }
+
   return c.json({
-    ...result, rebillings: policyRebillings, installments: instRows, subPolicies, cancelledByName,
+    ...result, effectiveStatus, parentPolicy, accessoryLink,
+    rebillings: policyRebillings, installments: instRows,
+    subPolicies: subPolicies.map((s) => ({ ...s, effectiveStatus: effectivePolicyStatus(s.policy.status, s.policy.endDate, today) })),
+    cancelledByName,
     invalidatedByNames: Object.fromEntries(invalidatedByNameById),
   }, 200);
 }));
@@ -1731,11 +1746,15 @@ app.get("/stats", requireAuth(async (c: any) => {
     .leftJoin(companies, eq(policies.companyId, companies.id))
     .where(isNull(policies.parentPolicyId))
     .all();
-  const activas = allPolicies.filter((p) => p.policy.status === "activa").length;
-  const vencidas = allPolicies.filter((p) => p.policy.status === "vencida").length;
-  const porVencer = allPolicies.filter((p) => p.policy.status === "por_vencer").length;
+  // Conteos por estado efectivo (por fecha final, día de Argentina); cancelada
+  // y renovada se cuentan tal cual están guardadas.
+  const statsToday = toArgentinaCalendarDay();
+  const effOf = (p: (typeof allPolicies)[number]) => effectivePolicyStatus(p.policy.status, p.policy.endDate, statsToday);
+  const activas = allPolicies.filter((p) => effOf(p) === "activa").length;
+  const vencidas = allPolicies.filter((p) => effOf(p) === "vencida").length;
+  const porVencer = allPolicies.filter((p) => effOf(p) === "por_vencer").length;
   const canceladas = allPolicies.filter((p) => p.policy.status === "cancelada").length;
-  const vigentes = allPolicies.filter((p) => p.policy.status === "activa" || p.policy.status === "por_vencer");
+  const vigentes = allPolicies.filter((p) => effOf(p) === "activa" || effOf(p) === "por_vencer");
   const total = vigentes.length;
   const byType: Record<string, number> = {};
   for (const p of vigentes) {
@@ -8203,6 +8222,8 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     billingCycle: policies.billingCycle,
     notes: policies.notes,
     renewedFromId: policies.renewedFromId,
+    parentPolicyId: policies.parentPolicyId,
+    insuredId: policies.insuredId,
     companyId: policies.companyId,
     insuredName: insureds.name,
     companyName: companies.name,
@@ -8293,38 +8314,64 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
   // ── 4. Proyección de renovaciones/refacturaciones futuras ──────────────────
   // Solo para meses POSTERIORES al mes actual de Argentina (mes actual y
   // pasados preservan el comportamiento de siempre: nada se proyecta, solo se
-  // muestran eventos reales ya registrados). "Vigente" usa la MISMA
-  // definición que ya usa el resto del sistema (ver GET /stats más arriba):
-  // policies.status IN ('activa', 'por_vencer') — es el status ya
-  // mantenido por el propio flujo de alta/edición/renovación, no un
-  // recálculo propio por endDate que podría desalinearse del resto de la app.
-  const VIGENTE_STATUSES = ["activa", "por_vencer"];
+  // muestran eventos reales ya registrados). "Vigente" = estado EFECTIVO
+  // activa/por_vencer (lib/policies/effective-status.ts): el status guardado
+  // recalculado por fecha final con el día de Argentina, misma regla que el
+  // alta/edición; cancelada y renovada nunca cuentan como vigentes.
+  //
+  // Accesorias (policies.parentPolicyId): con vínculo válido
+  // (lib/policies/accessory-link.ts) siguen a su principal en proyecciones y
+  // colas — sin fila propia; con vínculo inválido van a "Vínculos a revisar".
+  // Los filtros de compañía van en SQL (un vínculo válido exige la misma
+  // compañía); el de ramo se aplica DESPUÉS de agrupar, sobre la fila
+  // resultante (la de la principal para un grupo). Movimientos reales,
+  // altas y cuotas pendientes (secciones 1–3) no se tocan.
   const currentArgentinaMonth = shiftArgentinaMonth(0);
   const isFutureMonth = month > currentArgentinaMonth;
+  const reportToday = toArgentinaCalendarDay();
+  const matchesTypeFilter = (r: { type: string | null }) => !validType || r.type === validType;
 
-  let projRenewalRaw: typeof polRaw = [];
-  type ResolvedPolicyRow = (typeof polRaw)[number] & { resolution: ReturnType<typeof resolveNextRebilling> };
+  // Principales referenciadas por accesorias, sin filtros (la principal puede
+  // no cumplir el filtro de compañía/ramo, ni estar vigente).
+  const parentsById = new Map<number, AccessoryLinkPolicy & { policyNumber: string }>();
+  const loadParents = async (rows: { parentPolicyId: number | null }[]) => {
+    const missing = [...new Set(rows.map((r) => r.parentPolicyId).filter((id): id is number => id != null && !parentsById.has(id)))];
+    if (missing.length === 0) return;
+    const found = await db.select({
+      id: policies.id, parentPolicyId: policies.parentPolicyId, companyId: policies.companyId,
+      insuredId: policies.insuredId, status: policies.status, endDate: policies.endDate, policyNumber: policies.policyNumber,
+    }).from(policies).where(inArray(policies.id, missing)).all();
+    for (const p of found) parentsById.set(p.id, p);
+  };
+  const asLinkPolicy = (p: { policyId: number; parentPolicyId: number | null; companyId: number | null; insuredId: number | null; status: string | null; endDate: string | null }): AccessoryLinkPolicy =>
+    ({ id: p.policyId, parentPolicyId: p.parentPolicyId, companyId: p.companyId, insuredId: p.insuredId, status: p.status, endDate: p.endDate });
+
+  type VigenteReportRow = (typeof polRaw)[number] & { status: string | null };
+  type GroupedRenewalRow = GroupedRow<VigenteReportRow & { id: number }>;
+  let projRenewalRaw: GroupedRenewalRow[] = [];
+  type ResolvedPolicyRow = (typeof polRaw)[number] & { resolution: ReturnType<typeof resolveNextRebilling>; accessoryCount: number };
   const projRebillingRaw: ResolvedPolicyRow[] = [];
   const rebillingReviewRaw: ResolvedPolicyRow[] = [];
+  type LinkReviewRow = (typeof polRaw)[number] & { linkReason: AccessoryLinkReason; parentPolicyNumber: string | null };
+  const linkReviewRaw: LinkReviewRow[] = [];
 
   if (isFutureMonth) {
     // Renovación proyectada: pólizas vigentes cuyo endDate cae en el mes
     // seleccionado — esa fecha ES la "fecha prevista de renovación" pedida.
     const projRenewalConditions: any[] = [
-      inArray(policies.status, VIGENTE_STATUSES),
+      inArray(policies.status, [...RECALCULABLE_POLICY_STATUSES]),
       gte(policies.endDate, startDate),
       lt(policies.endDate, endDateExclusive),
     ];
     if (companyId) projRenewalConditions.push(eq(policies.companyId, companyId));
-    if (validType) projRenewalConditions.push(eq(policies.type, validType));
 
-    const renewalCandidates = await db
-      .select(POLICY_REPORT_COLUMNS)
+    const renewalCandidates = (await db
+      .select({ ...POLICY_REPORT_COLUMNS, status: policies.status })
       .from(policies)
       .innerJoin(insureds, eq(policies.insuredId, insureds.id))
       .innerJoin(companies, eq(policies.companyId, companies.id))
       .where(and(...projRenewalConditions))
-      .all();
+      .all()).filter((r) => isEffectivelyVigente(r.status, r.endDate, reportToday));
 
     // Dedupe con dato real: si otra póliza YA la renovó (relación real
     // policies.renewedFromId), el evento ya ocurrió — no proyectar encima.
@@ -8344,7 +8391,13 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
         childRows.map((r) => r.renewedFromId).filter((x): x is number => x != null)
       );
     }
-    projRenewalRaw = renewalCandidates.filter((r) => !alreadyRenewedIds.has(r.policyId));
+    const notRenewed = renewalCandidates.filter((r) => !alreadyRenewedIds.has(r.policyId));
+    // Accesorias válidas → fila de su principal (un movimiento, prima
+    // principal + accesorias una sola vez); luego el filtro de ramo.
+    await loadParents(notRenewed);
+    const links = classifyAccessoryLinks(notRenewed.map(asLinkPolicy), parentsById, reportToday);
+    projRenewalRaw = groupAccessoriesUnderPrincipals(notRenewed.map((r) => ({ ...r, id: r.policyId })), links)
+      .filter(matchesTypeFilter);
   }
 
   // Próxima refacturación de cada póliza vigente — regla central
@@ -8355,20 +8408,26 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
   // segura forman la cola global "A revisar": no depende del mes, así que se
   // entrega una sola vez (con el mes actual) y los meses futuros solo informan
   // cuántas hay — ninguna póliza vigente queda omitida en silencio.
+  //
+  // Cola combinada sin doble clasificación: cada póliza vigente cae en a lo
+  // sumo UNA de las dos colas. Accesoria con vínculo válido → ninguna (la
+  // representa su principal, que informa cuántas accesorias sigue); con
+  // vínculo inválido → solo "Vínculos a revisar" (si además tiene fecha
+  // segura, se proyecta igual: no se oculta un evento real).
   const isCurrentMonth = month === currentArgentinaMonth;
   let rebillingReviewQueueCount = 0;
+  let linkReviewQueueCount = 0;
   if (month >= currentArgentinaMonth) {
-    const resolutionConditions: any[] = [inArray(policies.status, VIGENTE_STATUSES)];
+    const resolutionConditions: any[] = [inArray(policies.status, [...RECALCULABLE_POLICY_STATUSES])];
     if (companyId) resolutionConditions.push(eq(policies.companyId, companyId));
-    if (validType) resolutionConditions.push(eq(policies.type, validType));
 
-    const vigentePolicies = await db
+    const vigentePolicies = (await db
       .select({ ...POLICY_REPORT_COLUMNS, status: policies.status })
       .from(policies)
       .innerJoin(insureds, eq(policies.insuredId, insureds.id))
       .innerJoin(companies, eq(policies.companyId, companies.id))
       .where(and(...resolutionConditions))
-      .all();
+      .all()).filter((r) => isEffectivelyVigente(r.status, r.endDate, reportToday));
     const vigenteRebillings = await db
       .select({
         policyId: rebillings.policyId,
@@ -8392,24 +8451,44 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     // póliza en este mismo mes (rebRaw, ya consultado arriba), el dato real
     // manda — no duplicar con una proyección.
     const realRebillingPolicyIds = new Set(rebRaw.map((r) => Number(r.policyId)));
-    const today = toArgentinaCalendarDay();
+    await loadParents(vigentePolicies);
+    const links = classifyAccessoryLinks(vigentePolicies.map(asLinkPolicy), parentsById, reportToday);
+    const accessoryCountByParent = new Map<number, number>();
+    for (const p of vigentePolicies) {
+      if (p.parentPolicyId != null && links.get(p.policyId)?.valid) {
+        accessoryCountByParent.set(p.parentPolicyId, (accessoryCountByParent.get(p.parentPolicyId) ?? 0) + 1);
+      }
+    }
     for (const { status: _status, ...p } of vigentePolicies) {
-      const resolution = resolveNextRebilling({ ...p, status: _status }, rebillingsByPolicy.get(p.policyId) ?? [], today);
+      const link = p.parentPolicyId != null ? links.get(p.policyId) : undefined;
+      if (link?.valid) continue;
+      const resolution = resolveNextRebilling(
+        { ...p, status: effectivePolicyStatus(_status, p.endDate, reportToday) },
+        rebillingsByPolicy.get(p.policyId) ?? [], reportToday,
+      );
+      const accessoryCount = accessoryCountByParent.get(p.policyId) ?? 0;
       if (resolution.kind === "safe") {
         if (isFutureMonth && resolution.date!.slice(0, 7) === month && !realRebillingPolicyIds.has(p.policyId)) {
-          projRebillingRaw.push({ ...p, resolution });
+          projRebillingRaw.push({ ...p, resolution, accessoryCount });
         }
+      }
+      if (link && !link.valid) {
+        linkReviewRaw.push({ ...p, linkReason: link.reason, parentPolicyNumber: parentsById.get(p.parentPolicyId!)?.policyNumber ?? null });
       } else if (resolution.kind === "review") {
-        rebillingReviewRaw.push({ ...p, resolution });
+        rebillingReviewRaw.push({ ...p, resolution, accessoryCount });
       }
     }
   }
+  // Filtro de ramo sobre la fila resultante (principal para un grupo).
+  const projRebillingTyped = projRebillingRaw.filter(matchesTypeFilter);
+  const rebillingReviewTyped = rebillingReviewRaw.filter(matchesTypeFilter);
+  const linkReviewTyped = linkReviewRaw.filter(matchesTypeFilter);
 
   // ── Bien asegurado: conteo de flota en un solo query batched (sin N+1) ──
   const fleetPolicyIds = [
     ...rebRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
     ...projRenewalRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
-    ...projRebillingRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
+    ...projRebillingTyped.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
     ...polRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
     ...instRaw.filter((r) => r.isFleet).map((r) => Number(r.policyId)),
   ];
@@ -8456,7 +8535,9 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
   // todavía — usamos sus valores ACTUALES de referencia (premio, cuota,
   // cobertura, suma asegurada), nunca inventados. rebillingId negativo:
   // nunca colisiona con un id real (autoincrement, siempre positivo).
-  const projectedRebillingRows = projRebillingRaw.map((p) => ({
+  // accessoryCount: accesorias válidas que siguen a esta principal (solo
+  // informativo; una accesoria no se refactura, su prima no se suma acá).
+  const projectedRebillingRows = projRebillingTyped.map((p) => ({
     rebillingId: -Number(p.policyId),
     policyId: Number(p.policyId),
     policyNumber: String(p.policyNumber),
@@ -8479,12 +8560,14 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     coverageType: p.coverageType ? String(p.coverageType) : null,
     sumInsured: p.sumInsured != null ? Number(p.sumInsured) : null,
     projected: true as const,
+    accessoryCount: p.accessoryCount,
   }));
   rebillingRows = [...rebillingRows, ...projectedRebillingRows];
 
   // "A revisar": pólizas vigentes sin fecha segura para la próxima
   // refacturación, con el motivo (mismo texto en pantalla, Excel y CSV).
-  const rebillingReviewRows = rebillingReviewRaw
+  // accessoryCount = accesorias válidas que se revisan junto con la principal.
+  const rebillingReviewRows = rebillingReviewTyped
     .map((p) => ({
       policyId: Number(p.policyId),
       policyNumber: String(p.policyNumber),
@@ -8497,6 +8580,25 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
       reviewState: p.resolution.state,
       reviewReason: p.resolution.reason,
       reviewReasonLabel: nextRebillingReviewLabel(p.resolution),
+      accessoryCount: p.accessoryCount,
+    }))
+    .sort((a, b) => a.policyNumber.localeCompare(b.policyNumber) || a.policyId - b.policyId);
+
+  // "Vínculos a revisar": accesorias vigentes cuyo vínculo con la principal
+  // no es válido (lib/policies/accessory-link.ts). Cola global como "A
+  // revisar": no es un movimiento del mes ni entra en totals.
+  const linkReviewRows = linkReviewTyped
+    .map((p) => ({
+      policyId: Number(p.policyId),
+      policyNumber: String(p.policyNumber),
+      insuredName: String(p.insuredName),
+      companyName: String(p.companyName),
+      type: String(p.type),
+      startDate: p.startDate ? String(p.startDate) : null,
+      endDate: p.endDate ? String(p.endDate) : null,
+      parentPolicyNumber: p.parentPolicyNumber,
+      linkReason: p.linkReason,
+      linkReasonLabel: accessoryLinkReasonLabel(p.linkReason),
     }))
     .sort((a, b) => a.policyNumber.localeCompare(b.policyNumber) || a.policyId - b.policyId);
 
@@ -8607,6 +8709,9 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
   // prevista de renovación". startDate/renewedFrom* quedan null a propósito:
   // la póliza nueva (real) todavía no existe, no hay fecha de inicio ni
   // predecesor que inventar.
+  // Con accesorias válidas agrupadas: UN movimiento, premium = principal +
+  // accesorias (cada una una vez, groupPremium); accessoryCount informa
+  // cuántas incluye.
   for (const p of projRenewalRaw) {
     renovationsConfirmed.push({
       policyId: p.policyId,
@@ -8616,7 +8721,7 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
       type: p.type,
       startDate: null,
       endDate: p.endDate,
-      premium: p.premium != null ? Number(p.premium) : null,
+      premium: p.groupPremium,
       monthlyFee: p.monthlyFee != null ? Number(p.monthlyFee) : null,
       renewedFromPolicyNumber: null,
       renewedFromEndDate: null,
@@ -8624,6 +8729,7 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
       coverageType: p.coverageType ? String(p.coverageType) : null,
       sumInsured: p.sumInsured != null ? Number(p.sumInsured) : null,
       projected: true as const,
+      accessoryCount: p.accessoryCount,
     });
   }
 
@@ -8648,7 +8754,12 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     (validMovementType && validMovementType !== "rebilling") || validRebillingType ? [] : rebillingReviewRows.filter(matchesQ);
   rebillingReviewQueueCount = matchingRebillingReview.length;
   const filteredRebillingReview = isCurrentMonth ? matchingRebillingReview : [];
-  let filteredPending       = validMovementType && validMovementType !== "pending_installment"    ? [] : pendingInstallmentRows.filter(matchesQ);
+  // "Vínculos a revisar" no es un tipo de movimiento: cualquier filtro de
+  // movimiento o subtipo la excluye; búsqueda, compañía y ramo sí aplican.
+  const matchingLinkReview = validMovementType || validRebillingType ? [] : linkReviewRows.filter(matchesQ);
+  linkReviewQueueCount = matchingLinkReview.length;
+  const filteredLinkReview = isCurrentMonth ? matchingLinkReview : [];
+  let filteredPending      = validMovementType && validMovementType !== "pending_installment"    ? [] : pendingInstallmentRows.filter(matchesQ);
 
   // ── 4. Sort ──
   const VALID_SORT_KEYS_REBILLING   = new Set(["billingStart","billingEnd","policyNumber","insuredName","companyName","premium","type","rebillingType"]);
@@ -8716,6 +8827,10 @@ app.get("/reports/renewals-rebillings", requireAuth(async (c: any) => {
     // tamaño (mismos filtros) en el mes actual y los futuros; 0 en pasados.
     rebillingReview:       filteredRebillingReview,
     rebillingReviewQueueCount,
+    // Cola global "Vínculos a revisar" (accesorias vigentes con vínculo
+    // inválido a su principal): mismas reglas de viaje que rebillingReview.
+    linkReview:            filteredLinkReview,
+    linkReviewQueueCount,
     totals: {
       rebillingsCount:           filteredRebillings.length,
       rebillingsDuplicateGroups,

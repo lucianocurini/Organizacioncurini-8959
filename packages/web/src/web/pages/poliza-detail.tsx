@@ -168,7 +168,11 @@ export default function PolizaDetail() {
   const allRebillingsList: any[] = row.rebillings ?? [];
   const rebillingsList: any[] = allRebillingsList.filter((r: any) => (r.status ?? "activa") !== "duplicada");
   const typeInfo = POLICY_TYPES[p.type];
-  const statusInfo = STATUS_TYPES[p.status];
+  // Estado efectivo (GET /policies/:id, por fecha final); el guardado queda
+  // como respaldo si el backend no lo envía.
+  const statusInfo = STATUS_TYPES[row.effectiveStatus ?? p.status];
+  const parentPolicy: any = row.parentPolicy ?? null;
+  const accessoryLink: { valid: boolean; reasonLabel: string | null } | null = row.accessoryLink ?? null;
   const Icon = typeIcons[p.type] || FileText;
   const days = daysUntil(p.endDate);
   const hasRebilling = true; // todas las pólizas pueden tener refacturaciones
@@ -410,6 +414,30 @@ export default function PolizaDetail() {
             </button>
           </div>
         </div>
+
+        {/* Póliza accesoria: a qué principal pertenece y si el vínculo es válido */}
+        {p.parentPolicyId != null && (
+          <div className={cn("mb-5 rounded-xl px-5 py-4 text-sm space-y-1 border",
+            accessoryLink?.valid ? "bg-blue-500/5 border-blue-500/20" : "bg-amber-500/10 border-amber-500/30")}>
+            <p className="text-gray-300 font-medium flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-amber-400" /> Accesoria de{" "}
+              {parentPolicy
+                ? <Link href={`/polizas/${parentPolicy.id}`}><a className="text-blue-400 hover:underline font-mono">{parentPolicy.policyNumber}</a></Link>
+                : <span className="text-gray-400">póliza principal inexistente</span>}
+            </p>
+            {parentPolicy && (
+              <p className="text-xs text-gray-500">
+                Principal: <span className="text-gray-300">{STATUS_TYPES[parentPolicy.effectiveStatus ?? parentPolicy.status]?.label ?? parentPolicy.status}</span>
+                {" · "}vigencia {formatDate(parentPolicy.startDate)} – {formatDate(parentPolicy.endDate)}
+              </p>
+            )}
+            {accessoryLink && !accessoryLink.valid && (
+              <p role="alert" className="text-xs text-amber-300">
+                Vínculo a revisar: {accessoryLink.reasonLabel}. Esta accesoria figura en "Vínculos a revisar" del reporte.
+              </p>
+            )}
+          </div>
+        )}
 
         {/* Datos de la anulación, si la póliza está cancelada */}
         {p.status === "cancelada" && (
@@ -1488,7 +1516,8 @@ export default function PolizaDetail() {
           <div className="space-y-2">
             {subPoliciesList.map((sub: any) => {
               const sp = sub.policy;
-              const spStatus = STATUS_TYPES[sp.status] ?? { label: sp.status, color: "text-gray-400" };
+              const spStatusKey = sub.effectiveStatus ?? sp.status;
+              const spStatus = STATUS_TYPES[spStatusKey] ?? { label: spStatusKey, color: "text-gray-400" };
               return (
                 <Link key={sp.id} href={`/polizas/${sp.id}`}>
                   <div className="flex items-center justify-between p-3 bg-[#0d1117] border border-[#1f2937] rounded-lg hover:border-amber-700 cursor-pointer transition-colors">
