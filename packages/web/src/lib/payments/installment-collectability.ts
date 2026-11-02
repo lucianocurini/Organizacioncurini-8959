@@ -9,8 +9,9 @@
 //      (pagada / no_exigible / duplicada nunca se cobran).
 //   3. Debe existir UNA póliza vigente en la cadena de renovación
 //      (renewedFromId) para la fecha de pago. Solo se admiten cuotas de esa
-//      póliza vigente y de su antecesora DIRECTA; nunca de antecesoras más
-//      antiguas, de sucesoras futuras ni de cadenas sin póliza vigente.
+//      póliza vigente, de su antecesora DIRECTA y de su próxima INMEDIATA
+//      (regla 8); nunca de antecesoras más antiguas, de una segunda
+//      renovación futura ni de cadenas sin póliza vigente (salvo regla 8b).
 //   4. Vigencia inclusiva: startDate <= fecha <= endDate. Una cancelada con
 //      fecha efectiva E sigue vigente durante E y queda fuera desde E+1; sus
 //      cuotas que vencen después de E no se cobran.
@@ -22,6 +23,16 @@
 //      "renovada" sin ninguna póliza que la renueve.
 //   7. renewedFromId roto (apunta a una póliza inexistente): la póliza se trata
 //      como inicio de cadena y se reporta la anomalía.
+//   8. Próxima inmediata (confirmada 2026-10-30): una póliza que todavía no
+//      inició (startDate > fecha) es cobrable solo si su renewedFromId apunta
+//      a su "ancla" y es la ÚNICA sucesora no cancelada de esa ancla, y ella
+//      misma no está cancelada. El ancla es:
+//        a. la póliza vigente de la cadena, o
+//        b. si la cadena no tiene vigente (hueco entre vigencias), la
+//           predecesora directa ya terminada (fin < fecha).
+//      Se rechazan: una futura sin renewedFromId (suelta), una segunda
+//      renovación futura (su predecesora también es futura), una cancelada y
+//      cualquier cadena ambigua (ciclo o más de una sucesora no cancelada).
 //
 // Todas las fechas son días calendario "YYYY-MM-DD" (Argentina) y se comparan
 // como strings, que es orden cronológico para ese formato validado.
@@ -61,15 +72,18 @@ export type CollectabilityReason =
   | "RENOVADA_SIN_SUCESOR"
   | "VENCE_DESPUES_DE_CANCELACION"
   | "POLIZA_FUTURA"
+  | "PROXIMA_CANCELADA"
+  | "SUCESORA_NO_INMEDIATA"
   | "SIN_POLIZA_VIGENTE_EN_CADENA"
   | "CADENA_AMBIGUA"
   | "ANTECESORA_MAS_ANTIGUA"
   | "FUERA_DE_CADENA_VIGENTE";
 
-export type CollectabilityVia = "poliza_vigente" | "antecesora_directa";
+export type CollectabilityVia = "poliza_vigente" | "antecesora_directa" | "proxima_inmediata";
 
 export type CollectabilityResult =
-  | { collectable: true; via: CollectabilityVia; currentPolicyId: number }
+  /** currentPolicyId es null solo para proxima_inmediata en un hueco entre vigencias (regla 8b). */
+  | { collectable: true; via: CollectabilityVia; currentPolicyId: number | null }
   | { collectable: false; reason: CollectabilityReason; message: string };
 
 // ─── Índice de cadenas de renovación ────────────────────────────────────────
@@ -283,7 +297,7 @@ export function evaluateInstallmentCollectability(
   if (integ.cancellationDate != null && installment.dueDate > integ.cancellationDate) {
     return fail("VENCE_DESPUES_DE_CANCELACION", "La cuota vence después de la fecha efectiva de cancelación de la póliza.");
   }
-  if (integ.start > paymentDate) return fail("POLIZA_FUTURA", "La póliza todavía no inició su vigencia en la fecha de pago.");
+  if (integ.start > paymentDate) return evaluateUpcomingPolicy(index, policy, paymentDate);
 
   const current = resolveChainCurrentPolicy(index, policy.id, paymentDate);
   if (current.kind === "none") {
@@ -300,6 +314,53 @@ export function evaluateInstallmentCollectability(
     return fail("ANTECESORA_MAS_ANTIGUA", "La póliza es una antecesora anterior a la antecesora directa de la póliza vigente.");
   }
   return fail("FUERA_DE_CADENA_VIGENTE", "La póliza no es la vigente ni su antecesora directa en la fecha de pago.");
+}
+
+/**
+ * Regla 8: cuota (ya validada en estado, vencimiento e integridad) de una
+ * póliza que todavía no inició en `paymentDate`. Solo la próxima inmediata
+ * de su ancla es cobrable.
+ */
+function evaluateUpcomingPolicy(index: RenewalChainIndex, policy: CollectabilityPolicy, paymentDate: string): CollectabilityResult {
+  const anchorId = index.predecessorOf.get(policy.id) ?? null;
+  if (anchorId == null) {
+    return fail("POLIZA_FUTURA", "La póliza todavía no inició su vigencia y no es la renovación de ninguna póliza.");
+  }
+  if (policy.status === "cancelada") {
+    return fail("PROXIMA_CANCELADA", "La póliza todavía no inició su vigencia y está cancelada.");
+  }
+
+  const current = resolveChainCurrentPolicy(index, policy.id, paymentDate);
+  if (current.kind === "ambiguous") {
+    return fail("CADENA_AMBIGUA", "La cadena de renovación tiene más de una póliza vigente o un ciclo; no se puede determinar la vigente.");
+  }
+  let currentPolicyId: number | null;
+  if (current.kind === "current") {
+    // 8a: el ancla es la vigente.
+    if (anchorId !== current.policyId) {
+      return fail("SUCESORA_NO_INMEDIATA", "La póliza todavía no inició y no es la renovación inmediata de la póliza vigente.");
+    }
+    currentPolicyId = current.policyId;
+  } else {
+    // 8b: hueco entre vigencias — el ancla tiene que ser una póliza ya terminada.
+    const anchorInteg = policyIntegrity(index, index.policies.get(anchorId)!);
+    if (!anchorInteg.ok) {
+      return fail("SIN_POLIZA_VIGENTE_EN_CADENA", "No hay póliza vigente y la póliza anterior de la cadena tiene datos inválidos.");
+    }
+    if (anchorInteg.start > paymentDate) {
+      return fail("SUCESORA_NO_INMEDIATA", "La póliza todavía no inició y la póliza que renueva tampoco inició (segunda renovación futura).");
+    }
+    if (anchorInteg.end >= paymentDate) {
+      return fail("SIN_POLIZA_VIGENTE_EN_CADENA", "No hay ninguna póliza vigente en la cadena de renovación para la fecha de pago.");
+    }
+    currentPolicyId = null;
+  }
+
+  const liveSuccessors = (index.successorsOf.get(anchorId) ?? []).filter((id) => index.policies.get(id)?.status !== "cancelada");
+  if (liveSuccessors.length !== 1) {
+    return fail("CADENA_AMBIGUA", "La póliza anterior tiene más de una renovación no cancelada; no se puede determinar la próxima.");
+  }
+  return { collectable: true, via: "proxima_inmediata", currentPolicyId };
 }
 
 // ─── Diagnóstico agregado (solo conteos, sin datos personales) ──────────────
@@ -329,7 +390,7 @@ export function summarizeCollectability(
   installments: ReadonlyArray<CollectabilityInstallment>,
   paymentDate: string
 ): CollectabilitySummary {
-  const collectableByVia: Record<CollectabilityVia, number> = { poliza_vigente: 0, antecesora_directa: 0 };
+  const collectableByVia: Record<CollectabilityVia, number> = { poliza_vigente: 0, antecesora_directa: 0, proxima_inmediata: 0 };
   const notCollectableByReason: Partial<Record<CollectabilityReason, number>> = {};
   for (const inst of installments) {
     const r = evaluateInstallmentCollectability(index, inst, paymentDate);

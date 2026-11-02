@@ -84,10 +84,10 @@ describe("cadena de renovación", () => {
     expect(reasonOf(p, inst(20, "2026-07-15"))).toBe("SIN_POLIZA_VIGENTE_EN_CADENA");
   });
 
-  test("renovación cargada pero futura: la vencida queda oculta y la nueva es futura", () => {
+  test("renovación cargada pero futura (hueco): la vencida queda oculta y la nueva es la próxima inmediata", () => {
     const p = [pol(30, "2025-07-01", "2026-08-31", { status: "renovada" }), pol(31, "2026-10-01", "2027-10-01", { renewedFromId: 30 })];
     expect(reasonOf(p, inst(30, "2026-08-01"))).toBe("SIN_POLIZA_VIGENTE_EN_CADENA");
-    expect(reasonOf(p, inst(31, "2026-10-15"))).toBe("POLIZA_FUTURA");
+    expect(reasonOf(p, inst(31, "2026-10-15"))).toBe("OK:proxima_inmediata");
   });
 
   test("superposición el día de renovación: la sucesora prevalece desde su inicio", () => {
@@ -96,9 +96,9 @@ describe("cadena de renovación", () => {
     expect(resolveChainCurrentPolicy(index, 40, "2026-09-25")).toEqual({ kind: "current", policyId: 41 });
     expect(reasonOf(p, inst(41, "2026-10-25"), "2026-09-25")).toBe("OK:poliza_vigente");
     expect(reasonOf(p, inst(40, "2026-09-01"), "2026-09-25")).toBe("OK:antecesora_directa");
-    // El día anterior la vigente es la anterior y la sucesora todavía es futura.
+    // El día anterior la vigente es la anterior y la sucesora es su próxima inmediata.
     expect(resolveChainCurrentPolicy(index, 41, "2026-09-24")).toEqual({ kind: "current", policyId: 40 });
-    expect(reasonOf(p, inst(41, "2026-10-25"), "2026-09-24")).toBe("POLIZA_FUTURA");
+    expect(reasonOf(p, inst(41, "2026-10-25"), "2026-09-24")).toBe("OK:proxima_inmediata");
     const s = summarizeCollectability(index, [], "2026-09-25");
     expect(s.policyAnomalies.chainsWithOverlappingVigentes).toBe(1);
     expect(s.policyAnomalies.ambiguousChains).toBe(0);
@@ -130,6 +130,106 @@ describe("cadena de renovación", () => {
     const p = [pol(80, "2026-01-01", "2026-12-31", { renewedFromId: 81 }), pol(81, "2026-01-01", "2026-12-31", { renewedFromId: 80 })];
     expect(reasonOf(p, inst(80, "2026-08-01"))).toBe("CADENA_AMBIGUA");
     expect(buildRenewalChainIndex(p).anomalies.cyclePolicyIds).toEqual([80, 81]);
+  });
+});
+
+describe("próxima inmediata (regla 8)", () => {
+  // Cadena semestral al 2026-10-30: A → V (vigente) → N (inicia 15/11) → N2.
+  const T = "2026-10-30";
+  const chain = (o: { n?: Partial<CollectabilityPolicy>; withN2?: boolean } = {}) => [
+    pol(1, "2025-11-15", "2026-05-15", { status: "renovada" }),
+    pol(2, "2026-05-15", "2026-11-15", { status: "renovada", renewedFromId: 1 }),
+    pol(3, "2026-11-15", "2027-05-15", { status: o.withN2 === false ? "activa" : "renovada", renewedFromId: 2, ...o.n }),
+    ...(o.withN2 === false ? [] : [pol(4, "2027-05-15", "2027-11-15", { renewedFromId: 3 })]),
+  ];
+
+  test("anterior + vigente + próxima del 15/11 cobrables; la segunda renovación futura queda afuera", () => {
+    const p = chain();
+    expect(evaluate(p, inst(1, "2026-07-10"), T)).toEqual({ collectable: true, via: "antecesora_directa", currentPolicyId: 2 });
+    expect(evaluate(p, inst(2, "2026-10-15"), T)).toEqual({ collectable: true, via: "poliza_vigente", currentPolicyId: 2 });
+    expect(evaluate(p, inst(3, "2026-11-15"), T)).toEqual({ collectable: true, via: "proxima_inmediata", currentPolicyId: 2 });
+    expect(reasonOf(p, inst(4, "2027-05-15"), T)).toBe("SUCESORA_NO_INMEDIATA");
+  });
+
+  test("sin próxima cargada: solo anterior y vigente", () => {
+    const p = chain().slice(0, 2).map((x) => (x.id === 2 ? { ...x, status: "activa" } : x));
+    expect(reasonOf(p, inst(1, "2026-07-10"), T)).toBe("OK:antecesora_directa");
+    expect(reasonOf(p, inst(2, "2026-10-15"), T)).toBe("OK:poliza_vigente");
+  });
+
+  test("próxima sin enlace (renewedFromId nulo) → excluida", () => {
+    const p = [...chain().slice(0, 2).map((x) => (x.id === 2 ? { ...x, status: "activa" } : x)), pol(3, "2026-11-15", "2027-05-15")];
+    expect(reasonOf(p, inst(3, "2026-11-15"), T)).toBe("POLIZA_FUTURA");
+  });
+
+  test("próxima cancelada → excluida (con y sin fecha efectiva), sin habilitar a su sucesora", () => {
+    const conFecha = chain({ n: { status: "cancelada", cancellationEffectiveDate: "2027-01-15" } });
+    expect(reasonOf(conFecha, inst(3, "2026-11-15"), T)).toBe("PROXIMA_CANCELADA");
+    expect(reasonOf(conFecha, inst(4, "2027-05-15"), T)).toBe("SUCESORA_NO_INMEDIATA");
+    const sinFecha = chain({ n: { status: "cancelada" }, withN2: false });
+    expect(reasonOf(sinFecha, inst(3, "2026-11-15"), T)).toBe("CANCELADA_SIN_FECHA_EFECTIVA");
+  });
+
+  test("dos sucesoras no canceladas de la vigente → ambigua, ninguna cobrable; con una cancelada, la otra sí", () => {
+    const base = [pol(30, "2026-05-15", "2026-11-15", { status: "renovada" })];
+    const dos = [...base, pol(31, "2026-11-15", "2027-05-15", { renewedFromId: 30 }), pol(32, "2026-11-15", "2027-05-15", { renewedFromId: 30 })];
+    expect(reasonOf(dos, inst(30, "2026-10-15"), T)).toBe("OK:poliza_vigente");
+    expect(reasonOf(dos, inst(31, "2026-11-15"), T)).toBe("CADENA_AMBIGUA");
+    expect(reasonOf(dos, inst(32, "2026-11-15"), T)).toBe("CADENA_AMBIGUA");
+    const unaCancelada = [...base, pol(31, "2026-11-15", "2027-05-15", { renewedFromId: 30 }), pol(32, "2026-11-15", "2027-05-15", { renewedFromId: 30, status: "cancelada", cancellationEffectiveDate: "2026-11-15" })];
+    expect(reasonOf(unaCancelada, inst(31, "2026-11-15"), T)).toBe("OK:proxima_inmediata");
+    expect(reasonOf(unaCancelada, inst(32, "2026-11-15"), T)).toBe("PROXIMA_CANCELADA");
+  });
+
+  test("hueco entre vigencias con enlace directo válido: la próxima es cobrable, la terminada no", () => {
+    const p = [pol(40, "2025-10-01", "2026-10-15", { status: "renovada" }), pol(41, "2026-11-15", "2027-11-15", { renewedFromId: 40 })];
+    expect(evaluate(p, inst(41, "2026-11-15"), T)).toEqual({ collectable: true, via: "proxima_inmediata", currentPolicyId: null });
+    expect(reasonOf(p, inst(40, "2026-10-01"), T)).toBe("SIN_POLIZA_VIGENTE_EN_CADENA");
+  });
+
+  test("hueco: segunda renovación futura, sucesoras ambiguas o anterior con datos inválidos → excluidas", () => {
+    const segunda = [pol(40, "2025-10-01", "2026-10-15", { status: "renovada" }), pol(41, "2026-11-15", "2027-11-15", { status: "renovada", renewedFromId: 40 }), pol(42, "2027-11-15", "2028-11-15", { renewedFromId: 41 })];
+    expect(reasonOf(segunda, inst(41, "2026-11-15"), T)).toBe("OK:proxima_inmediata");
+    expect(reasonOf(segunda, inst(42, "2027-11-15"), T)).toBe("SUCESORA_NO_INMEDIATA");
+    const ambigua = [pol(40, "2025-10-01", "2026-10-15", { status: "renovada" }), pol(41, "2026-11-15", "2027-11-15", { renewedFromId: 40 }), pol(43, "2026-12-01", "2027-12-01", { renewedFromId: 40 })];
+    expect(reasonOf(ambigua, inst(41, "2026-11-15"), T)).toBe("CADENA_AMBIGUA");
+    const anteriorInvalida = [pol(40, "2025-10-01", "2026-10-15", { status: "cancelada" }), pol(41, "2026-11-15", "2027-11-15", { renewedFromId: 40 })];
+    expect(reasonOf(anteriorInvalida, inst(41, "2026-11-15"), T)).toBe("SIN_POLIZA_VIGENTE_EN_CADENA");
+  });
+
+  test("hueco sin enlace → excluida", () => {
+    const p = [pol(40, "2025-10-01", "2026-10-15"), pol(41, "2026-11-15", "2027-11-15")];
+    expect(reasonOf(p, inst(41, "2026-11-15"), T)).toBe("POLIZA_FUTURA");
+  });
+
+  test("fecha de inicio igual a la fecha de pago: la próxima pasa a ser la vigente y la anterior, antecesora directa", () => {
+    const p = chain();
+    expect(reasonOf(p, inst(3, "2026-11-15"), "2026-11-15")).toBe("OK:poliza_vigente");
+    expect(reasonOf(p, inst(2, "2026-10-15"), "2026-11-15")).toBe("OK:antecesora_directa");
+    expect(reasonOf(p, inst(1, "2026-07-10"), "2026-11-15")).toBe("ANTECESORA_MAS_ANTIGUA");
+    expect(reasonOf(p, inst(4, "2027-05-15"), "2026-11-15")).toBe("OK:proxima_inmediata");
+  });
+
+  test("se conservan todas las exclusiones de cuota en la próxima", () => {
+    const p = chain();
+    expect(reasonOf(p, inst(3, "2026-11-15", { status: "pagada" }), T)).toBe("ESTADO_NO_COBRABLE");
+    expect(reasonOf(p, inst(3, "2026-11-15", { status: "no_exigible" }), T)).toBe("ESTADO_NO_COBRABLE");
+    expect(reasonOf(p, inst(3, "2026-11-15", { status: "duplicada" }), T)).toBe("ESTADO_NO_COBRABLE");
+    expect(reasonOf(p, inst(3, "2026-11-15", { rendered: 1 }), T)).toBe("RENDIDA");
+    expect(reasonOf(p, inst(3, "2026-11-15", { hasConfirmedPayment: true }), T)).toBe("PAGO_CONFIRMADO");
+    expect(reasonOf(p, inst(3, null), T)).toBe("VENCIMIENTO_INVALIDO");
+  });
+
+  test("existingCollection: la cuota pagada por el mismo cobro de la próxima se revalida igual", () => {
+    const r = evaluateInstallmentCollectability(buildRenewalChainIndex(chain()), inst(3, "2026-11-15", { status: "pagada" }), T, { existingCollection: true });
+    expect(r).toEqual({ collectable: true, via: "proxima_inmediata", currentPolicyId: 2 });
+  });
+
+  test("summarizeCollectability cuenta proxima_inmediata y cada cuota cae en una sola categoría", () => {
+    const list = [inst(1, "2026-07-10"), inst(2, "2026-10-15"), inst(3, "2026-11-15"), inst(4, "2027-05-15")];
+    const s = summarizeCollectability(buildRenewalChainIndex(chain()), list, T);
+    expect(s.collectableByVia).toEqual({ poliza_vigente: 1, antecesora_directa: 1, proxima_inmediata: 1 });
+    expect(s.notCollectableByReason).toEqual({ SUCESORA_NO_INMEDIATA: 1 });
   });
 });
 
@@ -217,7 +317,7 @@ describe("summarizeCollectability", () => {
     const p = [pol(1, "2026-01-01", "2026-12-31"), pol(2, "2026-01-01", "2026-12-31", { status: "cancelada" })];
     const list = [inst(1, "2026-08-01"), inst(1, "2026-06-01"), inst(2, "2026-08-01"), inst(1, "2026-08-02", { rendered: 1 })];
     const s = summarizeCollectability(buildRenewalChainIndex(p), list, D);
-    const total = s.collectableByVia.poliza_vigente + s.collectableByVia.antecesora_directa
+    const total = s.collectableByVia.poliza_vigente + s.collectableByVia.antecesora_directa + s.collectableByVia.proxima_inmediata
       + Object.values(s.notCollectableByReason).reduce((a, b) => a + (b ?? 0), 0);
     expect(total).toBe(list.length);
     expect(s.notCollectableByReason).toEqual({ ANTERIOR_FECHA_MINIMA: 1, CANCELADA_SIN_FECHA_EFECTIVA: 1, RENDIDA: 1 });
