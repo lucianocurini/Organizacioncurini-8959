@@ -14,6 +14,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { SURCHARGE_AMOUNT, SURCHARGE_AMOUNT_CENTS } from "../../lib/payments/batches";
 
 const SESSION_ID = "test-session-individual-funded-001";
 const USER_EMAIL = "test-individual-funded@test.local";
@@ -229,7 +230,7 @@ async function main(): Promise<void> {
   }
   async function renderWithSurcharge(paymentId: number, cuotaPesos: number, method: string) {
     const r = await call("POST", "/remittances", {
-      date: PAYMENT_DATE, canal: "pronto_pago", paymentBreakdown: { [method]: cuotaPesos + 800 },
+      date: PAYMENT_DATE, canal: "pronto_pago", paymentBreakdown: { [method]: cuotaPesos + SURCHARGE_AMOUNT },
       items: [{ source: "payment", sourceId: paymentId, amount: cuotaPesos, paymentMethod: method }],
     });
     assertEqual(r.status, 200, `POST /remittances pronto_pago (${JSON.stringify(r.body)})`);
@@ -348,18 +349,18 @@ async function main(): Promise<void> {
   });
 
   // ─── Pronto Pago ─────────────────────────────────────────────────────
-  await check("PP1. Pronto Pago con saldo total: el recargo $800 se mantiene y se cubre con saldo, cero medios", async () => {
-    const s = await scenario({ credit: 10080000, company: rivadaviaId });
-    const res = await postFunded(funded(s, { creditAppliedCents: 10080000, splits: [] }));
+  await check("PP1. Pronto Pago con saldo total: el recargo se mantiene y se cubre con saldo, cero medios", async () => {
+    const s = await scenario({ credit: 10000000 + SURCHARGE_AMOUNT_CENTS, company: rivadaviaId });
+    const res = await postFunded(funded(s, { creditAppliedCents: 10000000 + SURCHARGE_AMOUNT_CENTS, splits: [] }));
     assertEqual(res.status, 201, `status (${JSON.stringify(res.body)})`);
     const batch = await db.select().from(schema.paymentBatches).where(eq(schema.paymentBatches.id, res.body.id)).get();
-    assertEqual(batch!.surchargeAmountCents, 80000, "recargo dentro del total");
-    assertEqual(batch!.totalReceivedCents, 10080000, "total cancelado = cuota + recargo");
+    assertEqual(batch!.surchargeAmountCents, SURCHARGE_AMOUNT_CENTS, "recargo dentro del total");
+    assertEqual(batch!.totalReceivedCents, 10000000 + SURCHARGE_AMOUNT_CENTS, "total cancelado = cuota + recargo");
     const child = await childOf(res.body.id);
     const surcharge = await db.select().from(schema.cashEntries).where(and(eq(schema.cashEntries.paymentId, child.id), eq(schema.cashEntries.entryType, "pronto_pago_surcharge"))).all();
     assertEqual(surcharge.length, 1, "cash_entry de recargo");
     const allocs = await db.select().from(schema.paymentBatchFundingAllocations).where(eq(schema.paymentBatchFundingAllocations.cashEntryId, surcharge[0]!.id)).all();
-    assertEqual(allocs.reduce((t: number, a: any) => t + a.amountCents, 0), 80000, "el recargo queda financiado por el saldo");
+    assertEqual(allocs.reduce((t: number, a: any) => t + a.amountCents, 0), SURCHARGE_AMOUNT_CENTS, "el recargo queda financiado por el saldo");
     assertEqual(await balance(s.insuredId), 0, "saldo consumido");
     const remId = await renderWithSurcharge(child.id, 100000, "efectivo");
     assertTrue(remId > 0, "rendición pronto pago con cero medios");
@@ -367,10 +368,10 @@ async function main(): Promise<void> {
 
   await check("PP2. Pronto Pago con saldo parcial + efectivo", async () => {
     const s = await scenario({ credit: 5000000, company: rivadaviaId });
-    const res = await postFunded(funded(s, { creditAppliedCents: 5000000, splits: [{ method: "efectivo", amount: 50800 }] }));
+    const res = await postFunded(funded(s, { creditAppliedCents: 5000000, splits: [{ method: "efectivo", amount: (5000000 + SURCHARGE_AMOUNT_CENTS) / 100 }] }));
     assertEqual(res.status, 201, `status (${JSON.stringify(res.body)})`);
     const batch = await db.select().from(schema.paymentBatches).where(eq(schema.paymentBatches.id, res.body.id)).get();
-    assertEqual(batch!.surchargeAmountCents, 80000, "recargo");
+    assertEqual(batch!.surchargeAmountCents, SURCHARGE_AMOUNT_CENTS, "recargo");
     assertEqual(await balance(s.insuredId), 0, "cuenta 0");
   });
 
@@ -382,7 +383,7 @@ async function main(): Promise<void> {
     assertEqual(await countAll(schema.paymentBatches), beforeBatches, "sin filas nuevas");
     const ok = await postFunded(funded(s, { creditAppliedCents: 10000000, splits: [], debtAuthorized: true, debtReason: "falta el recargo" }));
     assertEqual(ok.status, 201, `status (${JSON.stringify(ok.body)})`);
-    assertEqual(await balance(s.insuredId), -80000, "deuda por el recargo");
+    assertEqual(await balance(s.insuredId), -SURCHARGE_AMOUNT_CENTS, "deuda por el recargo");
   });
 
   // ─── Medios propios, directos y combinados ───────────────────────────────

@@ -70,7 +70,7 @@ import {
   normalizeBatchItems, normalizeBatchSplits, validateInstallmentsEligibility,
   calculateBaseAmountCents, resolveBatchSplitGroup, calculateApplicableRivadaviaSurcharges,
   calculateBatchTotals, resolveBatchInsuredId, PaymentBatchValidationError,
-  SURCHARGE_AMOUNT_CENTS, type BatchItemContext, type NormalizedPaymentBatchSplit,
+  SURCHARGE_AMOUNT_CENTS, SURCHARGE_AMOUNT, type BatchItemContext, type NormalizedPaymentBatchSplit,
   type NormalizedPaymentBatchItem,
   checkBatchCancellable, findDisallowedBatchPatchFields, canPatchBatch,
   type BatchCancelChildPayment, type BatchCancelCheck,
@@ -143,8 +143,6 @@ import { loadAccountHolderBalanceSummary } from "./account-holder-balance";
 import { loadBatchFundingDetail } from "./payment-batch-funding-detail";
 
 const app = new Hono().basePath("/api");
-
-const SURCHARGE_AMOUNT = 800;
 
 // ─── Auth Middleware ───────────────────────────────────────────────────────────
 async function getUser(c: any) {
@@ -2008,6 +2006,7 @@ app.get("/payments", requireAuth(async (c: any) => {
       id: null;
       installmentId: null;
       hasSurcharge: boolean;
+      surchargeAmount: number | null;
       hasChecks: boolean;
       splits: { method: string; amountCents: number; notes: string | null }[];
       isCashPeriodPayment: true;
@@ -2117,6 +2116,7 @@ app.get("/payments", requireAuth(async (c: any) => {
           createdAt: cashPeriodPayment.createdAt,
           notes: batch.notes,
           hasSurcharge: false,
+          surchargeAmount: null,
           hasChecks: batchChecksSet.has(batchId),
           splits,
           isCashPeriodPayment: true,
@@ -2135,15 +2135,16 @@ app.get("/payments", requireAuth(async (c: any) => {
   }
 
   const paymentIds = results.map(r => r.payment.id);
-  const surchargeSet = new Set<number>();
+  // paymentId → importe guardado del recargo (cash_entries.amount), ver GET /remittances/pending.
+  const surchargeAmountByPaymentId = new Map<number, number>();
   const splitsByPayment = new Map<number, { method: string; amountCents: number; notes: string | null }[]>();
   const paymentIdsWithChecks = new Set<number>();
   if (paymentIds.length > 0) {
-    const sRows = await db.select({ paymentId: cashEntries.paymentId })
+    const sRows = await db.select({ paymentId: cashEntries.paymentId, amount: cashEntries.amount })
       .from(cashEntries)
       .where(and(inArray(cashEntries.paymentId, paymentIds), eq(cashEntries.entryType, "pronto_pago_surcharge")))
       .all();
-    for (const s of sRows) { if (s.paymentId != null) surchargeSet.add(s.paymentId); }
+    for (const s of sRows) { if (s.paymentId != null) surchargeAmountByPaymentId.set(s.paymentId, s.amount); }
 
     // Etapa 3A: splits solo de forma aditiva — no reemplaza amount/paymentMethod.
     const splitRows = await db.select({
@@ -2202,7 +2203,8 @@ app.get("/payments", requireAuth(async (c: any) => {
       const funding = r.payment.batchId != null ? individualFundingByBatchId.get(r.payment.batchId) : undefined;
       const base = {
         ...r.payment,
-        hasSurcharge: surchargeSet.has(r.payment.id),
+        hasSurcharge: surchargeAmountByPaymentId.has(r.payment.id),
+        surchargeAmount: surchargeAmountByPaymentId.get(r.payment.id) ?? null,
         hasChecks: paymentIdsWithChecks.has(r.payment.id),
         dueDate: (r.installment?.dueDate ?? r.payment.dueDate ?? null) as string | null,
         splits: splitsByPayment.get(r.payment.id) ?? [],
@@ -3377,7 +3379,7 @@ async function createPaymentBatchFromBody(c: any, user: any, body: any, options:
   // póliza ni asegurado. insuredId SIEMPRE null (no hay ninguna fuente real
   // de la que derivarlo; ver resolveBatchInsuredId). isRivadavia SIEMPRE
   // false: una compañía tipeada a mano no es una fuente confiable para un
-  // recargo automático de $800 (a diferencia del standalone histórico en
+  // recargo automático (a diferencia del standalone histórico en
   // POST /payments, que sí lo hace por compatibilidad con datos viejos —
   // ver comentario de cabecera de batches.ts para la decisión completa).
   for (const { item, idx } of manualEntries) {
@@ -3460,7 +3462,7 @@ async function createPaymentBatchFromBody(c: any, user: any, body: any, options:
     throw e;
   }
 
-  // 8. Recargos Pronto Pago aplicables: $800 por ítem Rivadavia (cuota o
+  // 8. Recargos Pronto Pago aplicables: SURCHARGE_AMOUNT_CENTS por ítem Rivadavia (cuota o
   // cobro manual), solo si TODOS los medios son "own" — nunca por recibo ni
   // por póliza. calculateApplicableRivadaviaSurcharges devuelve los
   // contextos concretos (no ids: un cobro manual no tiene installmentId) —
@@ -9343,7 +9345,7 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   const recuperosAdeudados = recuperoItems.reduce((s: number, i: any) => s + i.amount, 0);
 
   // ── Cartera pendiente — instrumentos reales (src/lib/payments/caja-summary.ts) ──
-  // recargosProntoPago es una categoría separada — el recargo fijo de $800
+  // recargosProntoPago es una categoría separada — el recargo fijo (SURCHARGE_AMOUNT)
   // no es plata cobrada en efectivo/transferencia/cheque, es un cargo
   // administrativo aparte. Nunca se le atribuye a un método.
   const carteraBucket = emptyMoneyBucket();
@@ -11104,7 +11106,9 @@ app.get("/remittances/pending", requireAuth(async (c: any) => {
     .all();
 
   const pendingPaymentIds = pendingPayments.map((p: any) => p.id as number);
-  const surchargePmtSet = new Set<number>();
+  // paymentId → importe GUARDADO del recargo (cash_entries.amount): un recargo
+  // histórico conserva su monto aunque SURCHARGE_AMOUNT haya cambiado después.
+  const surchargeAmountByPaymentId = new Map<number, number>();
   // Etapa 3B: se expone el desglose de splits y su grupo (own/direct_company)
   // de forma aditiva — paymentMethod puede seguir siendo "combinado" (útil
   // para listados legacy), pero el modal de rendición necesita esto para
@@ -11112,11 +11116,11 @@ app.get("/remittances/pending", requireAuth(async (c: any) => {
   // partir de un string resumen que no representa ningún método real.
   const splitsByPaymentId = new Map<number, { method: string; amountCents: number; notes: string | null }[]>();
   if (pendingPaymentIds.length > 0) {
-    const sRows = await db.select({ paymentId: cashEntries.paymentId })
+    const sRows = await db.select({ paymentId: cashEntries.paymentId, amount: cashEntries.amount })
       .from(cashEntries)
       .where(and(inArray(cashEntries.paymentId, pendingPaymentIds), eq(cashEntries.entryType, "pronto_pago_surcharge"), eq(cashEntries.rendered, 0)))
       .all();
-    for (const s of sRows) { if (s.paymentId != null) surchargePmtSet.add(s.paymentId); }
+    for (const s of sRows) { if (s.paymentId != null) surchargeAmountByPaymentId.set(s.paymentId, s.amount); }
 
     const splitRows = await db.select({
       paymentId: paymentSplits.paymentId, method: paymentSplits.method,
@@ -11134,6 +11138,7 @@ app.get("/remittances/pending", requireAuth(async (c: any) => {
     ...pendingPayments.map((p: any) => {
       const splits = splitsByPaymentId.get(p.id) ?? [];
       const paymentGroup: SplitGroup | null = splits.length > 0 ? classifySplitGroup(splits) : null;
+      const hasSurcharge = surchargeAmountByPaymentId.has(p.id) && String(p.companyName ?? p.manualCompany ?? "").toLowerCase().includes("rivadavia");
       return {
         source: "payment" as const,
         sourceId: p.id,
@@ -11160,7 +11165,10 @@ app.get("/remittances/pending", requireAuth(async (c: any) => {
         // huérfano. Re-validar contra la compañía ACTUAL evita que el
         // preview del modal muestre un recargo que el backend no va a
         // cobrar (y viceversa).
-        hasSurcharge: surchargePmtSet.has(p.id) && String(p.companyName ?? p.manualCompany ?? "").toLowerCase().includes("rivadavia"),
+        hasSurcharge,
+        // Importe guardado del recargo (null si no aplica) — el preview del
+        // modal suma ESTE valor, igual que POST /remittances (s.amount).
+        surchargeAmount: hasSurcharge ? surchargeAmountByPaymentId.get(p.id)! : null,
         splits,
         paymentGroup,
       };

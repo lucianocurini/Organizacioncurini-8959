@@ -21,7 +21,7 @@ import { runAccountHolderFundingBatch, FundingIdempotencyConflictError } from ".
 import { formatAccountHolderFundingBatchSuccess, mapAccountHolderFundingBatchError } from "../payment-batch-titular-response";
 import { AccountHolderFundingPlanError } from "../../lib/payments/account-holder-funding-plan";
 import { parseFundingRequest, AccountHolderFundingRequestError } from "../../lib/payments/account-holder-funding-request";
-import { calculateApplicableRivadaviaSurcharges, calculateBaseAmountCents, calculateBatchTotals, resolveBatchSplitGroup } from "../../lib/payments/batches";
+import { calculateApplicableRivadaviaSurcharges, calculateBaseAmountCents, calculateBatchTotals, resolveBatchSplitGroup, SURCHARGE_AMOUNT_CENTS } from "../../lib/payments/batches";
 import { findPossibleCheckDuplicates, type ExistingCheckForDuplicateCheck } from "../../lib/payments/received-checks";
 import { applyMigration0036AccountHolderFunding } from "../../lib/migrations/apply-0036-account-holder-funding";
 import type { Sql0036Client } from "../../lib/migrations/apply-0036-account-holder-funding";
@@ -235,7 +235,7 @@ async function runTitularBatch(params: {
   const splitGroup = resolveBatchSplitGroup(params.splitsWithChecks.map((s) => s.split));
   const applicableSurchargeSet = new Set(calculateApplicableRivadaviaSurcharges(contexts, splitGroup));
   const baseAmountCents = calculateBaseAmountCents(contexts);
-  const surchargeAmountCents = applicableSurchargeSet.size * 80000;
+  const surchargeAmountCents = applicableSurchargeSet.size * SURCHARGE_AMOUNT_CENTS;
   const totals = calculateBatchTotals(baseAmountCents, surchargeAmountCents);
   const receivedCents = params.splitsWithChecks.reduce((s, x) => s + x.split.amountCents, 0);
   const installmentIds = contexts.filter((c) => c.kind === "installment").map((c) => c.installmentId!);
@@ -326,9 +326,9 @@ describe("2. titular con múltiples items/splits y Pronto Pago", () => {
     const i1 = await mkInstallment(500);
     const i2 = await mkInstallment(700);
     const items = [installmentCtx(i1, 500, true), installmentCtx(i2, 700, true)];
-    // nominal = 50000+70000 (base) + 80000+80000 (recargo x2, SURCHARGE_AMOUNT_CENTS=80000=$800) = 280000
+    // nominal = 50000+70000 (base) + 2 × SURCHARGE_AMOUNT_CENTS (recargo x2)
     const splitsWithChecks: SplitWithChecksForInsert[] = [
-      { split: { method: "efectivo", amountCents: 180000, notes: null }, checks: [] },
+      { split: { method: "efectivo", amountCents: 20000 + 2 * SURCHARGE_AMOUNT_CENTS, notes: null }, checks: [] },
       { split: { method: "transferencia", amountCents: 100000, notes: null }, checks: [] },
     ];
 

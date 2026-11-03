@@ -346,11 +346,11 @@ describe("calculateCartTotal — total mixto", () => {
 });
 
 describe("recargo Pronto Pago estimado", () => {
-  test("un ítem Rivadavia (cuota) suma $800 estimados", () => {
+  test("un ítem Rivadavia (cuota) suma un recargo estimado", () => {
     const cart = [installmentCartItem({ companyName: "Rivadavia" })];
     expect(estimateProntoPagoSurchargeCents(cart)).toBe(SURCHARGE_AMOUNT_CENTS);
   });
-  test("un policy_manual_payment Rivadavia (compañía REAL) también suma $800 estimados", () => {
+  test("un policy_manual_payment Rivadavia (compañía REAL) también suma un recargo estimado", () => {
     const cart = [policyManualCartItem({ companyName: "Rivadavia Seguros" })];
     expect(estimateProntoPagoSurchargeCents(cart)).toBe(SURCHARGE_AMOUNT_CENTS);
   });
@@ -391,13 +391,13 @@ describe("recargo Pronto Pago estimado", () => {
   // (src/lib/payments/batches.ts) — frontend y backend deben coincidir
   // siempre en el conteo, ver policy-economic-group.ts (fuente única).
 
-  test("A. Rivadavia principal sola → $800", () => {
+  test("A. Rivadavia principal sola → 1 recargo", () => {
     const cart = [installmentCartItem({ companyName: "Rivadavia", policyId: 100, policyType: "automotor" })];
     expect(estimateProntoPagoSurchargeCents(cart)).toBe(SURCHARGE_AMOUNT_CENTS);
   });
 
-  test("B. principal + accesoria accidentes_pasajeros vinculada (parentPolicyId en el cart) → $800, no $1600", () => {
-    // Mismo ejemplo del pedido: principal $78.171 + accesoria $1.300 → recargo único $800.
+  test("B. principal + accesoria accidentes_pasajeros vinculada (parentPolicyId en el cart) → 1 recargo, no 2", () => {
+    // Mismo ejemplo del pedido: principal $78.171 + accesoria $1.300 → recargo único.
     const cart = [
       installmentCartItem({ amount: 78171, companyName: "Rivadavia", policyId: 100, policyType: "automotor" }),
       installmentCartItem({
@@ -409,7 +409,7 @@ describe("recargo Pronto Pago estimado", () => {
     expect(calculateCartTotal(cart)).toBe(79471);
   });
 
-  test("C. dos pólizas Rivadavia independientes → $1600", () => {
+  test("C. dos pólizas Rivadavia independientes → 2 recargos", () => {
     const cart = [
       installmentCartItem({ companyName: "Rivadavia", policyId: 100, policyType: "automotor" }),
       installmentCartItem({ companyName: "Rivadavia", policyId: 300, policyType: "automotor", installmentId: 2 }),
@@ -513,11 +513,11 @@ describe("validateBatchSplitsForm — métodos propios vs. directos (importe obj
     expect(result.valid).toBe(false);
   });
 
-  test("objetivo con recargo incluido (ej. $800) exige que los splits sumen ese total, no solo la base", () => {
+  test("objetivo con recargo incluido (SURCHARGE_AMOUNT_CENTS) exige que los splits sumen ese total, no solo la base", () => {
     const splits: BatchSplitFormRow[] = [createBatchSplitRow("efectivo", "1000")];
     const result = validateBatchSplitsForm(100000 + SURCHARGE_AMOUNT_CENTS, splits);
-    expect(result.valid).toBe(false); // faltan los $800 del recargo
-    const okSplits: BatchSplitFormRow[] = [createBatchSplitRow("efectivo", "1800")];
+    expect(result.valid).toBe(false); // falta el recargo
+    const okSplits: BatchSplitFormRow[] = [createBatchSplitRow("efectivo", String(1000 + SURCHARGE_AMOUNT_CENTS / 100))];
     expect(validateBatchSplitsForm(100000 + SURCHARGE_AMOUNT_CENTS, okSplits).valid).toBe(true);
   });
 });

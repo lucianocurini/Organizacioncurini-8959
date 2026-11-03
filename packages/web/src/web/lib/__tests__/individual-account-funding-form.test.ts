@@ -9,6 +9,7 @@ import {
   describeIndividualAccountFundingRow, type IndividualFundingFormState,
 } from "../individual-account-funding-form";
 import { createBatchSplitRow } from "../payment-batch-form";
+import { SURCHARGE_AMOUNT_CENTS } from "../../../lib/payments/batches";
 
 const CUOTA = 10000000;
 
@@ -51,10 +52,10 @@ describe("elegibilidad", () => {
 });
 
 describe("total a cancelar con Pronto Pago", () => {
-  test("Rivadavia + aplicado + medios propios (o cero medios) → $800 dentro del total", () => {
-    expect(individualFundingSurchargeCents({ isRivadavia: true, applyProntoPagoSurcharge: true, splits: [{ method: "efectivo" }] })).toBe(80000);
-    expect(individualFundingSurchargeCents({ isRivadavia: true, applyProntoPagoSurcharge: true, splits: [] })).toBe(80000);
-    expect(individualFundingTargetCents(CUOTA, 80000)).toBe(CUOTA + 80000);
+  test("Rivadavia + aplicado + medios propios (o cero medios) → SURCHARGE_AMOUNT_CENTS dentro del total", () => {
+    expect(individualFundingSurchargeCents({ isRivadavia: true, applyProntoPagoSurcharge: true, splits: [{ method: "efectivo" }] })).toBe(SURCHARGE_AMOUNT_CENTS);
+    expect(individualFundingSurchargeCents({ isRivadavia: true, applyProntoPagoSurcharge: true, splits: [] })).toBe(SURCHARGE_AMOUNT_CENTS);
+    expect(individualFundingTargetCents(CUOTA, SURCHARGE_AMOUNT_CENTS)).toBe(CUOTA + SURCHARGE_AMOUNT_CENTS);
   });
   test("medios directos, no aplicado o no Rivadavia → sin recargo", () => {
     expect(individualFundingSurchargeCents({ isRivadavia: true, applyProntoPagoSurcharge: true, splits: [{ method: "link_pago" }] })).toBe(0);
@@ -123,14 +124,14 @@ describe("preview y resumen", () => {
   });
   test("Pronto Pago con deuda: recargo explícito y nueva deuda", () => {
     const p = computeIndividualFundingPreview({
-      targetCents: CUOTA + 80000, splits: [], creditAppliedCents: CUOTA, roundingCoverageCents: 0, availableCreditCents: CUOTA, debtAuthorized: true,
+      targetCents: CUOTA + SURCHARGE_AMOUNT_CENTS, splits: [], creditAppliedCents: CUOTA, roundingCoverageCents: 0, availableCreditCents: CUOTA, debtAuthorized: true,
     });
     expect(p.ok).toBe(true);
     if (!p.ok) return;
-    const lines = buildIndividualFundingSummary({ installmentAmountCents: CUOTA, surchargeCents: 80000, plan: p.plan });
+    const lines = buildIndividualFundingSummary({ installmentAmountCents: CUOTA, surchargeCents: SURCHARGE_AMOUNT_CENTS, plan: p.plan });
     expect(lines.map((l) => l.key)).toEqual(["cuota", "recargo", "total", "saldo", "medios", "deuda"]);
     expect(lines.find((l) => l.key === "medios")!.amountCents).toBe(0);
-    expect(lines.find((l) => l.key === "deuda")!.amountCents).toBe(80000);
+    expect(lines.find((l) => l.key === "deuda")!.amountCents).toBe(SURCHARGE_AMOUNT_CENTS);
   });
   test("sobrante sin saldo → nuevo saldo a favor; con saldo → error", () => {
     const ok = computeIndividualFundingPreview({ targetCents: CUOTA, splits: [createBatchSplitRow("efectivo", "110000")], creditAppliedCents: 0, roundingCoverageCents: 0, availableCreditCents: 0, debtAuthorized: false });
@@ -278,9 +279,9 @@ describe("saldo aplicado con un único medio real (rebalanceo)", () => {
 
   test("Pronto Pago con saldo parcial: el medio cubre cuota + recargo − saldo", () => {
     const target = individualFundingTargetCents(TOTAL, individualFundingSurchargeCents({ isRivadavia: true, applyProntoPagoSurcharge: true, splits: efectivo("143014.24") }));
-    expect(target).toBe(TOTAL + 80000);
+    expect(target).toBe(TOTAL + SURCHARGE_AMOUNT_CENTS);
     const splits = rebalanceSingleSplitForCredit(efectivo("143014.24"), target, SALDO);
-    expect(splits[0]!.amount).toBe("129968.64");
+    expect(splits[0]!.amount).toBe(((TOTAL + SURCHARGE_AMOUNT_CENTS - SALDO) / 100).toFixed(2));
     const p = computeIndividualFundingPreview({ targetCents: target, splits, creditAppliedCents: SALDO, roundingCoverageCents: 0, availableCreditCents: SALDO, debtAuthorized: false });
     expect(p.ok && p.plan.creditAppliedCents + p.plan.realSplitsTotalCents).toBe(target);
   });

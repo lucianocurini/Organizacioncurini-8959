@@ -39,6 +39,8 @@ import {
   isCashPeriodPendingItem, isPendingItemSelectable, canMarkPendingItemAsDebtor, resolveRendicionItemDebtorStatus,
   describeCashPeriodPendingItem, formatCuotasCount, countRendicionCuotas,
 } from "@/lib/rendicion-pending";
+import { computeRendicionSurcharge } from "@/lib/rendicion-surcharge";
+import { SURCHARGE_AMOUNT } from "../../lib/payments/batches";
 import {
   type CashPeriodGroup, type CashPeriodSearchRow,
   resolveCashPeriodModalityAvailability, resolveSelectedCashPeriodCandidate,
@@ -124,8 +126,6 @@ const STATUS_COLORS: Record<string, string> = {
   anulado: "bg-red-500/20 text-red-400 border-red-500/30",
 };
 
-const PP_SURCHARGE = 800;
-
 interface PaymentRow {
   payment: {
     // null en filas sintéticas de "Pago de contado" (rediseño): un cobro de
@@ -147,6 +147,8 @@ interface PaymentRow {
     status: string;
     rendered: number;
     hasSurcharge: boolean;
+    /** Importe guardado del recargo (cash_entries.amount); null si no tiene. */
+    surchargeAmount?: number | null;
     hasChecks: boolean;
     dueDate: string | null;
     splits: { method: string; amountCents: number; notes: string | null }[];
@@ -1106,7 +1108,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
             isRendered ? (
               <div className="p-3 bg-purple-900/20 border border-purple-500/20 rounded-lg">
                 <span className="text-xs text-purple-400">
-                  Recargo Pronto Pago: {editing?.payment.hasSurcharge ? "aplicado ($800)" : "no aplicado"}
+                  Recargo Pronto Pago: {editing?.payment.hasSurcharge ? `aplicado (${formatCurrency(editing.payment.surchargeAmount ?? SURCHARGE_AMOUNT)})` : "no aplicado"}
                 </span>
               </div>
             ) : (
@@ -1116,7 +1118,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
                   onChange={e => setApplyProntoPagoSurcharge(e.target.checked)}
                   className="w-4 h-4 accent-purple-500" />
                 <label htmlFor="pp-surcharge" className="text-xs text-purple-300 cursor-pointer">
-                  Registrar recargo Pronto Pago ($800) — Rivadavia
+                  Registrar recargo Pronto Pago ({formatCurrency(editing?.payment.hasSurcharge ? (editing.payment.surchargeAmount ?? SURCHARGE_AMOUNT) : SURCHARGE_AMOUNT)}) — Rivadavia
                 </label>
               </div>
             )
@@ -2234,18 +2236,12 @@ export function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void;
   const totalSeleccionado = selectedItems.reduce((s, i) => s + i.amount, 0);
   const totalBreakdown = (Number(breakdown.efectivo) || 0) + (Number(breakdown.transferencia) || 0) +
     (Number(breakdown.cheque) || 0);
-  const autoSurchargeItems = canal === "pronto_pago"
-    ? selectedCobradas.filter((i: any) => i.source === "payment" && i.hasSurcharge)
-    : [];
-  const manualSurchargeItems = canal === "pronto_pago"
-    ? manualItems.filter((i: any) =>
-        String(i.companyName ?? "").trim().toLowerCase().includes("rivadavia"))
-    : [];
-  const rivadaviaNoSurchargeItems = canal === "pronto_pago"
-    ? selectedCobradas.filter((i: any) => i.source === "payment" && !i.hasSurcharge && (i.companyName as string | undefined)?.toLowerCase().includes("rivadavia"))
-    : [];
-  const totalSurchargeCount = autoSurchargeItems.length + manualSurchargeItems.length;
-  const autoSurchargeTotal = totalSurchargeCount * PP_SURCHARGE;
+  // Recargos ya registrados suman su importe guardado; deudas manuales
+  // Rivadavia, el SURCHARGE_AMOUNT vigente — mismo criterio que POST /remittances.
+  const surchargeSummary = computeRendicionSurcharge({ canal, selectedCobradas, manualItems });
+  const rivadaviaNoSurchargeItems = surchargeSummary.rivadaviaWithoutSurcharge;
+  const totalSurchargeCount = surchargeSummary.count;
+  const autoSurchargeTotal = surchargeSummary.total;
   const expectedTotal = totalSeleccionado + autoSurchargeTotal;
 
   // Cuántos de los ítems seleccionados son hijos de lote (el medio de
@@ -2340,7 +2336,7 @@ export function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void;
         canal,
         notes: notes || null,
         paymentBreakdown: bd,
-        prontoPagoSurcharge: canal === "pronto_pago" ? 800 : 0,
+        prontoPagoSurcharge: canal === "pronto_pago" ? SURCHARGE_AMOUNT : 0,
         items: itemsPayload,
       });
       toast.success("Rendición registrada");
@@ -2416,7 +2412,7 @@ export function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void;
                                   <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>
                                   <PaymentMethodBadge splits={item.splits ?? []} paymentMethod={item.paymentMethod} compact />
                                   {item.hasSurcharge && canal === "pronto_pago" && (
-                                    <span className="block text-xs text-purple-400 mt-0.5">+$800 PP</span>
+                                    <span className="block text-xs text-purple-400 mt-0.5">+{fmt(item.surchargeAmount ?? SURCHARGE_AMOUNT)} PP</span>
                                   )}
                                 </div>
                                 {/* Un cobro confirmado (source='payment') o un pago de contado
@@ -2603,7 +2599,7 @@ export function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void;
                             <p className="text-sm font-semibold text-white">{fmt(item.amount)}</p>
                             <span className="text-xs text-orange-400 border border-orange-500/30 bg-orange-900/20 px-1.5 py-0.5 rounded">Adeudado</span>
                             {canal === "pronto_pago" && String(item.companyName ?? "").trim().toLowerCase().includes("rivadavia") && (
-                              <span className="block text-xs text-purple-400 mt-0.5">+${PP_SURCHARGE} PP</span>
+                              <span className="block text-xs text-purple-400 mt-0.5">+{fmt(SURCHARGE_AMOUNT)} PP</span>
                             )}
                           </div>
                           <button
@@ -2716,7 +2712,8 @@ export function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void;
                   <AlertCircle size={16} className="text-purple-400 shrink-0" />
                   <div>
                     <p className="text-xs text-purple-300">
-                      Recargo Pronto Pago: {totalSurchargeCount} cuota{totalSurchargeCount !== 1 ? "s" : ""} × ${PP_SURCHARGE} = {fmt(autoSurchargeTotal)}
+                      Recargo Pronto Pago: {totalSurchargeCount} cuota{totalSurchargeCount !== 1 ? "s" : ""}
+                      {surchargeSummary.uniformUnitAmount != null && <> × {fmt(surchargeSummary.uniformUnitAmount)}</>} = {fmt(autoSurchargeTotal)}
                     </p>
                     <p className="text-xs text-white/40">Se incluye automáticamente al confirmar</p>
                   </div>
@@ -2727,7 +2724,7 @@ export function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void;
                 <div className="bg-yellow-900/20 border border-yellow-500/30 rounded-lg p-3 flex items-center gap-3">
                   <AlertCircle size={16} className="text-yellow-400 shrink-0" />
                   <p className="text-xs text-yellow-300">
-                    Hay {rivadaviaNoSurchargeItems.length} pago{rivadaviaNoSurchargeItems.length > 1 ? "s" : ""} de Rivadavia sin recargo Pronto Pago registrado. No se sumarán $800 automáticamente.
+                    Hay {rivadaviaNoSurchargeItems.length} pago{rivadaviaNoSurchargeItems.length > 1 ? "s" : ""} de Rivadavia sin recargo Pronto Pago registrado. No se sumará el recargo automáticamente.
                   </p>
                 </div>
               )}
@@ -2799,7 +2796,8 @@ export function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void;
                 </div>
                 {canal === "pronto_pago" && totalSurchargeCount > 0 && (
                   <div className="mt-1 flex justify-between items-center text-xs text-white/40">
-                    <span>Recargo PP ({totalSurchargeCount} cuota{totalSurchargeCount !== 1 ? "s" : ""} × ${PP_SURCHARGE} — auto-incluido):</span>
+                    <span>Recargo PP ({totalSurchargeCount} cuota{totalSurchargeCount !== 1 ? "s" : ""}
+                      {surchargeSummary.uniformUnitAmount != null && <> × {fmt(surchargeSummary.uniformUnitAmount)}</>} — auto-incluido):</span>
                     <span className="text-purple-400">+{fmt(autoSurchargeTotal)}</span>
                   </div>
                 )}

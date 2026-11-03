@@ -8,14 +8,14 @@
 // trazabilidad: cobertura, vencimientos y montos son reales y distintos).
 // calculateApplicableRivadaviaSurcharges (batches.ts) contaba el recargo
 // Pronto Pago POR ÍTEM Rivadavia sin ninguna noción de este vínculo,
-// duplicando el recargo ($800 x 2) cuando ambas cuotas se cobran juntas en
+// duplicando el recargo (x 2) cuando ambas cuotas se cobran juntas en
 // el mismo batch — este archivo resuelve esa agrupación, nunca fusiona
 // importes ni oculta ninguna de las dos cuotas.
 //
 // IMPORTANTE — qué NO cambia: si un batch tiene 2+ cuotas de la MISMA
 // póliza (ej. dos cuotas atrasadas de una sola póliza automotor Rivadavia
 // cobradas juntas), cada una sigue generando su propio recargo — esa regla
-// ("$800 por cada cuota Rivadavia elegible, nunca por recibo ni por
+// ("un recargo por cada cuota Rivadavia elegible, nunca por recibo ni por
 // póliza") es intencional y preexistente (ver batches.ts), no se toca acá.
 // Esta agrupación es estrictamente para el caso accesoria+principal.
 

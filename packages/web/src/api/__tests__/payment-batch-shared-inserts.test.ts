@@ -21,7 +21,7 @@ import {
 } from "../payment-batch-shared-inserts";
 import { applyMigration0036AccountHolderFunding } from "../../lib/migrations/apply-0036-account-holder-funding";
 import type { Sql0036Client } from "../../lib/migrations/apply-0036-account-holder-funding";
-import type { BatchItemContext } from "../../lib/payments/batches";
+import { SURCHARGE_AMOUNT, SURCHARGE_AMOUNT_CENTS, type BatchItemContext } from "../../lib/payments/batches";
 
 let tmpDir: string | null = null;
 let client: Client | null = null;
@@ -429,7 +429,7 @@ describe("4. insertBatchChildren", () => {
   test("ítem con hasSurcharge=true: cash_entry de recargo Pronto Pago creado y vinculado", async () => {
     const installmentId = await mkInstallment(1000);
     const batch = await db.transaction(async (tx: any) => insertPaymentBatchRow(tx, {
-      insuredId, baseAmountCents: 100000, surchargeAmountCents: 80000, totalReceivedCents: 180000,
+      insuredId, baseAmountCents: 100000, surchargeAmountCents: SURCHARGE_AMOUNT_CENTS, totalReceivedCents: 100000 + SURCHARGE_AMOUNT_CENTS,
       receivedAmountCents: 180000, paymentDate: FIXTURE_DATE, notes: null, createdBy: userId,
     }));
     const items: BatchChildContextForInsert[] = [{ ctxItem: installmentCtx(installmentId, 1000), display: DISPLAY, hasSurcharge: true }];
@@ -438,7 +438,7 @@ describe("4. insertBatchChildren", () => {
     const cashEntryId = result.cashEntryIdByIndex.get(0);
     const entryRes = await client!.execute({ sql: `SELECT * FROM cash_entries WHERE id = ?`, args: [cashEntryId!] });
     expect(entryRes.rows[0]!.entry_type).toBe("pronto_pago_surcharge");
-    expect(entryRes.rows[0]!.amount).toBe(800); // SURCHARGE_AMOUNT_CENTS/100
+    expect(entryRes.rows[0]!.amount).toBe(SURCHARGE_AMOUNT);
     expect(entryRes.rows[0]!.payment_id).toBe(result.childIds[0]);
   });
 

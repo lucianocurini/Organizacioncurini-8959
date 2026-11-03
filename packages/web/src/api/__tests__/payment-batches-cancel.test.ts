@@ -15,6 +15,7 @@ import {
   remittances, remittanceItems, remittanceAllocations, insuredAccountMovements,
 } from "../database/schema";
 import { eq, inArray } from "drizzle-orm";
+import { SURCHARGE_AMOUNT, SURCHARGE_AMOUNT_CENTS } from "../../lib/payments/batches";
 
 const SESSION_ID = "test-session-batch-cancel-001";
 const USER_EMAIL = "test-batch-cancel@test.local";
@@ -417,10 +418,10 @@ describe("POST /payment-batches/:id/cancel", () => {
     const { body: created } = await callPost({
       insuredId, paymentDate: "2027-06-01", notes: null,
       items: [{ installmentId: instId }],
-      splits: [{ method: "efectivo", amount: 1800 }], // 1000 base + 800 recargo Rivadavia
+      splits: [{ method: "efectivo", amount: 1000 + SURCHARGE_AMOUNT }], // 1000 base + recargo Rivadavia
     });
     const batch = await getBatch(created.id);
-    expect(batch!.surchargeAmountCents).toBe(80000);
+    expect(batch!.surchargeAmountCents).toBe(SURCHARGE_AMOUNT_CENTS);
 
     const childrenBefore = await getChildren(created.id);
     const surchargesBefore = await getSurcharges(childrenBefore.map((c) => c.id));

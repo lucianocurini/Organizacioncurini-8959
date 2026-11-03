@@ -14,6 +14,7 @@ import {
   insuredAccountMovements, paymentAmountAdjustments,
 } from "../database/schema";
 import { eq, inArray, and } from "drizzle-orm";
+import { SURCHARGE_AMOUNT, SURCHARGE_AMOUNT_CENTS } from "../../lib/payments/batches";
 
 const SESSION_ID = "test-session-batches-001";
 const USER_EMAIL = "test-batches@test.local";
@@ -504,14 +505,14 @@ describe("19-22. Pronto Pago por cuota Rivadavia", () => {
     const { status, body } = await callPost({
       insuredId, paymentDate: "2027-01-01", notes: null,
       items: [{ installmentId: instId }],
-      splits: [{ method: "efectivo", amount: 1000 + 800 }], // base + 1×800
+      splits: [{ method: "efectivo", amount: 1000 + SURCHARGE_AMOUNT }], // base + 1 recargo
     });
     expect(status).toBe(201);
     const children = await getChildren(body.id);
     const surcharges = await db.select().from(cashEntries)
       .where(and(eq(cashEntries.paymentId, children[0]!.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
     expect(surcharges.length).toBe(1);
-    expect(surcharges[0]!.amount).toBe(800);
+    expect(surcharges[0]!.amount).toBe(SURCHARGE_AMOUNT);
   });
 
   test("20. dos cuotas Rivadavia → dos recargos", async () => {
@@ -522,7 +523,7 @@ describe("19-22. Pronto Pago por cuota Rivadavia", () => {
     const { body } = await callPost({
       insuredId, paymentDate: "2027-01-01", notes: null,
       items: [{ installmentId: inst1 }, { installmentId: inst2 }],
-      splits: [{ method: "efectivo", amount: 1000 + 1600 }], // base + 2×800
+      splits: [{ method: "efectivo", amount: 1000 + 2 * SURCHARGE_AMOUNT }], // base + 2 recargos
     });
     const children = await getChildren(body.id);
     const childIds = children.map(c => c.id);
@@ -542,7 +543,7 @@ describe("19-22. Pronto Pago por cuota Rivadavia", () => {
     const { body } = await callPost({
       insuredId, paymentDate: "2027-01-01", notes: null,
       items: [{ installmentId: rivInst }, { installmentId: otherInst }],
-      splits: [{ method: "efectivo", amount: 1000 + 800 }], // base + 1×800 (solo la Rivadavia)
+      splits: [{ method: "efectivo", amount: 1000 + SURCHARGE_AMOUNT }], // base + 1 recargo (solo la Rivadavia)
     });
     const children = await getChildren(body.id);
     const childIds = children.map(c => c.id);
@@ -583,17 +584,17 @@ describe("Grupo económico Rivadavia — principal + Accidentes de Pasajeros aso
     const instPrincipal = await mkInstallment(principalId, 1, "2027-01-01", 78171);
     const instAccesoria = await mkInstallment(accesoriaId, 1, "2027-01-01", 1300);
 
-    // Ejemplo obligatorio del pedido: 78.171 + 1.300 = 79.471 base + 800 recargo = 80.271 total.
+    // Ejemplo obligatorio del pedido: 78.171 + 1.300 = 79.471 base + 1 recargo (SURCHARGE_AMOUNT).
     const { status, body } = await callPost({
       insuredId, paymentDate: "2027-01-01", notes: null,
       items: [{ installmentId: instPrincipal }, { installmentId: instAccesoria }],
-      splits: [{ method: "efectivo", amount: 79471 + 800 }],
+      splits: [{ method: "efectivo", amount: 79471 + SURCHARGE_AMOUNT }],
     });
     expect(status).toBe(201);
     const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
     expect(batch!.baseAmountCents).toBe(7947100);
-    expect(batch!.surchargeAmountCents).toBe(80000);
-    expect(batch!.totalReceivedCents).toBe(8027100);
+    expect(batch!.surchargeAmountCents).toBe(SURCHARGE_AMOUNT_CENTS);
+    expect(batch!.totalReceivedCents).toBe(7947100 + SURCHARGE_AMOUNT_CENTS);
 
     // 2 payments hijos — ambas cuotas siguen existiendo por separado, con su importe real propio.
     const children = await getChildren(body.id);
@@ -607,7 +608,7 @@ describe("Grupo económico Rivadavia — principal + Accidentes de Pasajeros aso
     const surcharges = await db.select().from(cashEntries)
       .where(and(inArray(cashEntries.paymentId, childIds), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
     expect(surcharges.length).toBe(1);
-    expect(surcharges[0]!.amount).toBe(800);
+    expect(surcharges[0]!.amount).toBe(SURCHARGE_AMOUNT);
   });
 
   test("accesoria SIN principal en el mismo batch (parentPolicyId no incluido) → no agrupa, cada una su propio recargo", async () => {
@@ -620,13 +621,13 @@ describe("Grupo económico Rivadavia — principal + Accidentes de Pasajeros aso
     const { body } = await callPost({
       insuredId, paymentDate: "2027-01-01", notes: null,
       items: [{ installmentId: instAccesoria }],
-      splits: [{ method: "efectivo", amount: 1300 + 800 }],
+      splits: [{ method: "efectivo", amount: 1300 + SURCHARGE_AMOUNT }],
     });
     const children = await getChildren(body.id);
     const surcharges = await db.select().from(cashEntries)
       .where(and(eq(cashEntries.paymentId, children[0]!.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
     expect(surcharges.length).toBe(1);
-    expect(surcharges[0]!.amount).toBe(800);
+    expect(surcharges[0]!.amount).toBe(SURCHARGE_AMOUNT);
   });
 
   test("accesoria sin parentPolicyId (nunca vinculada) → genera su propio recargo, sin agrupar", async () => {
@@ -636,7 +637,7 @@ describe("Grupo económico Rivadavia — principal + Accidentes de Pasajeros aso
     const { body } = await callPost({
       insuredId, paymentDate: "2027-01-01", notes: null,
       items: [{ installmentId: inst }],
-      splits: [{ method: "efectivo", amount: 1300 + 800 }],
+      splits: [{ method: "efectivo", amount: 1300 + SURCHARGE_AMOUNT }],
     });
     const children = await getChildren(body.id);
     const surcharges = await db.select().from(cashEntries)
@@ -653,7 +654,7 @@ describe("Grupo económico Rivadavia — principal + Accidentes de Pasajeros aso
     const { body } = await callPost({
       insuredId, paymentDate: "2027-01-01", notes: null,
       items: [{ installmentId: inst1 }, { installmentId: inst2 }],
-      splits: [{ method: "efectivo", amount: 1000 + 1600 }],
+      splits: [{ method: "efectivo", amount: 1000 + 2 * SURCHARGE_AMOUNT }],
     });
     const children = await getChildren(body.id);
     const childIds = children.map((c) => c.id);
@@ -680,13 +681,13 @@ describe("Grupo económico Rivadavia — principal + Accidentes de Pasajeros aso
     expect(surcharges.length).toBe(0);
   });
 
-  test("Caja refleja un solo recargo ($800, no $1600) para principal + accesoria", async () => {
+  test("Caja refleja un solo recargo (1, no 2) para principal + accesoria", async () => {
     // El recargo de un batch NO aparece como bucket "recargosProntoPago"
     // separado (eso es solo para cash_entries standalone) — va fundido en
     // el importe del split (payment_batch_splits), que representa el total
     // realmente recibido (base + recargo). Por eso la forma correcta de
     // verificar "un solo recargo, no dos" en Caja es que el total pendiente
-    // suba EXACTAMENTE base + 1×$800 (80.271), nunca base + 2×$800 (81.071).
+    // suba EXACTAMENTE base + 1 recargo, nunca base + 2 recargos.
     const before = await getCashSummary();
 
     const principalId = await mkPolicy(insuredId, rivadaviaCompanyId, { type: "automotor" });
@@ -697,12 +698,12 @@ describe("Grupo económico Rivadavia — principal + Accidentes de Pasajeros aso
     await callPost({
       insuredId, paymentDate: "2027-01-01", notes: null,
       items: [{ installmentId: instPrincipal }, { installmentId: instAccesoria }],
-      splits: [{ method: "efectivo", amount: 79471 + 800 }],
+      splits: [{ method: "efectivo", amount: 79471 + SURCHARGE_AMOUNT }],
     });
 
     const after = await getCashSummary();
-    expect(after.cartera.efectivo - before.cartera.efectivo).toBeCloseTo(80271, 2);
-    expect(after.cartera.total - before.cartera.total).toBeCloseTo(80271, 2);
+    expect(after.cartera.efectivo - before.cartera.efectivo).toBeCloseTo(79471 + SURCHARGE_AMOUNT, 2);
+    expect(after.cartera.total - before.cartera.total).toBeCloseTo(79471 + SURCHARGE_AMOUNT, 2);
   });
 });
 
@@ -809,7 +810,7 @@ describe("26. GET /api/payment-batches/:id e integridad", () => {
     const { body: created } = await callPost({
       insuredId, paymentDate: "2027-01-01", notes: null,
       items: [{ installmentId: inst1 }, { installmentId: inst2 }],
-      splits: [{ method: "efectivo", amount: 600 }, { method: "transferencia", amount: 400 + 1600 }],
+      splits: [{ method: "efectivo", amount: 600 }, { method: "transferencia", amount: 400 + 2 * SURCHARGE_AMOUNT }],
     });
 
     const { status, body } = await callGetBatch(created.id);
@@ -1477,16 +1478,16 @@ describe("37. Pronto Pago sigue correcto combinado con cheque", () => {
     const { status, body } = await callPost({
       insuredId, paymentDate: "2027-01-01", notes: null,
       items: [{ installmentId: instId }],
-      splits: [{ method: "cheque", amount: 1000 + 800, checks: [mkCheckPayload({ amount: 1800 })] }],
+      splits: [{ method: "cheque", amount: 1000 + SURCHARGE_AMOUNT, checks: [mkCheckPayload({ amount: 1000 + SURCHARGE_AMOUNT })] }],
     });
     expect(status).toBe(201);
     const children = await getChildren(body.id);
     const surcharges = await db.select().from(cashEntries)
       .where(and(eq(cashEntries.paymentId, children[0]!.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
     expect(surcharges.length).toBe(1);
-    expect(surcharges[0]!.amount).toBe(800);
+    expect(surcharges[0]!.amount).toBe(SURCHARGE_AMOUNT);
     const checks = await getChecksForBatch(body.id);
-    expect(checks[0]!.amountCents).toBe(180000);
+    expect(checks[0]!.amountCents).toBe(100000 + SURCHARGE_AMOUNT_CENTS);
   });
 });
 
@@ -1498,11 +1499,11 @@ describe("38. Los cheques quedan dentro del total recibido, sin sumar adicional"
     const { status, body } = await callPost({
       insuredId, paymentDate: "2027-01-01", notes: null,
       items: [{ installmentId: instId }],
-      splits: [{ method: "cheque", amount: 1800, checks: [mkCheckPayload({ amount: 1000 }), mkCheckPayload({ amount: 800 })] }],
+      splits: [{ method: "cheque", amount: 1000 + SURCHARGE_AMOUNT, checks: [mkCheckPayload({ amount: 1000 }), mkCheckPayload({ amount: SURCHARGE_AMOUNT })] }],
     });
     expect(status).toBe(201);
     const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
-    expect(batch!.totalReceivedCents).toBe(180000);
+    expect(batch!.totalReceivedCents).toBe(100000 + SURCHARGE_AMOUNT_CENTS);
     const splitRows = await db.select().from(paymentBatchSplits).where(eq(paymentBatchSplits.batchId, body.id)).all();
     expect(splitRows.reduce((s, sp) => s + sp.amountCents, 0)).toBe(batch!.totalReceivedCents);
     const checks = await getChecksForBatch(body.id);
@@ -1888,14 +1889,14 @@ describe("57. Recargo Pronto Pago Rivadavia sobre un cobro manual", () => {
     const { body } = await callPost({
       insuredId, paymentDate: "2027-01-01", notes: null,
       items: [{ source: "policy_manual_payment", policyId: rivPolicy, amount: 1000 }],
-      splits: [{ method: "efectivo", amount: 1000 + 800 }],
+      splits: [{ method: "efectivo", amount: 1000 + SURCHARGE_AMOUNT }],
     });
     const children = await getChildren(body.id);
     expect(children.length).toBe(1);
     const surcharges = await db.select().from(cashEntries)
       .where(and(eq(cashEntries.paymentId, children[0]!.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
     expect(surcharges.length).toBe(1);
-    expect(surcharges[0]!.amount).toBe(800);
+    expect(surcharges[0]!.amount).toBe(SURCHARGE_AMOUNT);
   });
 
   test("batch mixto: cuota Rivadavia + manual Rivadavia → dos recargos, uno por hijo", async () => {
@@ -1908,7 +1909,7 @@ describe("57. Recargo Pronto Pago Rivadavia sobre un cobro manual", () => {
         { source: "installment", installmentId: instId },
         { source: "policy_manual_payment", policyId: rivPolicyB, amount: 400 },
       ],
-      splits: [{ method: "efectivo", amount: 1000 + 1600 }],
+      splits: [{ method: "efectivo", amount: 1000 + 2 * SURCHARGE_AMOUNT }],
     });
     const children = await getChildren(body.id);
     const childIds = children.map(c => c.id);
@@ -2302,10 +2303,10 @@ describe("69. Pronto Pago NUNCA se aplica solo por texto libre de compañía", (
     const { body } = await callPost({
       insuredId, paymentDate: "2027-01-01", notes: null,
       items: [{ source: "policy_manual_payment", policyId: rivPolicy, amount: 1000 }],
-      splits: [{ method: "efectivo", amount: 1000 + 800 }],
+      splits: [{ method: "efectivo", amount: 1000 + SURCHARGE_AMOUNT }],
     });
     const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, body.id)).get();
-    expect(batch!.surchargeAmountCents).toBe(80000);
+    expect(batch!.surchargeAmountCents).toBe(SURCHARGE_AMOUNT_CENTS);
   });
 });
 

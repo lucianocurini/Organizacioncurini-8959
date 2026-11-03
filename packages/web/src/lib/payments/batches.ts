@@ -40,7 +40,7 @@
 //     legacy, no se toca acá), un manual_payment de batch NUNCA califica
 //     para el recargo — isRivadavia siempre false por construcción — porque
 //     acá no hay ninguna fuente confiable (una compañía tipeada a mano no
-//     alcanza para un recargo automático de $800). Ver comentario en
+//     alcanza para un recargo automático). Ver comentario en
 //     POST /payment-batches (index.ts) para la decisión completa.
 // Ningún cobro manual crea policy_installments, cash_debts, ni un
 // remittance_item source='manual_debt'. Su payment hijo nunca dispara
@@ -364,7 +364,7 @@ export function resolveBatchSplitGroup(splits: NormalizedPaymentBatchSplit[]): S
 // ─── Pronto Pago ──────────────────────────────────────────────────────────────
 
 /**
- * $800 por cada GRUPO ECONÓMICO Rivadavia elegible — nunca por recibo ni por
+ * SURCHARGE_AMOUNT_CENTS por cada GRUPO ECONÓMICO Rivadavia elegible — nunca por recibo ni por
  * póliza suelta. Solo aplica si TODOS los medios del batch son del grupo
  * "own" (mixed ya se rechazó antes de llegar acá). `isRivadavia` es siempre
  * false para manual_payment (imputación libre, ver comentario de cabecera)
@@ -405,7 +405,17 @@ export function calculateApplicableRivadaviaSurcharges(
   });
 }
 
-export const SURCHARGE_AMOUNT_CENTS = 80000; // $800, mismo monto fijo que Etapa 3B
+/**
+ * Monto fijo del recargo Pronto Pago Rivadavia — ÚNICA fuente de verdad para
+ * operaciones NUEVAS (cobro individual, lote común, lote con titular, edición
+ * que agrega un recargo que no existía, deuda manual en rendición, y los
+ * previews del frontend). Los recargos ya registrados conservan su importe
+ * guardado (cash_entries.amount / payment_batches.surchargeAmountCents) —
+ * nunca se recalculan con esta constante. Historial: $800 hasta 2026-11.
+ */
+export const SURCHARGE_AMOUNT_CENTS = 90000; // $900
+/** Mismo monto en pesos, para las columnas legacy en REAL (cash_entries.amount, remittances). */
+export const SURCHARGE_AMOUNT = SURCHARGE_AMOUNT_CENTS / 100;
 
 // ─── Totales ──────────────────────────────────────────────────────────────────
 

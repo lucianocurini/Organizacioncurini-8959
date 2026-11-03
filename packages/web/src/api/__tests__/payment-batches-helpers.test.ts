@@ -306,8 +306,8 @@ describe("calculateApplicableRivadaviaSurcharges", () => {
     const result = calculateApplicableRivadaviaSurcharges([inst, manual], "own");
     expect(result).toEqual([manual]);
   });
-  test("SURCHARGE_AMOUNT_CENTS es $800", () => {
-    expect(SURCHARGE_AMOUNT_CENTS).toBe(80000);
+  test("SURCHARGE_AMOUNT_CENTS es $900 (una póliza Rivadavia = $900)", () => {
+    expect(SURCHARGE_AMOUNT_CENTS).toBe(90000);
   });
 
   // ─── Grupo económico Rivadavia + Accidentes de Pasajeros ──────────────────

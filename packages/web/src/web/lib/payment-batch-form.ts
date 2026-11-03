@@ -9,7 +9,7 @@
 // payment, así que no hace falta reimplementarla acá. También reutiliza
 // classifySplitGroup y SURCHARGE_AMOUNT_CENTS de src/lib/payments — mismo
 // criterio que usa el backend para decidir si el recargo Pronto Pago aplica,
-// sin duplicar el monto ($800) en una segunda constante.
+// sin duplicar el monto en una segunda constante.
 //
 // UN COBRO MANUAL NUNCA ES UNA DEUDA — ver comentario de cabecera de
 // src/lib/payments/batches.ts. Este archivo solo arma el carrito/payload; la
@@ -543,7 +543,7 @@ export function splitsToPaymentSplitsPayload(splits: ReadonlyArray<BatchSplitFor
 // esto es una ESTIMACIÓN de UI para que el importe que el usuario tipea en
 // los medios ya incluya el recargo esperado, en vez de descubrir recién al
 // confirmar que "la suma no coincide". Mismo criterio exacto que
-// calculateApplicableRivadaviaSurcharges del backend: $800 por GRUPO
+// calculateApplicableRivadaviaSurcharges del backend: SURCHARGE_AMOUNT_CENTS por GRUPO
 // ECONÓMICO Rivadavia (cuota o policy_manual_payment cuya companyName REAL
 // contenga "rivadavia"), solo si el grupo de medios es "own". Una póliza
 // accesoria de Accidentes de Pasajeros cuyo parentPolicyId apunta a otra

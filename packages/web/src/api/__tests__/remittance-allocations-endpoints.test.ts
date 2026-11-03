@@ -14,6 +14,7 @@ import {
   cashEntries, remittances, remittanceItems, remittanceAllocations, paymentAmountAdjustments,
 } from "../database/schema";
 import { eq, inArray } from "drizzle-orm";
+import { SURCHARGE_AMOUNT, SURCHARGE_AMOUNT_CENTS } from "../../lib/payments/batches";
 
 const SESSION_ID = "test-session-remit-alloc-001";
 const USER_EMAIL = "test-remit-alloc@test.local";
@@ -516,7 +517,7 @@ describe("POST /api/remittances — cobro múltiple (payment_batches), rendició
     const created = await callPostBatch({
       paymentDate: "2027-06-01", insuredId,
       items: [{ installmentId: i1 }],
-      splits: [{ method: "efectivo", amount: 1800 }], // 1000 base + 800 recargo
+      splits: [{ method: "efectivo", amount: 1000 + SURCHARGE_AMOUNT }], // 1000 base + recargo
       applyProntoPagoSurcharge: true,
     });
     expect(created.status).toBe(201);
@@ -530,22 +531,22 @@ describe("POST /api/remittances — cobro múltiple (payment_batches), rendició
     expect(surchargeRows[0]!.entryType).toBe("pronto_pago_surcharge");
 
     const res = await callPostRemittance({
-      date: "2027-06-01", canal: "pronto_pago", paymentBreakdown: { efectivo: 1800 },
+      date: "2027-06-01", canal: "pronto_pago", paymentBreakdown: { efectivo: 1000 + SURCHARGE_AMOUNT },
       items: [{ source: "payment", sourceId: children[0], amount: 1000, paymentMethod: "efectivo" }],
     });
     expect(res.status).toBe(200);
 
     const allocs = await getAllocations(res.body.id);
     // Una allocation por la cuota (1000) + una allocation propia por el
-    // recargo (800) — ninguna arrastra el instrumento del batch, y la suma
+    // recargo (SURCHARGE_AMOUNT) — ninguna arrastra el instrumento del batch, y la suma
     // total sigue siendo exacta (nada se pierde ni se duplica).
     expect(allocs.length).toBe(2);
-    expect(allocs.reduce((s, a) => s + a.amountCents, 0)).toBe(180000);
+    expect(allocs.reduce((s, a) => s + a.amountCents, 0)).toBe(100000 + SURCHARGE_AMOUNT_CENTS);
     const paymentLeaf = allocs.find((a) => a.paymentId === children[0] && a.cashEntryId == null);
     const surchargeLeaf = allocs.find((a) => a.cashEntryId != null);
     expect(paymentLeaf?.amountCents).toBe(100000);
     expect(paymentLeaf?.paymentBatchSplitId).toBeNull();
-    expect(surchargeLeaf?.amountCents).toBe(80000);
+    expect(surchargeLeaf?.amountCents).toBe(SURCHARGE_AMOUNT_CENTS);
     expect(surchargeLeaf?.cashEntryId).toBe(surchargeRows[0]!.id);
     expect(surchargeLeaf?.method).toBe("efectivo"); // heredado del método elegido para la cuota, no "lote"
 

@@ -14,6 +14,7 @@ import {
   payments, paymentSplits, remittances, remittanceItems, cashEntries,
 } from "../database/schema";
 import { eq, inArray, and, sql } from "drizzle-orm";
+import { SURCHARGE_AMOUNT } from "../../lib/payments/batches";
 
 const SESSION_ID = "test-session-pay-splits-001";
 const USER_EMAIL = "test-pay-splits@test.local";
@@ -1011,7 +1012,7 @@ describe("3B.22-24. Pronto Pago con medios combinados", () => {
     const surcharges = await db.select().from(cashEntries)
       .where(and(eq(cashEntries.paymentId, created.id), eq(cashEntries.entryType, "pronto_pago_surcharge"))).all();
     expect(surcharges.length).toBe(1);
-    expect(surcharges[0]!.amount).toBe(800);
+    expect(surcharges[0]!.amount).toBe(SURCHARGE_AMOUNT);
   });
 
   test("23. todos los splits directos a compañía + Rivadavia → NO aplica el recargo", async () => {
@@ -1166,7 +1167,7 @@ describe("3B.32. Compatibilidad histórica con un solo split", () => {
 
 // ─── Recargo Pronto Pago como categoría separada en Caja ─────────────────────
 // El cashEntry pronto_pago_surcharge no tiene splits propios (no es un
-// "payment"): su monto fijo ($800) va a cartera.recargosProntoPago, nunca a
+// "payment"): su monto fijo (SURCHARGE_AMOUNT) va a cartera.recargosProntoPago, nunca a
 // efectivo/transferencia/cheque — identificado por entryType, no por
 // paymentMethod (que puede valer "combinado").
 
@@ -1183,8 +1184,8 @@ describe("3B.33-38. Recargo Pronto Pago — categoría separada en Caja", () => 
     const after = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
 
     expect(after.cartera.efectivo - before.cartera.efectivo).toBe(1000);
-    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(800);
-    expect(after.cartera.total - before.cartera.total).toBe(1800);
+    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(SURCHARGE_AMOUNT);
+    expect(after.cartera.total - before.cartera.total).toBe(1000 + SURCHARGE_AMOUNT);
   });
 
   test("34. Rivadavia combinado efectivo + transferencia: cada split en su bucket, recargo únicamente en recargosProntoPago, nada bajo 'combinado'", async () => {
@@ -1201,8 +1202,8 @@ describe("3B.33-38. Recargo Pronto Pago — categoría separada en Caja", () => 
 
     expect(after.cartera.efectivo - before.cartera.efectivo).toBe(600);
     expect(after.cartera.transferencia - before.cartera.transferencia).toBe(400);
-    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(800);
-    expect(after.cartera.total - before.cartera.total).toBe(1800); // 600 + 400 + 800, cada uno una vez
+    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(SURCHARGE_AMOUNT);
+    expect(after.cartera.total - before.cartera.total).toBe(1000 + SURCHARGE_AMOUNT); // 600 + 400 + recargo, cada uno una vez
     expect(after.cartera).not.toHaveProperty("combinado");
   });
 
@@ -1242,7 +1243,7 @@ describe("3B.33-38. Recargo Pronto Pago — categoría separada en Caja", () => 
     expect(surchargesAfter.length).toBe(0);
 
     const after = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
-    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(-800);
+    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(-SURCHARGE_AMOUNT);
   });
 
   test("37. anular un pago Rivadavia no deja el recargo activo (se borra aunque no se envíe applyProntoPagoSurcharge)", async () => {
@@ -1264,7 +1265,7 @@ describe("3B.33-38. Recargo Pronto Pago — categoría separada en Caja", () => 
     expect(surchargesAfter.length).toBe(0);
 
     const after = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
-    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(-800);
+    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(-SURCHARGE_AMOUNT);
   });
 
   test("38. no duplicación: el total del payment y el recargo se cuentan cada uno exactamente una vez en cartera.total", async () => {
@@ -1279,11 +1280,11 @@ describe("3B.33-38. Recargo Pronto Pago — categoría separada en Caja", () => 
 
     const after = await (await app.fetch(new Request("http://localhost/api/cash/summary", { headers: authHeaders() }))).json();
 
-    // 2500 (payment, repartido en sus 2 splits) + 800 (recargo) = 3300, ni más ni menos.
-    expect(after.cartera.total - before.cartera.total).toBe(3300);
+    // 2500 (payment, repartido en sus 2 splits) + recargo, ni más ni menos.
+    expect(after.cartera.total - before.cartera.total).toBe(2500 + SURCHARGE_AMOUNT);
     expect(after.cartera.efectivo - before.cartera.efectivo).toBe(1000);
     expect(after.cartera.cheque - before.cartera.cheque).toBe(1500);
-    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(800);
+    expect(after.cartera.recargosProntoPago - before.cartera.recargosProntoPago).toBe(SURCHARGE_AMOUNT);
   });
 });
 
@@ -1369,7 +1370,7 @@ describe("Hotfix Pronto Pago Rivadavia — recargo huérfano", () => {
     expect(items.every((it) => it.source !== "cash_entry")).toBe(true);
   });
 
-  test("42. Escenario reportado: 3 cuotas El Norte (una con recargo huérfano) + 1 Rivadavia real → recargo total $800, no $1600", async () => {
+  test("42. Escenario reportado: 3 cuotas El Norte (una con recargo huérfano) + 1 Rivadavia real → un solo recargo, no dos", async () => {
     const rivPolicyId = await mkRivadaviaPolicy();
     const elNortePolicyId = await mkPolicy();
 
@@ -1398,8 +1399,8 @@ describe("Hotfix Pronto Pago Rivadavia — recargo huérfano", () => {
       method: "POST", headers: authHeaders(),
       body: JSON.stringify({
         date: "2027-01-02", canal: "pronto_pago",
-        paymentBreakdown: { efectivo: totalBase + 800 },
-        prontoPagoSurcharge: 800,
+        paymentBreakdown: { efectivo: totalBase + SURCHARGE_AMOUNT },
+        prontoPagoSurcharge: SURCHARGE_AMOUNT,
         items: [
           { source: "payment", sourceId: rivPayment.id, amount: 1000, debtorStatus: "pagado" },
           { source: "payment", sourceId: orphanPayment.id, amount: 500, debtorStatus: "pagado" },
@@ -1412,12 +1413,12 @@ describe("Hotfix Pronto Pago Rivadavia — recargo huérfano", () => {
     const body = await res.json();
     remittanceIdsToClean.push(body.id);
     const remRow = await db.select().from(remittances).where(eq(remittances.id, body.id)).get();
-    expect(remRow?.totalAmount).toBe(totalBase + 800);
+    expect(remRow?.totalAmount).toBe(totalBase + SURCHARGE_AMOUNT);
 
     const items = await db.select().from(remittanceItems).where(eq(remittanceItems.remittanceId, body.id)).all();
     const surchargeItems = items.filter((it) => it.source === "cash_entry");
     expect(surchargeItems.length).toBe(1);
-    expect(surchargeItems[0]!.amount).toBe(800);
+    expect(surchargeItems[0]!.amount).toBe(SURCHARGE_AMOUNT);
   });
 
   test("43. 0 Rivadavia entre los ítems seleccionados → sin recargo, canal pronto_pago no fuerza nada", async () => {
@@ -1445,7 +1446,7 @@ describe("Hotfix Pronto Pago Rivadavia — recargo huérfano", () => {
     expect(items.length).toBe(1);
   });
 
-  test("44. 2 pólizas Rivadavia distintas seleccionadas → $1600, cada una con su propio recargo (no se deduplica entre pólizas distintas)", async () => {
+  test("44. 2 pólizas Rivadavia distintas seleccionadas → 2 recargos, cada una con su propio recargo (no se deduplica entre pólizas distintas)", async () => {
     const rivPolicyA = await mkRivadaviaPolicy();
     const rivPolicyB = await mkRivadaviaPolicy();
     const { body: paymentA } = await callPost({
@@ -1461,7 +1462,7 @@ describe("Hotfix Pronto Pago Rivadavia — recargo huérfano", () => {
       method: "POST", headers: authHeaders(),
       body: JSON.stringify({
         date: "2027-01-02", canal: "pronto_pago",
-        paymentBreakdown: { efectivo: 1000 + 700 + 1600 },
+        paymentBreakdown: { efectivo: 1000 + 700 + 2 * SURCHARGE_AMOUNT },
         items: [
           { source: "payment", sourceId: paymentA.id, amount: 1000, debtorStatus: "pagado" },
           { source: "payment", sourceId: paymentB.id, amount: 700, debtorStatus: "pagado" },
@@ -1472,12 +1473,12 @@ describe("Hotfix Pronto Pago Rivadavia — recargo huérfano", () => {
     const body = await res.json();
     remittanceIdsToClean.push(body.id);
     const remRow = await db.select().from(remittances).where(eq(remittances.id, body.id)).get();
-    expect(remRow?.totalAmount).toBe(1000 + 700 + 1600);
+    expect(remRow?.totalAmount).toBe(1000 + 700 + 2 * SURCHARGE_AMOUNT);
 
     const items = await db.select().from(remittanceItems).where(eq(remittanceItems.remittanceId, body.id)).all();
     const surchargeItems = items.filter((it) => it.source === "cash_entry");
     expect(surchargeItems.length).toBe(2);
-    expect(surchargeItems.reduce((s, it) => s + it.amount, 0)).toBe(1600);
+    expect(surchargeItems.reduce((s, it) => s + it.amount, 0)).toBe(2 * SURCHARGE_AMOUNT);
   });
 
   test("45. manual_debt con compañía 'Rivadavia' tipeada a mano sigue sumando el recargo (regla explícita existente, sin policyId real)", async () => {
@@ -1485,7 +1486,7 @@ describe("Hotfix Pronto Pago Rivadavia — recargo huérfano", () => {
       method: "POST", headers: authHeaders(),
       body: JSON.stringify({
         date: "2027-01-02", canal: "pronto_pago",
-        paymentBreakdown: { efectivo: 300 + 800 },
+        paymentBreakdown: { efectivo: 300 + SURCHARGE_AMOUNT },
         items: [{
           source: "manual_debt", sourceId: null, amount: 300, debtorStatus: "adeudado",
           clientName: "Deudor Manual", policyNumber: "MAN-RIV-045", companyName: "Rivadavia",
@@ -1496,6 +1497,6 @@ describe("Hotfix Pronto Pago Rivadavia — recargo huérfano", () => {
     const body = await res.json();
     remittanceIdsToClean.push(body.id);
     const remRow = await db.select().from(remittances).where(eq(remittances.id, body.id)).get();
-    expect(remRow?.totalAmount).toBe(300 + 800);
+    expect(remRow?.totalAmount).toBe(300 + SURCHARGE_AMOUNT);
   });
 });

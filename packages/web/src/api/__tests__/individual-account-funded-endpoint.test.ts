@@ -30,7 +30,7 @@ const EXPECTED_CHECKS = [
   "E3. 100.000 de saldo sin medio real: cero splits, Caja sin dinero nuevo; rendición con cero medios reales",
   "E4. 110.000 reales: pagada, nuevo saldo a favor +10.000, Caja +110.000",
   "E4b. anulación con saldo ya consumido por un movimiento posterior → 409 revisión manual, nada cambia",
-  "PP1. Pronto Pago con saldo total: el recargo $800 se mantiene y se cubre con saldo, cero medios",
+  "PP1. Pronto Pago con saldo total: el recargo se mantiene y se cubre con saldo, cero medios",
   "PP2. Pronto Pago con saldo parcial + efectivo",
   "PP3. Pronto Pago con saldo insuficiente: sin deuda → 400 sin filas; con deuda autorizada → 201 con saldo deudor del recargo",
   "M1. saldo + transferencia_compania: el dinero directo no entra a Caja; rendición con medio directo",
