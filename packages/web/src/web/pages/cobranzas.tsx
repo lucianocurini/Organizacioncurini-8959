@@ -52,6 +52,12 @@ import {
   detachUnavailableInstallment, INSTALLMENT_NO_LONGER_AVAILABLE_MESSAGE,
 } from "@/lib/collectable-installments";
 import {
+  type PolicySelectorState,
+  buildCollectablePoliciesQuery, parseCollectablePoliciesResponse, policySelectorKey, isPolicySelectorReady,
+  groupPolicySelectorOptions, isSelectedPolicyStillSelectable, detachUnavailablePolicy,
+  POLICY_NO_LONGER_AVAILABLE_MESSAGE, POLICY_SELECTOR_ERROR_MESSAGE,
+} from "@/lib/payment-policy-selector";
+import {
   type IndividualFundingFormState, type IndividualAccountFundingRowData,
   emptyIndividualFundingState, resetFundingForPolicyChange, resetFundingForInstallmentChange, invalidateFundingKey,
   setFundingDebtAuthorized, isIndividualFundingEligible, individualFundingSurchargeCents, individualFundingTargetCents,
@@ -178,12 +184,6 @@ function paymentRowKey(r: PaymentRow): number {
   return r.payment.id ?? -(r.payment.batchId ?? 0);
 }
 
-interface PolicyOption {
-  policy: { id: number; policyNumber: string };
-  insured: { id?: number; name: string } | null;
-  company: { id: number; name: string } | null;
-}
-
 interface Stats {
   total: number;
   count: number;
@@ -194,7 +194,16 @@ interface Stats {
 export function PaymentModal({ open, onClose, onSaved, editing }: {
   open: boolean; onClose: () => void; onSaved: () => void; editing: PaymentRow | null;
 }) {
-  const [policies, setPolicies] = useState<PolicyOption[]>([]);
+  // Pólizas elegibles: SOLO las que están en posición cobrable para la fecha
+  // de pago (GET /policies/collectable-for-payment — misma regla de posición
+  // que las cuotas y que revalida el backend). Se piden de nuevo al cambiar
+  // la fecha. Fail closed: con error o respuesta inválida no se muestra
+  // ninguna (nunca se vuelve a la lista completa de pólizas).
+  const [policySelector, setPolicySelector] = useState<PolicySelectorState | null>(null);
+  const [policySelectorRetry, setPolicySelectorRetry] = useState(0);
+  // Aviso cuando la póliza elegida deja de estar disponible al cambiar la fecha.
+  const [policyNoLongerAvailable, setPolicyNoLongerAvailable] = useState(false);
+  const policies = policySelector?.options ?? [];
   const [policySearch, setPolicySearch] = useState("");
   const [policyOpen, setPolicyOpen] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -260,9 +269,9 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
     setFunding(emptyIndividualFundingState());
     setFundingBalance(null);
     setFundingDuplicateWarning(false);
-    // includeAccessories=1: mismas pólizas que "Cobrar en lote" (paridad de
-    // la regla de cobrabilidad — las accesorias también tienen cuotas).
-    api.get("/api/policies?includeAccessories=1").then(setPolicies).catch(() => {});
+    // Las pólizas se piden en el efecto del selector (atado a la fecha de pago).
+    setPolicySelector(null);
+    setPolicyNoLongerAvailable(false);
     setInstallmentNoLongerAvailable(false);
     setCollectableOptions(null);
     // Reset de modalidad: cada apertura del modal arranca en "cuota" — nunca
@@ -317,6 +326,41 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
       });
     }
   }, [open, editing]);
+
+  // Selector de pólizas atado a la fecha de pago. En edición se incluye
+  // siempre la póliza del pago (aunque ya no esté en posición cobrable, para
+  // no perder compañía/asegurado); nunca se desvincula en edición.
+  const includePolicyIdForSelector = editing?.payment.policyId ?? null;
+  const policySelectorCurrentKey = policySelectorKey(form.paymentDate, includePolicyIdForSelector);
+  useEffect(() => {
+    if (!open) return;
+    const paymentDate = form.paymentDate;
+    const key = policySelectorKey(paymentDate, includePolicyIdForSelector);
+    if (!looksLikeIsoDate(paymentDate)) { setPolicySelector({ status: "invalid_date", key, options: [] }); return; }
+    // cancelled: la respuesta de una fecha anterior nunca pisa la actual.
+    let cancelled = false;
+    setPolicySelector((prev) => ({ status: "loading", key, options: prev?.options ?? [] }));
+    api.get(buildCollectablePoliciesQuery({ paymentDate, includePolicyId: includePolicyIdForSelector }))
+      .then((data: unknown) => {
+        if (cancelled) return;
+        const options = parseCollectablePoliciesResponse(data);
+        setPolicySelector(options ? { status: "ok", key, options } : { status: "error", key, options: [] });
+      })
+      .catch(() => { if (!cancelled) setPolicySelector({ status: "error", key, options: [] }); });
+    return () => { cancelled = true; };
+  }, [open, form.paymentDate, includePolicyIdForSelector, policySelectorRetry]);
+
+  // Desvinculación de la póliza elegida si dejó de estar en posición cobrable
+  // con la fecha nueva (solo pago nuevo vinculado a póliza; solo con una
+  // lista OK de la fecha actual — nunca tras un error de red).
+  useEffect(() => {
+    if (editing || manualMode || !form.policyId) return;
+    if (!isPolicySelectorReady(policySelector, policySelectorCurrentKey)) return;
+    if (isSelectedPolicyStillSelectable(form.policyId, policySelector!.options)) return;
+    setPolicyNoLongerAvailable(true);
+    setInstallmentNoLongerAvailable(false);
+    setForm((f) => ({ ...detachUnavailablePolicy(f), splits: syncSingleBatchSplitAmount(f.splits, "") }));
+  }, [policySelector, policySelectorCurrentKey, form.policyId, editing, manualMode]);
 
   // Cuotas de la póliza elegida. Pago NUEVO: solo las cobrables según la
   // regla única, para la fecha de pago elegida (misma fuente que "Cobrar en
@@ -399,11 +443,14 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
     return () => { cancelled = true; };
   }, [form.policyId, form.paymentDate, editing]);
 
-  const filteredPolicies = policies.filter(p =>
-    p.policy.policyNumber.toLowerCase().includes(policySearch.toLowerCase()) ||
-    (p.insured?.name || "").toLowerCase().includes(policySearch.toLowerCase())
-  );
+  const policySelectorReady = isPolicySelectorReady(policySelector, policySelectorCurrentKey);
+  const policyEntries = policySelectorReady ? groupPolicySelectorOptions(policies, policySearch) : [];
   const selectedPolicy = policies.find(p => String(p.policy.id) === form.policyId);
+  // Fail closed: sin la lista de la fecha actual no se imputa contra una
+  // póliza. Excepción: editar un pago existente sin cambiar su póliza (notas
+  // u otros datos nunca se bloquean por el selector).
+  const editingKeepsPolicy = !!editing && form.policyId === (editing.payment.policyId != null ? String(editing.payment.policyId) : "");
+  const blockedByPolicySelector = !manualMode && !policySelectorReady && !editingKeepsPolicy;
   const pendingInstallments = installments.filter((i: any) => i.status !== "pagada" && i.status !== "no_exigible" && !i.rendered);
   const selectedInstallment = installments.find((i: any) => String(i.id) === form.installmentId);
 
@@ -574,6 +621,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
   // (reintento de red, doble clic, confirmación de cheque duplicado).
   async function handleFundedSave() {
     if (blockedByUnavailableInstallment) { toast.error(INSTALLMENT_NO_LONGER_AVAILABLE_MESSAGE); return; }
+    if (blockedByPolicySelector) { toast.error(POLICY_SELECTOR_ERROR_MESSAGE); return; }
     if (!form.policyId || !form.installmentId) { toast.error("Elegí la póliza y la cuota a cancelar."); return; }
     if (!form.paymentDate) { toast.error("Completá la fecha de pago."); return; }
     if (!fundingBalance) { toast.error("Todavía no se pudo leer el saldo del asegurado."); return; }
@@ -623,8 +671,12 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
   }
 
   async function handleTraditionalSave() {
+    if (blockedByPolicySelector) {
+      toast.error(POLICY_SELECTOR_ERROR_MESSAGE);
+      return;
+    }
     if (!manualMode && !form.policyId) {
-      toast.error("Seleccioná una póliza o usá imputación manual");
+      toast.error(policyNoLongerAvailable ? POLICY_NO_LONGER_AVAILABLE_MESSAGE : "Seleccioná una póliza o usá imputación manual");
       return;
     }
     if (manualMode && !form.manualPayer && !form.manualPolicyNumber) {
@@ -772,18 +824,40 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
                           onChange={e => setPolicySearch(e.target.value)} autoFocus
                           className="w-full bg-[#0a0f1e] border border-[#2d3748] rounded px-3 py-1.5 text-sm text-white placeholder-gray-500 outline-none" />
                       </div>
-                      {filteredPolicies.map(p => (
-                        <button key={p.policy.id} type="button"
-                          onClick={() => { setForm(f => ({ ...f, policyId: String(p.policy.id), installmentId: "" })); setInstallmentNoLongerAvailable(false); setPolicyOpen(false); setPolicySearch(""); }}
-                          className="w-full text-left px-3 py-2 text-sm hover:bg-[#1a2540] transition-colors">
+                      {policySelectorReady && policyEntries.map(({ option: p, kind, accessoryLabel, badges }) => (
+                        <button key={p.policy.id} type="button" data-testid={`policy-option-${p.policy.id}`}
+                          onClick={() => { setForm(f => ({ ...f, policyId: String(p.policy.id), installmentId: "" })); setInstallmentNoLongerAvailable(false); setPolicyNoLongerAvailable(false); setPolicyOpen(false); setPolicySearch(""); }}
+                          className={cn("w-full text-left px-3 py-2 text-sm hover:bg-[#1a2540] transition-colors", kind === "accessory" && "pl-7")}>
                           <span className="text-white">{p.policy.policyNumber}</span>
                           <span className="text-gray-400 ml-2">— {p.insured?.name}</span>
+                          {accessoryLabel && (
+                            <span className={cn("block text-[11px]", kind === "accessory_to_review" ? "text-amber-400" : "text-gray-500")}>{accessoryLabel}</span>
+                          )}
+                          {badges.length > 0 && <span className="block text-[11px] text-gray-500">{badges.join(" · ")}</span>}
                         </button>
                       ))}
-                      {filteredPolicies.length === 0 && <p className="text-gray-500 text-sm px-3 py-2">Sin resultados</p>}
+                      {policySelectorReady && policyEntries.length === 0 && <p className="text-gray-500 text-sm px-3 py-2">Sin resultados</p>}
+                      {!policySelectorReady && policySelector?.status !== "error" && policySelector?.status !== "invalid_date" && (
+                        <p className="text-gray-500 text-sm px-3 py-2">Cargando pólizas para esta fecha…</p>
+                      )}
+                      {!policySelectorReady && policySelector?.status === "invalid_date" && (
+                        <p className="text-amber-400 text-sm px-3 py-2">Ingresá una fecha de pago válida para ver las pólizas disponibles.</p>
+                      )}
                     </div>
                   )}
                 </div>
+                {!manualMode && policySelector?.status === "error" && policySelector.key === policySelectorCurrentKey && (
+                  <p className="text-xs text-red-400 mt-1" data-testid="policy-selector-error">
+                    {POLICY_SELECTOR_ERROR_MESSAGE}{" "}
+                    <button type="button" onClick={() => setPolicySelectorRetry((n) => n + 1)} className="underline hover:text-red-300">Reintentar</button>
+                  </p>
+                )}
+                {!editing && policyNoLongerAvailable && !form.policyId && (
+                  <p className="text-xs text-amber-400 mt-1 flex items-start gap-1.5" data-testid="policy-no-longer-available">
+                    <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                    <span>{POLICY_NO_LONGER_AVAILABLE_MESSAGE}</span>
+                  </p>
+                )}
               </div>
 
               {/* Contado configurado pero no disponible (actividad, o sin
@@ -1210,7 +1284,7 @@ export function PaymentModal({ open, onClose, onSaved, editing }: {
               quedaría redundante/sin función, así que se oculta en vez de
               dejarlo deshabilitado sin explicación. */}
           {showCuotaFields && (
-            <button onClick={handleSave} disabled={isImputarButtonDisabled(saving, effectiveSplitsValidation.valid) || blockedByUnavailableInstallment || !fundingReady}
+            <button onClick={handleSave} disabled={isImputarButtonDisabled(saving, effectiveSplitsValidation.valid) || blockedByUnavailableInstallment || blockedByPolicySelector || !fundingReady}
               className="flex-1 py-2 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-all disabled:opacity-50">
               {saving ? "Guardando..." : editing ? "Guardar cambios" : "Imputar pago"}
             </button>

@@ -101,7 +101,8 @@ async function buildScenario(): Promise<Record<string, Case>> {
   await add("sucesora_ambigua_2", await mkPolicy("2026-11-15", "2027-05-15", { renewedFromId: v3 }), "2026-11-15", false);
 
   const l1 = await mkPolicy("2025-10-01", "2026-10-15", { status: "renovada" });
-  await add("hueco_anterior_terminada", l1, "2026-10-01", false);
+  // Regla 9 (2026-11-03): en un hueco, la última terminada con próxima enlazada también es cobrable.
+  await add("hueco_anterior_terminada", l1, "2026-10-01", true);
   await add("hueco_proxima_enlazada", await mkPolicy("2026-11-15", "2027-11-15", { renewedFromId: l1 }), "2026-11-15", true);
 
   await mkPolicy("2025-10-01", "2026-10-15");
@@ -208,7 +209,6 @@ describe("paridad selector / individual / lote común / lote con titular", () =>
     expect(await reasonOf("proxima_cancelada")).toBe("PROXIMA_CANCELADA");
     expect(await reasonOf("sucesora_ambigua_1")).toBe("CADENA_AMBIGUA");
     expect(await reasonOf("hueco_proxima_sin_enlace")).toBe("POLIZA_FUTURA");
-    expect(await reasonOf("hueco_anterior_terminada")).toBe("SIN_POLIZA_VIGENTE_EN_CADENA");
   });
 });
 

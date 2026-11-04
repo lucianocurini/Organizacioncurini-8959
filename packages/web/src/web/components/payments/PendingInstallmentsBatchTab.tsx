@@ -41,6 +41,11 @@ import {
 } from "@/lib/payment-batch-titular-form";
 import { summarizeTitularBatchFunding, buildTitularBatchFundingLines } from "../../lib/payment-batch-titular-detail";
 import { CheckSubForm } from "./CheckSubForm";
+import {
+  type CollectablePolicyOption, type PolicySelectorState, type CartPolicyCheckState,
+  buildCollectablePoliciesQuery, parseCollectablePoliciesResponse, parseCollectablePolicyIds, policySelectorKey,
+  isPolicySelectorReady, groupPolicySelectorOptions, resolveCartPolicyCollectability, POLICY_SELECTOR_ERROR_MESSAGE,
+} from "@/lib/payment-policy-selector";
 
 const METHOD_LABELS: Record<string, string> = {
   efectivo: "Efectivo",
@@ -51,11 +56,7 @@ const METHOD_LABELS: Record<string, string> = {
 };
 const PAYMENT_METHODS = ["efectivo", "transferencia", "cheque", "link_pago", "transferencia_compania"];
 
-interface PolicyOption {
-  policy: { id: number; policyNumber: string; status: string; insuredId: number };
-  insured: { id: number; name: string } | null;
-  company: { id: number; name: string } | null;
-}
+type PolicyOption = CollectablePolicyOption;
 
 function fmtDate(iso: string): string {
   if (!iso) return "—";
@@ -109,7 +110,16 @@ export function PendingInstallmentsBatchTab() {
   const [pending, setPending] = useState<PendingInstallmentForPayment[]>([]);
   const [loadingPending, setLoadingPending] = useState(false);
 
-  const [policies, setPolicies] = useState<PolicyOption[]>([]);
+  // "Vincular a una póliza existente" del cobro manual: SOLO pólizas en
+  // posición cobrable (GET /policies/collectable-for-payment), con la fecha
+  // de HOY — igual que la lista de cuotas de este tab. La fecha real se elige
+  // en el modal de confirmación, que revalida cada cobro manual con póliza
+  // para esa fecha. Fail closed: sin lista OK no se ofrece ninguna póliza.
+  const [manualPolicySelector, setManualPolicySelector] = useState<PolicySelectorState | null>(null);
+  const [manualPolicySelectorRetry, setManualPolicySelectorRetry] = useState(0);
+  const [manualPolicySelectorDate] = useState(() => toArgentinaCalendarDay());
+  const manualPolicySelectorCurrentKey = policySelectorKey(manualPolicySelectorDate);
+  const policies: PolicyOption[] = manualPolicySelector?.options ?? [];
   const [showManualForm, setShowManualForm] = useState(false);
   const [manualForm, setManualForm] = useState<ManualPaymentFormState>(emptyManualPaymentForm());
   const [manualPolicySearch, setManualPolicySearch] = useState("");
@@ -167,7 +177,19 @@ export function PendingInstallmentsBatchTab() {
   }, [search, companyId]);
 
   useEffect(() => { loadRecentBatches(); }, []);
-  useEffect(() => { api.get("/api/policies").then(setPolicies).catch(() => {}); }, []);
+  useEffect(() => {
+    let cancelled = false;
+    const key = policySelectorKey(manualPolicySelectorDate);
+    setManualPolicySelector((prev) => ({ status: "loading", key, options: prev?.options ?? [] }));
+    api.get(buildCollectablePoliciesQuery({ paymentDate: manualPolicySelectorDate }))
+      .then((data: unknown) => {
+        if (cancelled) return;
+        const options = parseCollectablePoliciesResponse(data);
+        setManualPolicySelector(options ? { status: "ok", key, options } : { status: "error", key, options: [] });
+      })
+      .catch(() => { if (!cancelled) setManualPolicySelector({ status: "error", key, options: [] }); });
+    return () => { cancelled = true; };
+  }, [manualPolicySelectorDate, manualPolicySelectorRetry]);
 
   function addInstallment(item: PendingInstallmentForPayment) {
     const result = addInstallmentToCart(cart, item);
@@ -189,7 +211,7 @@ export function PendingInstallmentsBatchTab() {
       policyId: String(p.policy.id),
       policyNumber: p.policy.policyNumber,
       policyStatus: p.policy.status,
-      policyInsuredId: String(p.insured?.id ?? p.policy.insuredId),
+      policyInsuredId: String(p.insured?.id ?? p.policy.insuredId ?? ""),
       policyInsuredName: p.insured?.name ?? "",
       policyCompanyId: String(p.company?.id ?? ""),
       policyCompanyName: p.company?.name ?? "",
@@ -207,11 +229,8 @@ export function PendingInstallmentsBatchTab() {
   }
 
   const manualValidation = validateManualPaymentForm(manualForm);
-  const filteredManualPolicies = policies.filter((p) => {
-    const q = manualPolicySearch.toLowerCase();
-    if (!q) return true;
-    return p.policy.policyNumber.toLowerCase().includes(q) || (p.insured?.name ?? "").toLowerCase().includes(q);
-  });
+  const manualPolicySelectorReady = isPolicySelectorReady(manualPolicySelector, manualPolicySelectorCurrentKey);
+  const manualPolicyEntries = manualPolicySelectorReady ? groupPolicySelectorOptions(policies, manualPolicySearch) : [];
 
   async function openReceipt(batchId: number) {
     try {
@@ -389,22 +408,29 @@ export function PendingInstallmentsBatchTab() {
                           onChange={(e) => setManualPolicySearch(e.target.value)} autoFocus
                           className="w-full bg-white/5 border border-white/10 rounded px-3 py-1.5 text-sm text-white placeholder-white/30 outline-none" />
                       </div>
-                      {filteredManualPolicies.map((p) => (
-                        <button key={p.policy.id} type="button" onClick={() => selectManualPolicy(p)}
-                          className="w-full text-left px-3 py-2 text-sm hover:bg-white/5 transition-colors">
+                      {manualPolicyEntries.map(({ option: p, kind, accessoryLabel, badges }) => (
+                        <button key={p.policy.id} type="button" onClick={() => selectManualPolicy(p)} data-testid={`manual-policy-option-${p.policy.id}`}
+                          className={cn("w-full text-left px-3 py-2 text-sm hover:bg-white/5 transition-colors", kind === "accessory" && "pl-7")}>
                           <span className="text-white">{p.policy.policyNumber}</span>
                           <span className="text-white/40 ml-2">— {p.insured?.name}</span>
-                          {p.policy.status === "cancelada" && (
-                            <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded border border-red-500/30 bg-red-500/10 text-red-400">cancelada</span>
+                          {accessoryLabel && (
+                            <span className={cn("block text-[11px]", kind === "accessory_to_review" ? "text-amber-400" : "text-white/40")}>{accessoryLabel}</span>
                           )}
+                          {badges.length > 0 && <span className="block text-[11px] text-white/40">{badges.join(" · ")}</span>}
                         </button>
                       ))}
-                      {filteredManualPolicies.length === 0 && <p className="text-white/40 text-sm px-3 py-2">Sin resultados</p>}
+                      {manualPolicySelectorReady && manualPolicyEntries.length === 0 && <p className="text-white/40 text-sm px-3 py-2">Sin resultados</p>}
+                      {!manualPolicySelectorReady && manualPolicySelector?.status !== "error" && (
+                        <p className="text-white/40 text-sm px-3 py-2">Cargando pólizas disponibles…</p>
+                      )}
                     </div>
                   )}
                 </div>
-                {manualForm.policyStatus === "cancelada" && (
-                  <p className="text-xs text-red-400 mt-1">Esta póliza está cancelada — no se puede cargar un cobro manual.</p>
+                {manualPolicySelector?.status === "error" && (
+                  <p className="text-xs text-red-400 mt-1" data-testid="manual-policy-selector-error">
+                    {POLICY_SELECTOR_ERROR_MESSAGE}{" "}
+                    <button type="button" onClick={() => setManualPolicySelectorRetry((n) => n + 1)} className="underline hover:text-red-300">Reintentar</button>
+                  </p>
                 )}
               </div>
             ) : (
@@ -760,6 +786,29 @@ export function BatchPaymentModal({
   const cartCollectability = resolveCartCollectability(cart, collectableCheck, paymentDate);
   const unavailableInstallmentIds = cartCollectability.unavailableIds;
 
+  // Cobros manuales con póliza del carrito: misma revalidación por fecha con
+  // la regla de posición (GET /policies/collectable-for-payment). Solo se
+  // consulta si el carrito tiene alguno. Fail closed igual que las cuotas.
+  const cartHasPolicyManual = cart.some((i) => i.kind === "policy_manual_payment");
+  const [policyCheck, setPolicyCheck] = useState<CartPolicyCheckState>({ status: "loading", paymentDate });
+  const [policyCheckRetry, setPolicyCheckRetry] = useState(0);
+  useEffect(() => {
+    if (!cartHasPolicyManual) return;
+    if (!looksLikeIsoDate(paymentDate)) { setPolicyCheck({ status: "invalid_date", paymentDate }); return; }
+    let cancelled = false;
+    setPolicyCheck({ status: "loading", paymentDate });
+    api.get(buildCollectablePoliciesQuery({ paymentDate }))
+      .then((data: unknown) => {
+        if (cancelled) return;
+        const collectablePolicyIds = parseCollectablePolicyIds(data);
+        setPolicyCheck(collectablePolicyIds ? { status: "ok", paymentDate, collectablePolicyIds } : { status: "error", paymentDate });
+      })
+      .catch(() => { if (!cancelled) setPolicyCheck({ status: "error", paymentDate }); });
+    return () => { cancelled = true; };
+  }, [paymentDate, policyCheckRetry, cartHasPolicyManual]);
+  const cartPolicyCollectability = resolveCartPolicyCollectability(cart, policyCheck, paymentDate);
+  const unavailablePolicyLocalIds = cartPolicyCollectability.unavailableLocalIds;
+
   const subtotal = calculateCartTotal(cart);
   const targetCents = calculateBatchTargetAmountCents(cart, splits);
   const surchargeCents = targetCents - Math.round(subtotal * 100);
@@ -1027,7 +1076,7 @@ export function BatchPaymentModal({
 
   const legacyValid = validation.valid && differenceValidation.valid;
   const titularValid = validation.valid && !titularBalanceLoading && titularBalance != null && !!titularFieldsValidation?.valid && !!titularPreview?.ok && titularConfirmed;
-  const disabled = isBatchSubmitDisabled(submitting, (isTitularMode ? titularValid : legacyValid) && cartCollectability.canConfirm, cart.length > 0);
+  const disabled = isBatchSubmitDisabled(submitting, (isTitularMode ? titularValid : legacyValid) && cartCollectability.canConfirm && cartPolicyCollectability.canConfirm, cart.length > 0);
 
   return (
     <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 p-4 overflow-y-auto">
@@ -1053,7 +1102,8 @@ export function BatchPaymentModal({
                 {cart.map((item) => (
                   <tr key={cartItemKey(item)} className="border-b border-white/5 last:border-0">
                     <td className="px-3 py-2 text-white/80">
-                      {item.kind === "installment" && unavailableInstallmentIds.includes(item.installmentId) && (
+                      {((item.kind === "installment" && unavailableInstallmentIds.includes(item.installmentId))
+                        || (item.kind === "policy_manual_payment" && unavailablePolicyLocalIds.includes(item.localId))) && (
                         <span className="mr-1.5 text-[10px] px-1.5 py-0.5 rounded border border-amber-500/30 bg-amber-500/10 text-amber-400">no disponible</span>
                       )}
                       {item.kind === "installment"
@@ -1111,6 +1161,23 @@ export function BatchPaymentModal({
                 <p className="text-xs text-red-400 mt-1">
                   No se pudieron validar las cuotas para esta fecha. Reintentá antes de confirmar.{" "}
                   <button type="button" onClick={() => setCollectableCheckRetry((n) => n + 1)} className="underline hover:text-red-300">
+                    Reintentar
+                  </button>
+                </p>
+              )}
+              {cartPolicyCollectability.kind === "unavailable" && (
+                <p className="text-xs text-amber-400 mt-1" data-testid="cart-policy-unavailable">
+                  {unavailablePolicyLocalIds.length === 1 ? "1 cobro manual con póliza no está disponible" : `${unavailablePolicyLocalIds.length} cobros manuales con póliza no están disponibles`}{" "}
+                  para esta fecha de pago (la póliza no es la vigente, la anterior inmediata ni la próxima). Quitalos o cambiá la fecha para continuar.
+                </p>
+              )}
+              {cartPolicyCollectability.kind === "checking" && (
+                <p className="text-xs text-white/40 mt-1">Validando las pólizas de los cobros manuales para esta fecha…</p>
+              )}
+              {cartPolicyCollectability.kind === "error" && (
+                <p className="text-xs text-red-400 mt-1" data-testid="cart-policy-error">
+                  No se pudieron validar las pólizas de los cobros manuales para esta fecha. Reintentá antes de confirmar.{" "}
+                  <button type="button" onClick={() => setPolicyCheckRetry((n) => n + 1)} className="underline hover:text-red-300">
                     Reintentar
                   </button>
                 </p>

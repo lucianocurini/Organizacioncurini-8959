@@ -191,10 +191,9 @@ describe("cobro manual con póliza vinculada (linkPolicy=true) — validación",
     expect(result.errorMessage).toContain("Seleccioná una póliza");
   });
 
-  test("póliza cancelada → bloqueado", () => {
+  test("póliza cancelada: ya no se bloquea por status (la posición la decide el selector y el backend con la fecha)", () => {
     const result = validateManualPaymentForm(policyManualForm({ policyStatus: "cancelada" }));
-    expect(result.valid).toBe(false);
-    expect(result.errorMessage).toContain("cancelada");
+    expect(result.valid).toBe(true);
   });
 
   test("importe inválido (vacío, cero, negativo, 3 decimales) → bloqueado", () => {

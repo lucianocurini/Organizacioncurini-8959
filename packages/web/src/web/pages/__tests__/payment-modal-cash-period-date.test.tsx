@@ -9,6 +9,7 @@
 // Ejecutar con: bun test packages/web/src/web/pages/__tests__/payment-modal-cash-period-date.test.tsx
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { JSDOM } from "jsdom";
+import { asCollectableSelectorRows, COLLECTABLE_POLICIES_PATH } from "./policy-selector-fixtures";
 import { toArgentinaCalendarDay } from "../../../lib/dates/argentina-date";
 
 const POLICY_ID = 57508;
@@ -76,7 +77,7 @@ function mockFetch(opts: { searchByDate: Record<string, any[]>; deferredDates?: 
       return json(opts.searchByDate[date] ?? []);
     }
     if (url.startsWith("/api/installments/pending-for-payment")) return json(PENDING_RESPONSE);
-    if (url === "/api/policies?includeAccessories=1") return json(POLICIES_RESPONSE);
+    if (url.startsWith(COLLECTABLE_POLICIES_PATH)) return json(asCollectableSelectorRows(POLICIES_RESPONSE));
     if (url === "/api/payment-batches/cash-period-payment" && method === "POST") {
       return json({ id: 901, nominalAmountCents: 40000000, discountAmountCents: 2000000, cashAmountCents: 38000000 });
     }

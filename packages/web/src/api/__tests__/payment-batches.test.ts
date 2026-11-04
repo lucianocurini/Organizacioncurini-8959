@@ -1768,17 +1768,25 @@ describe("51. Cobro manual con póliza inexistente → 404, nada se crea", () =>
   });
 });
 
-describe("52. Cobro manual con póliza cancelada → 409", () => {
-  test("policy.status='cancelada' bloquea el manual_payment", async () => {
+describe("52. Cobro manual con póliza cancelada no cobrable → 400 POLICY_NOT_COLLECTABLE (regla central de posición)", () => {
+  // Decisión 2026-11-03: el status 'cancelada' ya no se rechaza genéricamente
+  // (antes 409). Lo decide la regla central de posición
+  // (evaluatePolicyCollectabilityPosition) con la fecha de pago: una cancelada
+  // SIN fecha efectiva válida no es cobrable → 400 POLICY_NOT_COLLECTABLE.
+  test("cancelada sin fecha efectiva: la regla de posición la rechaza y nada se crea", async () => {
     const policyId = await mkPolicy(insuredId, companyId);
     await db.update(policies).set({ status: "cancelada" }).where(eq(policies.id, policyId));
+    const before = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
     const { status, body } = await callPost({
       insuredId, paymentDate: "2027-01-01", notes: null,
       items: [{ source: "policy_manual_payment", policyId, amount: 500 }],
       splits: [{ method: "efectivo", amount: 500 }],
     });
-    expect(status).toBe(409);
-    expect(body.error).toContain("cancelada");
+    expect(status).toBe(400);
+    expect(body.code).toBe("POLICY_NOT_COLLECTABLE");
+    expect(body.failures).toEqual([{ policyId, reason: "CANCELADA_SIN_FECHA_EFECTIVA" }]);
+    const after = await db.select({ id: paymentBatches.id }).from(paymentBatches).all();
+    expect(after.length).toBe(before.length);
   });
 });
 

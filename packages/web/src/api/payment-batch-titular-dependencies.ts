@@ -13,7 +13,7 @@ import {
   insertPaymentBatchRow, checkInstallmentPaymentRace, insertBatchSplitsAndChecks, insertBatchChildren,
   type SplitWithChecksForInsert, type BatchChildContextForInsert,
 } from "./payment-batch-shared-inserts";
-import { assertInstallmentsCollectable } from "./installment-collectability-loader";
+import { assertInstallmentsCollectable, assertPoliciesCollectableForPayment } from "./installment-collectability-loader";
 import type { AccountHolderFundingBatchDependencies } from "./account-holder-funding-batch";
 import type { FundingDestinationInput } from "../lib/payments/account-holder-funding";
 import type { FundingPlanSplitInput } from "../lib/payments/account-holder-funding-plan";
@@ -61,6 +61,8 @@ export interface BuildTitularFundingDependenciesParams {
   createdBy: number;
   accountHolderInsuredId: number;
   installmentIds: ReadonlyArray<number>;
+  /** Pólizas de los cobros manuales con póliza (sin cuota) — misma regla de posición, revalidada dentro de la transacción. */
+  manualPolicyIds?: ReadonlyArray<number>;
   splitsWithChecks: ReadonlyArray<SplitWithChecksForInsert>;
   childInsertItems: ReadonlyArray<BatchChildContextForInsert>;
 }
@@ -90,6 +92,7 @@ export function buildTitularFundingDependencies(params: BuildTitularFundingDepen
       // Regla única de cobrabilidad revalidada dentro de la transacción —
       // mismo punto relativo que el camino legacy (ver index.ts).
       await assertInstallmentsCollectable(tx, params.installmentIds, params.paymentDate);
+      await assertPoliciesCollectableForPayment(tx, params.manualPolicyIds ?? [], params.paymentDate);
 
       const splitIds = await insertBatchSplitsAndChecks(tx, batch.id, params.splitsWithChecks, params.createdBy);
       const splitIdByKey = new Map<string, number>(splitIds.map((id, i) => [`split-${i}`, id]));

@@ -19,6 +19,7 @@ import {
   COLLECTIONS_MIN_DUE_DATE,
   buildRenewalChainIndex,
   evaluateInstallmentCollectability,
+  evaluatePolicyCollectabilityPosition,
   summarizeCollectability,
   type CollectabilityInstallment,
   type CollectabilityPolicy,
@@ -222,6 +223,108 @@ export function cashPeriodNotCollectableResponse(e: InstallmentNotCollectableErr
     r.body.error = `${CASH_PERIOD_HISTORICAL_INSTALLMENT_MESSAGE} (${e.message})`;
   }
   return r;
+}
+
+// ─── Posición de pólizas (cobros de póliza sin cuota + selector) ───────────
+
+/** Posición de cada póliza para `paymentDate` (misma función que usa la evaluación de cuotas). */
+export async function evaluatePoliciesCollectabilityPosition(
+  dbClient: DbClient,
+  policyIds: ReadonlyArray<number>,
+  paymentDate: string
+): Promise<Map<number, CollectabilityResult>> {
+  const ids = [...new Set(policyIds)];
+  const index = await loadRenewalChainIndex(dbClient, ids);
+  const out = new Map<number, CollectabilityResult>();
+  for (const id of ids) out.set(id, evaluatePolicyCollectabilityPosition(index, id, paymentDate));
+  return out;
+}
+
+export interface PolicyNotCollectableFailure {
+  policyId: number;
+  reason: CollectabilityReason;
+  message: string;
+}
+
+export class PolicyNotCollectableError extends Error {
+  readonly failures: PolicyNotCollectableFailure[];
+  constructor(failures: PolicyNotCollectableFailure[]) {
+    const detail = failures.map((f) => `póliza ${f.policyId}: ${f.message}`).join(" ");
+    super(`${failures.length === 1 ? "La póliza no está disponible para cobrar en esa fecha" : "Algunas pólizas no están disponibles para cobrar en esa fecha"} — ${detail}`);
+    this.failures = failures;
+  }
+}
+
+/**
+ * Cobro de póliza SIN cuota (POST/PUT /payments, cobro manual con póliza del
+ * lote): la póliza tiene que estar en posición cobrable para `paymentDate`
+ * (vigente, anterior directa, próxima inmediata o última terminada de un
+ * hueco). Igual que assertInstallmentsCollectable: con `db` antes de la
+ * transacción y con `tx` dentro de ella.
+ */
+export async function assertPoliciesCollectableForPayment(
+  dbClient: DbClient,
+  policyIds: ReadonlyArray<number>,
+  paymentDate: string
+): Promise<void> {
+  if (policyIds.length === 0) return;
+  const results = await evaluatePoliciesCollectabilityPosition(dbClient, policyIds, paymentDate);
+  const failures: PolicyNotCollectableFailure[] = [];
+  for (const [policyId, r] of results) if (!r.collectable) failures.push({ policyId, reason: r.reason, message: r.message });
+  if (failures.length > 0) {
+    failures.sort((a, b) => a.policyId - b.policyId);
+    throw new PolicyNotCollectableError(failures);
+  }
+}
+
+export function policyNotCollectableResponse(e: PolicyNotCollectableError): { status: 400; body: Record<string, unknown> } {
+  return {
+    status: 400,
+    body: {
+      error: e.message,
+      code: "POLICY_NOT_COLLECTABLE",
+      blockingPolicyIds: e.failures.map((f) => f.policyId),
+      failures: e.failures.map((f) => ({ policyId: f.policyId, reason: f.reason })),
+    },
+  };
+}
+
+/**
+ * Selector de pólizas de Cobranzas: posición de TODAS las pólizas para
+ * `paymentDate` (un único índice con todas las cadenas) y qué pólizas en
+ * posición cobrable tienen al menos una cuota cobrable — evaluada con el
+ * mismo índice y la misma función que GET /installments/pending-for-payment.
+ */
+export async function loadPolicySelectorPositions(dbClient: DbClient, paymentDate: string): Promise<{
+  positions: Map<number, CollectabilityResult>;
+  policyIdsWithCollectableInstallments: Set<number>;
+}> {
+  const allPolicies = await dbClient.select(POLICY_COLUMNS).from(policies).all();
+  const index = buildRenewalChainIndex((allPolicies as any[]).map((r) => ({
+    id: r.id, status: r.status, startDate: r.startDate ?? null, endDate: r.endDate ?? null,
+    renewedFromId: r.renewedFromId ?? null, cancellationEffectiveDate: r.cancellationEffectiveDate ?? null,
+  })));
+  const positions = new Map<number, CollectabilityResult>();
+  for (const id of index.policies.keys()) positions.set(id, evaluatePolicyCollectabilityPosition(index, id, paymentDate));
+
+  const collectablePolicyIds = [...positions].filter(([, r]) => r.collectable).map(([id]) => id);
+  const candidateIds: number[] = [];
+  for (const part of chunks(collectablePolicyIds)) {
+    const rows = await dbClient.select({ id: policyInstallments.id }).from(policyInstallments)
+      .where(and(
+        inArray(policyInstallments.policyId, part),
+        inArray(policyInstallments.status, ["pendiente", "vencida"]),
+        eq(policyInstallments.rendered, 0),
+      )).all();
+    for (const r of rows as any[]) candidateIds.push(r.id);
+  }
+  const inputs = await loadInstallmentInputs(dbClient, candidateIds, {});
+  const policyIdsWithCollectableInstallments = new Set<number>();
+  for (const inst of inputs.values()) {
+    if (policyIdsWithCollectableInstallments.has(inst.policyId)) continue;
+    if (evaluateInstallmentCollectability(index, inst, paymentDate).collectable) policyIdsWithCollectableInstallments.add(inst.policyId);
+  }
+  return { positions, policyIdsWithCollectableInstallments };
 }
 
 /** Diagnóstico agregado (solo conteos) sobre todas las cuotas pendientes/vencidas no rendidas. */

@@ -249,9 +249,8 @@ describe("validateInstallmentsEligibility", () => {
   test("manual_payment acepta póliza activa", () => {
     expect(() => validateInstallmentsEligibility([manualCtx({ policyStatus: "activa" })])).not.toThrow();
   });
-  test("manual_payment rechaza póliza cancelada", () => {
-    expect(() => validateInstallmentsEligibility([manualCtx({ policyStatus: "cancelada" })]))
-      .toThrow(/cobro manual \(póliza 1\) está cancelada/);
+  test("cobro manual con póliza cancelada: ya no se decide acá — la decide la regla de posición por fecha efectiva", () => {
+    expect(() => validateInstallmentsEligibility([manualCtx({ policyStatus: "cancelada" })])).not.toThrow();
   });
   test("manual_payment ignora status/rendered de cuota (no aplican)", () => {
     expect(() => validateInstallmentsEligibility([manualCtx({ policyStatus: "activa" })])).not.toThrow();

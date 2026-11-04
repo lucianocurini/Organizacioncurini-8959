@@ -5,7 +5,10 @@
 // de error ya lanzados por otros módulos a {status, body}.
 
 import { PaymentBatchRaceConditionError } from "./payment-batch-shared-inserts";
-import { InstallmentNotCollectableError, installmentNotCollectableResponse } from "./installment-collectability-loader";
+import {
+  InstallmentNotCollectableError, installmentNotCollectableResponse,
+  PolicyNotCollectableError, policyNotCollectableResponse,
+} from "./installment-collectability-loader";
 import {
   AccountHolderFundingBatchError, FundingPlanRaceConditionError, FundingIdempotencyConflictError,
   type RunAccountHolderFundingBatchResult,
@@ -49,6 +52,7 @@ export function formatAccountHolderFundingBatchSuccess(result: RunAccountHolderF
  * sin más contexto).
  *
  *   InstallmentNotCollectableError    -> 400 (la cuota ya no está disponible para cobrar)
+ *   PolicyNotCollectableError         -> 400 (la póliza de un cobro sin cuota no está en posición cobrable)
  *   PaymentBatchRaceConditionError    -> 409 (cuota cobrada por otra request)
  *   FundingPlanRaceConditionError     -> 409 (el saldo/plan cambió dentro de la tx)
  *   FundingIdempotencyConflictError   -> 409 (misma key, fingerprint distinto)
@@ -62,6 +66,8 @@ export function mapAccountHolderFundingBatchError(e: unknown): HttpJsonResponse 
   // Cuota que dejó de ser cobrable entre la validación previa y la
   // transacción (regla única de cobrabilidad, ver installment-collectability-loader.ts).
   if (e instanceof InstallmentNotCollectableError) return installmentNotCollectableResponse(e);
+  // Póliza de un cobro manual sin cuota que dejó de estar en posición cobrable.
+  if (e instanceof PolicyNotCollectableError) return policyNotCollectableResponse(e);
   if (e instanceof PaymentBatchRaceConditionError) {
     return { status: 409, body: { error: e.message, blockingInstallmentIds: e.installmentIds } };
   }

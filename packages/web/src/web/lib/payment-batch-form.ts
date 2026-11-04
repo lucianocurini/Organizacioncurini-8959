@@ -274,7 +274,7 @@ export interface ManualPaymentValidationResult {
  * redacción) las mismas reglas que el backend vuelve a chequear con datos
  * reales en POST /payment-batches. Ninguna de las dos ramas pide ni valida
  * ningún asegurado "fijado" — ese concepto ya no existe.
- *  - linkPolicy=true: póliza seleccionada, no cancelada.
+ *  - linkPolicy=true: póliza seleccionada (su posición la valida el backend).
  *  - linkPolicy=false: al menos pagador o N° de póliza manual (mismo
  *    criterio que la imputación manual standalone) — nada más.
  */
@@ -286,9 +286,9 @@ export function validateManualPaymentForm(form: ManualPaymentFormState): ManualP
     if (!form.policyId) {
       return { valid: false, errorMessage: "Seleccioná una póliza o desactivá \"Vincular a una póliza existente\"." };
     }
-    if (form.policyStatus === "cancelada") {
-      return { valid: false, errorMessage: "La póliza está cancelada — no se puede cargar un cobro manual." };
-    }
+    // Una póliza cancelada ya no se rechaza por status: el selector solo
+    // ofrece pólizas en posición cobrable (GET /policies/collectable-for-payment)
+    // y el backend revalida con la fecha de pago real.
     return { valid: true, errorMessage: null };
   }
   if (!form.manualPayer.trim() && !form.manualPolicyNumber.trim()) {

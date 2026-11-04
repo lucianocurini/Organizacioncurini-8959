@@ -10,6 +10,7 @@
 // Ejecutar con: bun test packages/web/src/web/pages/__tests__/payment-modal-installment-unavailable.test.tsx
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { JSDOM } from "jsdom";
+import { asCollectableSelectorRows, COLLECTABLE_POLICIES_PATH } from "./policy-selector-fixtures";
 
 const POLICY_ID = 57611;
 const POLICY_NUMBER = "QA-CUOTA-FECHA";
@@ -62,7 +63,7 @@ function mockFetch() {
       return json(date === DATE_ONLY_SECOND ? [INST_2] : [INST_1, INST_2]);
     }
     if (url.startsWith("/api/policies/cash-period-search")) return json([]);
-    if (url === "/api/policies?includeAccessories=1") return json(POLICIES_RESPONSE);
+    if (url.startsWith(COLLECTABLE_POLICIES_PATH)) return json(asCollectableSelectorRows(POLICIES_RESPONSE));
     if (url === "/api/payments" && method === "POST") return json({ id: 5001 });
     throw new Error(`Unmocked fetch in test: ${method} ${url}`);
   };

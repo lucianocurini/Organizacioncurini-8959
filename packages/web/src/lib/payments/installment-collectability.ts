@@ -11,7 +11,7 @@
 //      (renewedFromId) para la fecha de pago. Solo se admiten cuotas de esa
 //      póliza vigente, de su antecesora DIRECTA y de su próxima INMEDIATA
 //      (regla 8); nunca de antecesoras más antiguas, de una segunda
-//      renovación futura ni de cadenas sin póliza vigente (salvo regla 8b).
+//      renovación futura ni de cadenas sin póliza vigente (salvo reglas 8b y 9).
 //   4. Vigencia inclusiva: startDate <= fecha <= endDate. Una cancelada con
 //      fecha efectiva E sigue vigente durante E y queda fuera desde E+1; sus
 //      cuotas que vencen después de E no se cobran.
@@ -33,6 +33,17 @@
 //      Se rechazan: una futura sin renewedFromId (suelta), una segunda
 //      renovación futura (su predecesora también es futura), una cancelada y
 //      cualquier cadena ambigua (ciclo o más de una sucesora no cancelada).
+//   9. Última terminada en un hueco (confirmada 2026-11-03): si la cadena no
+//      tiene vigente, la póliza ya terminada (fin < fecha) cuya ÚNICA sucesora
+//      no cancelada todavía no inició (y tiene datos válidos) también es
+//      cobrable — es exactamente el ancla de la regla 8b. Nunca una más
+//      antigua (su sucesora también terminó) ni una terminada sin sucesora.
+//
+// La POSICIÓN de una póliza en su cadena (reglas 3-9, sin nada propio de una
+// cuota) se decide en un único lugar: evaluatePolicyCollectabilityPosition.
+// La usan la evaluación de cuotas (más abajo), el selector de pólizas de
+// Cobranzas y la validación de cobros de póliza sin cuota — nunca se
+// reimplementa en otro lado.
 //
 // Todas las fechas son días calendario "YYYY-MM-DD" (Argentina) y se comparan
 // como strings, que es orden cronológico para ese formato validado.
@@ -79,10 +90,10 @@ export type CollectabilityReason =
   | "ANTECESORA_MAS_ANTIGUA"
   | "FUERA_DE_CADENA_VIGENTE";
 
-export type CollectabilityVia = "poliza_vigente" | "antecesora_directa" | "proxima_inmediata";
+export type CollectabilityVia = "poliza_vigente" | "antecesora_directa" | "proxima_inmediata" | "ultima_terminada";
 
 export type CollectabilityResult =
-  /** currentPolicyId es null solo para proxima_inmediata en un hueco entre vigencias (regla 8b). */
+  /** currentPolicyId es null en un hueco entre vigencias (proxima_inmediata por regla 8b, ultima_terminada por regla 9). */
   | { collectable: true; via: CollectabilityVia; currentPolicyId: number | null }
   | { collectable: false; reason: CollectabilityReason; message: string };
 
@@ -286,23 +297,64 @@ export function evaluateInstallmentCollectability(
     return fail("ANTERIOR_FECHA_MINIMA", `La cuota vence antes de la fecha operativa mínima (${COLLECTIONS_MIN_DUE_DATE}).`);
   }
 
-  const policy = index.policies.get(installment.policyId);
-  if (!policy) return fail("POLIZA_INEXISTENTE", "La póliza de la cuota no existe.");
-  const integ = policyIntegrity(index, policy);
-  if (!integ.ok) {
-    if (integ.reason === "POLIZA_FECHAS_INVALIDAS") return fail(integ.reason, "La póliza tiene fechas de vigencia faltantes o inválidas.");
-    if (integ.reason === "CANCELADA_SIN_FECHA_EFECTIVA") return fail(integ.reason, "La póliza está cancelada sin fecha efectiva de cancelación válida.");
-    return fail(integ.reason, "La póliza figura como renovada pero ninguna póliza la renueva.");
-  }
+  const checked = checkPolicyForPosition(index, installment.policyId, "La póliza de la cuota no existe.");
+  if (!checked.ok) return checked.failure;
+  const { policy, integ } = checked;
   if (integ.cancellationDate != null && installment.dueDate > integ.cancellationDate) {
     return fail("VENCE_DESPUES_DE_CANCELACION", "La cuota vence después de la fecha efectiva de cancelación de la póliza.");
   }
+  return evaluatePositionOfCheckedPolicy(index, policy, integ, paymentDate);
+}
+
+// ─── Posición de una póliza (fuente única) ──────────────────────────────────
+
+type CheckedPolicy =
+  | { ok: true; policy: CollectabilityPolicy; integ: Extract<PolicyIntegrity, { ok: true }> }
+  | { ok: false; failure: CollectabilityResult };
+
+/** Existencia + integridad de la póliza (reglas 6 y 7). */
+function checkPolicyForPosition(index: RenewalChainIndex, policyId: number, missingMessage: string): CheckedPolicy {
+  const policy = index.policies.get(policyId);
+  if (!policy) return { ok: false, failure: fail("POLIZA_INEXISTENTE", missingMessage) };
+  const integ = policyIntegrity(index, policy);
+  if (!integ.ok) {
+    if (integ.reason === "POLIZA_FECHAS_INVALIDAS") return { ok: false, failure: fail(integ.reason, "La póliza tiene fechas de vigencia faltantes o inválidas.") };
+    if (integ.reason === "CANCELADA_SIN_FECHA_EFECTIVA") return { ok: false, failure: fail(integ.reason, "La póliza está cancelada sin fecha efectiva de cancelación válida.") };
+    return { ok: false, failure: fail(integ.reason, "La póliza figura como renovada pero ninguna póliza la renueva.") };
+  }
+  return { ok: true, policy, integ };
+}
+
+/**
+ * Posición de la póliza en su cadena para `paymentDate` (reglas 3-9): si es
+ * la vigente, su antecesora directa, su próxima inmediata o, en un hueco, la
+ * última terminada. FUENTE ÚNICA: la evaluación de cuotas la usa después de
+ * sus chequeos propios, y el selector de pólizas y los cobros de póliza sin
+ * cuota la usan directamente.
+ */
+export function evaluatePolicyCollectabilityPosition(
+  index: RenewalChainIndex,
+  policyId: number,
+  paymentDate: string
+): CollectabilityResult {
+  if (typeof paymentDate !== "string" || !isValidCalendarDate(paymentDate)) {
+    return fail("FECHA_PAGO_INVALIDA", "La fecha de pago no es una fecha calendario válida (YYYY-MM-DD).");
+  }
+  const checked = checkPolicyForPosition(index, policyId, "La póliza no existe.");
+  if (!checked.ok) return checked.failure;
+  return evaluatePositionOfCheckedPolicy(index, checked.policy, checked.integ, paymentDate);
+}
+
+function evaluatePositionOfCheckedPolicy(
+  index: RenewalChainIndex,
+  policy: CollectabilityPolicy,
+  integ: Extract<PolicyIntegrity, { ok: true }>,
+  paymentDate: string
+): CollectabilityResult {
   if (integ.start > paymentDate) return evaluateUpcomingPolicy(index, policy, paymentDate);
 
   const current = resolveChainCurrentPolicy(index, policy.id, paymentDate);
-  if (current.kind === "none") {
-    return fail("SIN_POLIZA_VIGENTE_EN_CADENA", "No hay ninguna póliza vigente en la cadena de renovación para la fecha de pago.");
-  }
+  if (current.kind === "none") return evaluateLastEndedPolicy(index, policy, paymentDate);
   if (current.kind === "ambiguous") {
     return fail("CADENA_AMBIGUA", "La cadena de renovación tiene más de una póliza vigente o un ciclo; no se puede determinar la vigente.");
   }
@@ -314,6 +366,27 @@ export function evaluateInstallmentCollectability(
     return fail("ANTECESORA_MAS_ANTIGUA", "La póliza es una antecesora anterior a la antecesora directa de la póliza vigente.");
   }
   return fail("FUERA_DE_CADENA_VIGENTE", "La póliza no es la vigente ni su antecesora directa en la fecha de pago.");
+}
+
+/**
+ * Regla 9: póliza ya iniciada (start <= fecha) en una cadena SIN vigente, o
+ * sea, ya terminada. Solo es cobrable si es el ancla de un hueco: su única
+ * sucesora no cancelada todavía no inició y tiene datos válidos. Mismas
+ * condiciones que evaluateUpcomingPolicy exige del lado de la próxima (8b).
+ */
+function evaluateLastEndedPolicy(index: RenewalChainIndex, policy: CollectabilityPolicy, paymentDate: string): CollectabilityResult {
+  const noVigente = fail("SIN_POLIZA_VIGENTE_EN_CADENA", "No hay ninguna póliza vigente en la cadena de renovación para la fecha de pago.");
+  const liveSuccessors = (index.successorsOf.get(policy.id) ?? []).filter((id) => index.policies.get(id)?.status !== "cancelada");
+  if (liveSuccessors.length === 0) return noVigente;
+  if (liveSuccessors.length > 1) {
+    return fail("CADENA_AMBIGUA", "La póliza tiene más de una renovación no cancelada; no se puede determinar la próxima.");
+  }
+  const next = index.policies.get(liveSuccessors[0]!)!;
+  const nextInteg = policyIntegrity(index, next);
+  if (!nextInteg.ok) return noVigente;
+  // Su sucesora también inició (y terminó, porque no hay vigente): esta es una antecesora más antigua.
+  if (nextInteg.start <= paymentDate) return noVigente;
+  return { collectable: true, via: "ultima_terminada", currentPolicyId: null };
 }
 
 /**
@@ -390,7 +463,7 @@ export function summarizeCollectability(
   installments: ReadonlyArray<CollectabilityInstallment>,
   paymentDate: string
 ): CollectabilitySummary {
-  const collectableByVia: Record<CollectabilityVia, number> = { poliza_vigente: 0, antecesora_directa: 0, proxima_inmediata: 0 };
+  const collectableByVia: Record<CollectabilityVia, number> = { poliza_vigente: 0, antecesora_directa: 0, proxima_inmediata: 0, ultima_terminada: 0 };
   const notCollectableByReason: Partial<Record<CollectabilityReason, number>> = {};
   for (const inst of installments) {
     const r = evaluateInstallmentCollectability(index, inst, paymentDate);

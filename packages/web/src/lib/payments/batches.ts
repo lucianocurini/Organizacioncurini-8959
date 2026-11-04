@@ -256,8 +256,8 @@ export function resolveBatchInsuredId(items: BatchItemContext[]): number | null 
  *    cobrabilidad (installment-collectability.ts), no este helper. Sin pagos
  *    parciales: el importe imputado es siempre installment.amount completo.
  *  - policy_manual_payment: no hay cuota ni estado de cobro previo que
- *    validar (es dinero nuevo, no preexistente) — el único requisito es que
- *    la póliza indicada no esté cancelada.
+ *    validar (es dinero nuevo, no preexistente) — la póliza la valida la
+ *    regla de posición (assertPoliciesCollectableForPayment), no este helper.
  *  - manual_payment: no hay ninguna fila real que validar — nada que
  *    chequear acá (siempre elegible por construcción; la única validación
  *    de forma ya corrió en normalizeBatchItems).
@@ -284,11 +284,12 @@ export function validateInstallmentsEligibility(items: BatchItemContext[]): void
       // efectiva de cancelación — misma decisión que el cobro individual.
       // Una cancelada sin fecha efectiva válida sigue bloqueada (400
       // INSTALLMENT_NOT_COLLECTABLE), nunca se cobra.
-    } else if (i.kind === "policy_manual_payment") {
-      if (i.policyStatus === "cancelada") {
-        throw new PaymentBatchValidationError(`La póliza del cobro manual (póliza ${i.policyId}) está cancelada.`);
-      }
     }
+    // policy_manual_payment: la póliza cancelada ya NO se rechaza acá por
+    // status (decisión 2026-11-03). La decide la regla de posición
+    // (evaluatePolicyCollectabilityPosition) con la fecha de pago, igual que
+    // POST /payments y el selector: vigente hasta su fecha efectiva inclusive;
+    // sin fecha efectiva válida, bloqueada (400 POLICY_NOT_COLLECTABLE).
     // manual_payment: nada que validar contra la base — no hay fila real.
   }
 }

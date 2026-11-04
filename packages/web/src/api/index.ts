@@ -121,6 +121,8 @@ import {
   evaluateInstallmentsCollectability, assertInstallmentsCollectable, InstallmentNotCollectableError,
   installmentNotCollectableResponse, loadCollectabilityDiagnostics,
   cashPeriodNotCollectableResponse, hasHistoricalInstallment, CASH_PERIOD_HISTORICAL_INSTALLMENT_MESSAGE,
+  assertPoliciesCollectableForPayment, PolicyNotCollectableError, policyNotCollectableResponse,
+  loadPolicySelectorPositions,
 } from "./installment-collectability-loader";
 import {
   parseFundingRequest, AccountHolderFundingRequestError, type FundingRequestParseResult,
@@ -315,6 +317,80 @@ app.get("/policies", requireAuth(async (c: any) => {
   // filtro: el filtro de estado, el conteo y la paginación del listado usan
   // el mismo conjunto. policy.status sigue siendo el dato guardado.
   return c.json(applyPolicyListFilters(results, { q, type, status, companyId }, toArgentinaCalendarDay()), 200);
+}));
+
+// ─── Selector de pólizas de Cobranzas ─────────────────────────────────────────
+//
+// Pólizas que se pueden elegir para imputar un cobro en `paymentDate`: SOLO
+// las que están en posición cobrable en su cadena de renovación (vigente,
+// anterior directa, próxima inmediata o, en un hueco, última terminada) — la
+// misma función (evaluatePolicyCollectabilityPosition) que decide la
+// cobrabilidad de cada cuota y que valida los cobros de póliza sin cuota.
+// Incluye accesorias (cada una con su propia cadena) y marca si tienen cuotas
+// cobrables (hasCollectableInstallments, misma evaluación que
+// GET /installments/pending-for-payment). Las pólizas fuera de posición
+// nunca se devuelven, salvo `includePolicyId` (edición de un pago existente),
+// que vuelve con collectable=false y su motivo.
+// Registrado ANTES de "/policies/:id" (Hono matchea en orden de registro).
+app.get("/policies/collectable-for-payment", requireAuth(async (c: any) => {
+  const paymentDate = c.req.query("paymentDate") || toArgentinaCalendarDay();
+  if (!isValidCalendarDate(paymentDate)) {
+    return c.json({ error: "paymentDate inválida (YYYY-MM-DD)." }, 400);
+  }
+  const rawInclude = c.req.query("includePolicyId");
+  const includePolicyId = rawInclude != null && rawInclude !== "" ? Number(rawInclude) : null;
+  if (includePolicyId != null && (!Number.isInteger(includePolicyId) || includePolicyId <= 0)) {
+    return c.json({ error: "includePolicyId inválido." }, 400);
+  }
+
+  const { positions, policyIdsWithCollectableInstallments } = await loadPolicySelectorPositions(db, paymentDate);
+  const rows = await db
+    .select({ policy: policies, company: companies, insured: insureds })
+    .from(policies)
+    .leftJoin(companies, eq(policies.companyId, companies.id))
+    .leftJoin(insureds, eq(policies.insuredId, insureds.id))
+    .orderBy(desc(policies.createdAt))
+    .all();
+  const byId = new Map(rows.map((r: any) => [r.policy.id as number, r]));
+  const linkInput = (p: any): AccessoryLinkPolicy => ({
+    id: p.id, parentPolicyId: p.parentPolicyId ?? null, companyId: p.companyId ?? null,
+    insuredId: p.insuredId ?? null, status: p.status ?? null, endDate: p.endDate ?? null,
+  });
+
+  const result = [];
+  for (const r of rows as any[]) {
+    const p = r.policy;
+    const position = positions.get(p.id);
+    const collectable = position?.collectable === true;
+    if (!collectable && p.id !== includePolicyId) continue;
+    let accessory: { parentPolicyId: number; parentPolicyNumber: string | null; linkValid: boolean } | null = null;
+    if (p.parentPolicyId != null) {
+      const parent = byId.get(p.parentPolicyId)?.policy ?? null;
+      // La vigencia de la principal NO decide acá (la decide la posición de
+      // cada una); el vínculo vale si es estructuralmente correcto.
+      const link = evaluateAccessoryLink(linkInput(p), parent ? linkInput(parent) : null, paymentDate);
+      accessory = {
+        parentPolicyId: p.parentPolicyId,
+        parentPolicyNumber: parent?.policyNumber ?? null,
+        linkValid: link.valid || link.reason === "principal_no_vigente",
+      };
+    }
+    result.push({
+      policy: {
+        id: p.id, policyNumber: p.policyNumber, status: p.status, type: p.type,
+        insuredId: p.insuredId, companyId: p.companyId, parentPolicyId: p.parentPolicyId ?? null,
+        startDate: p.startDate, endDate: p.endDate,
+      },
+      insured: r.insured ? { id: r.insured.id, name: r.insured.name } : null,
+      company: r.company ? { id: r.company.id, name: r.company.name } : null,
+      collectable,
+      via: position?.collectable ? position.via : null,
+      reason: position && !position.collectable ? position.reason : (position ? null : "POLIZA_INEXISTENTE"),
+      hasCollectableInstallments: policyIdsWithCollectableInstallments.has(p.id),
+      accessory,
+    });
+  }
+  return c.json(result, 200);
 }));
 
 // ─── Búsqueda de períodos con contado disponible (rediseño Pago de contado) ────
@@ -2337,6 +2413,9 @@ app.post("/payments", requireAuth(async (c: any) => {
       .innerJoin(companies, eq(policies.companyId, companies.id))
       .innerJoin(insureds, eq(policies.insuredId, insureds.id))
       .where(eq(policies.id, Number(body.policyId))).get();
+    // La póliza indicada tiene que existir (antes se aceptaba un policyId sin
+    // fila real y el pago quedaba colgado de una póliza inexistente).
+    if (!pRow) return c.json({ error: "La póliza indicada no existe." }, 404);
     resolvedCompany = pRow?.companyName ?? null;
     resolvedClient = pRow?.insuredName ?? null;
     resolvedPolicyNumber = pRow?.policyNumber ?? null;
@@ -2422,6 +2501,23 @@ app.post("/payments", requireAuth(async (c: any) => {
     }
   }
 
+  // Cobro de póliza SIN cuota (decisión 2026-11-03): la póliza tiene que
+  // estar en posición cobrable para la fecha de pago — misma regla de
+  // posición que decide las cuotas y el selector. Mismo criterio de alcance
+  // que el de cuotas: solo pagos confirmados (PUT revalida si se confirma).
+  const collectPolicyWithoutInstallmentId = hasPolicyId && !body.installmentId && isConfirmed ? Number(body.policyId) : null;
+  if (collectPolicyWithoutInstallmentId != null) {
+    try {
+      await assertPoliciesCollectableForPayment(db, [collectPolicyWithoutInstallmentId], body.paymentDate);
+    } catch (e: any) {
+      if (e instanceof PolicyNotCollectableError) {
+        const r = policyNotCollectableResponse(e);
+        return c.json(r.body, r.status);
+      }
+      throw e;
+    }
+  }
+
   let payment: any;
   try {
   [payment] = await db.transaction(async (tx) => {
@@ -2447,6 +2543,9 @@ app.post("/payments", requireAuth(async (c: any) => {
     // ser cobrable, el throw revierte también este insert.
     if (collectInstallmentId != null) {
       await assertInstallmentsCollectable(tx, [collectInstallmentId], body.paymentDate, { excludePaymentIds: [p!.id] });
+    }
+    if (collectPolicyWithoutInstallmentId != null) {
+      await assertPoliciesCollectableForPayment(tx, [collectPolicyWithoutInstallmentId], body.paymentDate);
     }
 
     // Splits uno por uno (no bulk) porque un split cheque necesita su propio
@@ -2509,6 +2608,10 @@ app.post("/payments", requireAuth(async (c: any) => {
   } catch (e: any) {
     if (e instanceof InstallmentNotCollectableError) {
       const r = installmentNotCollectableResponse(e);
+      return c.json(r.body, r.status);
+    }
+    if (e instanceof PolicyNotCollectableError) {
+      const r = policyNotCollectableResponse(e);
       return c.json(r.body, r.status);
     }
     throw e;
@@ -2789,6 +2892,32 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
     }
   }
 
+  // Cobro de póliza SIN cuota (decisión 2026-11-03): la póliza resultante se
+  // revalida con la regla de posición solo cuando el cobro cambia de verdad:
+  // cambia la póliza, cambia la fecha, se desvincula la cuota o pasa a
+  // confirmado. Editar notas u otros datos de un pago histórico nunca bloquea.
+  if ("policyId" in update && update.policyId != null && update.policyId !== current.policyId) {
+    const exists = await db.select({ id: policies.id }).from(policies).where(eq(policies.id, update.policyId)).get();
+    if (!exists) return c.json({ error: "La póliza indicada no existe." }, 404);
+  }
+  const collectPolicyWithoutInstallmentId = newInstallmentId == null && effectivePolicyId != null && effectiveStatus === "confirmado"
+    && (effectivePolicyId !== current.policyId
+      || effectivePaymentDate !== current.paymentDate
+      || current.installmentId != null
+      || current.status !== "confirmado")
+    ? effectivePolicyId : null;
+  if (collectPolicyWithoutInstallmentId != null) {
+    try {
+      await assertPoliciesCollectableForPayment(db, [collectPolicyWithoutInstallmentId], effectivePaymentDate);
+    } catch (e: any) {
+      if (e instanceof PolicyNotCollectableError) {
+        const r = policyNotCollectableResponse(e);
+        return c.json(r.body, r.status);
+      }
+      throw e;
+    }
+  }
+
   let payment: any;
   try {
   [payment] = await db.transaction(async (tx) => {
@@ -2801,6 +2930,9 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
 
     if (collectabilityInstallmentId != null) {
       await assertInstallmentsCollectable(tx, [collectabilityInstallmentId], effectivePaymentDate, collectabilityOpts);
+    }
+    if (collectPolicyWithoutInstallmentId != null) {
+      await assertPoliciesCollectableForPayment(tx, [collectPolicyWithoutInstallmentId], effectivePaymentDate);
     }
 
     if (bodyHasSplits && normalizedSplitUpdate) {
@@ -2926,6 +3058,10 @@ app.put("/payments/:id", requireAuth(async (c: any) => {
   } catch (e: any) {
     if (e instanceof InstallmentNotCollectableError) {
       const r = installmentNotCollectableResponse(e);
+      return c.json(r.body, r.status);
+    }
+    if (e instanceof PolicyNotCollectableError) {
+      const r = policyNotCollectableResponse(e);
       return c.json(r.body, r.status);
     }
     throw e;
@@ -3439,11 +3575,18 @@ async function createPaymentBatchFromBody(c: any, user: any, body: any, options:
   // operativa mínima, cancelaciones) — la misma que filtra
   // GET /installments/pending-for-payment y que valida POST /payments. Se
   // repite DENTRO de la transacción (legacy y titular), ver más abajo.
+  // Cobros manuales con póliza (sin cuota): misma regla de posición que las
+  // cuotas y el selector (decisión 2026-11-03), también dentro de la tx.
   try {
     await assertInstallmentsCollectable(db, installmentIds, body.paymentDate);
+    await assertPoliciesCollectableForPayment(db, policyManualIds, body.paymentDate);
   } catch (e: any) {
     if (e instanceof InstallmentNotCollectableError) {
       const r = installmentNotCollectableResponse(e);
+      return c.json(r.body, r.status);
+    }
+    if (e instanceof PolicyNotCollectableError) {
+      const r = policyNotCollectableResponse(e);
       return c.json(r.body, r.status);
     }
     throw e;
@@ -3648,6 +3791,7 @@ async function createPaymentBatchFromBody(c: any, user: any, body: any, options:
       createdBy: user.id,
       accountHolderInsuredId: parsed.dto.accountHolderInsuredId!,
       installmentIds,
+      manualPolicyIds: policyManualIds,
       splitsWithChecks,
       childInsertItems,
     });
@@ -3729,6 +3873,7 @@ async function createPaymentBatchFromBody(c: any, user: any, body: any, options:
     // transacción: si algo cambió desde la validación de arriba, el throw
     // revierte también el insert del batch.
     await assertInstallmentsCollectable(tx, installmentIds, body.paymentDate);
+    await assertPoliciesCollectableForPayment(tx, policyManualIds, body.paymentDate);
 
     // Splits uno por uno (no bulk) porque cada split cheque necesita su
     // propio id ya generado antes de poder insertar los cheques que cuelgan
@@ -3798,6 +3943,10 @@ async function createPaymentBatchFromBody(c: any, user: any, body: any, options:
     }
     if (e instanceof InstallmentNotCollectableError) {
       const r = installmentNotCollectableResponse(e);
+      return c.json(r.body, r.status);
+    }
+    if (e instanceof PolicyNotCollectableError) {
+      const r = policyNotCollectableResponse(e);
       return c.json(r.body, r.status);
     }
     // Contención real de escritura (dos requests verdaderamente simultáneas
@@ -4907,7 +5056,7 @@ app.patch("/payment-batches/:id", requireAuth(async (c: any) => {
   const batch = await db.select().from(paymentBatches).where(eq(paymentBatches.id, id)).get();
   if (!batch) return c.json({ error: "Cobro no encontrado" }, 404);
 
-  const childRows = await db.select({ id: payments.id, status: payments.status, rendered: payments.rendered, installmentId: payments.installmentId })
+  const childRows = await db.select({ id: payments.id, status: payments.status, rendered: payments.rendered, installmentId: payments.installmentId, policyId: payments.policyId })
     .from(payments).where(eq(payments.batchId, id)).all();
   const childPayments: BatchCancelChildPayment[] = childRows.map((r) => ({ id: r.id, status: r.status, rendered: r.rendered }));
 
@@ -4939,11 +5088,17 @@ app.patch("/payment-batches/:id", requireAuth(async (c: any) => {
     ? [...new Set(confirmedChildren.flatMap((r) => (r.installmentId != null ? [r.installmentId] : [])))]
     : [];
   const collectabilityOpts = { excludePaymentIds: confirmedChildren.map((r) => r.id), existingCollection: true };
+  // Cobros manuales con póliza (hijos sin cuota): misma regla de posición con
+  // la fecha nueva. Solo si cambia la fecha — notas nunca bloquean.
+  const revalidatePolicyIds = changesPaymentDate
+    ? [...new Set(confirmedChildren.flatMap((r) => (r.installmentId == null && r.policyId != null ? [r.policyId] : [])))]
+    : [];
 
   try {
     if (revalidateInstallmentIds.length > 0) {
       await assertInstallmentsCollectable(db, revalidateInstallmentIds, body.paymentDate, collectabilityOpts);
     }
+    await assertPoliciesCollectableForPayment(db, revalidatePolicyIds, body.paymentDate);
     const updated = await db.transaction(async (tx) => {
       const [u] = await tx.update(paymentBatches).set(update).where(eq(paymentBatches.id, id)).returning();
       if (changesPaymentDate && await batchHasAccountArtifacts(tx, id, childRows.map((r) => r.id))) {
@@ -4952,12 +5107,17 @@ app.patch("/payment-batches/:id", requireAuth(async (c: any) => {
       if (revalidateInstallmentIds.length > 0) {
         await assertInstallmentsCollectable(tx, revalidateInstallmentIds, body.paymentDate, collectabilityOpts);
       }
+      await assertPoliciesCollectableForPayment(tx, revalidatePolicyIds, body.paymentDate);
       return u;
     });
     return c.json(updated, 200);
   } catch (e: any) {
     if (e instanceof InstallmentNotCollectableError) {
       const r = installmentNotCollectableResponse(e);
+      return c.json(r.body, r.status);
+    }
+    if (e instanceof PolicyNotCollectableError) {
+      const r = policyNotCollectableResponse(e);
       return c.json(r.body, r.status);
     }
     if (e instanceof BatchDateLockedError) {

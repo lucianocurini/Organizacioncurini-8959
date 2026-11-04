@@ -7,6 +7,7 @@ import {
   COLLECTIONS_MIN_DUE_DATE,
   buildRenewalChainIndex,
   evaluateInstallmentCollectability,
+  evaluatePolicyCollectabilityPosition,
   resolveChainCurrentPolicy,
   summarizeCollectability,
   type CollectabilityInstallment,
@@ -84,9 +85,9 @@ describe("cadena de renovación", () => {
     expect(reasonOf(p, inst(20, "2026-07-15"))).toBe("SIN_POLIZA_VIGENTE_EN_CADENA");
   });
 
-  test("renovación cargada pero futura (hueco): la vencida queda oculta y la nueva es la próxima inmediata", () => {
+  test("renovación cargada pero futura (hueco): la terminada es ultima_terminada y la nueva es la próxima inmediata (regla 9)", () => {
     const p = [pol(30, "2025-07-01", "2026-08-31", { status: "renovada" }), pol(31, "2026-10-01", "2027-10-01", { renewedFromId: 30 })];
-    expect(reasonOf(p, inst(30, "2026-08-01"))).toBe("SIN_POLIZA_VIGENTE_EN_CADENA");
+    expect(reasonOf(p, inst(30, "2026-08-01"))).toBe("OK:ultima_terminada");
     expect(reasonOf(p, inst(31, "2026-10-15"))).toBe("OK:proxima_inmediata");
   });
 
@@ -181,10 +182,30 @@ describe("próxima inmediata (regla 8)", () => {
     expect(reasonOf(unaCancelada, inst(32, "2026-11-15"), T)).toBe("PROXIMA_CANCELADA");
   });
 
-  test("hueco entre vigencias con enlace directo válido: la próxima es cobrable, la terminada no", () => {
+  test("hueco entre vigencias con enlace directo válido: la próxima y la última terminada son cobrables (regla 9)", () => {
     const p = [pol(40, "2025-10-01", "2026-10-15", { status: "renovada" }), pol(41, "2026-11-15", "2027-11-15", { renewedFromId: 40 })];
     expect(evaluate(p, inst(41, "2026-11-15"), T)).toEqual({ collectable: true, via: "proxima_inmediata", currentPolicyId: null });
-    expect(reasonOf(p, inst(40, "2026-10-01"), T)).toBe("SIN_POLIZA_VIGENTE_EN_CADENA");
+    expect(evaluate(p, inst(40, "2026-10-01"), T)).toEqual({ collectable: true, via: "ultima_terminada", currentPolicyId: null });
+  });
+
+  test("hueco: la antecesora de la última terminada, una terminada sin sucesora o con sucesora cancelada → excluidas", () => {
+    const tres = [
+      pol(39, "2024-10-01", "2025-10-01", { status: "renovada" }),
+      pol(40, "2025-10-01", "2026-10-15", { status: "renovada", renewedFromId: 39 }),
+      pol(41, "2026-11-15", "2027-11-15", { renewedFromId: 40 }),
+    ];
+    expect(reasonOf(tres, inst(39, "2026-07-10"), T)).toBe("SIN_POLIZA_VIGENTE_EN_CADENA");
+    expect(reasonOf(tres, inst(40, "2026-10-01"), T)).toBe("OK:ultima_terminada");
+    expect(reasonOf([pol(40, "2025-10-01", "2026-10-15")], inst(40, "2026-10-01"), T)).toBe("SIN_POLIZA_VIGENTE_EN_CADENA");
+    const sucesoraCancelada = [pol(40, "2025-10-01", "2026-10-15", { status: "renovada" }), pol(41, "2026-11-15", "2027-11-15", { renewedFromId: 40, status: "cancelada", cancellationEffectiveDate: "2026-11-15" })];
+    expect(reasonOf(sucesoraCancelada, inst(40, "2026-10-01"), T)).toBe("SIN_POLIZA_VIGENTE_EN_CADENA");
+    // Dos sucesoras no canceladas de la terminada: ambigua, ninguna de las tres.
+    const ambigua = [pol(40, "2025-10-01", "2026-10-15", { status: "renovada" }), pol(41, "2026-11-15", "2027-11-15", { renewedFromId: 40 }), pol(43, "2026-12-01", "2027-12-01", { renewedFromId: 40 })];
+    expect(reasonOf(ambigua, inst(40, "2026-10-01"), T)).toBe("CADENA_AMBIGUA");
+    // La cuota de la terminada que vence después de su cancelación sigue excluida.
+    const canceladaTerminada = [pol(40, "2025-10-01", "2026-12-31", { status: "cancelada", cancellationEffectiveDate: "2026-10-15" }), pol(41, "2026-11-15", "2027-11-15", { renewedFromId: 40 })];
+    expect(reasonOf(canceladaTerminada, inst(40, "2026-10-01"), T)).toBe("OK:ultima_terminada");
+    expect(reasonOf(canceladaTerminada, inst(40, "2026-10-20"), T)).toBe("VENCE_DESPUES_DE_CANCELACION");
   });
 
   test("hueco: segunda renovación futura, sucesoras ambiguas o anterior con datos inválidos → excluidas", () => {
@@ -228,7 +249,7 @@ describe("próxima inmediata (regla 8)", () => {
   test("summarizeCollectability cuenta proxima_inmediata y cada cuota cae en una sola categoría", () => {
     const list = [inst(1, "2026-07-10"), inst(2, "2026-10-15"), inst(3, "2026-11-15"), inst(4, "2027-05-15")];
     const s = summarizeCollectability(buildRenewalChainIndex(chain()), list, T);
-    expect(s.collectableByVia).toEqual({ poliza_vigente: 1, antecesora_directa: 1, proxima_inmediata: 1 });
+    expect(s.collectableByVia).toEqual({ poliza_vigente: 1, antecesora_directa: 1, proxima_inmediata: 1, ultima_terminada: 0 });
     expect(s.notCollectableByReason).toEqual({ SUCESORA_NO_INMEDIATA: 1 });
   });
 });
@@ -312,13 +333,98 @@ describe("existingCollection (cambio de fecha de un cobro ya confirmado)", () =>
   });
 });
 
+describe("posición de póliza — fuente única (evaluatePolicyCollectabilityPosition)", () => {
+  const T = "2026-11-03";
+  const pos = (policies: CollectabilityPolicy[], id: number, date = T) => {
+    const r = evaluatePolicyCollectabilityPosition(buildRenewalChainIndex(policies), id, date);
+    return r.collectable ? `OK:${r.via}` : r.reason;
+  };
+  const chain4 = [
+    pol(1, "2024-12-01", "2025-11-30", { status: "renovada" }),
+    pol(2, "2025-06-01", "2025-11-30", { status: "renovada", renewedFromId: 1 }),
+    pol(3, "2025-12-01", "2026-11-30", { status: "renovada", renewedFromId: 2 }),
+    pol(4, "2026-12-01", "2027-11-30", { status: "renovada", renewedFromId: 3 }),
+    pol(5, "2027-12-01", "2028-11-30", { renewedFromId: 4 }),
+  ];
+
+  test("vigente + anterior inmediata + próxima inmediata; más antigua y segunda futura excluidas", () => {
+    expect(pos(chain4, 1)).toBe("ANTECESORA_MAS_ANTIGUA");
+    expect(pos(chain4, 2)).toBe("OK:antecesora_directa");
+    expect(pos(chain4, 3)).toBe("OK:poliza_vigente");
+    expect(pos(chain4, 4)).toBe("OK:proxima_inmediata");
+    expect(pos(chain4, 5)).toBe("SUCESORA_NO_INMEDIATA");
+  });
+
+  test("hueco: última terminada + próxima; nada más antiguo ni segunda futura", () => {
+    const p = [
+      pol(10, "2024-10-01", "2025-09-30", { status: "renovada" }),
+      pol(11, "2025-10-01", "2026-09-30", { status: "renovada", renewedFromId: 10 }),
+      pol(12, "2026-12-01", "2027-11-30", { status: "renovada", renewedFromId: 11 }),
+      pol(13, "2027-12-01", "2028-11-30", { renewedFromId: 12 }),
+    ];
+    expect(pos(p, 10)).toBe("SIN_POLIZA_VIGENTE_EN_CADENA");
+    expect(pos(p, 11)).toBe("OK:ultima_terminada");
+    expect(pos(p, 12)).toBe("OK:proxima_inmediata");
+    expect(pos(p, 13)).toBe("SUCESORA_NO_INMEDIATA");
+  });
+
+  test("futura suelta, canceladas, cadenas ambiguas e integridad", () => {
+    expect(pos([pol(20, "2026-12-01", "2027-11-30")], 20)).toBe("POLIZA_FUTURA");
+    expect(pos([pol(21, "2026-01-01", "2026-12-31", { status: "cancelada", cancellationEffectiveDate: "2026-11-10" })], 21)).toBe("OK:poliza_vigente");
+    expect(pos([pol(22, "2026-01-01", "2026-12-31", { status: "cancelada", cancellationEffectiveDate: "2026-10-01" })], 22)).toBe("SIN_POLIZA_VIGENTE_EN_CADENA");
+    expect(pos([pol(23, "2026-01-01", "2026-12-31", { status: "cancelada" })], 23)).toBe("CANCELADA_SIN_FECHA_EFECTIVA");
+    expect(pos([pol(24, "2026-01-01", "2026-12-31", { status: "renovada" })], 24)).toBe("RENOVADA_SIN_SUCESOR");
+    const proximaCancelada = [pol(25, "2026-01-01", "2026-11-30", { status: "renovada" }), pol(26, "2026-12-01", "2027-11-30", { renewedFromId: 25, status: "cancelada", cancellationEffectiveDate: "2026-12-01" })];
+    expect(pos(proximaCancelada, 26)).toBe("PROXIMA_CANCELADA");
+    const dosFuturas = [pol(30, "2026-01-01", "2026-11-30", { status: "renovada" }), pol(31, "2026-12-01", "2027-11-30", { renewedFromId: 30 }), pol(32, "2026-12-01", "2027-11-30", { renewedFromId: 30 })];
+    expect(pos(dosFuturas, 30)).toBe("OK:poliza_vigente");
+    expect(pos(dosFuturas, 31)).toBe("CADENA_AMBIGUA");
+    expect(pos(dosFuturas, 32)).toBe("CADENA_AMBIGUA");
+    const ciclo = [pol(40, "2026-01-01", "2026-12-31", { renewedFromId: 41 }), pol(41, "2026-01-01", "2026-12-31", { renewedFromId: 40 })];
+    expect(pos(ciclo, 40)).toBe("CADENA_AMBIGUA");
+    expect(pos([pol(50, null, "2026-12-31")], 50)).toBe("POLIZA_FECHAS_INVALIDAS");
+    expect(pos([], 999)).toBe("POLIZA_INEXISTENTE");
+    expect(pos(chain4, 3, "2026-02-30")).toBe("FECHA_PAGO_INVALIDA");
+  });
+
+  test("paridad: una cuota es cobrable ⇔ su póliza está en posición cobrable y la cuota pasa sus chequeos propios (misma vía)", () => {
+    const fixtures: { policies: CollectabilityPolicy[]; dates: string[] }[] = [
+      { policies: chain4, dates: ["2025-08-01", "2026-03-01", "2026-11-30", "2026-12-01", "2027-06-01"] },
+      { policies: [pol(60, "2025-10-01", "2026-09-30", { status: "renovada" }), pol(61, "2026-12-01", "2027-11-30", { renewedFromId: 60 })], dates: ["2026-09-30", "2026-10-15", "2026-12-01"] },
+      { policies: [pol(70, "2026-01-01", "2026-12-31", { status: "cancelada", cancellationEffectiveDate: "2026-09-15" }), pol(71, "2026-09-16", "2027-09-15", { renewedFromId: 70 })], dates: ["2026-09-15", "2026-09-16", "2026-11-03"] },
+      { policies: [pol(80, "2026-01-01", "2026-11-30", { status: "renovada" }), pol(81, "2026-12-01", "2027-11-30", { renewedFromId: 80 }), pol(82, "2026-12-01", "2027-11-30", { renewedFromId: 80 })], dates: ["2026-11-03", "2026-12-15"] },
+    ];
+    let checked = 0;
+    for (const { policies, dates } of fixtures) {
+      const index = buildRenewalChainIndex(policies);
+      for (const date of dates) {
+        for (const p of policies) {
+          const position = evaluatePolicyCollectabilityPosition(index, p.id, date);
+          for (const due of ["2026-07-01", "2026-09-10", "2026-10-01", "2026-12-15", "2027-06-01"]) {
+            const r = evaluateInstallmentCollectability(index, inst(p.id, due), date);
+            checked++;
+            if (r.collectable) {
+              expect(position).toEqual(r);
+            } else if (r.reason !== "VENCE_DESPUES_DE_CANCELACION") {
+              // Fuera de los chequeos propios de la cuota, el motivo es exactamente el de la posición.
+              expect(position.collectable).toBe(false);
+              if (!position.collectable) expect(position.reason).toBe(r.reason);
+            }
+          }
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(100);
+  });
+});
+
 describe("summarizeCollectability", () => {
   test("cada cuota cae en exactamente una categoría", () => {
     const p = [pol(1, "2026-01-01", "2026-12-31"), pol(2, "2026-01-01", "2026-12-31", { status: "cancelada" })];
     const list = [inst(1, "2026-08-01"), inst(1, "2026-06-01"), inst(2, "2026-08-01"), inst(1, "2026-08-02", { rendered: 1 })];
     const s = summarizeCollectability(buildRenewalChainIndex(p), list, D);
     const total = s.collectableByVia.poliza_vigente + s.collectableByVia.antecesora_directa + s.collectableByVia.proxima_inmediata
-      + Object.values(s.notCollectableByReason).reduce((a, b) => a + (b ?? 0), 0);
+      + s.collectableByVia.ultima_terminada + Object.values(s.notCollectableByReason).reduce((a, b) => a + (b ?? 0), 0);
     expect(total).toBe(list.length);
     expect(s.notCollectableByReason).toEqual({ ANTERIOR_FECHA_MINIMA: 1, CANCELADA_SIN_FECHA_EFECTIVA: 1, RENDIDA: 1 });
   });

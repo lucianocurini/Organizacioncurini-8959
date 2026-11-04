@@ -10,12 +10,13 @@
 //
 // Monta <PaymentModal> con react-dom/client sobre un DOM jsdom aislado
 // (creado en este archivo, no global) y un `fetch` mockeado que responde a
-// los endpoints reales que dispara el flujo: GET /policies?includeAccessories=1,
+// los endpoints reales que dispara el flujo: GET /policies/collectable-for-payment,
 // GET /installments/pending-for-payment (cuotas cobrables de un pago nuevo),
 // GET /policies/cash-period-search.
 // Ejecutar con: bun test packages/web/src/web/pages/__tests__/payment-modal-cash-period-wiring.test.tsx
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { JSDOM } from "jsdom";
+import { asCollectableSelectorRows, COLLECTABLE_POLICIES_PATH } from "./policy-selector-fixtures";
 
 const POLICY_ID = 57508;
 const POLICY_NUMBER = "QA-CONTADO-A-VIGENTE";
@@ -101,8 +102,8 @@ function mockFetch(cashPeriodSearchResponse: any[]) {
     if (/\/api\/policies\/\d+\/installments/.test(url)) {
       return jsonResponse(INSTALLMENTS_RESPONSE) as any;
     }
-    if (url === "/api/policies" || url === "/api/policies?includeAccessories=1") {
-      return jsonResponse(POLICIES_RESPONSE) as any;
+    if (url.startsWith(COLLECTABLE_POLICIES_PATH)) {
+      return jsonResponse(asCollectableSelectorRows(POLICIES_RESPONSE)) as any;
     }
     throw new Error(`Unmocked fetch in test: ${url}`);
   };
