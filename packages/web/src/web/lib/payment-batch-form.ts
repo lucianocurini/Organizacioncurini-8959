@@ -99,6 +99,28 @@ export interface InstallmentCartItem {
   dueDate: string;
   amount: number;
   status: string;
+  /** Período de la cuota (null = emisión/renovación) — para no mezclarla con el contado de su período. */
+  rebillingId?: number | null;
+}
+
+/**
+ * Contado de un período completo (emisión o refacturación) — source="cash_period"
+ * (Migración 0037). amount = importe de CONTADO (nunca el nominal): es lo que
+ * se imputa. Cancela todas las cuotas del período; ninguna de ellas puede
+ * estar además en el carrito como cuota suelta.
+ */
+export interface CashPeriodCartItem {
+  kind: "cash_period";
+  policyId: number;
+  rebillingId: number | null;
+  policyNumber: string;
+  insuredId: number;
+  insuredName: string;
+  companyId: number;
+  companyName: string;
+  amount: number;
+  nominalAmount: number;
+  installmentCount: number;
 }
 
 /** Cobro manual vinculado a una póliza real, sin cuota puntual — source="policy_manual_payment". */
@@ -132,7 +154,7 @@ export interface ManualPaymentCartItem {
   description: string;
 }
 
-export type BatchCartItem = InstallmentCartItem | PolicyManualPaymentCartItem | ManualPaymentCartItem;
+export type BatchCartItem = InstallmentCartItem | PolicyManualPaymentCartItem | ManualPaymentCartItem | CashPeriodCartItem;
 
 let manualUidCounter = 0;
 export function nextManualPaymentLocalId(): string {
@@ -140,8 +162,85 @@ export function nextManualPaymentLocalId(): string {
   return `manual-${manualUidCounter}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** Clave estable de un período (misma forma que cashPeriodCandidateKey). */
+export function cashPeriodKey(policyId: number, rebillingId: number | null): string {
+  return `${policyId}-${rebillingId ?? "emision"}`;
+}
+
 export function cartItemKey(item: BatchCartItem): string {
-  return item.kind === "installment" ? `installment-${item.installmentId}` : item.localId;
+  if (item.kind === "installment") return `installment-${item.installmentId}`;
+  if (item.kind === "cash_period") return `cash-period-${cashPeriodKey(item.policyId, item.rebillingId)}`;
+  return item.localId;
+}
+
+export function cartCashPeriodItem(cart: ReadonlyArray<BatchCartItem>): CashPeriodCartItem | null {
+  return (cart.find((i) => i.kind === "cash_period") as CashPeriodCartItem | undefined) ?? null;
+}
+
+/** true si la cuota pertenece al período de un contado que ya está en el carrito. */
+export function isInstallmentCoveredByCashPeriod(
+  installment: { policyId: number; rebillingId?: number | null },
+  cart: ReadonlyArray<BatchCartItem>,
+): boolean {
+  return cart.some((c) => c.kind === "cash_period"
+    && c.policyId === installment.policyId
+    && (c.rebillingId ?? null) === (installment.rebillingId ?? null));
+}
+
+/** Candidato de GET /policies/cash-period-search (solo los campos que usa el carrito). */
+export interface CashPeriodCandidateForCart {
+  policyId: number;
+  policyNumber: string;
+  insuredId: number;
+  insuredName: string;
+  companyId: number;
+  companyName: string;
+  rebillingId: number | null;
+  cashPaymentAmountCents: number | null;
+  nominalAmountCents: number;
+  installmentCount: number;
+  eligible: boolean;
+  ineligibleReasons?: string[];
+}
+
+export function getCashPeriodRowState(
+  candidate: CashPeriodCandidateForCart,
+  cart: ReadonlyArray<BatchCartItem>,
+): SearchResultRowState {
+  const key = cashPeriodKey(candidate.policyId, candidate.rebillingId);
+  if (cart.some((c) => c.kind === "cash_period" && cashPeriodKey(c.policyId, c.rebillingId) === key)) {
+    return { addable: false, alreadyInCart: true, reason: "Ya está en el carrito." };
+  }
+  if (!candidate.eligible || candidate.cashPaymentAmountCents == null || candidate.cashPaymentAmountCents <= 0) {
+    return { addable: false, alreadyInCart: false, reason: candidate.ineligibleReasons?.[0] ?? "El contado de este período no está disponible." };
+  }
+  if (cart.some((c) => c.kind === "cash_period")) {
+    return { addable: false, alreadyInCart: false, reason: "El lote ya tiene un contado: un lote admite un solo contado por período." };
+  }
+  if (cart.some((c) => c.kind === "installment" && c.policyId === candidate.policyId && (c.rebillingId ?? null) === candidate.rebillingId)) {
+    return { addable: false, alreadyInCart: false, reason: "Quitá del carrito las cuotas sueltas de este período para cobrarlo de contado." };
+  }
+  return { addable: true, alreadyInCart: false, reason: null };
+}
+
+/** Agrega el contado de un período: nunca junto con sus cuotas sueltas ni con otro contado. */
+export function addCashPeriodToCart(cart: BatchCartItem[], candidate: CashPeriodCandidateForCart): CartMutationResult {
+  const state = getCashPeriodRowState(candidate, cart);
+  if (!state.addable) return { cart, error: state.reason };
+  const next: CashPeriodCartItem = {
+    kind: "cash_period",
+    policyId: candidate.policyId,
+    rebillingId: candidate.rebillingId,
+    policyNumber: candidate.policyNumber,
+    insuredId: candidate.insuredId,
+    insuredName: candidate.insuredName,
+    companyId: candidate.companyId,
+    companyName: candidate.companyName,
+    amount: candidate.cashPaymentAmountCents! / 100,
+    nominalAmount: candidate.nominalAmountCents / 100,
+    installmentCount: candidate.installmentCount,
+  };
+  return { cart: [...cart, next], error: null };
 }
 
 /** Suma de amount del carrito, en pesos (no centavos) — cuotas + manuales. */
@@ -193,6 +292,9 @@ export function getInstallmentRowState(
   if (alreadyInCart) {
     return { addable: false, alreadyInCart: true, reason: "Ya está en el carrito." };
   }
+  if (isInstallmentCoveredByCashPeriod(item, cart)) {
+    return { addable: false, alreadyInCart: false, reason: "Incluida en el contado del período que ya está en el carrito." };
+  }
   return { addable: true, alreadyInCart: false, reason: null };
 }
 
@@ -218,6 +320,7 @@ export function addInstallmentToCart(cart: BatchCartItem[], item: PendingInstall
     dueDate: item.dueDate,
     amount: item.amount,
     status: item.status,
+    rebillingId: item.rebillingId ?? null,
   };
   return { cart: [...cart, next], error: null };
 }
@@ -555,14 +658,14 @@ export function splitsToPaymentSplitsPayload(splits: ReadonlyArray<BatchSplitFor
 // propósito, mismo criterio que el backend: ver batches.ts).
 
 export function estimateProntoPagoSurchargeCents(cart: ReadonlyArray<BatchCartItem>): number {
-  const rivadaviaItems = cart.filter((i) =>
-    i.kind !== "manual_payment" && (i.companyName ?? "").toLowerCase().includes("rivadavia")
-  );
-  const policyIdsInScope = new Set(
-    cart.filter((i): i is InstallmentCartItem | PolicyManualPaymentCartItem => i.kind !== "manual_payment").map((i) => i.policyId)
-  );
+  // El contado de un período (Migración 0037) nunca genera recargo ni entra
+  // en el alcance de grupos económicos — mismo criterio que el backend, que
+  // calcula los recargos solo sobre los ítems comunes.
+  const regular = cart.filter((i): i is InstallmentCartItem | PolicyManualPaymentCartItem =>
+    i.kind === "installment" || i.kind === "policy_manual_payment");
+  const rivadaviaItems = regular.filter((i) => (i.companyName ?? "").toLowerCase().includes("rivadavia"));
+  const policyIdsInScope = new Set(regular.map((i) => i.policyId));
   const applicableCount = rivadaviaItems.filter((i) => {
-    if (i.kind === "manual_payment") return false; // ya excluido arriba, defensivo para el type narrowing
     return !isSurchargeAbsorbedByGroup(
       { id: i.policyId, type: i.policyType, parentPolicyId: i.parentPolicyId },
       policyIdsInScope
@@ -828,7 +931,8 @@ export type PaymentBatchItemInput =
       manualCompany?: string | null;
       amount: number;
       description?: string | null;
-    };
+    }
+  | { source: "cash_period"; policyId: number; rebillingId: number | null };
 
 // Sin insuredId — el backend ya no lo exige ni lo lee: cada ítem resuelve el
 // suyo, y payment_batches.insured_id se deriva server-side.
@@ -893,6 +997,8 @@ export function buildPaymentBatchPayload(params: {
     paymentDate: params.paymentDate,
     items: params.cart.map((i): PaymentBatchItemInput => {
       if (i.kind === "installment") return { source: "installment", installmentId: i.installmentId };
+      // Contado: nunca manda importe — el backend usa el contado ya cargado.
+      if (i.kind === "cash_period") return { source: "cash_period", policyId: i.policyId, rebillingId: i.rebillingId };
       if (i.kind === "policy_manual_payment") {
         return { source: "policy_manual_payment", policyId: i.policyId, amount: i.amount, description: i.description || null };
       }
@@ -969,11 +1075,67 @@ export interface PaymentBatchDetailItem {
     id: number; amount: number; policyId: number | null; installmentId: number | null;
     paymentDate: string; status: string; notes: string | null;
     manualPayer: string | null; manualPolicyNumber: string | null; manualCompany: string | null;
+    /** Migración 0037: cuota cancelada por el contado del lote (no se muestra suelta). */
+    cashPeriodPaymentId?: number | null;
   };
   installment: { id: number; number: number; dueDate: string; amount: number } | null;
   policy: { id: number; policyNumber: string } | null;
   company: { id: number; name: string } | null;
   insured: { id: number; name: string } | null;
+}
+
+export interface PaymentBatchDetailCashPeriod {
+  id: number;
+  policyId: number;
+  rebillingId: number | null;
+  nominalAmountCents: number;
+  cashAmountCents: number;
+  discountAmountCents: number;
+  status: string;
+  rendered: number;
+}
+
+/** Fila del comprobante: una partida común, o el contado del período como UNA partida. */
+export type BatchReceiptRow =
+  | { kind: "item"; key: string; item: PaymentBatchDetailItem; label: string; insuredLabel: string; amountCents: number }
+  | {
+      kind: "cash_period"; key: string; label: string; insuredLabel: string; amountCents: number;
+      nominalCents: number; discountCents: number; installments: PaymentBatchDetailItem[];
+    };
+
+/**
+ * Comprobante del lote (Migración 0037): las cuotas del contado se agrupan en
+ * una sola fila por el importe de contado (con nominal y descuento como
+ * dato); el resto de los ítems se muestran igual que siempre.
+ */
+export function buildBatchReceiptRows(
+  items: ReadonlyArray<PaymentBatchDetailItem>,
+  cashPeriod: PaymentBatchDetailCashPeriod | null | undefined,
+): BatchReceiptRow[] {
+  const rows: BatchReceiptRow[] = [];
+  const cashChildren = cashPeriod ? items.filter((i) => i.payment.cashPeriodPaymentId === cashPeriod.id) : [];
+  if (cashPeriod && cashChildren.length > 0) {
+    const first = cashChildren[0]!;
+    rows.push({
+      kind: "cash_period",
+      key: `cash-period-${cashPeriod.id}`,
+      label: `Contado del período — ${cashPeriod.rebillingId == null ? "Emisión/renovación" : `Refacturación #${cashPeriod.rebillingId}`}` +
+        ` — póliza ${first.policy?.policyNumber ?? "—"} — ${cashChildren.length} cuota${cashChildren.length === 1 ? "" : "s"}`,
+      insuredLabel: batchDetailItemInsuredLabel(first),
+      amountCents: cashPeriod.cashAmountCents,
+      nominalCents: cashPeriod.nominalAmountCents,
+      discountCents: cashPeriod.discountAmountCents,
+      installments: cashChildren,
+    });
+  }
+  for (const item of items) {
+    if (cashPeriod && item.payment.cashPeriodPaymentId === cashPeriod.id) continue;
+    rows.push({
+      kind: "item", key: `payment-${item.payment.id}`, item, label: describeBatchDetailItem(item),
+      insuredLabel: batchDetailItemInsuredLabel(item), amountCents: Math.round(item.payment.amount * 100),
+    });
+  }
+  return rows;
 }
 
 export interface PaymentBatchDetailCheck {
@@ -1062,6 +1224,8 @@ export interface PaymentBatchDetail {
   /** Etapa 1B-4: solo batches con titular de cuenta (null/ausente en legacy). */
   accountHolder?: { id: number; name: string } | null;
   fundingAllocations?: BatchDetailFundingAllocation[];
+  /** Migración 0037: contado del período incluido en el lote (null/ausente si no tiene). */
+  cashPeriodPayment?: PaymentBatchDetailCashPeriod | null;
 }
 
 /** Fila persistida de payment_batch_funding_allocations (GET /payment-batches/:id). */

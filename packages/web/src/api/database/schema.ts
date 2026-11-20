@@ -130,6 +130,15 @@ export const payments = sqliteTable("payments", {
   // (installmentId/policyId/amount sin cambios de semántica), pero sus
   // medios reales NO viven acá — ver comentario de paymentSplits más abajo.
   batchId: integer("batch_id").references(() => paymentBatches.id),
+  // Migración 0037 (contado por período en un lote mixto): con valor, este
+  // payment es una cuota cancelada por ese contado (cash_period_payments) —
+  // guarda el nominal de su cuota, pero nunca se lista, rinde ni prorratea
+  // suelto: el contado es UNA partida por su importe de contado. NULL para
+  // todo otro payment, incluidos los hijos comunes de un lote mixto. Es la
+  // única forma de separar, dentro de un mismo lote, las cuotas del contado
+  // de las cuotas comunes (antes de 0037 un lote con contado era 100%
+  // contado y alcanzaba con batchId; el backfill de 0037 vinculó esos).
+  cashPeriodPaymentId: integer("cash_period_payment_id").references(() => cashPeriodPayments.id),
 });
 
 // Etapa 3A: desglose por medio de pago de un mismo payment. Todo payment
@@ -805,8 +814,11 @@ export const ownMoneyMovements = sqliteTable("own_money_movements", {
 // pero ya no afectan a este).
 //
 // "Cuotas canceladas" no se duplica acá: son exactamente los payments con
-// batchId = paymentBatchId (cada uno con su installmentId real) — misma
-// trazabilidad que cualquier otro payment_batches.
+// cashPeriodPaymentId = id (Migración 0037; cada uno con su installmentId
+// real). Desde 0037 un lote puede ser MIXTO: el contado más cuotas comunes
+// de otras pólizas — esas cuotas comunes también tienen batchId =
+// paymentBatchId pero cashPeriodPaymentId NULL. Sigue habiendo como máximo
+// un contado por lote (ux_cash_period_payments_batch_id).
 //
 // rendered/renderedAt: el período se rinde como UN SOLO instrumento (ver
 // POST /remittances, item.source = "payment_batch") — a diferencia de un

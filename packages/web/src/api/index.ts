@@ -110,6 +110,7 @@ import {
   assertAllInstallmentsEligibleForCashPeriod, checkCashPeriodEligibility, buildCashPeriodPaymentSnapshot,
   getCommissionBaseAmountCents, calculateCashPeriodDeadline, getCashPeriodDeadlineStatus,
   CashPeriodPaymentValidationError, type CashPeriodInstallmentForEligibility,
+  apportionCashPeriodChildrenCents, isMixedCashPeriodBatch,
 } from "../lib/payments/cash-period-payments";
 import { loadAccountMovementCajaTotals } from "./account-holder-funding-caja-loader";
 import { resolveAccountMovementCancelPlan } from "./account-holder-batch-cancel-plan";
@@ -2122,15 +2123,29 @@ app.get("/payments", requireAuth(async (c: any) => {
       }
     }
 
-    // Representante (policy/insured/company) de cada batch — cualquiera de
-    // sus hijos sirve, todos comparten policyId (ver POST
-    // /payment-batches/cash-period-payment: un único policyId por período).
+    // Representante (policy/insured/company) de cada contado — cualquiera de
+    // SUS hijos sirve (cash_period_payment_id, Migración 0037), todos
+    // comparten policyId. Nunca un hijo común de un lote mixto.
     const representativeByBatchId = new Map<number, (typeof results)[number]>();
     for (const r of results) {
-      if (r.payment.batchId != null && cashPeriodByBatchId.has(r.payment.batchId) && !representativeByBatchId.has(r.payment.batchId)) {
+      if (r.payment.batchId != null && r.payment.cashPeriodPaymentId != null && !representativeByBatchId.has(r.payment.batchId)) {
         representativeByBatchId.set(r.payment.batchId, r);
       }
     }
+    // Lote mixto (Migración 0037): sus medios reales pagan el contado Y
+    // otras cuotas — no se pueden atribuir al contado. La fila del contado
+    // se muestra entonces como cualquier hijo de lote ("lote"), sin splits.
+    const mixedBatchIds = new Set<number>();
+    const cashPeriodChildFlags = await db.select({ batchId: payments.batchId, cashPeriodPaymentId: payments.cashPeriodPaymentId })
+      .from(payments).where(inArray(payments.batchId, cashPeriodBatchIds)).all();
+    const flagsByBatchId = new Map<number, { cashPeriodPaymentId: number | null }[]>();
+    for (const f of cashPeriodChildFlags) {
+      if (f.batchId == null) continue;
+      const arr = flagsByBatchId.get(f.batchId) ?? [];
+      arr.push({ cashPeriodPaymentId: f.cashPeriodPaymentId });
+      flagsByBatchId.set(f.batchId, arr);
+    }
+    for (const [bId, flags] of flagsByBatchId) if (isMixedCashPeriodBatch(flags)) mixedBatchIds.add(bId);
 
     cashPeriodSyntheticRows = [...cashPeriodByBatchId.entries()].flatMap(([batchId, cashPeriodPayment]) => {
       const rep = representativeByBatchId.get(batchId);
@@ -2142,7 +2157,8 @@ app.get("/payments", requireAuth(async (c: any) => {
       // — 0 splits acá es la misma categoría de "no debería pasar" que
       // !rep || !batch de arriba, nunca un caso legítimo de "sin método".
       if (splits.length === 0) return [];
-      const resolvedMethod = splits.length === 1 ? splits[0]!.method : "combinado";
+      const mixed = mixedBatchIds.has(batchId);
+      const resolvedMethod = mixed ? "lote" : splits.length === 1 ? splits[0]!.method : "combinado";
       return [{
         policy: rep.policy, insured: rep.insured, company: rep.company, installment: null,
         payment: {
@@ -2153,6 +2169,7 @@ app.get("/payments", requireAuth(async (c: any) => {
           // ofrezca como si fuera un pago suelto).
           id: null,
           batchId,
+          cashPeriodPaymentId: cashPeriodPayment.id,
           policyId: rep.payment.policyId,
           // manualPayer/manualPolicyNumber/manualCompany: exclusivos de la
           // imputación manual sin póliza — un cobro de contado SIEMPRE está
@@ -2194,7 +2211,7 @@ app.get("/payments", requireAuth(async (c: any) => {
           hasSurcharge: false,
           surchargeAmount: null,
           hasChecks: batchChecksSet.has(batchId),
-          splits,
+          splits: mixed ? [] : splits,
           isCashPeriodPayment: true,
           concept: "Pago de contado",
           cashPeriodPayment: {
@@ -2207,7 +2224,9 @@ app.get("/payments", requireAuth(async (c: any) => {
       }];
     });
 
-    results = results.filter((r) => r.payment.batchId == null || !cashPeriodByBatchId.has(r.payment.batchId));
+    // Solo se ocultan las cuotas del contado; las cuotas comunes de un lote
+    // mixto siguen siendo filas propias, igual que en cualquier lote.
+    results = results.filter((r) => r.payment.cashPeriodPaymentId == null);
   }
 
   const paymentIds = results.map(r => r.payment.id);
@@ -3404,13 +3423,36 @@ async function createPaymentBatchFromBody(c: any, user: any, body: any, options:
   // no tiene ningún id propio antes de insertarse (y dos cobros manuales del
   // mismo request pueden compartir policyId), así que installmentId no sirve
   // como clave universal como sí servía cuando todos los ítems eran cuotas.
+  // Migración 0037 — contado de un período dentro del lote. No es un "ítem"
+  // más de `contexts` (no tiene importe propio ni un único payment hijo):
+  // se resuelve aparte, con las mismas reglas que el cobro de contado
+  // individual, y aporta su importe de contado a la base del lote.
+  const cashPeriodItem = normalizedItems.find(
+    (i): i is Extract<NormalizedPaymentBatchItem, { source: "cash_period" }> => i.source === "cash_period"
+  ) ?? null;
+  const regularItems = normalizedItems.filter((i) => i.source !== "cash_period");
+  if (cashPeriodItem) {
+    if (mode === "titular") {
+      return c.json({
+        error: "El contado de un período no se combina con titular de cuenta ni saldo a favor. Cobralo sin titular.",
+        code: "CASH_PERIOD_TITULAR_NOT_SUPPORTED",
+      }, 400);
+    }
+    if (body.accountDifferenceResolution != null) {
+      return c.json({
+        error: "Un lote con contado del período no admite resolver diferencias: el total recibido debe coincidir exactamente con lo imputado.",
+        code: "CASH_PERIOD_BATCH_DIFFERENCE_NOT_SUPPORTED",
+      }, 400);
+    }
+  }
+
   const installmentEntries: { item: Extract<NormalizedPaymentBatchItem, { source: "installment" }>; idx: number }[] = [];
   const policyManualEntries: { item: Extract<NormalizedPaymentBatchItem, { source: "policy_manual_payment" }>; idx: number }[] = [];
   const manualEntries: { item: Extract<NormalizedPaymentBatchItem, { source: "manual_payment" }>; idx: number }[] = [];
-  normalizedItems.forEach((item, idx) => {
+  regularItems.forEach((item, idx) => {
     if (item.source === "installment") installmentEntries.push({ item, idx });
     else if (item.source === "policy_manual_payment") policyManualEntries.push({ item, idx });
-    else manualEntries.push({ item, idx });
+    else if (item.source === "manual_payment") manualEntries.push({ item, idx });
   });
 
   const installmentIds = installmentEntries.map((x) => x.item.installmentId);
@@ -3470,8 +3512,8 @@ async function createPaymentBatchFromBody(c: any, user: any, body: any, options:
   const policyManualRowsById = new Map(policyManualRows.map((r) => [r.policyId, r]));
 
   interface ItemDisplay { insuredName: string | null; policyNumber: string | null; companyName: string | null }
-  const contexts: BatchItemContext[] = new Array(normalizedItems.length);
-  const displays: ItemDisplay[] = new Array(normalizedItems.length);
+  const contexts: BatchItemContext[] = new Array(regularItems.length);
+  const displays: ItemDisplay[] = new Array(regularItems.length);
 
   for (const { item, idx } of installmentEntries) {
     const r = installmentRowsById.get(item.installmentId)!;
@@ -3537,11 +3579,118 @@ async function createPaymentBatchFromBody(c: any, user: any, body: any, options:
     displays[idx] = { insuredName: item.manualPayer, policyNumber: item.manualPolicyNumber, companyName: item.manualCompany };
   }
 
+  // 3b. Contado del período (Migración 0037): mismas validaciones, en el
+  // mismo orden, que POST /payment-batches/cash-period-payment — póliza real,
+  // refacturación de esa póliza, importe de contado YA cargado (nunca del
+  // body), todas las cuotas del período (todo o nada), cobrabilidad con la
+  // fecha de pago y snapshot nominal/contado/descuento. Además: ninguna cuota
+  // del período puede venir también como ítem suelto del mismo lote.
+  let cashPeriod: {
+    policyId: number;
+    rebillingId: number | null;
+    insuredId: number;
+    periodInstallmentRows: Array<{ id: number; amount: number }>;
+    periodInstallmentIds: number[];
+    snapshot: { nominalAmountCents: number; cashAmountCents: number; discountAmountCents: number };
+  } | null = null;
+  if (cashPeriodItem) {
+    const cpPolicy = await db.select({
+      id: policies.id, status: policies.status, insuredId: policies.insuredId,
+      cashPaymentAmountCents: policies.cashPaymentAmountCents,
+    }).from(policies).where(eq(policies.id, cashPeriodItem.policyId)).get();
+    if (!cpPolicy) return c.json({ error: `La póliza ${cashPeriodItem.policyId} del contado no existe.` }, 404);
+    if (cpPolicy.status === "cancelada") return c.json({ error: "La póliza del contado está cancelada." }, 409);
+
+    let cpCashAmountCents: number | null;
+    if (cashPeriodItem.rebillingId !== null) {
+      const rebilling = await db.select({
+        id: rebillings.id, policyId: rebillings.policyId, cashPaymentAmountCents: rebillings.cashPaymentAmountCents,
+      }).from(rebillings).where(eq(rebillings.id, cashPeriodItem.rebillingId)).get();
+      if (!rebilling) return c.json({ error: "La refacturación del contado no existe." }, 404);
+      if (rebilling.policyId !== cpPolicy.id) return c.json({ error: "La refacturación no pertenece a la póliza del contado." }, 400);
+      cpCashAmountCents = rebilling.cashPaymentAmountCents;
+    } else {
+      cpCashAmountCents = cpPolicy.cashPaymentAmountCents;
+    }
+    if (cpCashAmountCents === null) {
+      return c.json({
+        error: "Este período no tiene un importe contado cargado. Cargalo primero en los datos de la póliza/refacturación para poder cobrarlo de contado.",
+      }, 400);
+    }
+
+    const periodInstallmentRows = await db.select({
+      id: policyInstallments.id, amount: policyInstallments.amount,
+      status: policyInstallments.status, rendered: policyInstallments.rendered,
+    }).from(policyInstallments)
+      .where(and(
+        eq(policyInstallments.policyId, cpPolicy.id),
+        cashPeriodItem.rebillingId !== null
+          ? eq(policyInstallments.rebillingId, cashPeriodItem.rebillingId)
+          : isNull(policyInstallments.rebillingId),
+        excludeDuplicateInstallments(),
+      )).all();
+    const periodInstallmentIds = periodInstallmentRows.map((r) => r.id);
+
+    const overlapping = installmentIds.filter((id) => periodInstallmentIds.includes(id));
+    if (overlapping.length > 0) {
+      return c.json({
+        error: `${overlapping.length === 1 ? `La cuota ${overlapping[0]} ya está incluida` : `Las cuotas ${overlapping.join(", ")} ya están incluidas`} ` +
+          `en el contado del período. Quitalas del lote: el contado cancela todas las cuotas del período por su importe de contado.`,
+        code: "CASH_PERIOD_INSTALLMENT_DUPLICATED_IN_BATCH",
+        blockingInstallmentIds: overlapping,
+      }, 400);
+    }
+
+    const cpConfirmedRows = periodInstallmentIds.length > 0
+      ? await db.select({ installmentId: payments.installmentId }).from(payments)
+        .where(and(inArray(payments.installmentId, periodInstallmentIds), eq(payments.status, "confirmado"))).all()
+      : [];
+    const cpConfirmedIds = new Set(cpConfirmedRows.map((p) => p.installmentId));
+    try {
+      assertAllInstallmentsEligibleForCashPeriod(periodInstallmentRows.map((r) => ({
+        id: r.id, status: r.status, rendered: r.rendered, hasConfirmedPayment: cpConfirmedIds.has(r.id),
+      })));
+    } catch (e: any) {
+      if (e instanceof CashPeriodPaymentValidationError) {
+        return c.json({ error: e.message, blockingInstallmentIds: periodInstallmentIds }, 409);
+      }
+      throw e;
+    }
+    try {
+      await assertInstallmentsCollectable(db, periodInstallmentIds, body.paymentDate);
+    } catch (e: any) {
+      if (e instanceof InstallmentNotCollectableError) {
+        const r = cashPeriodNotCollectableResponse(e);
+        return c.json(r.body, r.status);
+      }
+      throw e;
+    }
+    const nominalAmountCents = periodInstallmentRows.reduce((s, r) => s + Math.round(r.amount * 100), 0);
+    let snapshot;
+    try {
+      snapshot = buildCashPeriodPaymentSnapshot(nominalAmountCents, cpCashAmountCents);
+    } catch (e: any) {
+      if (e instanceof CashPeriodPaymentValidationError) return c.json({ error: e.message }, 400);
+      throw e;
+    }
+    cashPeriod = {
+      policyId: cpPolicy.id,
+      rebillingId: cashPeriodItem.rebillingId,
+      insuredId: cpPolicy.insuredId,
+      periodInstallmentRows: periodInstallmentRows.map((r) => ({ id: r.id, amount: r.amount })),
+      periodInstallmentIds,
+      snapshot,
+    };
+  }
+
   // 4. insuredId legacy del batch: DERIVADO de los ítems, nunca exigido ni
   // validado contra el body — un batch puede mezclar libremente ítems de
   // distintos asegurados (ver resolveBatchInsuredId). null si hay más de un
-  // asegurado real entre los ítems, o si ninguno tiene uno.
-  const derivedInsuredId = resolveBatchInsuredId(contexts);
+  // asegurado real entre los ítems, o si ninguno tiene uno. El asegurado del
+  // contado cuenta como uno más.
+  const derivedInsuredId = resolveBatchInsuredId(
+    cashPeriod ? [...contexts, { insuredId: cashPeriod.insuredId } as BatchItemContext] : contexts
+  );
 
   // 5. Estado de cada cuota + ausencia de pago confirmado ya existente.
   // Se distingue "ya pagada standalone" (batchId NULL) de "ya pertenece a
@@ -3594,7 +3743,11 @@ async function createPaymentBatchFromBody(c: any, user: any, body: any, options:
 
   // 6. Base = suma de las cuotas (importe exacto de cada una, sin parciales
   // — el body nunca manda un importe por cuota, ver normalizeBatchItems).
-  const baseAmountCents = calculateBaseAmountCents(contexts);
+  // Migración 0037: el contado aporta su importe de CONTADO (nunca el
+  // nominal de sus cuotas) y nunca genera recargo Pronto Pago (mismo
+  // criterio que el cobro de contado individual); los recargos de abajo se
+  // siguen calculando solo sobre los ítems comunes, con las reglas vigentes.
+  const baseAmountCents = calculateBaseAmountCents(contexts) + (cashPeriod?.snapshot.cashAmountCents ?? 0);
 
   // 7. Grupo de los medios — mixed se rechaza antes de cualquier escritura.
   let splitGroup: SplitGroup;
@@ -3640,6 +3793,21 @@ async function createPaymentBatchFromBody(c: any, user: any, body: any, options:
   // esta fase (ni siquiera se mira accountDifferenceResolution si vino).
   const appliedCents = totals.totalReceivedCents;
   const receivedCents = normalizedSplits.reduce((sum, s) => sum + s.amountCents, 0);
+
+  // Migración 0037 — primera versión del contado en lote: lo recibido (los
+  // cheques/medios por su importe real) debe coincidir EXACTO con lo
+  // imputado (contado + cuotas comunes + recargos). Sin saldos, sin ajuste
+  // por redondeo: esa resolución queda para el proyecto de saldos.
+  if (cashPeriod && receivedCents !== appliedCents) {
+    return c.json({
+      error:
+        `La suma de los medios ($${(receivedCents / 100).toFixed(2)}) no coincide con el total imputado del lote ` +
+        `($${(appliedCents / 100).toFixed(2)}: contado del período + cuotas + recargos). En un lote con contado ` +
+        `deben coincidir exactamente.`,
+      code: "CASH_PERIOD_BATCH_AMOUNT_MISMATCH",
+      receivedCents, appliedCents, differenceCents: receivedCents - appliedCents,
+    }, 400);
+  }
 
   let accountMovementToCreate: { type: "saldo_a_favor" | "saldo_deudor"; reason: string | null; differenceCents: number } | null = null;
   // Tolerancia de redondeo (payment_amount_adjustments, sin insuredId —
@@ -3890,6 +4058,43 @@ async function createPaymentBatchFromBody(c: any, user: any, body: any, options:
     }));
     const { singleChildId } = await insertBatchChildren(tx, batch.id, childInsertItems, body.paymentDate, user.id);
 
+    // Migración 0037 — contado del período dentro del lote: mismo registro
+    // que el cobro de contado individual (cash_period_payments con el
+    // snapshot + un hijo por cuota a su nominal, paymentMethod "contado"),
+    // pero cada hijo queda vinculado a su contado (cash_period_payment_id)
+    // para distinguirlo de las cuotas comunes del mismo lote. Carrera y
+    // cobrabilidad se revalidan acá, dentro de la transacción real.
+    if (cashPeriod) {
+      await checkInstallmentPaymentRace(tx, cashPeriod.periodInstallmentIds);
+      try {
+        await assertInstallmentsCollectable(tx, cashPeriod.periodInstallmentIds, body.paymentDate);
+      } catch (e: any) {
+        if (e instanceof InstallmentNotCollectableError) throw new CashPeriodNotCollectableInBatchError(e);
+        throw e;
+      }
+      const [cpp] = await tx.insert(cashPeriodPayments).values({
+        paymentBatchId: batch.id,
+        policyId: cashPeriod.policyId,
+        rebillingId: cashPeriod.rebillingId,
+        nominalAmountCents: cashPeriod.snapshot.nominalAmountCents,
+        cashAmountCents: cashPeriod.snapshot.cashAmountCents,
+        discountAmountCents: cashPeriod.snapshot.discountAmountCents,
+        status: "confirmado",
+        rendered: 0,
+        createdBy: user.id,
+        createdAt: new Date(),
+      }).returning();
+      for (const inst of cashPeriod.periodInstallmentRows) {
+        await tx.insert(payments).values({
+          policyId: cashPeriod.policyId, installmentId: inst.id, amount: inst.amount,
+          paymentMethod: "contado", paymentDate: body.paymentDate,
+          status: "confirmado", batchId: batch.id, createdBy: user.id,
+          cashPeriodPaymentId: cpp!.id,
+        });
+        await recalculateInstallmentPaymentStatus(tx, inst.id);
+      }
+    }
+
     // Fase 2B: movimiento de cuenta corriente por la diferencia
     // recibido/aplicado, ya validado por completo antes de abrir esta
     // transacción (derivedInsuredId real único + accountDifferenceResolution
@@ -3941,6 +4146,10 @@ async function createPaymentBatchFromBody(c: any, user: any, body: any, options:
     if (e instanceof PaymentBatchRaceConditionError) {
       return c.json({ error: e.message, blockingInstallmentIds: e.installmentIds }, 409);
     }
+    if (e instanceof CashPeriodNotCollectableInBatchError) {
+      const r = cashPeriodNotCollectableResponse(e.inner);
+      return c.json(r.body, r.status);
+    }
     if (e instanceof InstallmentNotCollectableError) {
       const r = installmentNotCollectableResponse(e);
       return c.json(r.body, r.status);
@@ -3973,6 +4182,15 @@ async function createPaymentBatchFromBody(c: any, user: any, body: any, options:
 // deuda nueva — hay que usar el modo titular para aplicarlo primero. Se
 // chequea antes y otra vez dentro de la transacción.
 class CreditAvailableBeforeDebtError extends Error {}
+
+// Migración 0037: una cuota del contado dejó de ser cobrable entre la
+// validación previa y la transacción de un lote mixto — se responde con el
+// mensaje de período (cashPeriodNotCollectableResponse), no el de cuota suelta.
+class CashPeriodNotCollectableInBatchError extends Error {
+  constructor(public readonly inner: InstallmentNotCollectableError) {
+    super(inner.message);
+  }
+}
 
 function creditAvailableBeforeDebtMessage(balanceCents: number): string {
   return `El asegurado tiene saldo a favor disponible ($${(balanceCents / 100).toFixed(2)}): aplicalo con "Titular de cuenta" antes de generar un saldo deudor.`;
@@ -4299,23 +4517,13 @@ app.post("/payment-batches/cash-period-payment", requireAuth(async (c: any) => {
         }
       }
 
-      // Cada cuota queda pagada por su importe NOMINAL completo (trazabilidad
-      // hacia la compañía intacta) — el descuento vive únicamente en
-      // cash_period_payments, nunca prorrateado entre las cuotas.
-      for (const inst of periodInstallmentRows) {
-        await tx.insert(payments).values({
-          policyId, installmentId: inst.id, amount: inst.amount,
-          paymentMethod: "contado", paymentDate: body.paymentDate,
-          status: "confirmado", batchId: batch!.id, createdBy: user.id,
-        });
-        await recalculateInstallmentPaymentStatus(tx, inst.id);
-      }
-
       // Regla 5/6: NUNCA insured_account_movements por el descuento — no se
       // llama a ese camino en absoluto acá (el descuento comercial vive
       // únicamente en discountAmountCents). payment_amount_adjustments SÍ se
       // usa, pero solo para la diferencia REAL de instrumentos (redondeo),
       // nunca para el descuento — ver roundingAdjustmentToCreate arriba.
+      // Se inserta ANTES que los hijos (Migración 0037): cada hijo guarda su
+      // cash_period_payment_id.
       const [cashPeriodPayment] = await tx.insert(cashPeriodPayments).values({
         paymentBatchId: batch!.id,
         policyId,
@@ -4328,6 +4536,19 @@ app.post("/payment-batches/cash-period-payment", requireAuth(async (c: any) => {
         createdBy: user.id,
         createdAt: new Date(),
       }).returning();
+
+      // Cada cuota queda pagada por su importe NOMINAL completo (trazabilidad
+      // hacia la compañía intacta) — el descuento vive únicamente en
+      // cash_period_payments, nunca prorrateado entre las cuotas.
+      for (const inst of periodInstallmentRows) {
+        await tx.insert(payments).values({
+          policyId, installmentId: inst.id, amount: inst.amount,
+          paymentMethod: "contado", paymentDate: body.paymentDate,
+          status: "confirmado", batchId: batch!.id, createdBy: user.id,
+          cashPeriodPaymentId: cashPeriodPayment!.id,
+        });
+        await recalculateInstallmentPaymentStatus(tx, inst.id);
+      }
 
       if (roundingAdjustmentToCreate) {
         await tx.insert(paymentAmountAdjustments).values({
@@ -4398,11 +4619,15 @@ app.get("/cash-period-payments/:batchId", requireAuth(async (c: any) => {
       number: policyInstallments.number, dueDate: policyInstallments.dueDate,
     }).from(payments)
       .leftJoin(policyInstallments, eq(payments.installmentId, policyInstallments.id))
-      .where(eq(payments.batchId, batchId)).all(),
+      // Solo las cuotas de ESTE contado (Migración 0037) — en un lote mixto
+      // el resto de los hijos son cuotas comunes de otras pólizas.
+      .where(eq(payments.cashPeriodPaymentId, row.id)).all(),
     db.select({ receivedAmountCents: paymentBatches.receivedAmountCents }).from(paymentBatches).where(eq(paymentBatches.id, batchId)).get(),
     db.select({ amountCents: paymentAmountAdjustments.amountCents }).from(paymentAmountAdjustments)
       .where(eq(paymentAmountAdjustments.paymentBatchId, batchId)).get(),
   ]);
+  const mixedBatch = !!(await db.select({ id: payments.id }).from(payments)
+    .where(and(eq(payments.batchId, batchId), isNull(payments.cashPeriodPaymentId))).get());
 
   return c.json({
     ...row,
@@ -4410,7 +4635,11 @@ app.get("/cash-period-payments/:batchId", requireAuth(async (c: any) => {
     // dinero real recibido y el ajuste por redondeo registrado, si hubo
     // alguno (0/null si cerró exacto) — ver POST
     // /payment-batches/cash-period-payment para la regla completa.
-    actualReceivedCents: batchRow?.receivedAmountCents ?? row.cashAmountCents,
+    // Lote mixto (Migración 0037): lo recibido del lote paga también otras
+    // cuotas y debe coincidir exacto con lo imputado — al contado le
+    // corresponde exactamente su importe de contado.
+    actualReceivedCents: mixedBatch ? row.cashAmountCents : (batchRow?.receivedAmountCents ?? row.cashAmountCents),
+    mixedBatch,
     roundingAdjustmentCents: adjustmentRow?.amountCents ?? 0,
     commissionBaseAmountCents: getCommissionBaseAmountCents(row),
     policy,
@@ -4684,7 +4913,14 @@ app.get("/payment-batches/:id", requireAuth(async (c: any) => {
     createdAt: paymentAmountAdjustments.createdAt,
   }).from(paymentAmountAdjustments).where(eq(paymentAmountAdjustments.paymentBatchId, id)).all();
 
-  const baseFromChildren = childRows.reduce((s, r) => s + Math.round(r.payment.amount * 100), 0);
+  // Contado del lote (si tiene): sus cuotas cuentan por el importe de
+  // contado, no por su nominal — la base del lote nunca incluyó el nominal
+  // (Migración 0034 para el contado individual, 0037 para el lote mixto).
+  const cashPeriodPayment = await db.select().from(cashPeriodPayments).where(eq(cashPeriodPayments.paymentBatchId, id)).get() ?? null;
+  const baseFromChildren = childRows
+    .filter((r) => r.payment.cashPeriodPaymentId == null)
+    .reduce((s, r) => s + Math.round(r.payment.amount * 100), 0)
+    + (cashPeriodPayment && childRows.some((r) => r.payment.cashPeriodPaymentId === cashPeriodPayment.id) ? cashPeriodPayment.cashAmountCents : 0);
   const surchargeFromEntries = surcharges.reduce((s, e) => s + Math.round(e.amount * 100), 0);
   const splitsSum = splitsRows.reduce((s, sp) => s + sp.amountCents, 0);
 
@@ -4737,7 +4973,17 @@ app.get("/payment-batches/:id", requireAuth(async (c: any) => {
 
   const { accountHolder, fundingAllocations } = await loadBatchFundingDetail(db, id, batch.accountHolderInsuredId ?? null);
 
-  return c.json({ batch, insuredSummary, items: childRows, splits: splitsWithChecksOut, surcharges, integrity, accountMovements, amountAdjustments, accountHolder, fundingAllocations }, 200);
+  return c.json({
+    batch, insuredSummary, items: childRows, splits: splitsWithChecksOut, surcharges, integrity, accountMovements, amountAdjustments,
+    accountHolder, fundingAllocations,
+    // Migración 0037: contado del período incluido en el lote (null si no
+    // tiene) — el comprobante lo muestra como UNA partida.
+    cashPeriodPayment: cashPeriodPayment ? {
+      id: cashPeriodPayment.id, policyId: cashPeriodPayment.policyId, rebillingId: cashPeriodPayment.rebillingId,
+      nominalAmountCents: cashPeriodPayment.nominalAmountCents, cashAmountCents: cashPeriodPayment.cashAmountCents,
+      discountAmountCents: cashPeriodPayment.discountAmountCents, status: cashPeriodPayment.status, rendered: cashPeriodPayment.rendered,
+    } : null,
+  }, 200);
 }));
 
 // ─── ANULACIÓN DE UN LOTE CONFIRMADO (corrección segura, con trazabilidad) ──
@@ -5420,9 +5666,16 @@ app.get("/payments/stats", requireAuth(async (c: any) => {
     : [];
   const cashPeriodByBatchId = new Map(cashPeriodRows.map((r) => [r.paymentBatchId, r]));
 
-  const standalone = all.filter((r) => r.payment.batchId == null || !cashPeriodByBatchId.has(r.payment.batchId));
+  // Migración 0037: solo las cuotas del contado se reemplazan por el importe
+  // de contado; las cuotas comunes de un lote mixto cuentan como cualquier
+  // hijo de lote (payments.amount).
+  const standalone = all.filter((r) => r.payment.cashPeriodPaymentId == null);
   const confirmed = standalone.filter((r) => r.payment.status === "confirmado");
   const confirmedCashPeriodBatches = cashPeriodRows.filter((r) => r.status === "confirmado");
+  const mixedCashPeriodBatchIds = new Set<number>(
+    all.filter((r) => r.payment.batchId != null && r.payment.cashPeriodPaymentId == null && cashPeriodByBatchId.has(r.payment.batchId))
+      .map((r) => r.payment.batchId as number)
+  );
 
   // paymentDate real de cada batch de contado — todos los hijos comparten el
   // mismo (ver POST /payment-batches/cash-period-payment), se toma de
@@ -5466,7 +5719,11 @@ app.get("/payments/stats", requireAuth(async (c: any) => {
   // Mismo criterio para los batches de contado confirmados: SIEMPRE por
   // payment_batch_splits (medios reales), nunca por payments.paymentMethod
   // de los hijos (vale "contado", que no es un instrumento real).
-  const confirmedCashPeriodBatchIds = confirmedCashPeriodBatches.map((r) => r.paymentBatchId);
+  // Lote mixto: sus medios pagan también otras cuotas, que (como todo hijo
+  // de lote) no suman en byMethod — no se atribuyen al contado.
+  const confirmedCashPeriodBatchIds = confirmedCashPeriodBatches
+    .map((r) => r.paymentBatchId)
+    .filter((id) => !mixedCashPeriodBatchIds.has(id));
   if (confirmedCashPeriodBatchIds.length > 0) {
     const batchSplitRows = await db.select({
       batchId: paymentBatchSplits.batchId, method: paymentBatchSplits.method, amountCents: paymentBatchSplits.amountCents,
@@ -9113,17 +9370,16 @@ app.patch("/cash/payments/:id/render", requireAdmin(async (c: any) => {
   // rendición junto con todo su período, vía POST/DELETE /remittances
   // (source="payment_batch"). Marcarlo suelto dejaría el contado rendido a
   // medias y desincronizado de cash_period_payments.rendered.
-  const target = await db.select({ batchId: payments.batchId }).from(payments).where(eq(payments.id, id)).get();
+  // Migración 0037: solo las cuotas del contado (cash_period_payment_id) —
+  // una cuota común de un lote mixto se rinde como cualquier hijo de lote.
+  const target = await db.select({ batchId: payments.batchId, cashPeriodPaymentId: payments.cashPeriodPaymentId })
+    .from(payments).where(eq(payments.id, id)).get();
   if (!target) return c.json({ error: "No encontrado" }, 404);
-  if (target.batchId != null) {
-    const cashPeriodOwner = await db.select({ id: cashPeriodPayments.id }).from(cashPeriodPayments)
-      .where(eq(cashPeriodPayments.paymentBatchId, target.batchId)).get();
-    if (cashPeriodOwner) {
-      return c.json({
-        error: "Este pago es una cuota de un pago de contado: se rinde junto con todo el período desde Rendiciones, nunca por separado.",
-        code: "CASH_PERIOD_CHILD_RENDER_FORBIDDEN",
-      }, 409);
-    }
+  if (target.cashPeriodPaymentId != null) {
+    return c.json({
+      error: "Este pago es una cuota de un pago de contado: se rinde junto con todo el período desde Rendiciones, nunca por separado.",
+      code: "CASH_PERIOD_CHILD_RENDER_FORBIDDEN",
+    }, 409);
   }
   const result = await db.update(payments).set({
     rendered,
@@ -9548,7 +9804,16 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     const batchRows = await db.select().from(paymentBatches).where(inArray(paymentBatches.id, batchIdsArr)).all();
     const childRows = await db.select({
       id: payments.id, batchId: payments.batchId, status: payments.status, rendered: payments.rendered, amount: payments.amount,
+      cashPeriodPaymentId: payments.cashPeriodPaymentId,
     }).from(payments).where(inArray(payments.batchId, batchIdsArr)).all();
+    // Migración 0037: el peso de cada cuota del contado en el prorrateo de
+    // lo pendiente es su parte del importe de CONTADO (no su nominal) — si
+    // no, rendir primero las cuotas comunes de un lote mixto dejaría en
+    // cartera una porción equivocada. Mismo reparto que POST /remittances.
+    const cashPeriodWeightByPaymentId = await loadCashPeriodChildCents(
+      (childRows as any[]).filter((c) => c.cashPeriodPaymentId != null)
+        .map((c) => ({ paymentId: c.id, cashPeriodPaymentId: c.cashPeriodPaymentId, amount: c.amount })),
+    );
     const batchSplitRows = await db.select().from(paymentBatchSplits).where(inArray(paymentBatchSplits.batchId, batchIdsArr)).all();
     const batchSplitIdsArr = batchSplitRows.map((s: any) => s.id);
     const batchCheckRows = batchSplitIdsArr.length
@@ -9569,7 +9834,10 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
     const childrenByBatchId = new Map<number, { paymentId: number; status: string; rendered: number; amountCents: number }[]>();
     for (const c of childRows as any[]) {
       const arr = childrenByBatchId.get(c.batchId) ?? [];
-      arr.push({ paymentId: c.id, status: c.status, rendered: c.rendered, amountCents: Math.round(c.amount * 100) });
+      arr.push({
+        paymentId: c.id, status: c.status, rendered: c.rendered,
+        amountCents: cashPeriodWeightByPaymentId.get(c.id) ?? Math.round(c.amount * 100),
+      });
       childrenByBatchId.set(c.batchId, arr);
     }
     for (const b of batchRows as any[]) {
@@ -9661,9 +9929,19 @@ app.get("/cash/summary", requireAdmin(async (c: any) => {
   // las mismas allocations (ver calculateExpectedCollectedCents).
   const distinctAllForRendido = collectDistinctExpectedSources(allocationsForRendido as any[]);
   const expectedPaymentRows = distinctAllForRendido.standalonePaymentIds.length
-    ? await db.select({ id: payments.id, amount: payments.amount }).from(payments).where(inArray(payments.id, distinctAllForRendido.standalonePaymentIds)).all()
+    ? await db.select({ id: payments.id, amount: payments.amount, cashPeriodPaymentId: payments.cashPeriodPaymentId })
+      .from(payments).where(inArray(payments.id, distinctAllForRendido.standalonePaymentIds)).all()
     : [];
-  const expectedPaymentAmountCentsById = new Map<number, number>(expectedPaymentRows.map((p: any) => [p.id, Math.round(p.amount * 100)]));
+  // Migración 0037: una cuota del contado de un lote mixto se rinde por su
+  // parte del importe de contado (no por su nominal) — mismo reparto que
+  // usó POST /remittances al crear la allocation.
+  const expectedCashPeriodCentsById = await loadCashPeriodChildCents(
+    (expectedPaymentRows as any[]).filter((p) => p.cashPeriodPaymentId != null)
+      .map((p) => ({ paymentId: p.id, cashPeriodPaymentId: p.cashPeriodPaymentId, amount: p.amount })),
+  );
+  const expectedPaymentAmountCentsById = new Map<number, number>(expectedPaymentRows.map((p: any) => [
+    p.id, expectedCashPeriodCentsById.get(p.id) ?? Math.round(p.amount * 100),
+  ]));
 
   // Un lote rendido completo (hoy solo el cobro de contado, source=
   // "payment_batch") se rinde con sus instrumentos REALES
@@ -10292,7 +10570,8 @@ app.get("/remittances/:id/items", requireAuth(async (c: any) => {
     number: policyInstallments.number, dueDate: policyInstallments.dueDate,
   }).from(payments)
     .leftJoin(policyInstallments, eq(payments.installmentId, policyInstallments.id))
-    .where(inArray(payments.batchId, cashPeriodBatchIds)).all();
+    // Solo cuotas DEL contado (Migración 0037), nunca las comunes de un lote mixto.
+    .where(and(inArray(payments.batchId, cashPeriodBatchIds), isNotNull(payments.cashPeriodPaymentId))).all();
   const childrenByBatchId = new Map<number, any[]>();
   for (const r of childRows as any[]) {
     const arr = childrenByBatchId.get(r.batchId) ?? [];
@@ -10459,6 +10738,25 @@ app.post("/remittances", requireAuth(async (c: any) => {
           .where(inArray(paymentBatches.id, cashPeriodBatchIds)).all()
         : [];
       const cashPeriodBatchRowsById = new Map(cashPeriodBatchRows.map((r: any) => [r.batch.id, r]));
+      // Migración 0037: hijos de cada lote con contado, separados en cuotas
+      // del contado (cash_period_payment_id) y el resto. Si hay "resto", el
+      // lote es mixto: el contado se rinde como una partida por su importe de
+      // contado, con el medio de rendición elegido — nunca con los medios del
+      // lote (que pagan también las otras cuotas).
+      const cashPeriodChildRowsTx = cashPeriodBatchIds.length
+        ? await tx.select({
+          id: payments.id, batchId: payments.batchId, amount: payments.amount, status: payments.status,
+          rendered: payments.rendered, cashPeriodPaymentId: payments.cashPeriodPaymentId,
+        }).from(payments).where(inArray(payments.batchId, cashPeriodBatchIds)).all()
+        : [];
+      const cashPeriodChildrenByBatchId = new Map<number, any[]>();
+      const mixedCashPeriodBatchIds = new Set<number>();
+      for (const ch of cashPeriodChildRowsTx as any[]) {
+        if (ch.cashPeriodPaymentId == null) { mixedCashPeriodBatchIds.add(ch.batchId); continue; }
+        const arr = cashPeriodChildrenByBatchId.get(ch.batchId) ?? [];
+        arr.push(ch);
+        cashPeriodChildrenByBatchId.set(ch.batchId, arr);
+      }
       for (const item of paymentBatchSourceItems) {
         const r = cashPeriodBatchRowsById.get(item.sourceId);
         // El JOIN con cash_period_payments arriba ya excluye por construcción
@@ -10481,6 +10779,33 @@ app.post("/remittances", requireAuth(async (c: any) => {
         // (validadas más abajo contra instrumentos reales) sigan siendo
         // exactas por el importe contado.
         const declaredCents = Math.round((item.amount || 0) * 100);
+        if (mixedCashPeriodBatchIds.has(item.sourceId)) {
+          // Lote mixto: importe = exactamente el contado; medio de rendición
+          // obligatorio y real (igual que un hijo de lote, Migración 0029);
+          // las cuotas del contado, todas confirmadas y sin rendir.
+          if (declaredCents !== r.cashPeriodPayment.cashAmountCents) {
+            throw new RemittanceAllocationValidationError(
+              `El importe declarado para el contado del cobro ${item.sourceId} ($${(declaredCents / 100).toFixed(2)}) debe ser ` +
+              `exactamente el importe de contado ($${(r.cashPeriodPayment.cashAmountCents / 100).toFixed(2)}), nunca el nominal ` +
+              `de las cuotas ni el total del lote.`
+            );
+          }
+          if (!item.paymentMethod || !isContableMethod(item.paymentMethod)) {
+            throw new RemittanceAllocationValidationError(
+              `El contado del cobro ${item.sourceId} pertenece a un lote con otras cuotas: necesita un método de rendición real ` +
+              `(efectivo, transferencia, cheque, link_pago o transferencia_compania).`
+            );
+          }
+          const cppChildren = cashPeriodChildrenByBatchId.get(item.sourceId) ?? [];
+          if (cppChildren.length === 0) throw new RemittanceAllocationValidationError(`El contado del cobro ${item.sourceId} no tiene cuotas cobradas asociadas.`);
+          if (cppChildren.some((ch: any) => ch.status !== "confirmado")) {
+            throw new RemittanceAllocationValidationError(`Alguna cuota del contado del cobro ${item.sourceId} no está confirmada.`);
+          }
+          if (cppChildren.some((ch: any) => ch.rendered !== 0)) {
+            throw new RemittanceAllocationValidationError(`Alguna cuota del contado del cobro ${item.sourceId} ya figura rendida.`);
+          }
+          continue;
+        }
         if (declaredCents !== r.batch.totalReceivedCents) {
           throw new RemittanceAllocationValidationError(
             `El importe declarado para el cobro ${item.sourceId} ($${(declaredCents / 100).toFixed(2)}) debe ser exactamente ` +
@@ -10510,25 +10835,15 @@ app.post("/remittances", requireAuth(async (c: any) => {
       // NOMINAL completo, ignorando el descuento) y/o duplicar el mismo
       // dinero: una vez como source="payment_batch" (importe contado real) y
       // otra vez como source="payment" por cada hijo (importe nominal).
-      const paymentBatchIdsAmongPayments = [...new Set(
-        (paymentRows as any[]).filter((p) => p.batchId != null).map((p) => p.batchId as number)
-      )];
-      if (paymentBatchIdsAmongPayments.length > 0) {
-        const cashPeriodOwnersOfChildren = await tx.select({ paymentBatchId: cashPeriodPayments.paymentBatchId })
-          .from(cashPeriodPayments)
-          .where(inArray(cashPeriodPayments.paymentBatchId, paymentBatchIdsAmongPayments))
-          .all();
-        const cashPeriodBatchIdSet = new Set(cashPeriodOwnersOfChildren.map((r: any) => r.paymentBatchId as number));
-        if (cashPeriodBatchIdSet.size > 0) {
-          for (const item of paymentSourceItems) {
-            const p = paymentsById.get(item.sourceId);
-            if (p?.batchId != null && cashPeriodBatchIdSet.has(p.batchId)) {
-              throw new RemittanceAllocationValidationError(
-                `El pago ${item.sourceId} pertenece a un cobro de período de contado (cobro ${p.batchId}) — ese período se ` +
-                `rinde como un único instrumento (source="payment_batch"), nunca por cuota individual.`
-              );
-            }
-          }
+      // Migración 0037: solo las cuotas DEL contado (cash_period_payment_id);
+      // una cuota común de un lote mixto se rinde como cualquier hijo de lote.
+      for (const item of paymentSourceItems) {
+        const p = paymentsById.get(item.sourceId);
+        if (p?.cashPeriodPaymentId != null) {
+          throw new RemittanceAllocationValidationError(
+            `El pago ${item.sourceId} pertenece a un cobro de período de contado (cobro ${p.batchId}) — ese período se ` +
+            `rinde como un único instrumento (source="payment_batch"), nunca por cuota individual.`
+          );
         }
       }
 
@@ -10714,6 +11029,27 @@ app.post("/remittances", requireAuth(async (c: any) => {
           });
           allInstruments.push(instrument);
           collectedSources.push({ kind: "cash_entry", amountCents: Math.round(e.amount * 100) });
+        } else if (item.source === "payment_batch" && mixedCashPeriodBatchIds.has(item.sourceId)) {
+          // Migración 0037 — contado de un lote mixto: se rinde como las
+          // cuotas de un lote (Migración 0029), con el medio de rendición
+          // elegido y SIN consumir los medios del lote (que pagan también las
+          // cuotas comunes). El importe de contado se reparte entre sus cuotas
+          // con apportionCashPeriodChildrenCents — el mismo reparto que usa
+          // Caja para el esperado y la cartera, así nunca se descuadran.
+          const r = cashPeriodBatchRowsById.get(item.sourceId)!;
+          const cppChildren = cashPeriodChildrenByBatchId.get(item.sourceId) ?? [];
+          const centsByPaymentId = apportionCashPeriodChildrenCents(
+            r.cashPeriodPayment.cashAmountCents,
+            cppChildren.map((ch: any) => ({ paymentId: ch.id, nominalCents: Math.round(ch.amount * 100) })),
+          );
+          for (const ch of cppChildren) {
+            const amountCents = centsByPaymentId.get(ch.id)!;
+            if (amountCents <= 0) continue; // allocation exige amount_cents > 0
+            allInstruments.push(resolveBatchChildPaymentInstrument({
+              remittanceItemId: row.id, paymentId: ch.id, paymentBatchId: item.sourceId, method: item.paymentMethod, amountCents,
+            }));
+            collectedSources.push({ kind: "batch_child_payment", amountCents });
+          }
         } else if (item.source === "payment_batch") {
           // Migración 0034 — Regla 8: el instrumento de cobranza REAL del
           // batch entero (payment_batch_splits/received_checks, el importe
@@ -10811,10 +11147,13 @@ app.post("/remittances", requireAuth(async (c: any) => {
           // applyBatchToCartera lee para excluir de "cartera pendiente" en
           // Caja — sin esto, Caja seguiría mostrando el período como
           // pendiente de rendir después de rendido).
+          // Migración 0037: solo las cuotas DEL contado — en un lote mixto las
+          // cuotas comunes conservan su propio estado de rendición.
           const now = new Date();
+          const cpp = cashPeriodBatchRowsById.get(item.sourceId)!.cashPeriodPayment;
           await tx.update(cashPeriodPayments).set({ rendered: 1, renderedAt: now })
-            .where(eq(cashPeriodPayments.paymentBatchId, item.sourceId));
-          await tx.update(payments).set({ rendered: 1, renderedAt: now }).where(eq(payments.batchId, item.sourceId));
+            .where(eq(cashPeriodPayments.id, cpp.id));
+          await tx.update(payments).set({ rendered: 1, renderedAt: now }).where(eq(payments.cashPeriodPaymentId, cpp.id));
         }
       }
 
@@ -10861,9 +11200,14 @@ app.delete("/remittances/:id", requireAdmin(async (c: any) => {
           // vuelven a rendered=0 (Caja vuelve a mostrar el período como
           // pendiente de rendir). payment_batch_splits/received_checks no se
           // tocan (mismo criterio que un batch_split común).
-          await tx.update(cashPeriodPayments).set({ rendered: 0, renderedAt: null })
-            .where(eq(cashPeriodPayments.paymentBatchId, item.sourceId));
-          await tx.update(payments).set({ rendered: 0, renderedAt: null }).where(eq(payments.batchId, item.sourceId));
+          // Migración 0037: solo las cuotas DEL contado — revertir el contado
+          // de un lote mixto nunca toca las cuotas comunes de ese lote.
+          const cpp = await tx.select({ id: cashPeriodPayments.id }).from(cashPeriodPayments)
+            .where(eq(cashPeriodPayments.paymentBatchId, item.sourceId)).get();
+          if (cpp) {
+            await tx.update(cashPeriodPayments).set({ rendered: 0, renderedAt: null }).where(eq(cashPeriodPayments.id, cpp.id));
+            await tx.update(payments).set({ rendered: 0, renderedAt: null }).where(eq(payments.cashPeriodPaymentId, cpp.id));
+          }
         }
       }
 
@@ -11117,6 +11461,32 @@ app.get("/remittances/uncollected", requireAuth(async (c: any) => {
   return c.json(rows);
 }));
 
+// Migración 0037 — parte del importe de contado que le toca a cada cuota del
+// contado (payments con cash_period_payment_id), para los payments pedidos.
+// El reparto (apportionCashPeriodChildrenCents) se hace siempre sobre TODAS
+// las cuotas de cada contado, aunque se pidan solo algunas: así el resultado
+// por cuota es idéntico en POST /remittances y en Caja.
+async function loadCashPeriodChildCents(
+  requested: ReadonlyArray<{ paymentId: number; cashPeriodPaymentId: number }>,
+): Promise<Map<number, number>> {
+  const result = new Map<number, number>();
+  const cppIds = [...new Set(requested.map((r) => r.cashPeriodPaymentId))];
+  if (cppIds.length === 0) return result;
+  const [cppRows, allChildren] = await Promise.all([
+    db.select({ id: cashPeriodPayments.id, cashAmountCents: cashPeriodPayments.cashAmountCents })
+      .from(cashPeriodPayments).where(inArray(cashPeriodPayments.id, cppIds)).all(),
+    db.select({ id: payments.id, amount: payments.amount, cashPeriodPaymentId: payments.cashPeriodPaymentId })
+      .from(payments).where(inArray(payments.cashPeriodPaymentId, cppIds)).all(),
+  ]);
+  for (const cpp of cppRows) {
+    const children = allChildren
+      .filter((ch) => ch.cashPeriodPaymentId === cpp.id)
+      .map((ch) => ({ paymentId: ch.id, nominalCents: Math.round(ch.amount * 100) }));
+    for (const [paymentId, cents] of apportionCashPeriodChildrenCents(cpp.cashAmountCents, children)) result.set(paymentId, cents);
+  }
+  return result;
+}
+
 // Cobros de contado por período (Migración 0034) que GET /remittances/pending
 // debe considerar: todos los que tengan algún payment hijo pendiente en la
 // lista (para ocultar esos hijos, sea cual sea el estado del contado) más
@@ -11136,8 +11506,10 @@ async function loadCashPeriodPendingSources(pendingBatchIds: number[]): Promise<
   const [batchRows, splitRows, childRows, policyRows, rebillingRows] = await Promise.all([
     db.select().from(paymentBatches).where(inArray(paymentBatches.id, batchIds)).all(),
     db.select().from(paymentBatchSplits).where(inArray(paymentBatchSplits.batchId, batchIds)).orderBy(asc(paymentBatchSplits.id)).all(),
-    db.select({ id: payments.id, batchId: payments.batchId, status: payments.status, rendered: payments.rendered })
-      .from(payments).where(inArray(payments.batchId, batchIds)).all(),
+    db.select({
+      id: payments.id, batchId: payments.batchId, status: payments.status, rendered: payments.rendered,
+      cashPeriodPaymentId: payments.cashPeriodPaymentId,
+    }).from(payments).where(inArray(payments.batchId, batchIds)).all(),
     db.select({
       id: policies.id, policyNumber: policies.policyNumber, startDate: policies.startDate, endDate: policies.endDate,
       insuredName: insureds.name, companyName: companies.name,
@@ -11169,12 +11541,16 @@ async function loadCashPeriodPendingSources(pendingBatchIds: number[]): Promise<
     arr.push({ method: s.method, amountCents: s.amountCents, notes: s.notes, checks: checksBySplitId.get(s.id) ?? [] });
     splitsByBatchId.set(s.batchId, arr);
   }
-  const childrenByBatchId = new Map<number, CashPeriodPendingSource["children"][number][]>();
+  // Migración 0037: hijos del contado = cash_period_payment_id; cualquier
+  // otro hijo del mismo lote (cuota común) vuelve el lote "mixto".
+  const childrenByCashPeriodId = new Map<number, CashPeriodPendingSource["children"][number][]>();
+  const mixedBatchIds = new Set<number>();
   for (const ch of childRows) {
     if (ch.batchId == null) continue;
-    const arr = childrenByBatchId.get(ch.batchId) ?? [];
+    if (ch.cashPeriodPaymentId == null) { mixedBatchIds.add(ch.batchId); continue; }
+    const arr = childrenByCashPeriodId.get(ch.cashPeriodPaymentId) ?? [];
     arr.push({ paymentId: ch.id, status: ch.status, rendered: ch.rendered });
-    childrenByBatchId.set(ch.batchId, arr);
+    childrenByCashPeriodId.set(ch.cashPeriodPaymentId, arr);
   }
   const batchById = new Map(batchRows.map((b) => [b.id, b]));
   const policyById = new Map(policyRows.map((p) => [p.id, p]));
@@ -11201,7 +11577,8 @@ async function loadCashPeriodPendingSources(pendingBatchIds: number[]): Promise<
         }
         : null,
       splits: splitsByBatchId.get(cpp.paymentBatchId) ?? [],
-      children: childrenByBatchId.get(cpp.paymentBatchId) ?? [],
+      children: childrenByCashPeriodId.get(cpp.id) ?? [],
+      mixedBatch: mixedBatchIds.has(cpp.paymentBatchId),
       policyNumber: policy?.policyNumber ?? null,
       insuredName: policy?.insuredName ?? null,
       companyName: policy?.companyName ?? null,
@@ -11224,6 +11601,7 @@ app.get("/remittances/pending", requireAuth(async (c: any) => {
       paymentDate: payments.paymentDate,
       policyId: payments.policyId,
       batchId: payments.batchId,
+      cashPeriodPaymentId: payments.cashPeriodPaymentId,
       manualPayer: payments.manualPayer,
       manualPolicyNumber: payments.manualPolicyNumber,
       manualCompany: payments.manualCompany,
@@ -11249,8 +11627,9 @@ app.get("/remittances/pending", requireAuth(async (c: any) => {
   // standalone siguen igual que antes.
   const pendingBatchIds = [...new Set(pendingPaymentsRaw.map((p) => p.batchId).filter((id): id is number => id != null))];
   const cashPeriodSources = await loadCashPeriodPendingSources(pendingBatchIds);
-  const cashPeriodBatchIds = new Set(cashPeriodSources.map((s) => s.paymentBatchId));
-  const pendingPayments = excludeCashPeriodChildren(pendingPaymentsRaw, cashPeriodBatchIds);
+  // Solo se ocultan las cuotas del contado; las cuotas comunes de un lote
+  // mixto se listan y rinden como cualquier hijo de lote.
+  const pendingPayments = excludeCashPeriodChildren(pendingPaymentsRaw);
   const cashPeriodItems = cashPeriodSources
     .map(buildCashPeriodPendingItem)
     .filter((item): item is NonNullable<typeof item> => item !== null);

@@ -72,6 +72,12 @@ export type PaymentBatchItemInput =
       amount: number;
       description?: string | null;
     }
+  // Contado de un período completo (emisión: rebillingId null; o una
+  // refacturación puntual) — Migración 0037. Nunca trae importe ni cuotas:
+  // el backend relee el importe de contado cargado y TODAS las cuotas del
+  // período (todo o nada, mismas reglas que POST
+  // /payment-batches/cash-period-payment).
+  | { source: "cash_period"; policyId: number; rebillingId: number | null }
   | { installmentId: number }; // legacy sin source
 
 export type NormalizedPaymentBatchItem =
@@ -84,7 +90,13 @@ export type NormalizedPaymentBatchItem =
       manualCompany: string | null;
       amountCents: number;
       description: string | null;
-    };
+    }
+  | { source: "cash_period"; policyId: number; rebillingId: number | null };
+
+/** Máximo de contados por lote (índice único ux_cash_period_payments_batch_id, Migración 0034). */
+export const MAX_CASH_PERIOD_ITEMS_PER_BATCH = 1;
+export const CASH_PERIOD_ITEM_LIMIT_ERROR =
+  "Un lote admite un solo contado por período. Cobrá el otro contado en un lote aparte.";
 
 /**
  * Valida la forma del array de ítems tal cual llega del body: al menos uno,
@@ -175,8 +187,33 @@ export function normalizeBatchItems(items: PaymentBatchItemInput[]): NormalizedP
       return;
     }
 
+    if (source === "cash_period") {
+      const policyId = Number(raw?.policyId);
+      if (!Number.isInteger(policyId) || policyId <= 0) {
+        throw new PaymentBatchValidationError(`El ${label} (contado del período) tiene un policyId inválido: ${raw?.policyId}.`);
+      }
+      const rebillingId = raw?.rebillingId == null ? null : Number(raw.rebillingId);
+      if (rebillingId !== null && (!Number.isInteger(rebillingId) || rebillingId <= 0)) {
+        throw new PaymentBatchValidationError(`El ${label} (contado del período) tiene un rebillingId inválido: ${raw?.rebillingId}.`);
+      }
+      // Nunca un importe desde el body: el contado es SIEMPRE el ya cargado
+      // en la póliza/refacturación (mismo criterio que el cobro individual).
+      if (raw?.amount != null) {
+        throw new PaymentBatchValidationError(
+          `El ${label} (contado del período) no admite importe: se usa el importe de contado cargado en el período.`
+        );
+      }
+      normalized.push({ source: "cash_period", policyId, rebillingId });
+      return;
+    }
+
     throw new PaymentBatchValidationError(`El ${label} tiene un source inválido: "${source}".`);
   });
+
+  const cashPeriodItems = normalized.filter((i) => i.source === "cash_period");
+  if (cashPeriodItems.length > MAX_CASH_PERIOD_ITEMS_PER_BATCH) {
+    throw new PaymentBatchValidationError(CASH_PERIOD_ITEM_LIMIT_ERROR);
+  }
   return normalized;
 }
 

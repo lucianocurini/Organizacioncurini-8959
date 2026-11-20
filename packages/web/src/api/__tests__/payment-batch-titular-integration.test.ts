@@ -105,7 +105,8 @@ async function createSchema(c: Client): Promise<void> {
       manual_policy_number TEXT, manual_company TEXT, amount REAL NOT NULL, payment_method TEXT NOT NULL,
       payment_date TEXT NOT NULL, period_month TEXT, notes TEXT, status TEXT NOT NULL DEFAULT 'confirmado',
       rendered INTEGER NOT NULL DEFAULT 0, rendered_at INTEGER, installment_id INTEGER REFERENCES policy_installments(id),
-      due_date TEXT, created_by INTEGER REFERENCES users(id), created_at INTEGER, batch_id INTEGER REFERENCES payment_batches(id)
+      due_date TEXT, created_by INTEGER REFERENCES users(id), created_at INTEGER, batch_id INTEGER REFERENCES payment_batches(id),
+      cash_period_payment_id INTEGER
     )
   `);
   await c.execute(`

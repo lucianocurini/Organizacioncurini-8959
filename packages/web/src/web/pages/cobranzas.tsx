@@ -36,7 +36,7 @@ import {
   getPendingItemPaymentGroup, isBatchChildPendingPayment,
   computeDefaultRendicionMethod, attachRendicionMethod, CONTABLE_METHODS,
   RENDICION_METHOD_LABELS, getRendicionItemMethodLabel,
-  isCashPeriodPendingItem, isPendingItemSelectable, canMarkPendingItemAsDebtor, resolveRendicionItemDebtorStatus,
+  isCashPeriodPendingItem, isMixedCashPeriodPendingItem, isPendingItemSelectable, canMarkPendingItemAsDebtor, resolveRendicionItemDebtorStatus,
   describeCashPeriodPendingItem, formatCuotasCount, countRendicionCuotas,
 } from "@/lib/rendicion-pending";
 import { computeRendicionSurcharge } from "@/lib/rendicion-surcharge";
@@ -2322,10 +2322,13 @@ export function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void;
   // rendición elegido SÍ reemplaza su instrumento contable real, Migración
   // 0029) vs. standalone/manuales (por ahora solo informativo — ver
   // rendicion-pending.ts). Maneja la nota de aviso más abajo.
-  const batchChildSelectedCount = selectedCobradas.filter(isBatchChildPendingPayment).length;
-  // Pagos de contado: se rinden con sus medios reales de cobro, nunca con el
-  // medio elegido acá (ver attachRendicionMethod).
-  const cashPeriodSelectedCount = selectedCobradas.filter(isCashPeriodPendingItem).length;
+  // Contado de un lote mixto (Migración 0037): se rinde con el medio elegido,
+  // igual que un hijo de lote — se cuenta con ellos.
+  const mixedCashPeriodSelectedCount = selectedCobradas.filter(isMixedCashPeriodPendingItem).length;
+  const batchChildSelectedCount = selectedCobradas.filter(isBatchChildPendingPayment).length + mixedCashPeriodSelectedCount;
+  // Pagos de contado (no mixtos): se rinden con sus medios reales de cobro,
+  // nunca con el medio elegido acá (ver attachRendicionMethod).
+  const cashPeriodSelectedCount = selectedCobradas.filter(isCashPeriodPendingItem).length - mixedCashPeriodSelectedCount;
   const limitedSelectedCount = selectedItems.length - batchChildSelectedCount - cashPeriodSelectedCount;
 
   // Al entrar al paso 2 (o cambiar la selección sin haber tocado el
@@ -2400,7 +2403,9 @@ export function NuevaRendicionModal({ onClose, onSaved }: { onClose: () => void;
           clientName: i.clientName,
           policyNumber: i.policyNumber,
           companyName: i.companyName,
-          cashPeriodRealMethod: isCashPeriodPendingItem(i) ? i.paymentMethod : null,
+          // Contado de un lote mixto: sin medio "real" propio — viaja el
+          // medio de rendición elegido (attachRendicionMethod), Migración 0037.
+          cashPeriodRealMethod: isCashPeriodPendingItem(i) && !isMixedCashPeriodPendingItem(i) ? i.paymentMethod : null,
         })),
         rendicionMethod,
       );

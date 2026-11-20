@@ -22,7 +22,7 @@ import {
   syncSingleBatchSplitAmount, addCheckToSplit, removeCheckFromSplit, updateCheckInSplit,
   validateBatchSplitsForm, computeSplitTotals, groupSplitsByMethod,
   isBatchSubmitDisabled, buildPaymentBatchPayload, normalizeBatchSubmitError,
-  isManualBatchDetailItem, describeBatchDetailItem, batchDetailItemInsuredLabel,
+  isManualBatchDetailItem,
   canShowCancelButton, canShowEditButton, describeBatchCancelImpact, isCancelConfirmationValid,
   isBatchTrulyCancellable, combinedCancelBlockingReasons,
   buildBatchCancelPayload, emptyBatchEditForm, validateBatchEditForm, buildBatchPatchPayload, BATCH_CORRECTION_HINT,
@@ -30,7 +30,10 @@ import {
   buildAccountDifferenceResolutionPayload, receivedCentsOf, summarizeBatchResolution,
   syncChequeSplitAmounts, isRoundingAdjustmentEligible, buildRoundingAdjustmentPayload,
   validateBatchDifferenceResolutionWithRounding,
+  type CashPeriodCandidateForCart, addCashPeriodToCart, getCashPeriodRowState, cartCashPeriodItem,
+  buildBatchReceiptRows,
 } from "@/lib/payment-batch-form";
+import { buildCashPeriodSearchQuery, cashPeriodCandidateLabel } from "@/lib/cash-period-payment-form";
 import {
   type TitularFormState, type AccountHolderOption, type AccountHolderBalance,
   emptyTitularFormState, selectAccountHolder, clearAccountHolder, setDebtAuthorized,
@@ -73,6 +76,7 @@ function cartItemInsuredLabel(item: BatchCartItem): string {
 
 function cartItemLabel(item: BatchCartItem): string {
   if (item.kind === "installment") return `Cuota #${item.installmentNumber} — ${item.policyNumber}`;
+  if (item.kind === "cash_period") return `Contado ${cashPeriodCandidateLabel(item)} — ${item.policyNumber}`;
   if (item.kind === "policy_manual_payment") return `Cobro manual — ${item.policyNumber}`;
   const parts = [item.manualPayer, item.manualPolicyNumber].filter(Boolean);
   return `Cobro manual — ${parts.length > 0 ? parts.join(" / ") : "imputación libre"}`;
@@ -91,6 +95,10 @@ function cartItemAccessoryHint(item: BatchCartItem): string | null {
 function cartItemSubtitle(item: BatchCartItem): string {
   const hint = cartItemAccessoryHint(item) ?? "";
   if (item.kind === "installment") return `${item.companyName} · vence ${fmtDate(item.dueDate)}${hint}`;
+  if (item.kind === "cash_period") {
+    return `${item.companyName} · cancela ${item.installmentCount} cuota${item.installmentCount === 1 ? "" : "s"} ` +
+      `(nominal ${formatCurrency(item.nominalAmount)}, descuento ${formatCurrency(item.nominalAmount - item.amount)})`;
+  }
   if (item.kind === "policy_manual_payment") return `${item.companyName}${item.description ? ` · ${item.description}` : ""}${hint}`;
   const company = item.manualCompany ? `Compañía: ${item.manualCompany}` : "Sin compañía";
   return `${company}${item.description ? ` · ${item.description}` : ""}`;
@@ -109,6 +117,10 @@ export function PendingInstallmentsBatchTab() {
   const [companyId, setCompanyId] = useState("");
   const [pending, setPending] = useState<PendingInstallmentForPayment[]>([]);
   const [loadingPending, setLoadingPending] = useState(false);
+  // Contados por período con importe cargado para los mismos filtros
+  // (GET /policies/cash-period-search, fecha de hoy) — Migración 0037. El
+  // modal de confirmación los revalida con la fecha de pago real.
+  const [cashCandidates, setCashCandidates] = useState<CashPeriodCandidateForCart[]>([]);
 
   // "Vincular a una póliza existente" del cobro manual: SOLO pólizas en
   // posición cobrable (GET /policies/collectable-for-payment), con la fecha
@@ -156,6 +168,22 @@ export function PendingInstallmentsBatchTab() {
     } finally {
       setLoadingPending(false);
     }
+    // No bloqueante: si falla, simplemente no se ofrece el contado.
+    try {
+      const params = new URLSearchParams();
+      if (search) params.set("search", search);
+      if (companyId) params.set("companyId", companyId);
+      const rows = await api.get(`/api/policies/cash-period-search?${params.toString()}`);
+      setCashCandidates(Array.isArray(rows) ? rows.filter((r: CashPeriodCandidateForCart) => r.eligible) : []);
+    } catch {
+      setCashCandidates([]);
+    }
+  }
+
+  function addCashPeriod(candidate: CashPeriodCandidateForCart) {
+    const result = addCashPeriodToCart(cart, candidate);
+    if (result.error) { toast.error(result.error); return; }
+    setCart(result.cart);
   }
 
   async function loadRecentBatches() {
@@ -171,7 +199,7 @@ export function PendingInstallmentsBatchTab() {
   }
 
   useEffect(() => {
-    if (!shouldSearch) { setPending([]); return; }
+    if (!shouldSearch) { setPending([]); setCashCandidates([]); return; }
     loadPending();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [search, companyId]);
@@ -358,6 +386,40 @@ export function PendingInstallmentsBatchTab() {
             )}
           </div>
         )}
+
+        {shouldSearch && cashCandidates.length > 0 && (
+          <div className="border border-emerald-500/20 rounded-xl overflow-x-auto" data-testid="batch-cash-period-candidates">
+            <p className="px-3 pt-2.5 text-xs text-emerald-300 font-medium">Contado por período disponible</p>
+            <p className="px-3 pb-2 text-[11px] text-white/40">
+              Cobra el período completo por su importe de contado: cancela todas sus cuotas (no se agregan sueltas). Un contado por lote.
+            </p>
+            <table className="w-full text-sm min-w-[820px]">
+              <tbody>
+                {cashCandidates.map((cand) => {
+                  const state = getCashPeriodRowState(cand, cart);
+                  return (
+                    <tr key={`${cand.policyId}-${cand.rebillingId ?? "emision"}`} title={state.reason ?? undefined}
+                      className={cn("border-t border-white/5", !state.addable && "opacity-40")}>
+                      <td className="px-3 py-2.5 text-white">{cand.insuredName}</td>
+                      <td className="px-3 py-2.5 text-white/70 font-mono text-xs">{cand.policyNumber}</td>
+                      <td className="px-3 py-2.5 text-white/70">{cand.companyName}</td>
+                      <td className="px-3 py-2.5 text-white/50 text-xs">
+                        {cashPeriodCandidateLabel(cand)} · {cand.installmentCount} cuota{cand.installmentCount === 1 ? "" : "s"} · nominal {formatCurrency(cand.nominalAmountCents / 100)}
+                      </td>
+                      <td className="px-3 py-2.5 text-right text-white font-mono">{formatCurrency((cand.cashPaymentAmountCents ?? 0) / 100)}</td>
+                      <td className="px-3 py-2.5 text-right w-40">
+                        <button onClick={() => addCashPeriod(cand)} disabled={!state.addable}
+                          className="flex items-center gap-1 px-2.5 py-1 bg-emerald-600/80 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs rounded-lg transition-all ml-auto">
+                          <Plus className="w-3 h-3" /> Agregar contado
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {/* Agregar cobro manual */}
@@ -527,10 +589,13 @@ export function PendingInstallmentsBatchTab() {
                   <div key={k} className="flex items-center justify-between gap-3 px-3 py-2 bg-white/5 rounded-lg text-sm">
                     <div className="min-w-0 flex-1">
                       <p className="text-white truncate">
-                        {item.kind !== "installment" && (
+                        {item.kind === "cash_period" && (
+                          <span className="text-xs px-1.5 py-0.5 rounded border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 mr-1.5">Contado</span>
+                        )}
+                        {item.kind !== "installment" && item.kind !== "cash_period" && (
                           <span className="text-xs px-1.5 py-0.5 rounded border border-orange-500/30 bg-orange-500/10 text-orange-400 mr-1.5">Cobro manual</span>
                         )}
-                        {item.kind === "installment" ? cartItemLabel(item) : (
+                        {item.kind === "installment" || item.kind === "cash_period" ? cartItemLabel(item) : (
                           item.kind === "policy_manual_payment" ? item.policyNumber
                             : [item.manualPayer, item.manualPolicyNumber].filter(Boolean).join(" / ") || "imputación libre"
                         )}
@@ -809,6 +874,43 @@ export function BatchPaymentModal({
   const cartPolicyCollectability = resolveCartPolicyCollectability(cart, policyCheck, paymentDate);
   const unavailablePolicyLocalIds = cartPolicyCollectability.unavailableLocalIds;
 
+  // Migración 0037 — contado del período: se revalida con la fecha de pago
+  // elegida (misma búsqueda que "Imputar pago", GET /policies/cash-period-search
+  // con policyId + paymentDate). Fail closed: sin respuesta OK, o si el
+  // período dejó de ser elegible o cambió su importe de contado, no se puede
+  // confirmar. El backend vuelve a validar todo dentro de la transacción.
+  const cashItem = cartCashPeriodItem(cart);
+  type CashCheck = { status: "not_needed" | "loading" | "ok" | "unavailable" | "error"; paymentDate: string; reason?: string };
+  const [cashCheck, setCashCheck] = useState<CashCheck>({ status: cashItem ? "loading" : "not_needed", paymentDate });
+  const [cashCheckRetry, setCashCheckRetry] = useState(0);
+  useEffect(() => {
+    if (!cashItem) { setCashCheck({ status: "not_needed", paymentDate }); return; }
+    if (!looksLikeIsoDate(paymentDate)) { setCashCheck({ status: "error", paymentDate, reason: "Ingresá una fecha de pago válida." }); return; }
+    let cancelled = false;
+    setCashCheck({ status: "loading", paymentDate });
+    api.get(buildCashPeriodSearchQuery({ policyId: cashItem.policyId, paymentDate }))
+      .then((rows: unknown) => {
+        if (cancelled) return;
+        const row = Array.isArray(rows)
+          ? (rows as CashPeriodCandidateForCart[]).find((r) => r.policyId === cashItem.policyId && (r.rebillingId ?? null) === cashItem.rebillingId)
+          : undefined;
+        if (!row) { setCashCheck({ status: "error", paymentDate, reason: "No se pudo validar el contado del período." }); return; }
+        if (!row.eligible) {
+          setCashCheck({ status: "unavailable", paymentDate, reason: row.ineligibleReasons?.[0] ?? "El contado ya no está disponible." });
+          return;
+        }
+        if (row.cashPaymentAmountCents !== Math.round(cashItem.amount * 100)) {
+          setCashCheck({ status: "unavailable", paymentDate, reason: "El importe de contado del período cambió: quitalo y volvé a agregarlo." });
+          return;
+        }
+        setCashCheck({ status: "ok", paymentDate });
+      })
+      .catch(() => { if (!cancelled) setCashCheck({ status: "error", paymentDate, reason: "No se pudo validar el contado del período." }); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paymentDate, cashItem?.policyId, cashItem?.rebillingId, cashCheckRetry]);
+  const cashCanConfirm = !cashItem || (cashCheck.status === "ok" && cashCheck.paymentDate === paymentDate);
+
   const subtotal = calculateCartTotal(cart);
   const targetCents = calculateBatchTargetAmountCents(cart, splits);
   const surchargeCents = targetCents - Math.round(subtotal * 100);
@@ -983,13 +1085,18 @@ export function BatchPaymentModal({
       return;
     }
 
-    if (isTitularMode) {
+    if (isTitularMode && !cashItem) {
       await handleTitularSubmit();
       submissionLock = false;
       return;
     }
 
-    if (!differenceValidation.valid) {
+    if (cashItem && difference.kind !== "exacto") {
+      toast.error("Con contado del período, los medios deben sumar exactamente el total a cobrar.");
+      submissionLock = false;
+      return;
+    }
+    if (!cashItem && !differenceValidation.valid) {
       toast.error(differenceValidation.errorMessage ?? "Resolvé la diferencia entre lo recibido y lo aplicado.");
       submissionLock = false;
       return;
@@ -1074,9 +1181,16 @@ export function BatchPaymentModal({
     }
   }
 
-  const legacyValid = validation.valid && differenceValidation.valid;
+  // Con contado del período (Migración 0037, primera versión): lo recibido
+  // debe coincidir exacto con lo imputado — sin saldos ni redondeo.
+  const cashExactValid = !cashItem || difference.kind === "exacto";
+  const legacyValid = validation.valid && (cashItem ? cashExactValid : differenceValidation.valid);
   const titularValid = validation.valid && !titularBalanceLoading && titularBalance != null && !!titularFieldsValidation?.valid && !!titularPreview?.ok && titularConfirmed;
-  const disabled = isBatchSubmitDisabled(submitting, (isTitularMode ? titularValid : legacyValid) && cartCollectability.canConfirm && cartPolicyCollectability.canConfirm, cart.length > 0);
+  const disabled = isBatchSubmitDisabled(
+    submitting,
+    (isTitularMode && !cashItem ? titularValid : legacyValid) && cartCollectability.canConfirm && cartPolicyCollectability.canConfirm && cashCanConfirm,
+    cart.length > 0,
+  );
 
   return (
     <div className="fixed inset-0 bg-black/70 flex items-start justify-center z-50 p-4 overflow-y-auto">
@@ -1106,8 +1220,13 @@ export function BatchPaymentModal({
                         || (item.kind === "policy_manual_payment" && unavailablePolicyLocalIds.includes(item.localId))) && (
                         <span className="mr-1.5 text-[10px] px-1.5 py-0.5 rounded border border-amber-500/30 bg-amber-500/10 text-amber-400">no disponible</span>
                       )}
+                      {item.kind === "cash_period" && cashCheck.status === "unavailable" && (
+                        <span className="mr-1.5 text-[10px] px-1.5 py-0.5 rounded border border-amber-500/30 bg-amber-500/10 text-amber-400">no disponible</span>
+                      )}
                       {item.kind === "installment"
                         ? `Cuota #${item.installmentNumber} — ${item.policyNumber} — vence ${fmtDate(item.dueDate)}`
+                        : item.kind === "cash_period"
+                          ? `${cartItemLabel(item)} — ${cartItemSubtitle(item)}`
                         : item.kind === "policy_manual_payment"
                           ? `Cobro manual — ${item.policyNumber}${item.description ? ` — ${item.description}` : ""}`
                           : `Cobro manual — ${[item.manualPayer, item.manualPolicyNumber].filter(Boolean).join(" / ") || "imputación libre"}${item.description ? ` — ${item.description}` : ""}`}
@@ -1173,6 +1292,17 @@ export function BatchPaymentModal({
               )}
               {cartPolicyCollectability.kind === "checking" && (
                 <p className="text-xs text-white/40 mt-1">Validando las pólizas de los cobros manuales para esta fecha…</p>
+              )}
+              {cashItem && (cashCheck.status === "unavailable" || cashCheck.status === "error") && (
+                <p className="text-xs text-amber-400 mt-1" data-testid="cart-cash-period-unavailable">
+                  Contado del período: {cashCheck.reason}{" "}
+                  {cashCheck.status === "error" && (
+                    <button type="button" onClick={() => setCashCheckRetry((n) => n + 1)} className="underline hover:text-amber-300">Reintentar</button>
+                  )}
+                </p>
+              )}
+              {cashItem && cashCheck.status === "loading" && (
+                <p className="text-xs text-white/40 mt-1">Validando el contado del período para esta fecha…</p>
               )}
               {cartPolicyCollectability.kind === "error" && (
                 <p className="text-xs text-red-400 mt-1" data-testid="cart-policy-error">
@@ -1252,7 +1382,14 @@ export function BatchPaymentModal({
                 deuda (ver más abajo) — accountDifferenceResolution es
                 mutuamente excluyente con accountHolderInsuredId (Regla 5),
                 así que este bloque nunca se muestra con un titular activo. */}
-            {!isTitularMode && validation.valid && difference.kind !== "exacto" && (
+            {cashItem && validation.valid && difference.kind !== "exacto" && (
+              <p className="mt-3 text-xs text-red-400" data-testid="cash-period-exact-required">
+                Con contado del período, lo recibido debe coincidir exactamente con lo imputado
+                ({formatCurrencyCents(targetCents)}). Diferencia: {formatCurrencyCents(difference.differenceCents)}.
+                Los cheques se cargan por su importe real; ajustá los medios para que sumen el total.
+              </p>
+            )}
+            {!cashItem && !isTitularMode && validation.valid && difference.kind !== "exacto" && (
               <div className={cn(
                 "mt-3 rounded-xl border p-3 space-y-2",
                 difference.kind === "saldo_a_favor" ? "bg-emerald-500/10 border-emerald-500/20" : "bg-red-500/10 border-red-500/20"
@@ -1336,6 +1473,11 @@ export function BatchPaymentModal({
               defecto. Seleccionar un titular activa el modo nuevo (oculta el
               bloque de sobrante/faltante de arriba); quitarlo vuelve al modo
               legacy y limpia todos sus campos (handleClearTitular). */}
+          {cashItem ? (
+            <p className="text-[11px] text-white/40 px-1" data-testid="cash-period-no-titular">
+              Un lote con contado del período no usa titular de cuenta ni saldo a favor.
+            </p>
+          ) : (
           <div className="bg-white/5 border border-white/10 rounded-xl p-4 space-y-3">
             <div className="flex items-center gap-2">
               <UserCheck className="w-4 h-4 text-blue-400" />
@@ -1471,6 +1613,7 @@ export function BatchPaymentModal({
               </div>
             )}
           </div>
+          )}
 
           <div className="flex justify-end gap-3 pt-1">
             <button onClick={onClose} className="px-4 py-2 bg-white/5 text-white/60 text-sm rounded-lg hover:bg-white/10 transition-all">Cancelar</button>
@@ -1543,12 +1686,21 @@ function BatchReceiptModal({
 
           <div className="bg-white/5 border border-white/10 rounded-xl p-3">
             <p className="text-xs text-white/40 uppercase tracking-wider mb-2">Ítems del cobro</p>
-            {detail.items.map((item) => (
-              <div key={item.payment.id} className="flex justify-between items-start gap-3 text-xs py-1 border-b border-white/5 last:border-0">
-                <span className={cn("flex-1", isManualBatchDetailItem(item) ? "text-orange-300" : "text-white/70")}>
-                  <span className="text-white/50">{batchDetailItemInsuredLabel(item)}</span> — {describeBatchDetailItem(item)}
+            {buildBatchReceiptRows(detail.items, detail.cashPeriodPayment).map((row) => (
+              <div key={row.key} className="flex justify-between items-start gap-3 text-xs py-1 border-b border-white/5 last:border-0">
+                <span className={cn(
+                  "flex-1",
+                  row.kind === "cash_period" ? "text-emerald-300" : isManualBatchDetailItem(row.item) ? "text-orange-300" : "text-white/70",
+                )}>
+                  <span className="text-white/50">{row.insuredLabel}</span> — {row.label}
+                  {row.kind === "cash_period" && (
+                    <span className="block text-[11px] text-white/40">
+                      Nominal {formatCurrencyCents(row.nominalCents)} · descuento {formatCurrencyCents(row.discountCents)} · cuotas{" "}
+                      {row.installments.map((i) => i.installment?.number ?? "—").join(", ")}
+                    </span>
+                  )}
                 </span>
-                <span className="text-white font-mono shrink-0">{formatCurrency(item.payment.amount)}</span>
+                <span className="text-white font-mono shrink-0">{formatCurrencyCents(row.amountCents)}</span>
               </div>
             ))}
           </div>
