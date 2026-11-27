@@ -147,7 +147,6 @@ afterAll(async () => {
   const payIds = (await db.select({ id: payments.id }).from(payments).where(eq(payments.createdBy, userId)).all()).map((p) => p.id);
   if (batchIds.length) await db.delete(paymentBatchFundingAllocations).where(inArray(paymentBatchFundingAllocations.paymentBatchId, batchIds));
   await db.delete(accountHolderFundingIdempotencyKeys).where(eq(accountHolderFundingIdempotencyKeys.createdBy, userId));
-  await db.delete(cashPeriodPayments).where(eq(cashPeriodPayments.createdBy, userId));
   if (payIds.length) await db.delete(cashEntries).where(inArray(cashEntries.paymentId, payIds));
   await db.delete(paymentAmountAdjustments).where(eq(paymentAmountAdjustments.createdBy, userId));
   await db.delete(insuredAccountMovements).where(eq(insuredAccountMovements.createdBy, userId));
@@ -155,6 +154,8 @@ afterAll(async () => {
     await db.delete(paymentSplits).where(inArray(paymentSplits.paymentId, payIds));
     await db.delete(payments).where(inArray(payments.id, payIds));
   }
+  // Después de payments: payments.cash_period_payment_id referencia el contado (Migración 0037).
+  await db.delete(cashPeriodPayments).where(eq(cashPeriodPayments.createdBy, userId));
   if (batchIds.length) {
     await db.delete(paymentBatchSplits).where(inArray(paymentBatchSplits.batchId, batchIds));
     await db.delete(paymentBatches).where(inArray(paymentBatches.id, batchIds));

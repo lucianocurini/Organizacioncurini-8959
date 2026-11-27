@@ -149,7 +149,8 @@ async function createSchema(c: Client): Promise<void> {
       due_date       TEXT,
       created_by     INTEGER REFERENCES users(id),
       created_at     INTEGER,
-      batch_id       INTEGER REFERENCES payment_batches(id)
+      batch_id       INTEGER REFERENCES payment_batches(id),
+      cash_period_payment_id INTEGER -- Migración 0037
     )
   `);
   await c.execute(`

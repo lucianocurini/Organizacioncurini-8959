@@ -172,11 +172,12 @@ function remittanceBodyFor(item: any, breakdownKey = "efectivo") {
 
 async function cleanupBatches(batchIds: number[]) {
   if (batchIds.length === 0) return;
-  await db.delete(cashPeriodPayments).where(inArray(cashPeriodPayments.paymentBatchId, batchIds)).catch(() => {});
   const childRows = await db.select({ id: payments.id }).from(payments).where(inArray(payments.batchId, batchIds)).all();
   const childIds = childRows.map((r) => r.id);
   if (childIds.length) await db.delete(cashEntries).where(inArray(cashEntries.paymentId, childIds)).catch(() => {});
   if (childIds.length) await db.delete(payments).where(inArray(payments.id, childIds)).catch(() => {});
+  // Después de payments: el hijo referencia su contado (Migración 0037).
+  await db.delete(cashPeriodPayments).where(inArray(cashPeriodPayments.paymentBatchId, batchIds)).catch(() => {});
   const splitRows = await db.select({ id: paymentBatchSplits.id }).from(paymentBatchSplits).where(inArray(paymentBatchSplits.batchId, batchIds)).all();
   const splitIds = splitRows.map((s) => s.id);
   if (splitIds.length) await db.delete(receivedChecks).where(inArray(receivedChecks.batchSplitId, splitIds)).catch(() => {});

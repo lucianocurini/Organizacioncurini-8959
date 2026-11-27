@@ -1128,7 +1128,11 @@ export default function CajaPage() {
 
                 {/* Desglose cartera propia */}
                 <div className="mt-4">
-                  <p className="text-xs text-white/30 uppercase tracking-wider mb-2 font-medium">Cuentas propias</p>
+                  <p className="text-xs text-white/30 uppercase tracking-wider mb-1 font-medium">Cuentas propias — pendiente de rendir por medio de cobro</p>
+                  <p className="text-[11px] text-white/30 mb-2" data-testid="caja-cartera-pending-note">
+                    Importes cobrados que todavía falta rendir, según el medio con que se cobraron. En un lote, lo pendiente se reparte
+                    entre sus medios en proporción a lo que falta rendir: no es el detalle de cheques físicos en la oficina.
+                  </p>
                   <div className="grid grid-cols-3 gap-3">
                     <div className="bg-green-900/20 border border-green-500/20 rounded-lg px-4 py-3">
                       <div className="flex items-center gap-2 mb-1">
@@ -1147,9 +1151,10 @@ export default function CajaPage() {
                     <div className="bg-yellow-900/20 border border-yellow-500/20 rounded-lg px-4 py-3">
                       <div className="flex items-center gap-2 mb-1">
                         <FileText size={14} className="text-yellow-400" />
-                        <p className="text-xs text-white/40">Cheques</p>
+                        <p className="text-xs text-white/40">Cobrado con cheque, sin rendir</p>
                       </div>
                       <p className="text-base font-bold text-yellow-400">{fmt(summary.cartera.cheque)}</p>
+                      <p className="text-[10px] text-white/30 mt-0.5">No es la cartera física de cheques</p>
                     </div>
                   </div>
                 </div>

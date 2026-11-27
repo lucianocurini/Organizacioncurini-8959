@@ -214,7 +214,10 @@ export type FingerprintItemInput =
       manualCompany: string | null;
       amountCents: number;
       description: string | null;
-    };
+    }
+  // Migración 0037 — contado de un período en un lote. Sin importe: el
+  // backend usa siempre el importe de contado ya cargado.
+  | { source: "cash_period"; policyId: number; rebillingId: number | null };
 
 export type FingerprintAccountDifferenceResolution =
   | { action: "saldo_a_favor"; reason: string | null }
@@ -255,6 +258,7 @@ const ITEM_KEYS_POLICY_MANUAL: ReadonlySet<string> = new Set(["source", "policyI
 const ITEM_KEYS_MANUAL: ReadonlySet<string> = new Set([
   "source", "manualPayer", "manualPolicyNumber", "manualCompany", "amountCents", "description",
 ]);
+const ITEM_KEYS_CASH_PERIOD: ReadonlySet<string> = new Set(["source", "policyId", "rebillingId"]);
 const SPLIT_KEYS: ReadonlySet<string> = new Set(["method", "amountCents", "notes", "checks"]);
 const CHECK_KEYS: ReadonlySet<string> = new Set([
   "checkNumber", "bankName", "bankCode", "drawerName", "drawerDocument", "issueDate", "dueDate", "amountCents", "notes",
@@ -304,6 +308,12 @@ function validateItem(raw: unknown, index: number): FingerprintItemInput {
       amountCents: raw.amountCents as number,
       description: raw.description as string | null,
     };
+  }
+  if (source === "cash_period") {
+    assertExactKeys(`El ítem en la posición ${index} (cash_period)`, raw, ITEM_KEYS_CASH_PERIOD);
+    assertSafeInt(`El policyId del ítem ${index}`, raw.policyId, { min: 1 });
+    if (raw.rebillingId !== null) assertSafeInt(`El rebillingId del ítem ${index}`, raw.rebillingId, { min: 1 });
+    return { source: "cash_period", policyId: raw.policyId as number, rebillingId: raw.rebillingId as number | null };
   }
   throw new FundingRequestFingerprintInputError(`El ítem en la posición ${index} tiene un source inválido: ${String(source)}.`);
 }

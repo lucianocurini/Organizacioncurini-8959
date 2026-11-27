@@ -23,8 +23,54 @@
 // cierren exacto).
 
 import { addCalendarDays } from "../dates/argentina-date";
+import { apportionCents } from "./apportion";
 
 export class CashPeriodPaymentValidationError extends Error {}
+
+// ─── Contado en un lote mixto (Migración 0037) ─────────────────────────────
+//
+// Un contado puede compartir lote con cuotas comunes de otras pólizas. Sus
+// payments hijos (uno por cuota, con payments.cash_period_payment_id) guardan
+// el NOMINAL de su cuota para que la cuota quede "pagada" con trazabilidad,
+// pero económicamente el contado es UNA partida por su importe de contado.
+// Cuando ese importe tiene que bajar a nivel de hijo (rendir el contado de un
+// lote mixto, o prorratear lo pendiente de rendir de ese lote en Caja), se
+// reparte acá — una sola función, para que la rendición y Caja calculen
+// exactamente los mismos centavos por hijo y nunca se descuadren.
+
+export interface CashPeriodChildForApportion {
+  paymentId: number;
+  /** payments.amount del hijo (nominal de su cuota), en centavos. */
+  nominalCents: number;
+}
+
+/**
+ * Reparte cashAmountCents entre los hijos del contado en proporción a su
+ * nominal (resto mayor, sin drift: la suma es exactamente cashAmountCents).
+ * Orden canónico por paymentId para que el resultado no dependa del orden
+ * en que la consulta devolvió las filas. Nominales en 0 (no debería pasar)
+ * reparten en partes iguales.
+ */
+export function apportionCashPeriodChildrenCents(
+  cashAmountCents: number,
+  children: ReadonlyArray<CashPeriodChildForApportion>,
+): Map<number, number> {
+  const sorted = [...children].sort((a, b) => a.paymentId - b.paymentId);
+  const totalNominal = sorted.reduce((s, c) => s + Math.max(0, c.nominalCents), 0);
+  const weights = sorted.map((c) => (totalNominal > 0 ? Math.max(0, c.nominalCents) : 1));
+  const parts = apportionCents(cashAmountCents, weights);
+  return new Map(sorted.map((c, i) => [c.paymentId, parts[i]!]));
+}
+
+/**
+ * true si el lote mezcla el contado con otros hijos (cuotas comunes o
+ * cobros manuales). Un lote "puro" (todos sus hijos son del contado) es el
+ * caso histórico de POST /payment-batches/cash-period-payment y sigue
+ * rindiéndose con sus instrumentos reales; uno mixto se rinde por partida.
+ */
+export function isMixedCashPeriodBatch(children: ReadonlyArray<{ cashPeriodPaymentId: number | null }>): boolean {
+  return children.some((c) => c.cashPeriodPaymentId == null);
+}
 
 // ─── Vencimiento informativo del contado (fecha límite, nunca un gate) ─────
 //

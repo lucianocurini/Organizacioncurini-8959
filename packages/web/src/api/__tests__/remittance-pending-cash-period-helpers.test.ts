@@ -20,6 +20,7 @@ function src(overrides: Partial<CashPeriodPendingSource> = {}): CashPeriodPendin
     batch: { status: "confirmado", paymentDate: "2027-06-15", totalReceivedCents: 38000000, receivedAmountCents: 38000000, notes: null },
     splits: [{ method: "efectivo", amountCents: 38000000, notes: null, checks: [] }],
     children: [1, 2, 3, 4].map((n) => ({ paymentId: 100 + n, status: "confirmado", rendered: 0 })),
+    mixedBatch: false,
     policyNumber: "POL-1",
     insuredName: "Asegurado",
     companyName: "Compañía",
@@ -115,7 +116,7 @@ describe("buildCashPeriodPendingItem", () => {
       cashPeriodPayment: {
         id: 7, policyId: 11, rebillingId: null, periodStart: "2027-01-01", periodEnd: "2027-12-31",
         installmentCount: 4, nominalAmountCents: 40000000, discountAmountCents: 2000000,
-        cashAmountCents: 38000000, receivedAmountCents: 38000000, hasChecks: false,
+        cashAmountCents: 38000000, receivedAmountCents: 38000000, hasChecks: false, mixedBatch: false,
       },
       blocked: false,
       blockedCode: null,
@@ -181,14 +182,54 @@ describe("buildCashPeriodPendingItem", () => {
 });
 
 describe("excludeCashPeriodChildren", () => {
-  test("saca solo los hijos de contados; standalone y lotes normales quedan", () => {
+  test("saca solo las cuotas de contados (cash_period_payment_id); standalone, lotes normales y cuotas comunes de un lote mixto quedan", () => {
     const rows = [
-      { id: 1, batchId: null },
-      { id: 2, batchId: 70 },
-      { id: 3, batchId: 70 },
-      { id: 4, batchId: 80 },
+      { id: 1, batchId: null, cashPeriodPaymentId: null },
+      { id: 2, batchId: 70, cashPeriodPaymentId: 7 },
+      { id: 3, batchId: 70, cashPeriodPaymentId: 7 },
+      { id: 4, batchId: 80, cashPeriodPaymentId: null },
+      { id: 5, batchId: 70, cashPeriodPaymentId: null }, // cuota común del lote mixto 70
     ];
-    expect(excludeCashPeriodChildren(rows, new Set([70])).map((r) => r.id)).toEqual([1, 4]);
-    expect(excludeCashPeriodChildren(rows, new Set()).map((r) => r.id)).toEqual([1, 2, 3, 4]);
+    expect(excludeCashPeriodChildren(rows).map((r) => r.id)).toEqual([1, 4, 5]);
+  });
+});
+
+describe("contado de un lote mixto (Migración 0037)", () => {
+  // Lote de $48.000: contado $38.000 (en otro src) + cuotas comunes; los medios pagan todo el lote.
+  const mixed = (overrides: Partial<CashPeriodPendingSource> = {}) => src({
+    mixedBatch: true,
+    batch: { status: "confirmado", paymentDate: "2027-06-15", totalReceivedCents: 48000000, receivedAmountCents: 48000000, notes: null },
+    splits: [{ method: "cheque", amountCents: 48000000, notes: null, checks: [{ amountCents: 30000000 }, { amountCents: 18000000 }] }],
+    ...overrides,
+  });
+
+  test("se ofrece aunque el total y los medios del lote no coincidan con el contado", () => {
+    expect(decideCashPeriodPending(mixed())).toEqual({ kind: "offer" });
+  });
+
+  test("ítem: importe = contado, medio 'lote', sin exponer los medios del lote, grupo del lote", () => {
+    const item = buildCashPeriodPendingItem(mixed())!;
+    expect(item.amount).toBe(380000);
+    expect(item.paymentMethod).toBe("lote");
+    expect(item.splits).toEqual([]);
+    expect(item.paymentGroup).toBe("own");
+    expect(item.cashPeriodPayment.mixedBatch).toBe(true);
+    expect(item.cashPeriodPayment.receivedAmountCents).toBe(38000000);
+    expect(item.cashPeriodPayment.hasChecks).toBe(false);
+    expect(item.blocked).toBe(false);
+  });
+
+  test("las inconsistencias de sus propias cuotas siguen bloqueando", () => {
+    const oneRendered = [1, 2].map((n) => ({ paymentId: 100 + n, status: "confirmado", rendered: n === 1 ? 1 : 0 }));
+    expect(decideCashPeriodPending(mixed({ children: oneRendered }))).toEqual({ kind: "blocked", code: "CASH_PERIOD_CHILDREN_PARTIALLY_RENDERED" });
+    expect(decideCashPeriodPending(mixed({ children: [] }))).toEqual({ kind: "blocked", code: "CASH_PERIOD_NO_CHILDREN" });
+    expect(decideCashPeriodPending(mixed({ batch: null }))).toEqual({ kind: "blocked", code: "CASH_PERIOD_BATCH_NOT_CONFIRMED" });
+  });
+
+  test("contado puro (histórico) sin cambios: medio real y monto = total del lote", () => {
+    const item = buildCashPeriodPendingItem(src())!;
+    expect(item.paymentMethod).toBe("efectivo");
+    expect(item.amount).toBe(380000);
+    expect(item.cashPeriodPayment.mixedBatch).toBe(false);
   });
 });

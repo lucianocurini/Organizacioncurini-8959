@@ -83,7 +83,16 @@ export interface CashPeriodPendingSource {
     notes: string | null;
   } | null;
   splits: ReadonlyArray<CashPeriodPendingSplit>;
+  /** Solo las cuotas de ESTE contado (payments.cash_period_payment_id, Migración 0037). */
   children: ReadonlyArray<CashPeriodPendingChild>;
+  /**
+   * Migración 0037: true si el lote también tiene otros hijos (cuotas comunes
+   * de otras pólizas). Sus medios reales pagan todo el lote, así que no se
+   * comparan contra el contado ni se rinden con él: el contado se rinde como
+   * una partida por su importe de contado, con el medio de rendición elegido
+   * (igual que cualquier hijo de lote, Migración 0029).
+   */
+  mixedBatch: boolean;
   policyNumber: string | null;
   insuredName: string | null;
   companyName: string | null;
@@ -120,6 +129,8 @@ export interface CashPeriodPendingItem {
     cashAmountCents: number;
     receivedAmountCents: number | null;
     hasChecks: boolean;
+    /** Lote mixto (Migración 0037): se rinde con el medio elegido, no con los medios del lote. */
+    mixedBatch: boolean;
   };
   blocked: boolean;
   blockedCode: CashPeriodPendingBlockedCode | null;
@@ -151,6 +162,13 @@ export function decideCashPeriodPending(src: CashPeriodPendingSource): CashPerio
   if (src.children.some((c) => c.status !== "confirmado")) return { kind: "blocked", code: "CASH_PERIOD_CHILD_NOT_CONFIRMED" };
   if (src.children.some((c) => c.rendered !== 0)) return { kind: "blocked", code: "CASH_PERIOD_CHILDREN_PARTIALLY_RENDERED" };
 
+  // Lote mixto (Migración 0037): el lote paga además otras cuotas, así que su
+  // total y sus medios nunca coinciden con el contado — y no tienen por qué:
+  // POST /remittances rinde el contado por su importe de contado con el medio
+  // de rendición elegido, sin consumir los medios del lote. El alta del lote
+  // ya exigió recibido = imputado.
+  if (src.mixedBatch) return { kind: "offer" };
+
   // POST /remittances exige importe declarado === payment_batches.total_received_cents.
   if (src.batch.totalReceivedCents !== src.cashAmountCents) return { kind: "blocked", code: "CASH_PERIOD_AMOUNT_MISMATCH" };
 
@@ -175,16 +193,21 @@ export function buildCashPeriodPendingItem(src: CashPeriodPendingSource): CashPe
   const decision = decideCashPeriodPending(src);
   if (decision.kind === "hide") return null;
 
-  const splits = src.splits.map((s) => ({ method: s.method, amountCents: s.amountCents, notes: s.notes }));
+  const batchSplits = src.splits.map((s) => ({ method: s.method, amountCents: s.amountCents, notes: s.notes }));
+  // Lote mixto: los medios del lote no son "del contado" — no se exponen como
+  // tales (el grupo propio/directo sí: un lote nunca mezcla grupos).
+  const splits = src.mixedBatch ? [] : batchSplits;
   const blockedCode = decision.kind === "blocked" ? decision.code : null;
   return {
     source: "payment_batch",
     sourceId: src.paymentBatchId,
     paymentBatchId: src.paymentBatchId,
-    // Exactamente lo que POST /remittances acepta como importe del ítem.
-    amount: (src.batch?.totalReceivedCents ?? src.cashAmountCents) / 100,
-    // Medio REAL del lote, nunca el literal "contado" de los hijos.
-    paymentMethod: splits.length === 1 ? splits[0]!.method : splits.length > 1 ? "combinado" : "contado",
+    // Exactamente lo que POST /remittances acepta como importe del ítem: el
+    // total del lote si es un contado puro (histórico), el contado si es mixto.
+    amount: (src.mixedBatch ? src.cashAmountCents : (src.batch?.totalReceivedCents ?? src.cashAmountCents)) / 100,
+    // Medio REAL del lote, nunca el literal "contado" de los hijos. En un
+    // lote mixto, "lote": el medio de rendición se elige al rendir.
+    paymentMethod: src.mixedBatch ? "lote" : splits.length === 1 ? splits[0]!.method : splits.length > 1 ? "combinado" : "contado",
     paymentDate: src.batch?.paymentDate ?? null,
     dueDate: null,
     clientName: src.insuredName || "—",
@@ -193,7 +216,7 @@ export function buildCashPeriodPendingItem(src: CashPeriodPendingSource): CashPe
     notes: src.batch?.notes ?? null,
     hasSurcharge: false,
     splits,
-    paymentGroup: classifySplitGroup(splits),
+    paymentGroup: classifySplitGroup(batchSplits),
     isCashPeriodPayment: true,
     concept: CASH_PERIOD_PENDING_CONCEPT,
     cashPeriodPayment: {
@@ -206,8 +229,9 @@ export function buildCashPeriodPendingItem(src: CashPeriodPendingSource): CashPe
       nominalAmountCents: src.nominalAmountCents,
       discountAmountCents: src.discountAmountCents,
       cashAmountCents: src.cashAmountCents,
-      receivedAmountCents: src.batch?.receivedAmountCents ?? null,
-      hasChecks: src.splits.some((s) => s.method === "cheque" && s.checks.length > 0),
+      receivedAmountCents: src.mixedBatch ? src.cashAmountCents : (src.batch?.receivedAmountCents ?? null),
+      hasChecks: !src.mixedBatch && src.splits.some((s) => s.method === "cheque" && s.checks.length > 0),
+      mixedBatch: src.mixedBatch,
     },
     blocked: blockedCode !== null,
     blockedCode,
@@ -216,13 +240,13 @@ export function buildCashPeriodPendingItem(src: CashPeriodPendingSource): CashPe
 }
 
 /**
- * Pagos individuales que siguen listándose tal cual: todos menos los hijos de
- * un contado (payments.batchId con fila en cash_period_payments). Los lotes
- * normales y los pagos standalone no cambian.
+ * Pagos individuales que siguen listándose tal cual: todos menos las cuotas
+ * de un contado (payments.cash_period_payment_id, Migración 0037). Los lotes
+ * normales, los pagos standalone y las cuotas comunes de un lote mixto no
+ * cambian.
  */
-export function excludeCashPeriodChildren<T extends { batchId: number | null }>(
+export function excludeCashPeriodChildren<T extends { cashPeriodPaymentId: number | null }>(
   pendingPayments: ReadonlyArray<T>,
-  cashPeriodBatchIds: ReadonlySet<number>
 ): T[] {
-  return pendingPayments.filter((p) => p.batchId == null || !cashPeriodBatchIds.has(p.batchId));
+  return pendingPayments.filter((p) => p.cashPeriodPaymentId == null);
 }

@@ -95,6 +95,15 @@ export function isCashPeriodPendingItem(item: PendingItemForSelection): boolean 
 }
 
 /**
+ * Contado que comparte lote con otras cuotas (Migración 0037): se rinde por
+ * su importe de contado con el medio de rendición ELEGIDO (como un hijo de
+ * lote), nunca con los medios del lote, que pagan también las otras cuotas.
+ */
+export function isMixedCashPeriodPendingItem(item: PendingItemForSelection & { cashPeriodPayment?: { mixedBatch?: boolean } | null }): boolean {
+  return item.source === "payment_batch" && item.cashPeriodPayment?.mixedBatch === true;
+}
+
+/**
  * false para un ítem que el backend marcó bloqueado (contado con datos
  * inconsistentes): se muestra con su aviso, pero nunca se puede elegir.
  */

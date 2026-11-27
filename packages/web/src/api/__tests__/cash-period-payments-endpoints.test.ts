@@ -164,8 +164,9 @@ beforeAll(async () => {
     if (remIds.length) await db.delete(remittanceAllocations).where(inArray(remittanceAllocations.remittanceId, remIds)).catch(() => {});
     if (remIds.length) await db.delete(remittanceItems).where(inArray(remittanceItems.remittanceId, remIds)).catch(() => {});
     if (remIds.length) await db.delete(remittances).where(inArray(remittances.id, remIds)).catch(() => {});
-    if (batchIds.length) await db.delete(cashPeriodPayments).where(inArray(cashPeriodPayments.paymentBatchId, batchIds)).catch(() => {});
+    // payments antes que cash_period_payments: el hijo referencia su contado (Migración 0037).
     if (payIds.length) await db.delete(payments).where(inArray(payments.id, payIds)).catch(() => {});
+    if (batchIds.length) await db.delete(cashPeriodPayments).where(inArray(cashPeriodPayments.paymentBatchId, batchIds)).catch(() => {});
     if (batchIds.length) {
       const splitRows = await db.select({ id: paymentBatchSplits.id }).from(paymentBatchSplits).where(inArray(paymentBatchSplits.batchId, batchIds)).all();
       const splitIds = splitRows.map((s) => s.id);
@@ -209,10 +210,11 @@ afterAll(async () => {
     await db.delete(remittances).where(inArray(remittances.id, remittanceIdsToClean)).catch(() => {});
   }
   if (batchIdsToClean.length) {
-    await db.delete(cashPeriodPayments).where(inArray(cashPeriodPayments.paymentBatchId, batchIdsToClean)).catch(() => {});
     const childRows = await db.select({ id: payments.id }).from(payments).where(inArray(payments.batchId, batchIdsToClean)).all();
     const childIds = childRows.map((r) => r.id);
     if (childIds.length) await db.delete(payments).where(inArray(payments.id, childIds)).catch(() => {});
+    // Después de payments: el hijo referencia su contado (Migración 0037).
+    await db.delete(cashPeriodPayments).where(inArray(cashPeriodPayments.paymentBatchId, batchIdsToClean)).catch(() => {});
     const splitRows = await db.select({ id: paymentBatchSplits.id }).from(paymentBatchSplits).where(inArray(paymentBatchSplits.batchId, batchIdsToClean)).all();
     const splitIds = splitRows.map((s) => s.id);
     if (splitIds.length) await db.delete(receivedChecks).where(inArray(receivedChecks.batchSplitId, splitIds)).catch(() => {});
